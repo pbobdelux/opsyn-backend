@@ -51,6 +51,9 @@ class ConfirmedOrderLine(Base):
     unit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     customer_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     source_row_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    line_total: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    validation_status: Mapped[str] = mapped_column(String(50), default="valid")
+    validation_message: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

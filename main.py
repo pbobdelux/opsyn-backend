@@ -9,6 +9,7 @@ import os
 from io import BytesIO
 import re
 import ast
+from collections import Counter
 from difflib import SequenceMatcher
 
 import openpyxl
@@ -71,6 +72,7 @@ async def auth_middleware(request: Request, call_next):
         "/review-order",
         "/confirm-order",
         "/confirmed-lines",
+        "/order-summary",
     ]:
         return await call_next(request)
 
@@ -98,7 +100,7 @@ def row_is_empty(row):
 def detect_header_row(rows):
     keywords = [
         "product", "item", "sku", "quantity", "qty",
-        "units", "customer", "price", "cost"
+        "units", "customer", "price", "cost", "store", "client"
     ]
     for idx, row in enumerate(rows[:10]):
         joined = " ".join(normalize_cell(c).lower() for c in row)
@@ -178,7 +180,7 @@ def normalize_order_items(items):
         )
         customer_key = find_best_key(
             keys,
-            ["customer", "customer_name", "account", "store", "client"]
+            ["customer", "customer_name", "account", "store", "client", "dispensary"]
         )
 
         product_name = row.get(product_key, "") if product_key else ""
@@ -279,6 +281,42 @@ def parse_saved_order_text(raw_text: str):
         return []
     except Exception:
         return []
+
+def detect_customer_name(items):
+    names = []
+    for item in items:
+        name = normalize_cell(item.get("customer_name"))
+        if name:
+            names.append(name)
+
+    if names:
+        return Counter(names).most_common(1)[0][0]
+
+    return "Parsed Excel Order"
+
+def validate_confirmed_line(quantity, unit_price):
+    if quantity is None or quantity <= 0:
+        return "invalid", "Quantity missing or not greater than zero"
+
+    if unit_price is None or unit_price < 0:
+        return "warning", "Unit price missing or negative"
+
+    return "valid", None
+
+def calculate_line_total(quantity, unit_price):
+    if quantity is None or unit_price is None:
+        return None
+    return round(quantity * unit_price, 2)
+
+def determine_order_status(lines):
+    if not lines:
+        return "empty"
+
+    invalid_count = sum(1 for line in lines if line.validation_status == "invalid")
+    if invalid_count > 0:
+        return "needs_attention"
+
+    return "ready_for_routing"
 
 # =========================
 # HEALTH
@@ -382,11 +420,7 @@ async def upload_order(file: UploadFile = File(...)):
 
                 matched_items.append(combined)
 
-            customer_name = "Parsed Excel Order"
-            for item in matched_items:
-                if item.get("customer_name"):
-                    customer_name = item["customer_name"]
-                    break
+            customer_name = detect_customer_name(matched_items)
 
             new_order = UploadedOrder(
                 customer_name=customer_name,
@@ -402,6 +436,7 @@ async def upload_order(file: UploadFile = File(...)):
                 "success": True,
                 "order_id": new_order.id,
                 "filename": file.filename,
+                "customer_name": customer_name,
                 "headers": parsed["headers"],
                 "items_detected": len(parsed["items"]),
                 "normalized_count": len(normalized_items),
@@ -478,7 +513,7 @@ def confirm_order(req: ConfirmOrderRequest):
             )
         )
 
-        confirmed_lines = []
+        created_lines = []
         unresolved = []
 
         for item in items:
@@ -501,17 +536,24 @@ def confirm_order(req: ConfirmOrderRequest):
                 unresolved.append(item)
                 continue
 
+            quantity = item.get("quantity")
+            validation_status, validation_message = validate_confirmed_line(quantity, unit_price)
+            line_total = calculate_line_total(quantity, unit_price)
+
             line = ConfirmedOrderLine(
                 uploaded_order_id=req.uploaded_order_id,
                 sku=sku,
                 product_name=product_name,
-                quantity=item.get("quantity"),
+                quantity=quantity,
                 unit_price=unit_price,
-                customer_name=item.get("customer_name"),
+                customer_name=item.get("customer_name") or order.customer_name,
                 source_row_index=row_index,
+                line_total=line_total,
+                validation_status=validation_status,
+                validation_message=validation_message,
             )
             db.add(line)
-            confirmed_lines.append(line)
+            created_lines.append(line)
 
         if unresolved:
             db.commit()
@@ -522,13 +564,26 @@ def confirm_order(req: ConfirmOrderRequest):
                 "unresolved_preview": unresolved[:10],
             }
 
-        order.status = "confirmed"
         db.commit()
+
+        saved_lines = db.execute(
+            select(ConfirmedOrderLine).where(
+                ConfirmedOrderLine.uploaded_order_id == req.uploaded_order_id
+            )
+        ).scalars().all()
+
+        order.status = determine_order_status(saved_lines)
+        db.commit()
+
+        invalid_count = sum(1 for line in saved_lines if line.validation_status == "invalid")
+        warning_count = sum(1 for line in saved_lines if line.validation_status == "warning")
 
         return {
             "success": True,
             "uploaded_order_id": req.uploaded_order_id,
-            "confirmed_count": len(confirmed_lines),
+            "confirmed_count": len(saved_lines),
+            "invalid_count": invalid_count,
+            "warning_count": warning_count,
             "status": order.status,
         }
     finally:
@@ -558,11 +613,56 @@ def confirmed_lines(uploaded_order_id: int):
                     "product_name": row.product_name,
                     "quantity": row.quantity,
                     "unit_price": row.unit_price,
+                    "line_total": row.line_total,
                     "customer_name": row.customer_name,
                     "source_row_index": row.source_row_index,
+                    "validation_status": row.validation_status,
+                    "validation_message": row.validation_message,
                 }
                 for row in rows
             ],
+        }
+    finally:
+        db.close()
+
+# =========================
+# ORDER SUMMARY
+# =========================
+
+@app.get("/order-summary/{uploaded_order_id}")
+def order_summary(uploaded_order_id: int):
+    db = SessionLocal()
+    try:
+        order = db.execute(
+            select(UploadedOrder).where(UploadedOrder.id == uploaded_order_id)
+        ).scalar_one_or_none()
+
+        if not order:
+            raise HTTPException(status_code=404, detail="Uploaded order not found")
+
+        rows = db.execute(
+            select(ConfirmedOrderLine).where(
+                ConfirmedOrderLine.uploaded_order_id == uploaded_order_id
+            )
+        ).scalars().all()
+
+        total_lines = len(rows)
+        total_units = sum(row.quantity or 0 for row in rows)
+        total_value = round(sum(row.line_total or 0 for row in rows), 2)
+        invalid_count = sum(1 for row in rows if row.validation_status == "invalid")
+        warning_count = sum(1 for row in rows if row.validation_status == "warning")
+
+        return {
+            "uploaded_order_id": uploaded_order_id,
+            "customer_name": order.customer_name,
+            "filename": order.source_filename,
+            "status": order.status,
+            "total_lines": total_lines,
+            "total_units": total_units,
+            "total_value": total_value,
+            "invalid_count": invalid_count,
+            "warning_count": warning_count,
+            "ready_for_routing": order.status == "ready_for_routing",
         }
     finally:
         db.close()
