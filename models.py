@@ -57,6 +57,40 @@ class ConfirmedOrderLine(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class DeliveryOrder(Base):
+    __tablename__ = "delivery_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    uploaded_order_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    customer_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    delivery_date: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    address_line_1: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    address_line_2: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    state: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    postal_code: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="draft", index=True)
+    total_lines: Mapped[int] = mapped_column(Integer, default=0)
+    total_units: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    total_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    validation_status: Mapped[str] = mapped_column(String(50), default="valid")
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class DeliveryOrderLine(Base):
+    __tablename__ = "delivery_order_lines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    delivery_order_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    sku: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    product_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    quantity: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    unit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    line_total: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 # =========================
 # ENUMS
 # =========================
@@ -228,3 +262,14 @@ class ReviewCorrection(BaseModel):
 class ConfirmOrderRequest(BaseModel):
     uploaded_order_id: int
     corrections: List[ReviewCorrection] = []
+
+
+class CreateDeliveryOrderRequest(BaseModel):
+    uploaded_order_id: int
+    delivery_date: Optional[str] = None
+    address_line_1: Optional[str] = None
+    address_line_2: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    postal_code: Optional[str] = None
+    notes: Optional[str] = None

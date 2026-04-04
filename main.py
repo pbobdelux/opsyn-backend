@@ -73,6 +73,10 @@ async def auth_middleware(request: Request, call_next):
         "/confirm-order",
         "/confirmed-lines",
         "/order-summary",
+        "/create-delivery-order",
+        "/delivery-orders",
+        "/delivery-order",
+        "/route-ready-deliveries",
     ]:
         return await call_next(request)
 
@@ -317,6 +321,35 @@ def determine_order_status(lines):
         return "needs_attention"
 
     return "ready_for_routing"
+
+def determine_delivery_validation(lines):
+    if not lines:
+        return "empty"
+
+    invalid_count = sum(1 for line in lines if line.validation_status == "invalid")
+    if invalid_count > 0:
+        return "needs_attention"
+
+    return "valid"
+
+def serialize_delivery(delivery: DeliveryOrder):
+    return {
+        "id": delivery.id,
+        "uploaded_order_id": delivery.uploaded_order_id,
+        "customer_name": delivery.customer_name,
+        "delivery_date": delivery.delivery_date,
+        "address_line_1": delivery.address_line_1,
+        "address_line_2": delivery.address_line_2,
+        "city": delivery.city,
+        "state": delivery.state,
+        "postal_code": delivery.postal_code,
+        "status": delivery.status,
+        "total_lines": delivery.total_lines,
+        "total_units": delivery.total_units,
+        "total_value": delivery.total_value,
+        "validation_status": delivery.validation_status,
+        "notes": delivery.notes,
+    }
 
 # =========================
 # HEALTH
@@ -663,6 +696,156 @@ def order_summary(uploaded_order_id: int):
             "invalid_count": invalid_count,
             "warning_count": warning_count,
             "ready_for_routing": order.status == "ready_for_routing",
+        }
+    finally:
+        db.close()
+
+# =========================
+# CREATE DELIVERY ORDER
+# =========================
+
+@app.post("/create-delivery-order")
+def create_delivery_order(req: CreateDeliveryOrderRequest):
+    db = SessionLocal()
+    try:
+        uploaded_order = db.execute(
+            select(UploadedOrder).where(UploadedOrder.id == req.uploaded_order_id)
+        ).scalar_one_or_none()
+
+        if not uploaded_order:
+            raise HTTPException(status_code=404, detail="Uploaded order not found")
+
+        confirmed_lines = db.execute(
+            select(ConfirmedOrderLine).where(
+                ConfirmedOrderLine.uploaded_order_id == req.uploaded_order_id
+            ).order_by(ConfirmedOrderLine.id)
+        ).scalars().all()
+
+        if not confirmed_lines:
+            raise HTTPException(status_code=400, detail="No confirmed order lines found")
+
+        invalid_count = sum(1 for line in confirmed_lines if line.validation_status == "invalid")
+        validation_status = determine_delivery_validation(confirmed_lines)
+        delivery_status = "needs_attention" if invalid_count > 0 else "route_ready"
+
+        total_lines = len(confirmed_lines)
+        total_units = sum(line.quantity or 0 for line in confirmed_lines)
+        total_value = round(sum(line.line_total or 0 for line in confirmed_lines), 2)
+
+        delivery = DeliveryOrder(
+            uploaded_order_id=req.uploaded_order_id,
+            customer_name=uploaded_order.customer_name,
+            delivery_date=req.delivery_date,
+            address_line_1=req.address_line_1,
+            address_line_2=req.address_line_2,
+            city=req.city,
+            state=req.state,
+            postal_code=req.postal_code,
+            status=delivery_status,
+            total_lines=total_lines,
+            total_units=total_units,
+            total_value=total_value,
+            validation_status=validation_status,
+            notes=req.notes,
+        )
+        db.add(delivery)
+        db.commit()
+        db.refresh(delivery)
+
+        for line in confirmed_lines:
+            delivery_line = DeliveryOrderLine(
+                delivery_order_id=delivery.id,
+                sku=line.sku,
+                product_name=line.product_name,
+                quantity=line.quantity,
+                unit_price=line.unit_price,
+                line_total=line.line_total,
+            )
+            db.add(delivery_line)
+
+        db.commit()
+
+        return {
+            "success": True,
+            "delivery_order": serialize_delivery(delivery),
+        }
+    finally:
+        db.close()
+
+# =========================
+# LIST DELIVERY ORDERS
+# =========================
+
+@app.get("/delivery-orders")
+def delivery_orders():
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(DeliveryOrder).order_by(DeliveryOrder.id.desc())
+        ).scalars().all()
+
+        return {
+            "count": len(rows),
+            "items": [serialize_delivery(row) for row in rows],
+        }
+    finally:
+        db.close()
+
+# =========================
+# VIEW SINGLE DELIVERY ORDER
+# =========================
+
+@app.get("/delivery-order/{delivery_order_id}")
+def delivery_order(delivery_order_id: int):
+    db = SessionLocal()
+    try:
+        delivery = db.execute(
+            select(DeliveryOrder).where(DeliveryOrder.id == delivery_order_id)
+        ).scalar_one_or_none()
+
+        if not delivery:
+            raise HTTPException(status_code=404, detail="Delivery order not found")
+
+        lines = db.execute(
+            select(DeliveryOrderLine).where(
+                DeliveryOrderLine.delivery_order_id == delivery_order_id
+            ).order_by(DeliveryOrderLine.id)
+        ).scalars().all()
+
+        return {
+            "delivery_order": serialize_delivery(delivery),
+            "lines": [
+                {
+                    "id": line.id,
+                    "sku": line.sku,
+                    "product_name": line.product_name,
+                    "quantity": line.quantity,
+                    "unit_price": line.unit_price,
+                    "line_total": line.line_total,
+                }
+                for line in lines
+            ],
+        }
+    finally:
+        db.close()
+
+# =========================
+# ROUTE READY DELIVERIES
+# =========================
+
+@app.get("/route-ready-deliveries")
+def route_ready_deliveries():
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(DeliveryOrder).where(
+                DeliveryOrder.status == "route_ready"
+            ).order_by(DeliveryOrder.delivery_date, DeliveryOrder.id.desc())
+        ).scalars().all()
+
+        return {
+            "count": len(rows),
+            "items": [serialize_delivery(row) for row in rows],
         }
     finally:
         db.close()
