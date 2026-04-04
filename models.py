@@ -91,6 +91,38 @@ class DeliveryOrderLine(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class RouteBatch(Base):
+    __tablename__ = "route_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    route_date: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(50), default="draft", index=True)
+    total_stops: Mapped[int] = mapped_column(Integer, default=0)
+    total_units: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    total_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class RouteStop(Base):
+    __tablename__ = "route_stops"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    route_batch_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    delivery_order_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    stop_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    customer_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    address_line_1: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    address_line_2: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    state: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    postal_code: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    total_units: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    total_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="queued")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 # =========================
 # ENUMS
 # =========================
@@ -272,4 +304,9 @@ class CreateDeliveryOrderRequest(BaseModel):
     city: Optional[str] = None
     state: Optional[str] = None
     postal_code: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class CreateRouteBatchRequest(BaseModel):
+    route_date: str
     notes: Optional[str] = None

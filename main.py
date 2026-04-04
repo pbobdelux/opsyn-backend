@@ -77,6 +77,10 @@ async def auth_middleware(request: Request, call_next):
         "/delivery-orders",
         "/delivery-order",
         "/route-ready-deliveries",
+        "/create-route-batch",
+        "/route-batches",
+        "/route-batch",
+        "/route-batch-stops",
     ]:
         return await call_next(request)
 
@@ -351,6 +355,17 @@ def serialize_delivery(delivery: DeliveryOrder):
         "notes": delivery.notes,
     }
 
+def serialize_route_batch(batch: RouteBatch):
+    return {
+        "id": batch.id,
+        "route_date": batch.route_date,
+        "status": batch.status,
+        "total_stops": batch.total_stops,
+        "total_units": batch.total_units,
+        "total_value": batch.total_value,
+        "notes": batch.notes,
+    }
+
 # =========================
 # HEALTH
 # =========================
@@ -546,7 +561,6 @@ def confirm_order(req: ConfirmOrderRequest):
             )
         )
 
-        created_lines = []
         unresolved = []
 
         for item in items:
@@ -586,7 +600,6 @@ def confirm_order(req: ConfirmOrderRequest):
                 validation_message=validation_message,
             )
             db.add(line)
-            created_lines.append(line)
 
         if unresolved:
             db.commit()
@@ -846,6 +859,150 @@ def route_ready_deliveries():
         return {
             "count": len(rows),
             "items": [serialize_delivery(row) for row in rows],
+        }
+    finally:
+        db.close()
+
+# =========================
+# CREATE ROUTE BATCH
+# =========================
+
+@app.post("/create-route-batch")
+def create_route_batch(req: CreateRouteBatchRequest):
+    db = SessionLocal()
+    try:
+        deliveries = db.execute(
+            select(DeliveryOrder).where(
+                DeliveryOrder.status == "route_ready",
+                DeliveryOrder.delivery_date == req.route_date,
+            ).order_by(DeliveryOrder.city, DeliveryOrder.customer_name)
+        ).scalars().all()
+
+        if not deliveries:
+            raise HTTPException(status_code=400, detail="No route-ready deliveries found for that date")
+
+        batch = RouteBatch(
+            route_date=req.route_date,
+            status="draft",
+            total_stops=len(deliveries),
+            total_units=sum(d.total_units or 0 for d in deliveries),
+            total_value=round(sum(d.total_value or 0 for d in deliveries), 2),
+            notes=req.notes,
+        )
+        db.add(batch)
+        db.commit()
+        db.refresh(batch)
+
+        stop_number = 1
+        for delivery in deliveries:
+            stop = RouteStop(
+                route_batch_id=batch.id,
+                delivery_order_id=delivery.id,
+                stop_number=stop_number,
+                customer_name=delivery.customer_name,
+                address_line_1=delivery.address_line_1,
+                address_line_2=delivery.address_line_2,
+                city=delivery.city,
+                state=delivery.state,
+                postal_code=delivery.postal_code,
+                total_units=delivery.total_units,
+                total_value=delivery.total_value,
+                status="queued",
+            )
+            db.add(stop)
+            delivery.status = "batched"
+            stop_number += 1
+
+        db.commit()
+
+        return {
+            "success": True,
+            "route_batch": serialize_route_batch(batch),
+        }
+    finally:
+        db.close()
+
+# =========================
+# LIST ROUTE BATCHES
+# =========================
+
+@app.get("/route-batches")
+def route_batches():
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(RouteBatch).order_by(RouteBatch.route_date.desc(), RouteBatch.id.desc())
+        ).scalars().all()
+
+        return {
+            "count": len(rows),
+            "items": [serialize_route_batch(row) for row in rows],
+        }
+    finally:
+        db.close()
+
+# =========================
+# VIEW SINGLE ROUTE BATCH
+# =========================
+
+@app.get("/route-batch/{route_batch_id}")
+def route_batch(route_batch_id: int):
+    db = SessionLocal()
+    try:
+        batch = db.execute(
+            select(RouteBatch).where(RouteBatch.id == route_batch_id)
+        ).scalar_one_or_none()
+
+        if not batch:
+            raise HTTPException(status_code=404, detail="Route batch not found")
+
+        return {
+            "route_batch": serialize_route_batch(batch),
+        }
+    finally:
+        db.close()
+
+# =========================
+# VIEW ROUTE BATCH STOPS
+# =========================
+
+@app.get("/route-batch-stops/{route_batch_id}")
+def route_batch_stops(route_batch_id: int):
+    db = SessionLocal()
+    try:
+        batch = db.execute(
+            select(RouteBatch).where(RouteBatch.id == route_batch_id)
+        ).scalar_one_or_none()
+
+        if not batch:
+            raise HTTPException(status_code=404, detail="Route batch not found")
+
+        stops = db.execute(
+            select(RouteStop).where(
+                RouteStop.route_batch_id == route_batch_id
+            ).order_by(RouteStop.stop_number)
+        ).scalars().all()
+
+        return {
+            "route_batch": serialize_route_batch(batch),
+            "count": len(stops),
+            "stops": [
+                {
+                    "id": stop.id,
+                    "delivery_order_id": stop.delivery_order_id,
+                    "stop_number": stop.stop_number,
+                    "customer_name": stop.customer_name,
+                    "address_line_1": stop.address_line_1,
+                    "address_line_2": stop.address_line_2,
+                    "city": stop.city,
+                    "state": stop.state,
+                    "postal_code": stop.postal_code,
+                    "total_units": stop.total_units,
+                    "total_value": stop.total_value,
+                    "status": stop.status,
+                }
+                for stop in stops
+            ],
         }
     finally:
         db.close()
