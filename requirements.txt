@@ -5,3 +5,4 @@ python-dotenv==1.0.0
 python-multipart==0.0.6
 sqlalchemy
 psycopg2-binary
+openpyxl
