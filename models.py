@@ -40,6 +40,20 @@ class ProductCatalog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class ConfirmedOrderLine(Base):
+    __tablename__ = "confirmed_order_lines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    uploaded_order_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    sku: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    product_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    quantity: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    unit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    customer_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    source_row_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 # =========================
 # ENUMS
 # =========================
@@ -197,3 +211,17 @@ class ScanValidateRequest(BaseModel):
 class BulkValidateRequest(BaseModel):
     tags: List[str]
     context: Optional[ContextObj] = None
+
+
+# =========================
+# ORDER REVIEW REQUEST MODELS
+# =========================
+
+class ReviewCorrection(BaseModel):
+    row_index: int
+    catalog_id: int
+
+
+class ConfirmOrderRequest(BaseModel):
+    uploaded_order_id: int
+    corrections: List[ReviewCorrection] = []

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, UploadFile, File
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -8,10 +8,11 @@ from config import config
 import os
 from io import BytesIO
 import re
+import ast
 from difflib import SequenceMatcher
 
 import openpyxl
-from sqlalchemy import create_engine, text, select
+from sqlalchemy import create_engine, text, select, delete
 from sqlalchemy.orm import sessionmaker
 
 # =========================
@@ -67,6 +68,9 @@ async def auth_middleware(request: Request, call_next):
         "/test-db",
         "/upload-order",
         "/catalog",
+        "/review-order",
+        "/confirm-order",
+        "/confirmed-lines",
     ]:
         return await call_next(request)
 
@@ -117,12 +121,12 @@ def parse_order_rows(rows):
     headers = [normalize_cell(c) for c in rows[header_idx]]
 
     items = []
-    for raw_row in rows[header_idx + 1:]:
+    for row_idx, raw_row in enumerate(rows[header_idx + 1:]):
         if row_is_empty(raw_row):
             continue
 
         values = [normalize_cell(c) for c in raw_row]
-        item = {}
+        item = {"_source_row_index": row_idx}
 
         for i, header in enumerate(headers):
             key = clean_key(header, i)
@@ -150,7 +154,7 @@ def parse_number(value):
     try:
         if "." in text_value:
             return float(text_value)
-        return int(text_value)
+        return float(int(text_value))
     except Exception:
         return None
 
@@ -190,6 +194,7 @@ def normalize_order_items(items):
             "quantity": quantity,
             "unit_price": price,
             "customer_name": customer_name,
+            "source_row_index": row.get("_source_row_index"),
             "raw_row": row,
         })
 
@@ -263,6 +268,17 @@ def seed_product_catalog():
         db.commit()
     finally:
         db.close()
+
+def parse_saved_order_text(raw_text: str):
+    if not raw_text:
+        return []
+    try:
+        data = ast.literal_eval(raw_text)
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception:
+        return []
 
 # =========================
 # HEALTH
@@ -351,6 +367,7 @@ async def upload_order(file: UploadFile = File(...)):
                     "matched_sku": match["sku"],
                     "matched_product_name": match["catalog_product_name"],
                     "match_score": match["match_score"],
+                    "source_row_index": item.get("source_row_index"),
                     "raw_row": item.get("raw_row"),
                 }
 
@@ -374,8 +391,8 @@ async def upload_order(file: UploadFile = File(...)):
             new_order = UploadedOrder(
                 customer_name=customer_name,
                 source_filename=file.filename,
-                status="matched",
-                raw_text=str(matched_items[:50]),
+                status="matched" if unmatched_count == 0 else "needs_review",
+                raw_text=str(matched_items),
             )
             db.add(new_order)
             db.commit()
@@ -390,6 +407,7 @@ async def upload_order(file: UploadFile = File(...)):
                 "normalized_count": len(normalized_items),
                 "matched_count": matched_count,
                 "unmatched_count": unmatched_count,
+                "status": new_order.status,
                 "matched_preview": matched_items[:10],
             }
         finally:
@@ -400,3 +418,151 @@ async def upload_order(file: UploadFile = File(...)):
             "success": False,
             "error": str(e),
         }
+
+# =========================
+# REVIEW ORDER
+# =========================
+
+@app.get("/review-order/{uploaded_order_id}")
+def review_order(uploaded_order_id: int):
+    db = SessionLocal()
+    try:
+        order = db.execute(
+            select(UploadedOrder).where(UploadedOrder.id == uploaded_order_id)
+        ).scalar_one_or_none()
+
+        if not order:
+            raise HTTPException(status_code=404, detail="Uploaded order not found")
+
+        items = parse_saved_order_text(order.raw_text)
+
+        unmatched = [item for item in items if not item.get("matched")]
+        matched = [item for item in items if item.get("matched")]
+
+        return {
+            "uploaded_order_id": order.id,
+            "customer_name": order.customer_name,
+            "filename": order.source_filename,
+            "status": order.status,
+            "matched_count": len(matched),
+            "unmatched_count": len(unmatched),
+            "matched_items": matched[:20],
+            "unmatched_items": unmatched[:20],
+        }
+    finally:
+        db.close()
+
+# =========================
+# CONFIRM ORDER
+# =========================
+
+@app.post("/confirm-order")
+def confirm_order(req: ConfirmOrderRequest):
+    db = SessionLocal()
+    try:
+        order = db.execute(
+            select(UploadedOrder).where(UploadedOrder.id == req.uploaded_order_id)
+        ).scalar_one_or_none()
+
+        if not order:
+            raise HTTPException(status_code=404, detail="Uploaded order not found")
+
+        items = parse_saved_order_text(order.raw_text)
+        catalog_rows = db.execute(select(ProductCatalog)).scalars().all()
+        catalog_map = {row.id: row for row in catalog_rows}
+        correction_map = {c.row_index: c.catalog_id for c in req.corrections}
+
+        db.execute(
+            delete(ConfirmedOrderLine).where(
+                ConfirmedOrderLine.uploaded_order_id == req.uploaded_order_id
+            )
+        )
+
+        confirmed_lines = []
+        unresolved = []
+
+        for item in items:
+            row_index = item.get("source_row_index")
+
+            if item.get("matched"):
+                sku = item.get("matched_sku")
+                product_name = item.get("matched_product_name") or item.get("product_name")
+                unit_price = item.get("unit_price")
+            elif row_index in correction_map:
+                catalog_id = correction_map[row_index]
+                catalog_hit = catalog_map.get(catalog_id)
+                if not catalog_hit:
+                    unresolved.append(item)
+                    continue
+                sku = catalog_hit.sku
+                product_name = catalog_hit.product_name
+                unit_price = item.get("unit_price") if item.get("unit_price") is not None else catalog_hit.unit_price
+            else:
+                unresolved.append(item)
+                continue
+
+            line = ConfirmedOrderLine(
+                uploaded_order_id=req.uploaded_order_id,
+                sku=sku,
+                product_name=product_name,
+                quantity=item.get("quantity"),
+                unit_price=unit_price,
+                customer_name=item.get("customer_name"),
+                source_row_index=row_index,
+            )
+            db.add(line)
+            confirmed_lines.append(line)
+
+        if unresolved:
+            db.commit()
+            return {
+                "success": False,
+                "message": "Some lines still need review",
+                "unresolved_count": len(unresolved),
+                "unresolved_preview": unresolved[:10],
+            }
+
+        order.status = "confirmed"
+        db.commit()
+
+        return {
+            "success": True,
+            "uploaded_order_id": req.uploaded_order_id,
+            "confirmed_count": len(confirmed_lines),
+            "status": order.status,
+        }
+    finally:
+        db.close()
+
+# =========================
+# VIEW CONFIRMED LINES
+# =========================
+
+@app.get("/confirmed-lines/{uploaded_order_id}")
+def confirmed_lines(uploaded_order_id: int):
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(ConfirmedOrderLine).where(
+                ConfirmedOrderLine.uploaded_order_id == uploaded_order_id
+            ).order_by(ConfirmedOrderLine.id)
+        ).scalars().all()
+
+        return {
+            "uploaded_order_id": uploaded_order_id,
+            "count": len(rows),
+            "items": [
+                {
+                    "id": row.id,
+                    "sku": row.sku,
+                    "product_name": row.product_name,
+                    "quantity": row.quantity,
+                    "unit_price": row.unit_price,
+                    "customer_name": row.customer_name,
+                    "source_row_index": row.source_row_index,
+                }
+                for row in rows
+            ],
+        }
+    finally:
+        db.close()
