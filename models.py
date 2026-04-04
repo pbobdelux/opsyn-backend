@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
-from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy import DateTime, Integer, String, Text, Float
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -25,6 +25,18 @@ class UploadedOrder(Base):
     source_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="uploaded")
     raw_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ProductCatalog(Base):
+    __tablename__ = "product_catalog"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    sku: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    product_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    brand: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    unit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    active: Mapped[str] = mapped_column(String(10), default="yes")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
