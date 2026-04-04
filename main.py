@@ -37,7 +37,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    if request.url.path in ["/api/health", "/docs", "/openapi.json", "/redoc"]:
+    if request.url.path in ["/api/health", "/docs", "/openapi.json", "/redoc", "/test-db"]:
         return await call_next(request)
 
     api_key = request.headers.get("X-API-Key")
