@@ -14,6 +14,12 @@ from workflows import (
     analyze_inventory,
     get_mock_package,
 )
+import os
+from sqlalchemy import create_engine
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 app = FastAPI(
     title="Opsyn API",
@@ -582,3 +588,11 @@ def session_documents(session_id: str):
         "documents": session.documents or [],
         "session_id": session_id,
     }
+@app.get("/test-db")
+def test_db():
+    try:
+        with engine.connect() as conn:
+            result = conn.exec_driver_sql("SELECT 1")
+            return {"database": "connected", "result": [row[0] for row in result]}
+    except Exception as e:
+        return {"error": str(e)}
