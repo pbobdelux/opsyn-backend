@@ -17,6 +17,7 @@ from workflows import (
 
 import os
 from io import BytesIO
+import re
 import openpyxl
 
 from sqlalchemy import create_engine, text
@@ -98,12 +99,22 @@ def row_is_empty(row):
     return all(not normalize_cell(cell) for cell in row)
 
 def detect_header_row(rows):
-    keywords = ["product", "item", "sku", "quantity", "qty", "units", "customer"]
+    keywords = [
+        "product", "item", "sku", "quantity", "qty",
+        "units", "customer", "price", "cost"
+    ]
     for idx, row in enumerate(rows[:10]):
         joined = " ".join(normalize_cell(c).lower() for c in row)
         if any(k in joined for k in keywords):
             return idx
     return 0
+
+def clean_key(header, index):
+    key = normalize_cell(header).lower()
+    key = re.sub(r"[^a-z0-9]+", "_", key).strip("_")
+    if not key:
+        key = f"column_{index + 1}"
+    return key
 
 def parse_order_rows(rows):
     if not rows:
@@ -121,14 +132,75 @@ def parse_order_rows(rows):
         item = {}
 
         for i, header in enumerate(headers):
-            key = header.lower().strip().replace(" ", "_")
-            if not key:
-                key = f"column_{i+1}"
+            key = clean_key(header, i)
             item[key] = values[i] if i < len(values) else ""
 
         items.append(item)
 
     return {"headers": headers, "items": items}
+
+def find_best_key(keys, candidates):
+    for candidate in candidates:
+        for key in keys:
+            if key == candidate:
+                return key
+    for candidate in candidates:
+        for key in keys:
+            if candidate in key:
+                return key
+    return None
+
+def parse_number(value):
+    text_value = normalize_cell(value).replace(",", "").replace("$", "")
+    if not text_value:
+        return None
+    try:
+        if "." in text_value:
+            return float(text_value)
+        return int(text_value)
+    except Exception:
+        return None
+
+def normalize_order_items(items):
+    normalized = []
+
+    for row in items:
+        keys = list(row.keys())
+
+        product_key = find_best_key(
+            keys,
+            ["product", "item", "product_name", "item_name", "sku", "description"]
+        )
+        qty_key = find_best_key(
+            keys,
+            ["quantity", "qty", "units", "unit_qty", "count"]
+        )
+        price_key = find_best_key(
+            keys,
+            ["price", "unit_price", "cost", "rate", "amount"]
+        )
+        customer_key = find_best_key(
+            keys,
+            ["customer", "customer_name", "account", "store", "client"]
+        )
+
+        product_name = row.get(product_key, "") if product_key else ""
+        quantity = parse_number(row.get(qty_key, "")) if qty_key else None
+        price = parse_number(row.get(price_key, "")) if price_key else None
+        customer_name = row.get(customer_key, "") if customer_key else ""
+
+        if not product_name and quantity is None and price is None:
+            continue
+
+        normalized.append({
+            "product_name": product_name,
+            "quantity": quantity,
+            "unit_price": price,
+            "customer_name": customer_name,
+            "raw_row": row,
+        })
+
+    return normalized
 
 # =========================
 # HEALTH
@@ -152,7 +224,7 @@ def test_db():
         return {"error": str(e)}
 
 # =========================
-# EXCEL ORDER UPLOAD + PARSE
+# EXCEL ORDER UPLOAD + NORMALIZATION
 # =========================
 
 @app.post("/upload-order")
@@ -168,14 +240,21 @@ async def upload_order(file: UploadFile = File(...)):
             rows.append(list(row))
 
         parsed = parse_order_rows(rows)
+        normalized_items = normalize_order_items(parsed["items"])
+
+        customer_name = "Parsed Excel Order"
+        for item in normalized_items:
+            if item.get("customer_name"):
+                customer_name = item["customer_name"]
+                break
 
         db = SessionLocal()
         try:
             new_order = UploadedOrder(
-                customer_name="Parsed Excel Order",
+                customer_name=customer_name,
                 source_filename=file.filename,
-                status="parsed",
-                raw_text=str(parsed["items"][:50]),
+                status="normalized",
+                raw_text=str(normalized_items[:50]),
             )
             db.add(new_order)
             db.commit()
@@ -187,7 +266,8 @@ async def upload_order(file: UploadFile = File(...)):
                 "filename": file.filename,
                 "headers": parsed["headers"],
                 "items_detected": len(parsed["items"]),
-                "preview_items": parsed["items"][:10],
+                "normalized_count": len(normalized_items),
+                "normalized_preview": normalized_items[:10],
             }
         finally:
             db.close()
