@@ -11,6 +11,7 @@ import re
 import ast
 from collections import Counter
 from difflib import SequenceMatcher
+from datetime import datetime
 
 import openpyxl
 from sqlalchemy import create_engine, text, select, delete
@@ -40,13 +41,14 @@ SessionLocal = sessionmaker(bind=engine)
 app = FastAPI(
     title="Opsyn API",
     version="1.0.0",
-    description="METRC Ops Hub Backend",
+    description="Full Ops Backend v1",
 )
 
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
     seed_product_catalog()
+    seed_drivers()
 
 # =========================
 # MIDDLEWARE
@@ -81,6 +83,12 @@ async def auth_middleware(request: Request, call_next):
         "/route-batches",
         "/route-batch",
         "/route-batch-stops",
+        "/drivers",
+        "/create-driver",
+        "/assign-driver",
+        "/reorder-stops",
+        "/update-stop-status",
+        "/dispatch-summary",
     ]:
         return await call_next(request)
 
@@ -279,6 +287,22 @@ def seed_product_catalog():
     finally:
         db.close()
 
+def seed_drivers():
+    db = SessionLocal()
+    try:
+        existing = db.execute(select(Driver)).scalars().first()
+        if existing:
+            return
+
+        rows = [
+            Driver(name="Preston Anderson", phone="555-0101", vehicle_name="Ops Van 1"),
+            Driver(name="Zach Driver", phone="555-0102", vehicle_name="Ops Van 2"),
+        ]
+        db.add_all(rows)
+        db.commit()
+    finally:
+        db.close()
+
 def parse_saved_order_text(raw_text: str):
     if not raw_text:
         return []
@@ -360,10 +384,21 @@ def serialize_route_batch(batch: RouteBatch):
         "id": batch.id,
         "route_date": batch.route_date,
         "status": batch.status,
+        "assigned_driver_id": batch.assigned_driver_id,
+        "assigned_driver_name": batch.assigned_driver_name,
         "total_stops": batch.total_stops,
         "total_units": batch.total_units,
         "total_value": batch.total_value,
         "notes": batch.notes,
+    }
+
+def serialize_driver(driver: Driver):
+    return {
+        "id": driver.id,
+        "name": driver.name,
+        "phone": driver.phone,
+        "vehicle_name": driver.vehicle_name,
+        "active": driver.active,
     }
 
 # =========================
@@ -409,6 +444,53 @@ def get_catalog():
                 }
                 for row in rows
             ],
+        }
+    finally:
+        db.close()
+
+# =========================
+# DRIVERS
+# =========================
+
+@app.get("/drivers")
+def get_drivers():
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(Driver).order_by(Driver.name)
+        ).scalars().all()
+
+        return {
+            "count": len(rows),
+            "items": [serialize_driver(row) for row in rows],
+        }
+    finally:
+        db.close()
+
+@app.post("/create-driver")
+def create_driver(req: CreateDriverRequest):
+    db = SessionLocal()
+    try:
+        existing = db.execute(
+            select(Driver).where(Driver.name == req.name)
+        ).scalar_one_or_none()
+
+        if existing:
+            return {"success": False, "message": "Driver already exists"}
+
+        driver = Driver(
+            name=req.name,
+            phone=req.phone,
+            vehicle_name=req.vehicle_name,
+            active="yes",
+        )
+        db.add(driver)
+        db.commit()
+        db.refresh(driver)
+
+        return {
+            "success": True,
+            "driver": serialize_driver(driver),
         }
     finally:
         db.close()
@@ -786,7 +868,7 @@ def create_delivery_order(req: CreateDeliveryOrderRequest):
         db.close()
 
 # =========================
-# LIST DELIVERY ORDERS
+# DELIVERY ORDER ENDPOINTS
 # =========================
 
 @app.get("/delivery-orders")
@@ -803,10 +885,6 @@ def delivery_orders():
         }
     finally:
         db.close()
-
-# =========================
-# VIEW SINGLE DELIVERY ORDER
-# =========================
 
 @app.get("/delivery-order/{delivery_order_id}")
 def delivery_order(delivery_order_id: int):
@@ -841,10 +919,6 @@ def delivery_order(delivery_order_id: int):
         }
     finally:
         db.close()
-
-# =========================
-# ROUTE READY DELIVERIES
-# =========================
 
 @app.get("/route-ready-deliveries")
 def route_ready_deliveries():
@@ -923,7 +997,7 @@ def create_route_batch(req: CreateRouteBatchRequest):
         db.close()
 
 # =========================
-# LIST ROUTE BATCHES
+# ROUTE BATCH ENDPOINTS
 # =========================
 
 @app.get("/route-batches")
@@ -941,10 +1015,6 @@ def route_batches():
     finally:
         db.close()
 
-# =========================
-# VIEW SINGLE ROUTE BATCH
-# =========================
-
 @app.get("/route-batch/{route_batch_id}")
 def route_batch(route_batch_id: int):
     db = SessionLocal()
@@ -961,10 +1031,6 @@ def route_batch(route_batch_id: int):
         }
     finally:
         db.close()
-
-# =========================
-# VIEW ROUTE BATCH STOPS
-# =========================
 
 @app.get("/route-batch-stops/{route_batch_id}")
 def route_batch_stops(route_batch_id: int):
@@ -1000,9 +1066,157 @@ def route_batch_stops(route_batch_id: int):
                     "total_units": stop.total_units,
                     "total_value": stop.total_value,
                     "status": stop.status,
+                    "notes": stop.notes,
                 }
                 for stop in stops
             ],
+        }
+    finally:
+        db.close()
+
+# =========================
+# DISPATCH / DRIVER ASSIGNMENT
+# =========================
+
+@app.post("/assign-driver")
+def assign_driver(req: AssignDriverRequest):
+    db = SessionLocal()
+    try:
+        batch = db.execute(
+            select(RouteBatch).where(RouteBatch.id == req.route_batch_id)
+        ).scalar_one_or_none()
+
+        if not batch:
+            raise HTTPException(status_code=404, detail="Route batch not found")
+
+        driver = db.execute(
+            select(Driver).where(Driver.id == req.driver_id, Driver.active == "yes")
+        ).scalar_one_or_none()
+
+        if not driver:
+            raise HTTPException(status_code=404, detail="Driver not found or inactive")
+
+        batch.assigned_driver_id = driver.id
+        batch.assigned_driver_name = driver.name
+        batch.status = "assigned"
+        db.commit()
+
+        return {
+            "success": True,
+            "route_batch": serialize_route_batch(batch),
+            "driver": serialize_driver(driver),
+        }
+    finally:
+        db.close()
+
+@app.post("/reorder-stops")
+def reorder_stops(req: ReorderStopsRequest):
+    db = SessionLocal()
+    try:
+        batch = db.execute(
+            select(RouteBatch).where(RouteBatch.id == req.route_batch_id)
+        ).scalar_one_or_none()
+
+        if not batch:
+            raise HTTPException(status_code=404, detail="Route batch not found")
+
+        stops = db.execute(
+            select(RouteStop).where(RouteStop.route_batch_id == req.route_batch_id)
+        ).scalars().all()
+
+        stop_map = {stop.id: stop for stop in stops}
+
+        if len(req.stop_ids_in_order) != len(stops):
+            raise HTTPException(status_code=400, detail="Stop count mismatch")
+
+        for idx, stop_id in enumerate(req.stop_ids_in_order, start=1):
+            stop = stop_map.get(stop_id)
+            if not stop:
+                raise HTTPException(status_code=400, detail=f"Stop id {stop_id} not found in batch")
+            stop.stop_number = idx
+
+        db.commit()
+
+        return {
+            "success": True,
+            "message": "Stops reordered",
+        }
+    finally:
+        db.close()
+
+@app.post("/update-stop-status")
+def update_stop_status(req: UpdateStopStatusRequest):
+    db = SessionLocal()
+    try:
+        stop = db.execute(
+            select(RouteStop).where(RouteStop.id == req.stop_id)
+        ).scalar_one_or_none()
+
+        if not stop:
+            raise HTTPException(status_code=404, detail="Stop not found")
+
+        stop.status = req.status
+        if req.notes:
+            stop.notes = req.notes
+
+        if req.status == "completed":
+            stop.completed_at = datetime.utcnow()
+
+        batch = db.execute(
+            select(RouteBatch).where(RouteBatch.id == stop.route_batch_id)
+        ).scalar_one_or_none()
+
+        db.commit()
+
+        if batch:
+            stops = db.execute(
+                select(RouteStop).where(RouteStop.route_batch_id == batch.id)
+            ).scalars().all()
+
+            statuses = [s.status for s in stops]
+            if all(status == "completed" for status in statuses):
+                batch.status = "completed"
+            elif any(status in ["en_route", "arrived", "completed"] for status in statuses):
+                batch.status = "in_progress"
+            elif batch.assigned_driver_id:
+                batch.status = "assigned"
+            else:
+                batch.status = "draft"
+
+            db.commit()
+
+        return {
+            "success": True,
+            "stop_id": stop.id,
+            "status": stop.status,
+        }
+    finally:
+        db.close()
+
+# =========================
+# DISPATCH SUMMARY
+# =========================
+
+@app.get("/dispatch-summary")
+def dispatch_summary():
+    db = SessionLocal()
+    try:
+        drivers = db.execute(select(Driver).where(Driver.active == "yes")).scalars().all()
+        deliveries = db.execute(select(DeliveryOrder)).scalars().all()
+        batches = db.execute(select(RouteBatch)).scalars().all()
+        stops = db.execute(select(RouteStop)).scalars().all()
+
+        return {
+            "active_drivers": len(drivers),
+            "total_deliveries": len(deliveries),
+            "route_ready_deliveries": sum(1 for d in deliveries if d.status == "route_ready"),
+            "batched_deliveries": sum(1 for d in deliveries if d.status == "batched"),
+            "draft_batches": sum(1 for b in batches if b.status == "draft"),
+            "assigned_batches": sum(1 for b in batches if b.status == "assigned"),
+            "in_progress_batches": sum(1 for b in batches if b.status == "in_progress"),
+            "completed_batches": sum(1 for b in batches if b.status == "completed"),
+            "queued_stops": sum(1 for s in stops if s.status == "queued"),
+            "completed_stops": sum(1 for s in stops if s.status == "completed"),
         }
     finally:
         db.close()

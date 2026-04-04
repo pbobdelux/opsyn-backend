@@ -23,7 +23,7 @@ class UploadedOrder(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     customer_name: Mapped[str] = mapped_column(String(255), nullable=False)
     source_filename: Mapped[str] = mapped_column(String(255), nullable=False)
-    status: Mapped[str] = mapped_column(String(50), default="uploaded")
+    status: Mapped[str] = mapped_column(String(50), default="uploaded", index=True)
     raw_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -36,7 +36,7 @@ class ProductCatalog(Base):
     product_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     brand: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     unit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    active: Mapped[str] = mapped_column(String(10), default="yes")
+    active: Mapped[str] = mapped_column(String(10), default="yes", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -52,7 +52,7 @@ class ConfirmedOrderLine(Base):
     customer_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     source_row_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     line_total: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    validation_status: Mapped[str] = mapped_column(String(50), default="valid")
+    validation_status: Mapped[str] = mapped_column(String(50), default="valid", index=True)
     validation_message: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -66,14 +66,14 @@ class DeliveryOrder(Base):
     delivery_date: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
     address_line_1: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     address_line_2: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
     state: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     postal_code: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     status: Mapped[str] = mapped_column(String(50), default="draft", index=True)
     total_lines: Mapped[int] = mapped_column(Integer, default=0)
     total_units: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     total_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    validation_status: Mapped[str] = mapped_column(String(50), default="valid")
+    validation_status: Mapped[str] = mapped_column(String(50), default="valid", index=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -91,12 +91,25 @@ class DeliveryOrderLine(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class Driver(Base):
+    __tablename__ = "drivers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    vehicle_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    active: Mapped[str] = mapped_column(String(10), default="yes", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class RouteBatch(Base):
     __tablename__ = "route_batches"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     route_date: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(50), default="draft", index=True)
+    assigned_driver_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    assigned_driver_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     total_stops: Mapped[int] = mapped_column(Integer, default=0)
     total_units: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     total_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -110,7 +123,7 @@ class RouteStop(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     route_batch_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     delivery_order_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
-    stop_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    stop_number: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     customer_name: Mapped[str] = mapped_column(String(255), nullable=False)
     address_line_1: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     address_line_2: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -119,7 +132,9 @@ class RouteStop(Base):
     postal_code: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     total_units: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     total_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    status: Mapped[str] = mapped_column(String(50), default="queued")
+    status: Mapped[str] = mapped_column(String(50), default="queued", index=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -283,7 +298,7 @@ class BulkValidateRequest(BaseModel):
 
 
 # =========================
-# ORDER REVIEW REQUEST MODELS
+# ORDER / DELIVERY / ROUTING REQUESTS
 # =========================
 
 class ReviewCorrection(BaseModel):
@@ -310,3 +325,25 @@ class CreateDeliveryOrderRequest(BaseModel):
 class CreateRouteBatchRequest(BaseModel):
     route_date: str
     notes: Optional[str] = None
+
+
+class AssignDriverRequest(BaseModel):
+    route_batch_id: int
+    driver_id: int
+
+
+class ReorderStopsRequest(BaseModel):
+    route_batch_id: int
+    stop_ids_in_order: List[int]
+
+
+class UpdateStopStatusRequest(BaseModel):
+    stop_id: int
+    status: str
+    notes: Optional[str] = None
+
+
+class CreateDriverRequest(BaseModel):
+    name: str
+    phone: Optional[str] = None
+    vehicle_name: Optional[str] = None
