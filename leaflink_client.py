@@ -5,51 +5,31 @@ import requests
 LEAFLINK_API_KEY = os.getenv("LEAFLINK_API_KEY", "").strip()
 
 
-def test_connection():
-    if not LEAFLINK_API_KEY:
-        return {"error": "Missing LEAFLINK_API_KEY"}
+def get_bearer_token():
+    url = "https://api.leaflink.com/v1/oauth/token"
 
-    headers = {
-        "Authorization": f"App {LEAFLINK_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
+    payload = {
+        "grant_type": "client_credentials",
+        "client_id": LEAFLINK_API_KEY,
+        "client_secret": LEAFLINK_API_KEY,
     }
 
-    test_urls = [
-        # Legacy v2 host from docs
-        "https://app.leaflink.com/api/v2/orders-received/",
-        "https://app.leaflink.com/api/v2/products/",
-        "https://app.leaflink.com/api/v2/buyer/orders/",
-        "https://app.leaflink.com/api/v2/companies/",
+    headers = {
+        "Content-Type": "application/json",
+    }
 
-        # API host in case key is accepted there
-        "https://api.leaflink.com/api/v2/orders-received",
-        "https://api.leaflink.com/api/v2/products",
-        "https://api.leaflink.com/api/v2/buyer/orders",
-        "https://api.leaflink.com/api/v2/companies",
-    ]
-
-    results = []
-
-    for url in test_urls:
-        try:
-            response = requests.get(url, headers=headers, timeout=30)
-            results.append(
-                {
-                    "url": url,
-                    "status_code": response.status_code,
-                    "response_preview": response.text[:500],
-                }
-            )
-        except Exception as e:
-            results.append(
-                {
-                    "url": url,
-                    "error": str(e),
-                }
-            )
+    response = requests.post(url, json=payload, headers=headers)
 
     return {
-        "auth_header_preview": f"App {LEAFLINK_API_KEY[:6]}...",
-        "results": results,
+        "status_code": response.status_code,
+        "response": response.text[:500],
+    }
+
+
+def test_connection():
+    token_response = get_bearer_token()
+
+    return {
+        "step": "token_request",
+        "result": token_response,
     }
