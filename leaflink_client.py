@@ -1,24 +1,23 @@
-import os
 import requests
+import os
 
 BASE_URL = os.getenv("LEAFLINK_BASE_URL")
 API_KEY = os.getenv("LEAFLINK_API_KEY")
-API_VERSION = os.getenv("LEAFLINK_API_VERSION")
 
 
 def get_headers():
     return {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-        "LeafLink-Version": API_VERSION,
+        "Authorization": f"Api-Key {API_KEY}",
+        "Content-Type": "application/json"
     }
 
 
 def test_connection():
-    url = f"{BASE_URL}/orders-received?page=1&page_size=1"
+    url = f"{BASE_URL}/v2/orders/"
+
     response = requests.get(url, headers=get_headers())
 
-    print("Status Code:", response.status_code)
-    print("Response Text:", response.text)
-
-    return response.json()
+    return {
+        "status_code": response.status_code,
+        "response": response.text
+    }
