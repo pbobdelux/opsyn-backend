@@ -2,8 +2,7 @@ import os
 import requests
 
 
-LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://api.leaflink.com").rstrip("/")
-LEAFLINK_API_KEY = os.getenv("LEAFLINK_API_KEY", "")
+LEAFLINK_API_KEY = os.getenv("LEAFLINK_API_KEY", "").strip()
 
 
 def test_connection():
@@ -17,10 +16,17 @@ def test_connection():
     }
 
     test_urls = [
-        f"{LEAFLINK_BASE_URL}/api/v2/orders-received/",
-        f"{LEAFLINK_BASE_URL}/api/v2/orders-received",
-        f"{LEAFLINK_BASE_URL}/api/v2/products/",
-        f"{LEAFLINK_BASE_URL}/api/v2/products",
+        # Legacy v2 host from docs
+        "https://app.leaflink.com/api/v2/orders-received/",
+        "https://app.leaflink.com/api/v2/products/",
+        "https://app.leaflink.com/api/v2/buyer/orders/",
+        "https://app.leaflink.com/api/v2/companies/",
+
+        # API host in case key is accepted there
+        "https://api.leaflink.com/api/v2/orders-received",
+        "https://api.leaflink.com/api/v2/products",
+        "https://api.leaflink.com/api/v2/buyer/orders",
+        "https://api.leaflink.com/api/v2/companies",
     ]
 
     results = []
@@ -44,7 +50,6 @@ def test_connection():
             )
 
     return {
-        "base_url": LEAFLINK_BASE_URL,
         "auth_header_preview": f"App {LEAFLINK_API_KEY[:6]}...",
         "results": results,
     }
