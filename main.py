@@ -1,47 +1,65 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
-# ✅ LeafLink Debug Import
+import os
+
+# Import your existing modules
+from models import Base
+from config import settings
+
+# ✅ IMPORTANT: this is what enables the debug route
 from leaflink_debug import router as leaflink_debug_router
+
+
+# =========================
+# DATABASE SETUP
+# =========================
+engine = create_engine(settings.DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
 
 # =========================
 # APP INIT
 # =========================
-
 app = FastAPI(
     title="Opsyn API",
     version="1.0.0",
     description="Full Ops Backend v1",
 )
 
-# ✅ Attach LeafLink debug route
+# ✅ THIS LINE FIXES YOUR 404
 app.include_router(leaflink_debug_router)
 
-# =========================
-# MIDDLEWARE
-# =========================
 
+# =========================
+# STARTUP
+# =========================
+@app.on_event("startup")
+def on_startup():
+    Base.metadata.create_all(bind=engine)
+
+
+# =========================
+# CORS
+# =========================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
 
-    # ✅ SAFE ALLOWLIST (NO BLOCKING)
-    if request.url.path in [
-        "/api/health",
-        "/docs",
-        "/openapi.json",
-        "/redoc",
-        "/debug/leaflink",
-    ]:
-        return await call_next(request)
+# =========================
+# BASIC HEALTH CHECK
+# =========================
+@app.get("/")
+def root():
+    return {"status": "Opsyn backend running"}
 
-    # 👉 KEEP YOUR EXISTING AUTH LOGIC BELOW THIS LINE
-    # (if you had token checks, they go here)
-
-    return await call_next(request)
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
