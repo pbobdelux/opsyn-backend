@@ -10,7 +10,7 @@ from leaflink_debug import router as leaflink_debug_router
 
 app = FastAPI(
     title="Opsyn API",
-    version="1.0.0",
+    version="1.0.1",
     description="Full Ops Backend v1",
 )
 
