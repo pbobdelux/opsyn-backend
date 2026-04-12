@@ -4,18 +4,12 @@ import requests
 LEAFLINK_API_KEY = os.getenv("LEAFLINK_API_KEY", "").strip()
 LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://api.leaflink.com").strip()
 
-def _call(path: str, auth_type: str):
+def _call(path: str):
     headers = {
+        "Authorization": f"Bearer {LEAFLINK_API_KEY}",
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-
-    if auth_type == "Token":
-        headers["Authorization"] = f"Token {LEAFLINK_API_KEY}"
-    elif auth_type == "App":
-        headers["Authorization"] = f"App {LEAFLINK_API_KEY}"
-    else:
-        headers["Authorization"] = LEAFLINK_API_KEY
 
     url = f"{LEAFLINK_BASE_URL}{path}"
 
@@ -41,9 +35,7 @@ def test_connection():
     ]
 
     return {
+        "auth_type": "Bearer",
         "base_url": LEAFLINK_BASE_URL,
-        "tests": {
-            "Token": [_call(path, "Token") for path in paths],
-            "App": [_call(path, "App") for path in paths],
-        }
+        "results": [_call(path) for path in paths]
     }
