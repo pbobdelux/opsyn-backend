@@ -1,8 +1,12 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-# ✅ LeafLink Debug Import
+# =========================
+# ROUTE IMPORTS
+# =========================
+
 from leaflink_debug import router as leaflink_debug_router
+from routes.brain import router as brain_router
 
 # =========================
 # APP INIT
@@ -10,12 +14,16 @@ from leaflink_debug import router as leaflink_debug_router
 
 app = FastAPI(
     title="Opsyn API",
-    version="1.0.1",
+    version="1.0.0",
     description="Full Ops Backend v1",
 )
 
-# ✅ Attach LeafLink debug route
+# =========================
+# ROUTES
+# =========================
+
 app.include_router(leaflink_debug_router)
+app.include_router(brain_router)
 
 # =========================
 # MIDDLEWARE
@@ -28,6 +36,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# =========================
+# AUTH / REQUEST MIDDLEWARE
+# =========================
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
 
@@ -38,10 +50,18 @@ async def auth_middleware(request: Request, call_next):
         "/openapi.json",
         "/redoc",
         "/debug/leaflink",
+        "/api/brain/ask",
     ]:
         return await call_next(request)
 
-    # 👉 KEEP YOUR EXISTING AUTH LOGIC BELOW THIS LINE
-    # (if you had token checks, they go here)
+    # 👉 Add real auth logic here later if needed
 
     return await call_next(request)
+
+# =========================
+# HEALTH CHECK
+# =========================
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok"}
