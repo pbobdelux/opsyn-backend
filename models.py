@@ -347,3 +347,8 @@ class CreateDriverRequest(BaseModel):
     name: str
     phone: Optional[str] = None
     vehicle_name: Optional[str] = None
+
+from sqlalchemy import Column, String, Boolean, DateTime
+from sqlalchemy.dialects.postgresql import JSON
+
+
