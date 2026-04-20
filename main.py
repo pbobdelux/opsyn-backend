@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import Base, engine, get_db
 from models import BrandAPICredential, Order
-from services.leaflink_sync import sync_leaflink_orders_for_brand
+from services.leaflink_sync import sync_leaflink_orders
 
 import models  # noqa: F401
 
@@ -237,7 +237,7 @@ async def sync_orders_for_brand(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        result = await sync_leaflink_orders_for_brand(db, brand_id)
+        result = await await sync_leaflink_orders(db, brand_id)
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
