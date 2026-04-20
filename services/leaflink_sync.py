@@ -126,51 +126,11 @@ async def get_active_leaflink_credentials(
     return result.scalar_one_or_none()
 
 
-def build_headers(credentials: BrandAPICredential) -> dict[str, str]:
-    headers: dict[str, str] = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "opsyn-backend",
-    }
-
-    # LeafLink legacy v2 expects: Authorization: App <API_KEY>
-    if getattr(credentials, "api_key", None):
-        headers["Authorization"] = f"App {credentials.api_key}"
-
-    # Keep vendor key too in case this credential set needs it.
-    if getattr(credentials, "vendor_key", None):
-        headers["X-LeafLink-Vendor-Key"] = credentials.vendor_key
-
-    return headers
-
-
-def candidate_order_urls(credentials: BrandAPICredential) -> list[str]:
-    raw_base = (credentials.base_url or "").strip()
-
-    candidates: list[str] = []
-
-    # Legacy v2 documented brand orders endpoint, trailing slash required.
-    candidates.append("https://api.leaflink.com/orders-received/")
-    candidates.append("https://api.leaflink.com/api/v2/orders-received/")
-
-    if raw_base:
-        base = raw_base.rstrip("/")
-
-        # If saved base is already /api/v2, append the brand endpoint with trailing slash.
-        if base.endswith("/api/v2"):
-            candidates.append(f"{base}/orders-received/")
-        else:
-            candidates.append(f"{base}/orders-received/")
-            candidates.append(f"{base}/api/v2/orders-received/")
-
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for url in candidates:
-        if url not in seen:
-            seen.add(url)
-            deduped.append(url)
-
-    return deduped
+def build_auth_header_candidates(api_key: str) -> list[dict[str, str]]:
+    return [
+        {"Authorization": f"Token {api_key}"},
+        {"Authorization": f"App {api_key}"},
+    ]
 
 
 def extract_orders_from_payload(payload: Any) -> list[dict[str, Any]]:
@@ -187,70 +147,110 @@ def extract_orders_from_payload(payload: Any) -> list[dict[str, Any]]:
 
 
 async def fetch_leaflink_orders(credentials: BrandAPICredential) -> list[dict[str, Any]]:
-    headers = build_headers(credentials)
-    urls = candidate_order_urls(credentials)
+    api_key = getattr(credentials, "api_key", None)
+    company_id = getattr(credentials, "company_id", None)
+
+    if not api_key:
+        raise ValueError("LeafLink credential is missing api_key")
+
+    if not company_id:
+        raise ValueError("LeafLink credential is missing company_id")
+
+    base_url = (credentials.base_url or "https://app.leaflink.com/api/v2").rstrip("/")
+    url = f"{base_url}/orders-received/"
+
+    params = {
+        "company": str(company_id),
+    }
+
+    common_headers: dict[str, str] = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "opsyn-backend",
+    }
+
+    vendor_key = getattr(credentials, "vendor_key", None)
+    if vendor_key:
+        common_headers["X-LeafLink-Vendor-Key"] = vendor_key
 
     last_error: Exception | None = None
 
     async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
-        for url in urls:
-            logger.info("Trying LeafLink orders endpoint: %s", url)
+        for auth_headers in build_auth_header_candidates(api_key):
+            headers = {**common_headers, **auth_headers}
+            auth_preview = auth_headers["Authorization"].split(" ")[0]
+
             logger.info(
-                "Auth present=%s vendor_key present=%s",
-                bool(headers.get("Authorization")),
-                bool(headers.get("X-LeafLink-Vendor-Key")),
+                "Trying LeafLink orders endpoint=%s auth_style=%s company=%s vendor_key_present=%s",
+                url,
+                auth_preview,
+                company_id,
+                bool(vendor_key),
             )
 
             try:
-                response = await client.get(url, headers=headers)
+                response = await client.get(url, headers=headers, params=params)
+
                 logger.info(
-                    "LeafLink response from %s -> status=%s content_type=%s",
-                    url,
+                    "LeafLink response status=%s auth_style=%s content_type=%s",
                     response.status_code,
+                    auth_preview,
                     response.headers.get("content-type"),
                 )
 
-                if response.status_code in (400, 404):
-                    body_preview = response.text[:500]
-                    logger.warning("LeafLink path/auth issue on %s -> %s", url, body_preview)
-                    last_error = RuntimeError(f"LeafLink HTTP {response.status_code} from {url}: {body_preview}")
-                    continue
-
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    body_preview = response.text[:800]
+                    logger.warning(
+                        "LeafLink error auth_style=%s status=%s body=%s",
+                        auth_preview,
+                        response.status_code,
+                        body_preview,
+                    )
+                    response.raise_for_status()
 
                 try:
                     payload = response.json()
                 except Exception as exc:
                     raise RuntimeError(
-                        f"LeafLink returned non-JSON response from {url}: {response.text[:500]}"
+                        f"LeafLink returned non-JSON response: {response.text[:800]}"
                     ) from exc
 
                 orders = extract_orders_from_payload(payload)
-                logger.info("LeafLink parsed %s orders from %s", len(orders), url)
+                logger.info(
+                    "LeafLink parsed %s orders using auth_style=%s",
+                    len(orders),
+                    auth_preview,
+                )
                 return orders
 
             except httpx.HTTPStatusError as exc:
                 last_error = exc
-                body_preview = exc.response.text[:500] if exc.response is not None else ""
-                logger.error(
-                    "LeafLink HTTP error on %s -> status=%s body=%s",
-                    url,
-                    exc.response.status_code if exc.response is not None else "unknown",
-                    body_preview,
-                )
+                body_preview = exc.response.text[:800] if exc.response is not None else ""
+                status_code = exc.response.status_code if exc.response is not None else "unknown"
+
+                # Try next auth style only for auth-ish failures.
+                if exc.response is not None and exc.response.status_code in (400, 401, 403):
+                    logger.warning(
+                        "LeafLink auth/path failure with %s, trying next auth style if available. status=%s body=%s",
+                        auth_preview,
+                        status_code,
+                        body_preview,
+                    )
+                    continue
+
                 raise RuntimeError(
-                    f"LeafLink HTTP {exc.response.status_code} from {url}: {body_preview}"
+                    f"LeafLink HTTP {status_code} from {url}: {body_preview}"
                 ) from exc
 
             except Exception as exc:
                 last_error = exc
-                logger.exception("LeafLink request failed for %s", url)
+                logger.exception("LeafLink request failed using auth_style=%s", auth_preview)
                 raise
 
     if last_error is not None:
-        raise RuntimeError(f"LeafLink orders fetch failed after trying all endpoints: {last_error}")
+        raise RuntimeError(f"LeafLink orders fetch failed after trying auth styles: {last_error}")
 
-    raise RuntimeError("LeafLink orders fetch failed: no candidate endpoints were available")
+    raise RuntimeError("LeafLink orders fetch failed for unknown reason")
 
 
 async def upsert_leaflink_orders(
