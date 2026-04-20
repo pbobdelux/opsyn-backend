@@ -1,52 +1,20 @@
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base
 import os
-from typing import AsyncGenerator
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase
+DATABASE_URL = os.getenv("DATABASE_URL")
 
+# 🔥 FIX: asyncpg does NOT support sslmode like psycopg2
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    future=True,
+)
 
-def normalize_database_url(url: str) -> str:
-    if not url:
-        return url
+AsyncSessionLocal = sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
 
-    if url.startswith("postgresql+asyncpg://"):
-        return url
-
-    if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+asyncpg://", 1)
-
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-
-    return url
-
-
-DATABASE_URL = normalize_database_url(os.getenv("DATABASE_URL", "").strip())
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-if DATABASE_URL:
-    engine = create_async_engine(
-        DATABASE_URL,
-        echo=False,
-        pool_pre_ping=True,
-    )
-    AsyncSessionLocal = async_sessionmaker(
-        bind=engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-    )
-else:
-    engine = None
-    AsyncSessionLocal = None
-
-
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    if AsyncSessionLocal is None:
-        raise RuntimeError("DATABASE_URL is not configured")
-
-    async with AsyncSessionLocal() as session:
-        yield session
+Base = declarative_base()
