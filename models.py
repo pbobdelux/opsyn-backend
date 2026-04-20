@@ -20,7 +20,7 @@ class Base(DeclarativeBase):
 class UploadedOrder(Base):
     __tablename__ = "uploaded_orders"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    id: Mapped[str] = mapped_column(String(100), primary_key=True, index=True)
     customer_name: Mapped[str] = mapped_column(String(255), nullable=False)
     source_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="uploaded", index=True)
@@ -347,8 +347,3 @@ class CreateDriverRequest(BaseModel):
     name: str
     phone: Optional[str] = None
     vehicle_name: Optional[str] = None
-
-from sqlalchemy import Column, String, Boolean, DateTime
-from sqlalchemy.dialects.postgresql import JSON
-
-
