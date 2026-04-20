@@ -2,7 +2,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import logging
 import os
-from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,11 +11,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import Base, engine, get_db
-from leaflink_sync import sync_leaflink_orders_for_brand
 from models import BrandAPICredential, Order
+from services.leaflink_sync import sync_leaflink_orders_for_brand
 
 # IMPORTANT:
-# This import must stay here so SQLAlchemy knows about the models before create_all.
+# keep this import so SQLAlchemy sees all models before create_all
 import models  # noqa: F401
 
 # -----------------------------------------------------------------------------
@@ -42,8 +41,10 @@ PORT = int(os.getenv("PORT", "8000"))
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
 def database_configured() -> bool:
     return bool(os.getenv("DATABASE_URL"))
+
 
 # -----------------------------------------------------------------------------
 # Request models
@@ -53,6 +54,11 @@ class LeafLinkCredentialUpsertRequest(BaseModel):
     api_key: str
     vendor_key: str | None = None
     is_active: bool = True
+
+
+class LeafLinkSyncRequest(BaseModel):
+    brand_id: str
+
 
 # -----------------------------------------------------------------------------
 # Lifespan
@@ -83,6 +89,7 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info("Shutting down %s", APP_NAME)
+
 
 # -----------------------------------------------------------------------------
 # App
@@ -138,6 +145,7 @@ async def root():
         "timestamp": utc_now_iso(),
     }
 
+
 @app.get("/health")
 async def health():
     return {
@@ -148,6 +156,7 @@ async def health():
         "database_error": getattr(app.state, "db_error", None),
         "timestamp": utc_now_iso(),
     }
+
 
 @app.get("/debug/routes")
 async def debug_routes():
@@ -216,6 +225,7 @@ async def upsert_leaflink_credentials(
         "is_active": existing.is_active,
     }
 
+
 @app.get("/brands/{brand_id}/credentials/leaflink")
 async def get_leaflink_credentials_status(
     brand_id: str,
@@ -245,7 +255,7 @@ async def get_leaflink_credentials_status(
     }
 
 # -----------------------------------------------------------------------------
-# Sync endpoint
+# Sync endpoints
 # -----------------------------------------------------------------------------
 @app.post("/sync/orders/{brand_id}")
 async def sync_orders_for_brand(
@@ -258,8 +268,25 @@ async def sync_orders_for_brand(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
+
+@app.post("/sync/leaflink")
+async def sync_leaflink_compat(
+    payload: LeafLinkSyncRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Compatibility route for the existing sync worker.
+    The worker already calls /sync/leaflink, so this route forwards
+    that request into the real brand-based sync function.
+    """
+    try:
+        result = await sync_leaflink_orders_for_brand(db, payload.brand_id)
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
 # -----------------------------------------------------------------------------
-# Orders endpoint (REAL DB-BACKED)
+# Orders endpoint
 # -----------------------------------------------------------------------------
 @app.get("/orders")
 async def get_orders(
@@ -306,6 +333,7 @@ async def get_orders(
 @app.get("/api")
 async def api_root():
     return {"ok": True, "message": "Opsyn API root", "timestamp": utc_now_iso()}
+
 
 @app.get("/api/v1")
 async def api_v1_root():
