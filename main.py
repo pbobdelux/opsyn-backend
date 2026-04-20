@@ -14,30 +14,20 @@ from database import Base, engine, get_db
 from models import BrandAPICredential, Order
 from services.leaflink_sync import sync_leaflink_orders_for_brand
 
-# IMPORTANT:
-# keep this import so SQLAlchemy sees all models before create_all
 import models  # noqa: F401
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s - %(message)s",
 )
 logger = logging.getLogger("opsyn-backend")
 
-# -----------------------------------------------------------------------------
-# App metadata
-# -----------------------------------------------------------------------------
 APP_NAME = "Opsyn Backend"
 APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENVIRONMENT", "local"))
 PORT = int(os.getenv("PORT", "8000"))
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -46,13 +36,11 @@ def database_configured() -> bool:
     return bool(os.getenv("DATABASE_URL"))
 
 
-# -----------------------------------------------------------------------------
-# Request models
-# -----------------------------------------------------------------------------
 class LeafLinkCredentialUpsertRequest(BaseModel):
     base_url: str | None = "https://app.leaflink.com/api/v2"
     api_key: str
     vendor_key: str | None = None
+    company_id: str | None = None
     is_active: bool = True
 
 
@@ -60,9 +48,6 @@ class LeafLinkSyncRequest(BaseModel):
     brand_id: str
 
 
-# -----------------------------------------------------------------------------
-# Lifespan
-# -----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting %s v%s in %s on port %s", APP_NAME, APP_VERSION, APP_ENV, PORT)
@@ -91,18 +76,12 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down %s", APP_NAME)
 
 
-# -----------------------------------------------------------------------------
-# App
-# -----------------------------------------------------------------------------
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     lifespan=lifespan,
 )
 
-# -----------------------------------------------------------------------------
-# CORS
-# -----------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -111,9 +90,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
-# Error handler
-# -----------------------------------------------------------------------------
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.exception("Unhandled error on %s %s", request.method, request.url.path)
@@ -128,9 +105,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         },
     )
 
-# -----------------------------------------------------------------------------
-# System endpoints
-# -----------------------------------------------------------------------------
+
 @app.get("/")
 async def root():
     return {
@@ -176,9 +151,7 @@ async def debug_routes():
         "timestamp": utc_now_iso(),
     }
 
-# -----------------------------------------------------------------------------
-# Credential management
-# -----------------------------------------------------------------------------
+
 @app.post("/brands/{brand_id}/credentials/leaflink")
 async def upsert_leaflink_credentials(
     brand_id: str,
@@ -196,6 +169,7 @@ async def upsert_leaflink_credentials(
         existing.base_url = payload.base_url
         existing.api_key = payload.api_key
         existing.vendor_key = payload.vendor_key
+        existing.company_id = payload.company_id
         existing.is_active = payload.is_active
         existing.last_error = None
         existing.sync_status = "idle"
@@ -207,6 +181,7 @@ async def upsert_leaflink_credentials(
             base_url=payload.base_url,
             api_key=payload.api_key,
             vendor_key=payload.vendor_key,
+            company_id=payload.company_id,
             is_active=payload.is_active,
             sync_status="idle",
         )
@@ -246,6 +221,7 @@ async def get_leaflink_credentials_status(
         "brand_id": credential.brand_id,
         "integration_name": credential.integration_name,
         "base_url": credential.base_url,
+        "company_id": credential.company_id,
         "is_active": credential.is_active,
         "sync_status": credential.sync_status,
         "last_sync_at": credential.last_sync_at.isoformat() if credential.last_sync_at else None,
@@ -254,9 +230,7 @@ async def get_leaflink_credentials_status(
         "has_vendor_key": bool(credential.vendor_key),
     }
 
-# -----------------------------------------------------------------------------
-# Sync endpoints
-# -----------------------------------------------------------------------------
+
 @app.post("/sync/orders/{brand_id}")
 async def sync_orders_for_brand(
     brand_id: str,
@@ -274,20 +248,13 @@ async def sync_leaflink_compat(
     payload: LeafLinkSyncRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Compatibility route for the existing sync worker.
-    The worker already calls /sync/leaflink, so this route forwards
-    that request into the real brand-based sync function.
-    """
     try:
         result = await sync_leaflink_orders_for_brand(db, payload.brand_id)
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-# -----------------------------------------------------------------------------
-# Orders endpoint
-# -----------------------------------------------------------------------------
+
 @app.get("/orders")
 async def get_orders(
     brand_id: str | None = Query(default=None),
@@ -327,9 +294,7 @@ async def get_orders(
         ],
     }
 
-# -----------------------------------------------------------------------------
-# API root helpers
-# -----------------------------------------------------------------------------
+
 @app.get("/api")
 async def api_root():
     return {"ok": True, "message": "Opsyn API root", "timestamp": utc_now_iso()}
@@ -339,9 +304,7 @@ async def api_root():
 async def api_v1_root():
     return {"ok": True, "message": "Opsyn API v1", "timestamp": utc_now_iso()}
 
-# -----------------------------------------------------------------------------
-# Local run
-# -----------------------------------------------------------------------------
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
