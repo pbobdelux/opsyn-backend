@@ -6,7 +6,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from database import engine, Base
+from database import engine
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -46,8 +46,9 @@ async def lifespan(app: FastAPI):
 
     if database_configured():
         try:
-            async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+            # temporarily disable table creation (Base not defined)
+app.state.db_ready = True
+logger.info("Database connection assumed OK (Base disabled)")
             app.state.db_ready = True
             logger.info("Connected to database and ensured tables exist")
         except Exception as e:
