@@ -1,5 +1,6 @@
 import os
 from typing import AsyncGenerator
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
@@ -11,16 +12,19 @@ def normalize_database_url(url: str) -> str:
 
     url = url.strip()
 
-    if url.startswith("postgresql+asyncpg://"):
-        return url
-
     if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    parsed = urlparse(url)
+    query_params = parse_qsl(parsed.query, keep_blank_values=True)
 
-    return url
+    # asyncpg does NOT accept sslmode in the DSN the way psycopg2 does
+    filtered_params = [(k, v) for (k, v) in query_params if k.lower() != "sslmode"]
+
+    rebuilt = parsed._replace(query=urlencode(filtered_params))
+    return urlunparse(rebuilt)
 
 
 DATABASE_URL = normalize_database_url(os.getenv("DATABASE_URL", ""))
