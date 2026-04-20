@@ -35,7 +35,7 @@ def database_configured() -> bool:
     return bool(os.getenv("DATABASE_URL"))
 
 # -----------------------------------------------------------------------------
-# Lifespan (FIXED + SAFE)
+# Lifespan
 # -----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 
     if database_configured():
         try:
-            # TEMP: bypass ORM until we wire Base correctly
+            # TEMP: bypass ORM setup until Base/models are wired correctly
             app.state.db_ready = True
             logger.info("Database connection assumed OK (Base disabled)")
         except Exception as e:
@@ -150,6 +150,24 @@ async def debug_db():
         "database_configured": bool(os.getenv("DATABASE_URL")),
         "database_connected": getattr(app.state, "db_ready", False),
         "database_error": getattr(app.state, "db_error", None),
+        "timestamp": utc_now_iso(),
+    }
+
+@app.get("/debug/routes", tags=["system"])
+async def debug_routes():
+    return {
+        "ok": True,
+        "routes": sorted(
+            [
+                {
+                    "path": getattr(route, "path", None),
+                    "name": getattr(route, "name", None),
+                    "methods": sorted(list(getattr(route, "methods", []) or [])),
+                }
+                for route in app.routes
+            ],
+            key=lambda x: x["path"] or "",
+        ),
         "timestamp": utc_now_iso(),
     }
 
