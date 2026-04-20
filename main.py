@@ -1,5 +1,32 @@
 import os
 
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"ok": True, "message": "root works"}
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/orders")
+def orders():
+    return {"ok": True, "message": "orders works"}
+
+@app.get("/routes")
+def routes():
+    return {"ok": True, "message": "routes works"}
+
+@app.get("/snapshot")
+def snapshot():
+    return {"ok": True, "message": "snapshot works"}
+
+
+
+
 from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
