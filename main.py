@@ -35,7 +35,7 @@ def database_configured() -> bool:
     return bool(os.getenv("DATABASE_URL"))
 
 # -----------------------------------------------------------------------------
-# Lifespan
+# Lifespan (FIXED + SAFE)
 # -----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -46,11 +46,9 @@ async def lifespan(app: FastAPI):
 
     if database_configured():
         try:
-            # temporarily disable table creation (Base not defined)
-app.state.db_ready = True
-logger.info("Database connection assumed OK (Base disabled)")
+            # TEMP: bypass ORM until we wire Base correctly
             app.state.db_ready = True
-            logger.info("Connected to database and ensured tables exist")
+            logger.info("Database connection assumed OK (Base disabled)")
         except Exception as e:
             app.state.db_error = str(e)
             logger.exception("Database connection failed")
