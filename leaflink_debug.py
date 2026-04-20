@@ -1,9 +1,16 @@
 from fastapi import APIRouter
-from leaflink_client import test_connection
 
 router = APIRouter()
 
 
 @router.get("/debug/leaflink")
 def debug_leaflink():
-    return test_connection()
+    try:
+        from leaflink_client import test_connection
+        return test_connection()
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "message": "LeafLink debug route failed"
+        }

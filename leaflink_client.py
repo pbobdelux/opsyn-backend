@@ -3,9 +3,17 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 
-LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://app.leaflink.com/api/v2").strip().rstrip("/")
-LEAFLINK_VENDOR_KEY = os.getenv("LEAFLINK_VENDOR_KEY", "").strip()
-LEAFLINK_USER_KEY = os.getenv("LEAFLINK_USER_KEY", "").strip()
+def _get_base_url() -> str:
+    base = os.getenv("LEAFLINK_BASE_URL", "https://api.leaflink.com/v2").strip().rstrip("/")
+    return base
+
+
+def _get_vendor_key() -> str:
+    return os.getenv("LEAFLINK_VENDOR_KEY", "").strip()
+
+
+def _get_user_key() -> str:
+    return os.getenv("LEAFLINK_USER_KEY", "").strip()
 
 
 def _preview(text: str, limit: int = 300) -> str:
@@ -15,12 +23,15 @@ def _preview(text: str, limit: int = 300) -> str:
 
 
 def _call(path: str):
-    url = f"{LEAFLINK_BASE_URL}{path}"
+    base_url = _get_base_url()
+    vendor_key = _get_vendor_key()
+    user_key = _get_user_key()
+    url = f"{base_url}{path}"
 
     try:
         res = requests.get(
             url,
-            auth=HTTPBasicAuth(LEAFLINK_VENDOR_KEY, LEAFLINK_USER_KEY),
+            auth=HTTPBasicAuth(vendor_key, user_key),
             timeout=30,
         )
 
@@ -38,16 +49,20 @@ def _call(path: str):
 
 
 def test_connection():
+    base_url = _get_base_url()
+    vendor_key = _get_vendor_key()
+    user_key = _get_user_key()
+
     paths = [
-        "/orders-received",
+        "/orders",
         "/products",
         "/companies",
     ]
 
     return {
-        "base_url": LEAFLINK_BASE_URL,
+        "base_url": base_url,
         "auth_mode": "basic_auth_vendor_user",
-        "has_vendor_key": bool(LEAFLINK_VENDOR_KEY),
-        "has_user_key": bool(LEAFLINK_USER_KEY),
+        "has_vendor_key": bool(vendor_key),
+        "has_user_key": bool(user_key),
         "results": [_call(p) for p in paths],
     }
