@@ -3,7 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import os
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+
+from database import engine, Base
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -22,9 +25,48 @@ APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENVIRONMENT", "local"))
 PORT = int(os.getenv("PORT", "8000"))
 
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def database_configured() -> bool:
+    return bool(os.getenv("DATABASE_URL"))
+
+# -----------------------------------------------------------------------------
+# Lifespan
+# -----------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting %s v%s in %s on port %s", APP_NAME, APP_VERSION, APP_ENV, PORT)
+
+    app.state.db_ready = False
+    app.state.db_error = None
+
+    if database_configured():
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            app.state.db_ready = True
+            logger.info("Connected to database and ensured tables exist")
+        except Exception as e:
+            app.state.db_error = str(e)
+            logger.exception("Database connection failed")
+    else:
+        logger.warning("DATABASE_URL not configured")
+
+    yield
+
+    logger.info("Shutting down %s", APP_NAME)
+
+# -----------------------------------------------------------------------------
+# App
+# -----------------------------------------------------------------------------
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
+    lifespan=lifespan,
 )
 
 # -----------------------------------------------------------------------------
@@ -37,12 +79,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 # -----------------------------------------------------------------------------
 # Global exception handler
@@ -62,7 +98,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 # -----------------------------------------------------------------------------
-# Root & debug endpoints
+# System endpoints
 # -----------------------------------------------------------------------------
 @app.get("/", tags=["system"])
 async def root():
@@ -71,7 +107,10 @@ async def root():
         "name": APP_NAME,
         "version": APP_VERSION,
         "environment": APP_ENV,
-        "message": "Opsyn backend boot-safe mode is live",
+        "message": "Opsyn backend DB-safe mode is live",
+        "database_configured": database_configured(),
+        "database_connected": getattr(app.state, "db_ready", False),
+        "database_error": getattr(app.state, "db_error", None),
         "timestamp": utc_now_iso(),
     }
 
@@ -80,6 +119,9 @@ async def health():
     return {
         "ok": True,
         "status": "healthy",
+        "database_configured": database_configured(),
+        "database_connected": getattr(app.state, "db_ready", False),
+        "database_error": getattr(app.state, "db_error", None),
         "timestamp": utc_now_iso(),
     }
 
@@ -102,18 +144,14 @@ async def env_check():
         "timestamp": utc_now_iso(),
     }
 
-@app.get("/debug/routes", tags=["system"])
-async def debug_routes():
+@app.get("/debug/db", tags=["system"])
+async def debug_db():
     return {
         "ok": True,
-        "routes": [
-            {
-                "path": getattr(route, "path", None),
-                "name": getattr(route, "name", None),
-                "methods": sorted(list(getattr(route, "methods", []) or [])),
-            }
-            for route in app.routes
-        ],
+        "database_configured": bool(os.getenv("DATABASE_URL")),
+        "database_connected": getattr(app.state, "db_ready", False),
+        "database_error": getattr(app.state, "db_error", None),
+        "timestamp": utc_now_iso(),
     }
 
 # -----------------------------------------------------------------------------
