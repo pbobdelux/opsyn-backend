@@ -9,6 +9,9 @@ from services.leaflink_sync import sync_leaflink_orders
 
 from leaflink_debug import router as leaflink_debug_router
 from routes.brain import router as brain_router
+from routes.orders import router as orders_router
+from routes.routes import router as routes_router
+from routes.snapshot import router as snapshot_router
 
 # =========================
 # APP INIT
@@ -26,6 +29,9 @@ app = FastAPI(
 
 app.include_router(leaflink_debug_router)
 app.include_router(brain_router)
+app.include_router(orders_router)
+app.include_router(routes_router)
+app.include_router(snapshot_router)
 
 # =========================
 # MIDDLEWARE
@@ -53,6 +59,9 @@ async def auth_middleware(request: Request, call_next):
         "/debug/leaflink",
         "/api/brain/ask",
         "/sync/leaflink",
+        "/orders",
+        "/routes",
+        "/snapshot",
     ]:
         return await call_next(request)
 
