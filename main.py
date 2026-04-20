@@ -3,12 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import os
 import logging
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-
-# Import your existing database and config
-from database import engine, Base
-from config import settings
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -27,56 +22,14 @@ APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENVIRONMENT", "local"))
 PORT = int(os.getenv("PORT", "8000"))
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def database_configured() -> bool:
-    return bool(os.getenv("DATABASE_URL"))
-
-
-# -----------------------------------------------------------------------------
-# Lifespan
-# -----------------------------------------------------------------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Starting %s v%s in %s on port %s", APP_NAME, APP_VERSION, APP_ENV, PORT)
-
-    app.state.db_ready = False
-    app.state.db_error = None
-
-    if database_configured():
-        try:
-            async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
-            app.state.db_ready = True
-            logger.info("Connected to database and ensured tables exist")
-        except Exception as e:
-            app.state.db_error = str(e)
-            logger.exception("Database connection failed")
-    else:
-        logger.warning("DATABASE_URL not configured")
-
-    yield
-
-    logger.info("Shutting down %s", APP_NAME)
-
-
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
-    lifespan=lifespan,
 )
 
 # -----------------------------------------------------------------------------
 # CORS
 # -----------------------------------------------------------------------------
-# IMPORTANT:
-# If allow_origins=["*"], allow_credentials must be False.
-# The previous combo of "*" + True is invalid for browsers.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -86,7 +39,13 @@ app.add_middleware(
 )
 
 # -----------------------------------------------------------------------------
-# Global Exception Handler
+# Helpers
+# -----------------------------------------------------------------------------
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+# -----------------------------------------------------------------------------
+# Global exception handler
 # -----------------------------------------------------------------------------
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
@@ -96,14 +55,14 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         content={
             "ok": False,
             "error": "internal_server_error",
-            "message": "An unexpected server error occurred.",
+            "message": str(exc),
             "path": request.url.path,
             "timestamp": utc_now_iso(),
         },
     )
 
 # -----------------------------------------------------------------------------
-# Root & Health Endpoints
+# Root & debug endpoints
 # -----------------------------------------------------------------------------
 @app.get("/", tags=["system"])
 async def root():
@@ -112,46 +71,25 @@ async def root():
         "name": APP_NAME,
         "version": APP_VERSION,
         "environment": APP_ENV,
-        "message": "Opsyn backend is live ✅",
-        "database_configured": database_configured(),
-        "database_connected": getattr(app.state, "db_ready", False),
-        "database_error": getattr(app.state, "db_error", None),
+        "message": "Opsyn backend boot-safe mode is live",
         "timestamp": utc_now_iso(),
     }
-
 
 @app.get("/health", tags=["system"])
 async def health():
     return {
         "ok": True,
         "status": "healthy",
-        "database_configured": database_configured(),
-        "database_connected": getattr(app.state, "db_ready", False),
         "timestamp": utc_now_iso(),
     }
 
-
-@app.get("/ready", tags=["system"])
-async def ready():
-    if database_configured() and not getattr(app.state, "db_ready", False):
-        return JSONResponse(
-            status_code=503,
-            content={
-                "ok": False,
-                "status": "not_ready",
-                "database_connected": False,
-                "database_error": getattr(app.state, "db_error", None),
-                "timestamp": utc_now_iso(),
-            },
-        )
-
+@app.get("/ping", tags=["system"])
+async def ping():
     return {
         "ok": True,
-        "status": "ready",
-        "database_connected": getattr(app.state, "db_ready", False),
+        "message": "pong",
         "timestamp": utc_now_iso(),
     }
-
 
 @app.get("/env", tags=["system"])
 async def env_check():
@@ -163,58 +101,26 @@ async def env_check():
         "database_url_present": bool(os.getenv("DATABASE_URL")),
         "timestamp": utc_now_iso(),
     }
-@app.get("/health", tags=["system"])
-async def health():
-    return {
-        "ok": True,
-        "status": "healthy",
-        "database_configured": database_configured(),
-        "database_connected": getattr(app.state, "db_ready", False),
-        "timestamp": utc_now_iso(),
-    }
-
-# ===================== ADD BELOW THIS LINE =====================
-
-@app.get("/ping", tags=["system"])
-async def ping():
-    return {"ok": True, "message": "pong", "timestamp": utc_now_iso()}
-
 
 @app.get("/debug/routes", tags=["system"])
 async def debug_routes():
     return {
         "ok": True,
-        "routes": sorted(
-            [
-                {
-                    "path": getattr(route, "path", None),
-                    "name": getattr(route, "name", None),
-                    "methods": sorted(list(getattr(route, "methods", []) or [])),
-                }
-                for route in app.routes
-            ],
-            key=lambda x: x["path"] or "",
-        ),
+        "routes": [
+            {
+                "path": getattr(route, "path", None),
+                "name": getattr(route, "name", None),
+                "methods": sorted(list(getattr(route, "methods", []) or [])),
+            }
+            for route in app.routes
+        ],
     }
 
-
-@app.get("/debug/db", tags=["system"])
-async def debug_db():
-    return {
-        "ok": True,
-        "database_configured": bool(os.getenv("DATABASE_URL")),
-        "database_connected": getattr(app.state, "db_ready", False),
-        "database_error": getattr(app.state, "db_error", None),
-        "timestamp": utc_now_iso(),
-    }
-
-# ===================== END INSERT =====================
 # -----------------------------------------------------------------------------
-# API Routers
+# API routers
 # -----------------------------------------------------------------------------
 api = APIRouter(prefix="/api", tags=["api"])
 v1 = APIRouter(prefix="/v1", tags=["api-v1"])
-
 
 @api.get("")
 async def api_root():
@@ -224,7 +130,6 @@ async def api_root():
         "timestamp": utc_now_iso(),
     }
 
-
 @v1.get("")
 async def api_v1_root():
     return {
@@ -232,25 +137,6 @@ async def api_v1_root():
         "message": "Opsyn API v1",
         "timestamp": utc_now_iso(),
     }
-
-
-@v1.get("/status")
-async def api_v1_status():
-    return {
-        "ok": True,
-        "app": APP_NAME,
-        "version": APP_VERSION,
-        "environment": APP_ENV,
-        "database_connected": getattr(app.state, "db_ready", False),
-        "timestamp": utc_now_iso(),
-    }
-
-
-# Import your routes here later, for example:
-# from routes.inventory import router as inventory_router
-# from routes.mapping import router as mapping_router
-# v1.include_router(inventory_router, prefix="/inventory", tags=["inventory"])
-# v1.include_router(mapping_router, prefix="/mapping", tags=["mapping"])
 
 api.include_router(v1)
 app.include_router(api)
@@ -260,5 +146,4 @@ app.include_router(api)
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
