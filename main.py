@@ -1,118 +1,62 @@
-import os
+# =========================
+# OPSYN BACKEND — MINIMAL SAFE MODE
+# =========================
 
 from fastapi import FastAPI
 
-app = FastAPI()
+# Initialize app
+app = FastAPI(
+    title="Opsyn API (Safe Mode)",
+    version="1.0.0",
+    description="Minimal test server to verify Railway deployment",
+)
+
+# =========================
+# ROOT
+# =========================
 
 @app.get("/")
 def root():
-    return {"ok": True, "message": "root works"}
-
-@app.get("/api/health")
-def health():
-    return {"status": "ok"}
-
-@app.get("/orders")
-def orders():
-    return {"ok": True, "message": "orders works"}
-
-@app.get("/routes")
-def routes():
-    return {"ok": True, "message": "routes works"}
-
-@app.get("/snapshot")
-def snapshot():
-    return {"ok": True, "message": "snapshot works"}
-
-
-
-
-from fastapi import FastAPI, Depends, Request
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-
-from database import get_db
-from services.leaflink_sync import sync_leaflink_orders
-
-from leaflink_debug import router as leaflink_debug_router
-from routes.brain import router as brain_router
-from routes.orders import router as orders_router
-from routes.routes import router as routes_router
-from routes.snapshot import router as snapshot_router
-
-# =========================
-# APP INIT
-# =========================
-
-app = FastAPI(
-    title="Opsyn API",
-    version="1.0.0",
-    description="Full Ops Backend v1",
-)
-
-# =========================
-# ROUTES
-# =========================
-
-app.include_router(leaflink_debug_router)
-app.include_router(brain_router)
-app.include_router(orders_router)
-app.include_router(routes_router)
-app.include_router(snapshot_router)
-
-# =========================
-# MIDDLEWARE
-# =========================
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# =========================
-# AUTH MIDDLEWARE (SAFE)
-# =========================
-
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
-    if request.url.path in [
-        "/api/health",
-        "/docs",
-        "/openapi.json",
-        "/redoc",
-        "/debug/leaflink",
-        "/api/brain/ask",
-        "/sync/leaflink",
-        "/orders",
-        "/routes",
-        "/snapshot",
-    ]:
-        return await call_next(request)
-
-    return await call_next(request)
+    return {
+        "status": "ok",
+        "message": "Opsyn backend is running"
+    }
 
 # =========================
 # HEALTH CHECK
 # =========================
 
 @app.get("/api/health")
-def health_check():
-    return {"status": "ok"}
+def health():
+    return {
+        "status": "ok",
+        "service": "opsyn-backend"
+    }
 
 # =========================
-# LEAFLINK FORCE SYNC
+# TEST ENDPOINTS
 # =========================
 
-@app.post("/sync/leaflink")
-def force_sync_leaflink(db: Session = Depends(get_db)):
-    api_key = os.getenv("LEAFLINK_API_KEY")
+@app.get("/orders")
+def orders():
+    return {
+        "status": "ok",
+        "endpoint": "orders",
+        "message": "Orders endpoint working"
+    }
 
-    if not api_key:
-        return {"error": "Missing LEAFLINK_API_KEY"}
+@app.get("/routes")
+def routes():
+    return {
+        "status": "ok",
+        "endpoint": "routes",
+        "message": "Routes endpoint working"
+    }
 
-    sync_leaflink_orders(db, api_key)
-
-    return {"status": "LeafLink sync complete"}
+@app.get("/snapshot")
+def snapshot():
+    return {
+        "status": "ok",
+        "endpoint": "snapshot",
+        "message": "Snapshot endpoint working"
+    }
