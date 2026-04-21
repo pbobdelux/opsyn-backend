@@ -190,11 +190,10 @@ async def fetch_leaflink_orders(
     normalized_base = base_url.strip().rstrip("/")
     url = f"{normalized_base}/orders-received/"
 
-    headers = {
-        "Authorization": f"App {api_key}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
+   headers = {
+    "Authorization": f"Bearer {api_key}",
+    "Accept": "application/json",
+}
 
     params: dict[str, Any] = {}
     if company_id:
