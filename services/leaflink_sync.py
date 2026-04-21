@@ -43,7 +43,6 @@ def cents_from_amount(value: Any) -> int:
         return 0
 
     try:
-        # Handles strings like "123.45" and ints/floats
         return int(round(float(value) * 100))
     except Exception:
         return 0
@@ -56,7 +55,6 @@ def extract_order_list(payload: Any) -> list[dict]:
     if not isinstance(payload, dict):
         return []
 
-    # Common patterns across APIs
     for key in ("results", "data", "orders", "objects"):
         value = payload.get(key)
         if isinstance(value, list):
@@ -190,10 +188,11 @@ async def fetch_leaflink_orders(
     normalized_base = base_url.strip().rstrip("/")
     url = f"{normalized_base}/orders-received/"
 
-   headers = {
-    "Authorization": f"Bearer {api_key}",
-    "Accept": "application/json",
-}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
     params: dict[str, Any] = {}
     if company_id:
@@ -208,7 +207,11 @@ async def fetch_leaflink_orders(
             page_num += 1
             logger.info("LeafLink fetch page %s: %s", page_num, url)
 
-            response = await client.get(url, headers=headers, params=params if page_num == 1 else None)
+            response = await client.get(
+                url,
+                headers=headers,
+                params=params if page_num == 1 else None,
+            )
 
             content_type = response.headers.get("content-type", "")
             text_preview = response.text[:1000] if response.text else ""
@@ -268,7 +271,7 @@ async def sync_leaflink_orders(db, brand_id: str) -> dict:
             company_id=credential.company_id,
         )
 
-        external_ids = []
+        external_ids: list[str] = []
         for item in raw_orders:
             try:
                 external_ids.append(extract_external_order_id(item))
@@ -297,7 +300,10 @@ async def sync_leaflink_orders(db, brand_id: str) -> dict:
                 external_order_id = extract_external_order_id(raw)
             except Exception:
                 skipped_count += 1
-                logger.warning("Skipping LeafLink order with no usable external id: %s", raw)
+                logger.warning(
+                    "Skipping LeafLink order with no usable external id: %s",
+                    raw,
+                )
                 continue
 
             customer_name = extract_customer_name(raw)
