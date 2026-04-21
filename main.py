@@ -2,11 +2,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import logging
 import os
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,14 +27,48 @@ APP_NAME = "Opsyn Backend"
 APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENVIRONMENT", "local"))
 PORT = int(os.getenv("PORT", "8000"))
+TWIN_INGEST_SECRET = os.getenv("TWIN_INGEST_SECRET", "").strip()
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now().isoformat()
 
 
 def database_configured() -> bool:
     return bool(os.getenv("DATABASE_URL"))
+
+
+def parse_dt(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def dollars_to_cents(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        return int(round(float(value) * 100))
+    except Exception:
+        return 0
 
 
 class LeafLinkCredentialUpsertRequest(BaseModel):
@@ -46,6 +81,33 @@ class LeafLinkCredentialUpsertRequest(BaseModel):
 
 class LeafLinkSyncRequest(BaseModel):
     brand_id: str
+
+
+class TwinOrderItem(BaseModel):
+    sku: str | None = None
+    product_name: str | None = None
+    quantity: float | int | None = None
+    unit_price: float | int | None = None
+    line_total: float | int | None = None
+
+
+class TwinOrderRecord(BaseModel):
+    external_order_id: str = Field(..., min_length=1)
+    customer_name: str | None = None
+    status: str | None = "unknown"
+    total: float | int | None = None
+    total_cents: int | None = None
+    external_created_at: str | None = None
+    external_updated_at: str | None = None
+    notes: str | None = None
+    items: list[TwinOrderItem] = Field(default_factory=list)
+    raw_payload: dict[str, Any] | None = None
+
+
+class TwinOrdersIngestRequest(BaseModel):
+    brand_id: str
+    source: str = "twin"
+    orders: list[TwinOrderRecord] = Field(default_factory=list)
 
 
 @asynccontextmanager
@@ -117,6 +179,7 @@ async def root():
         "database_configured": database_configured(),
         "database_connected": getattr(app.state, "db_ready", False),
         "database_error": getattr(app.state, "db_error", None),
+        "twin_ingest_configured": bool(TWIN_INGEST_SECRET),
         "timestamp": utc_now_iso(),
     }
 
@@ -129,6 +192,7 @@ async def health():
         "database_configured": database_configured(),
         "database_connected": getattr(app.state, "db_ready", False),
         "database_error": getattr(app.state, "db_error", None),
+        "twin_ingest_configured": bool(TWIN_INGEST_SECRET),
         "timestamp": utc_now_iso(),
     }
 
@@ -258,6 +322,84 @@ async def sync_leaflink_compat(
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/ingest/twin/orders")
+async def ingest_twin_orders(
+    payload: TwinOrdersIngestRequest,
+    db: AsyncSession = Depends(get_db),
+    x_opsyn_secret: str | None = Header(default=None),
+):
+    if not TWIN_INGEST_SECRET:
+        raise HTTPException(status_code=500, detail="TWIN_INGEST_SECRET is not configured")
+
+    if x_opsyn_secret != TWIN_INGEST_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid ingest secret")
+
+    now = utc_now()
+    created = 0
+    updated = 0
+    skipped = 0
+
+    for incoming in payload.orders:
+        external_order_id = (incoming.external_order_id or "").strip()
+        if not external_order_id:
+            skipped += 1
+            continue
+
+        stmt = select(Order).where(
+            Order.brand_id == payload.brand_id,
+            Order.external_order_id == external_order_id,
+        )
+        result = await db.execute(stmt)
+        existing = result.scalar_one_or_none()
+
+        total_cents = incoming.total_cents
+        if total_cents is None:
+            total_cents = dollars_to_cents(incoming.total)
+
+        external_created_at = parse_dt(incoming.external_created_at)
+        external_updated_at = parse_dt(incoming.external_updated_at)
+
+        customer_name = (incoming.customer_name or "Unknown").strip() or "Unknown"
+        status = (incoming.status or "unknown").strip() or "unknown"
+
+        if existing:
+            existing.customer_name = customer_name
+            existing.status = status
+            existing.total_cents = total_cents
+            existing.external_created_at = external_created_at or existing.external_created_at
+            existing.external_updated_at = external_updated_at or existing.external_updated_at
+            existing.synced_at = now
+            existing.source = payload.source or existing.source or "twin"
+            updated += 1
+        else:
+            order = Order(
+                brand_id=payload.brand_id,
+                external_order_id=external_order_id,
+                customer_name=customer_name,
+                status=status,
+                total_cents=total_cents,
+                source=payload.source or "twin",
+                external_created_at=external_created_at,
+                external_updated_at=external_updated_at,
+                synced_at=now,
+            )
+            db.add(order)
+            created += 1
+
+    await db.commit()
+
+    return {
+        "ok": True,
+        "brand_id": payload.brand_id,
+        "source": payload.source,
+        "received": len(payload.orders),
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "timestamp": utc_now_iso(),
+    }
 
 
 @app.get("/orders")
