@@ -1,330 +1,340 @@
-import logging
+from __future__ import annotations
+
 from datetime import datetime, timezone
+import logging
 from typing import Any
 
 import httpx
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import BrandAPICredential, Order
 
-logger = logging.getLogger("opsyn-backend")
+logger = logging.getLogger("opsyn-backend.leaflink_sync")
 
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def parse_datetime(value: Any) -> datetime | None:
-    if value is None:
+def parse_dt(value: Any) -> datetime | None:
+    if not value:
         return None
 
     if isinstance(value, datetime):
         return value
 
-    if isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            return None
-        raw = raw.replace("Z", "+00:00")
-        try:
-            return datetime.fromisoformat(raw)
-        except ValueError:
-            return None
+    if not isinstance(value, str):
+        return None
 
-    return None
+    text = value.strip()
+    if not text:
+        return None
+
+    try:
+        if text.endswith("Z"):
+            text = text.replace("Z", "+00:00")
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
 
 
-def parse_money_to_cents(value: Any) -> int:
+def cents_from_amount(value: Any) -> int:
     if value is None:
         return 0
 
-    if isinstance(value, int):
-        return value
-
-    if isinstance(value, float):
-        return int(round(value * 100))
-
-    if isinstance(value, str):
-        cleaned = value.replace("$", "").replace(",", "").strip()
-        if not cleaned:
-            return 0
-        try:
-            return int(round(float(cleaned) * 100))
-        except ValueError:
-            return 0
-
-    return 0
+    try:
+        # Handles strings like "123.45" and ints/floats
+        return int(round(float(value) * 100))
+    except Exception:
+        return 0
 
 
-def extract_total_cents(raw: dict[str, Any]) -> int:
-    for candidate in (
-        raw.get("total_cents"),
-        raw.get("total"),
-        raw.get("grand_total"),
-        raw.get("amount"),
-        raw.get("subtotal"),
-    ):
-        cents = parse_money_to_cents(candidate)
-        if cents:
-            return cents
-    return 0
-
-
-def extract_customer_name(raw: dict[str, Any]) -> str | None:
-    customer = raw.get("customer")
-    if isinstance(customer, dict) and customer.get("name"):
-        return str(customer["name"])
-
-    account = raw.get("account")
-    if isinstance(account, dict) and account.get("name"):
-        return str(account["name"])
-
-    dispensary = raw.get("dispensary")
-    if isinstance(dispensary, dict) and dispensary.get("name"):
-        return str(dispensary["name"])
-
-    if raw.get("customer_name"):
-        return str(raw["customer_name"])
-
-    return None
-
-
-def normalize_leaflink_order(raw: dict[str, Any], brand_id: str) -> dict[str, Any]:
-    external_order_id = (
-        raw.get("id")
-        or raw.get("uuid")
-        or raw.get("order_id")
-        or raw.get("number")
-        or raw.get("short_id")
-    )
-
-    return {
-        "brand_id": brand_id,
-        "external_order_id": str(external_order_id) if external_order_id is not None else None,
-        "customer_name": extract_customer_name(raw),
-        "status": str(raw.get("status") or raw.get("state") or "unknown"),
-        "total_cents": extract_total_cents(raw),
-        "source": "leaflink",
-        "raw_payload": raw,
-        "external_created_at": parse_datetime(raw.get("created_at") or raw.get("created_on")),
-        "external_updated_at": parse_datetime(raw.get("updated_at") or raw.get("modified")),
-        "synced_at": utc_now(),
-    }
-
-
-async def get_active_leaflink_credentials(
-    db: AsyncSession,
-    brand_id: str,
-) -> BrandAPICredential | None:
-    stmt = select(BrandAPICredential).where(
-        BrandAPICredential.brand_id == brand_id,
-        BrandAPICredential.integration_name == "leaflink",
-        BrandAPICredential.is_active.is_(True),
-    )
-    result = await db.execute(stmt)
-    return result.scalar_one_or_none()
-
-
-def build_auth_header_candidates(api_key: str) -> list[dict[str, str]]:
-    return [
-        {"Authorization": f"Token {api_key}"},
-        {"Authorization": f"App {api_key}"},
-    ]
-
-
-def extract_orders_from_payload(payload: Any) -> list[dict[str, Any]]:
+def extract_order_list(payload: Any) -> list[dict]:
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
 
-    if isinstance(payload, dict):
-        for key in ("results", "data", "orders"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return [item for item in value if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    # Common patterns across APIs
+    for key in ("results", "data", "orders", "objects"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
 
     return []
 
 
-async def fetch_leaflink_orders(credentials: BrandAPICredential) -> list[dict[str, Any]]:
-    api_key = getattr(credentials, "api_key", None)
-    company_id = getattr(credentials, "company_id", None)
+def extract_next_url(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
 
-    if not api_key:
-        raise ValueError("LeafLink credential is missing api_key")
+    next_value = payload.get("next")
+    if isinstance(next_value, str) and next_value.strip():
+        return next_value.strip()
 
-    if not company_id:
-        raise ValueError("LeafLink credential is missing company_id")
+    return None
 
-    base_url = (credentials.base_url or "https://app.leaflink.com/api/v2").rstrip("/")
-    url = f"{base_url}/orders-received/"
 
-    params = {
-        "company": str(company_id),
-    }
+def extract_external_order_id(order_data: dict) -> str:
+    candidates = [
+        order_data.get("id"),
+        order_data.get("short_id"),
+        order_data.get("uid"),
+        order_data.get("number"),
+    ]
+    for value in candidates:
+        if value is not None and str(value).strip():
+            return str(value).strip()
 
-    common_headers: dict[str, str] = {
+    raise ValueError("LeafLink order missing external id")
+
+
+def extract_customer_name(order_data: dict) -> str | None:
+    candidates = [
+        order_data.get("customer_display_name"),
+        order_data.get("customer_name"),
+        order_data.get("buyer_name"),
+        order_data.get("dispensary_name"),
+        order_data.get("retailer_name"),
+        order_data.get("ship_to_name"),
+    ]
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    customer = order_data.get("customer")
+    if isinstance(customer, dict):
+        for key in ("display_name", "name", "business_name"):
+            value = customer.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    buyer = order_data.get("buyer")
+    if isinstance(buyer, dict):
+        for key in ("display_name", "name", "business_name"):
+            value = buyer.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return None
+
+
+def extract_status(order_data: dict) -> str:
+    candidates = [
+        order_data.get("status"),
+        order_data.get("fulfillment_status"),
+        order_data.get("state"),
+    ]
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return "unknown"
+
+
+def extract_total_cents(order_data: dict) -> int:
+    candidates = [
+        order_data.get("total"),
+        order_data.get("total_price"),
+        order_data.get("total_amount"),
+        order_data.get("subtotal"),
+        order_data.get("subtotal_price"),
+    ]
+    for value in candidates:
+        cents = cents_from_amount(value)
+        if cents > 0:
+            return cents
+
+    pricing = order_data.get("pricing")
+    if isinstance(pricing, dict):
+        for key in ("total", "total_price", "subtotal"):
+            cents = cents_from_amount(pricing.get(key))
+            if cents > 0:
+                return cents
+
+    return 0
+
+
+def extract_created_at(order_data: dict) -> datetime | None:
+    candidates = [
+        order_data.get("created_at"),
+        order_data.get("date_created"),
+        order_data.get("submitted_at"),
+    ]
+    for value in candidates:
+        parsed = parse_dt(value)
+        if parsed:
+            return parsed
+    return None
+
+
+def extract_updated_at(order_data: dict) -> datetime | None:
+    candidates = [
+        order_data.get("updated_at"),
+        order_data.get("modified_at"),
+        order_data.get("last_updated"),
+    ]
+    for value in candidates:
+        parsed = parse_dt(value)
+        if parsed:
+            return parsed
+    return None
+
+
+async def fetch_leaflink_orders(
+    base_url: str,
+    api_key: str,
+    company_id: str | None = None,
+) -> list[dict]:
+    normalized_base = base_url.strip().rstrip("/")
+    url = f"{normalized_base}/orders-received/"
+
+    headers = {
+        "Authorization": f"App {api_key}",
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "opsyn-backend",
     }
 
-    vendor_key = getattr(credentials, "vendor_key", None)
-    if vendor_key:
-        common_headers["X-LeafLink-Vendor-Key"] = vendor_key
+    params: dict[str, Any] = {}
+    if company_id:
+        params["company"] = company_id
 
-    last_error: Exception | None = None
+    all_orders: list[dict] = []
 
-    async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
-        for auth_headers in build_auth_header_candidates(api_key):
-            headers = {**common_headers, **auth_headers}
-            auth_preview = auth_headers["Authorization"].split(" ")[0]
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        page_num = 0
 
-            logger.info(
-                "Trying LeafLink orders endpoint=%s auth_style=%s company=%s vendor_key_present=%s",
-                url,
-                auth_preview,
-                company_id,
-                bool(vendor_key),
-            )
+        while url:
+            page_num += 1
+            logger.info("LeafLink fetch page %s: %s", page_num, url)
 
-            try:
-                response = await client.get(url, headers=headers, params=params)
+            response = await client.get(url, headers=headers, params=params if page_num == 1 else None)
 
-                logger.info(
-                    "LeafLink response status=%s auth_style=%s content_type=%s",
-                    response.status_code,
-                    auth_preview,
-                    response.headers.get("content-type"),
-                )
+            content_type = response.headers.get("content-type", "")
+            text_preview = response.text[:1000] if response.text else ""
 
-                if response.status_code >= 400:
-                    body_preview = response.text[:800]
-                    logger.warning(
-                        "LeafLink error auth_style=%s status=%s body=%s",
-                        auth_preview,
-                        response.status_code,
-                        body_preview,
-                    )
-                    response.raise_for_status()
-
-                try:
-                    payload = response.json()
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"LeafLink returned non-JSON response: {response.text[:800]}"
-                    ) from exc
-
-                orders = extract_orders_from_payload(payload)
-                logger.info(
-                    "LeafLink parsed %s orders using auth_style=%s",
-                    len(orders),
-                    auth_preview,
-                )
-                return orders
-
-            except httpx.HTTPStatusError as exc:
-                last_error = exc
-                body_preview = exc.response.text[:800] if exc.response is not None else ""
-                status_code = exc.response.status_code if exc.response is not None else "unknown"
-
-                # Try next auth style only for auth-ish failures.
-                if exc.response is not None and exc.response.status_code in (400, 401, 403):
-                    logger.warning(
-                        "LeafLink auth/path failure with %s, trying next auth style if available. status=%s body=%s",
-                        auth_preview,
-                        status_code,
-                        body_preview,
-                    )
-                    continue
-
+            if response.status_code >= 400:
                 raise RuntimeError(
-                    f"LeafLink HTTP {status_code} from {url}: {body_preview}"
-                ) from exc
-
-            except Exception as exc:
-                last_error = exc
-                logger.exception("LeafLink request failed using auth_style=%s", auth_preview)
-                raise
-
-    if last_error is not None:
-        raise RuntimeError(f"LeafLink orders fetch failed after trying auth styles: {last_error}")
-
-    raise RuntimeError("LeafLink orders fetch failed for unknown reason")
-
-
-async def upsert_leaflink_orders(
-    db: AsyncSession,
-    brand_id: str,
-    raw_orders: list[dict[str, Any]],
-) -> int:
-    synced_count = 0
-
-    for raw in raw_orders:
-        normalized = normalize_leaflink_order(raw, brand_id)
-
-        if not normalized["external_order_id"]:
-            logger.warning("Skipping LeafLink order with no external_order_id: %s", raw)
-            continue
-
-        stmt = select(Order).where(
-            Order.brand_id == normalized["brand_id"],
-            Order.external_order_id == normalized["external_order_id"],
-        )
-        result = await db.execute(stmt)
-        existing = result.scalar_one_or_none()
-
-        if existing:
-            existing.customer_name = normalized["customer_name"]
-            existing.status = normalized["status"]
-            existing.total_cents = normalized["total_cents"]
-            existing.source = normalized["source"]
-            existing.raw_payload = normalized["raw_payload"]
-            existing.external_created_at = normalized["external_created_at"]
-            existing.external_updated_at = normalized["external_updated_at"]
-            existing.synced_at = normalized["synced_at"]
-        else:
-            db.add(
-                Order(
-                    brand_id=normalized["brand_id"],
-                    external_order_id=normalized["external_order_id"],
-                    customer_name=normalized["customer_name"],
-                    status=normalized["status"],
-                    total_cents=normalized["total_cents"],
-                    source=normalized["source"],
-                    raw_payload=normalized["raw_payload"],
-                    external_created_at=normalized["external_created_at"],
-                    external_updated_at=normalized["external_updated_at"],
-                    synced_at=normalized["synced_at"],
+                    f"LeafLink API error {response.status_code} for {url}. "
+                    f"Response preview: {text_preview}"
                 )
-            )
 
-        synced_count += 1
+            if "application/json" not in content_type.lower():
+                raise RuntimeError(
+                    f"LeafLink returned non-JSON response for {url}. "
+                    f"Content-Type: {content_type}. Preview: {text_preview}"
+                )
 
-    return synced_count
+            payload = response.json()
+            orders = extract_order_list(payload)
+            all_orders.extend(orders)
+
+            next_url = extract_next_url(payload)
+            if next_url:
+                url = next_url
+            else:
+                break
+
+    return all_orders
 
 
-async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any]:
-    credentials = await get_active_leaflink_credentials(db, brand_id)
-    if not credentials:
-        raise ValueError(f"No active LeafLink credentials found for brand_id={brand_id}")
+async def sync_leaflink_orders(db, brand_id: str) -> dict:
+    credential_stmt = select(BrandAPICredential).where(
+        BrandAPICredential.brand_id == brand_id,
+        BrandAPICredential.integration_name == "leaflink",
+    )
+    credential_result = await db.execute(credential_stmt)
+    credential = credential_result.scalar_one_or_none()
+
+    if credential is None:
+        raise RuntimeError(f"No LeafLink credentials found for brand_id={brand_id}")
+
+    if not credential.is_active:
+        raise RuntimeError(f"LeafLink credentials are inactive for brand_id={brand_id}")
+
+    if not credential.api_key:
+        raise RuntimeError(f"LeafLink api_key is missing for brand_id={brand_id}")
+
+    credential.sync_status = "syncing"
+    credential.last_error = None
+    await db.commit()
+
+    now = utc_now()
 
     try:
-        if hasattr(credentials, "sync_status"):
-            credentials.sync_status = "syncing"
-        if hasattr(credentials, "last_error"):
-            credentials.last_error = None
-        await db.commit()
+        raw_orders = await fetch_leaflink_orders(
+            base_url=credential.base_url or "https://app.leaflink.com/api/v2",
+            api_key=credential.api_key,
+            company_id=credential.company_id,
+        )
 
-        raw_orders = await fetch_leaflink_orders(credentials)
-        synced_count = await upsert_leaflink_orders(db, brand_id, raw_orders)
+        external_ids = []
+        for item in raw_orders:
+            try:
+                external_ids.append(extract_external_order_id(item))
+            except Exception:
+                continue
 
-        if hasattr(credentials, "sync_status"):
-            credentials.sync_status = "ok"
-        if hasattr(credentials, "last_sync_at"):
-            credentials.last_sync_at = utc_now()
-        if hasattr(credentials, "last_error"):
-            credentials.last_error = None
+        existing_orders_map: dict[str, Order] = {}
+        if external_ids:
+            existing_stmt = select(Order).where(
+                Order.brand_id == brand_id,
+                Order.source == "leaflink",
+                Order.external_order_id.in_(external_ids),
+            )
+            existing_result = await db.execute(existing_stmt)
+            existing_orders = existing_result.scalars().all()
+            existing_orders_map = {
+                str(order.external_order_id): order for order in existing_orders
+            }
+
+        created_count = 0
+        updated_count = 0
+        skipped_count = 0
+
+        for raw in raw_orders:
+            try:
+                external_order_id = extract_external_order_id(raw)
+            except Exception:
+                skipped_count += 1
+                logger.warning("Skipping LeafLink order with no usable external id: %s", raw)
+                continue
+
+            customer_name = extract_customer_name(raw)
+            status = extract_status(raw)
+            total_cents = extract_total_cents(raw)
+            external_created_at = extract_created_at(raw)
+            external_updated_at = extract_updated_at(raw)
+
+            existing = existing_orders_map.get(external_order_id)
+
+            if existing:
+                existing.customer_name = customer_name
+                existing.status = status
+                existing.total_cents = total_cents
+                existing.external_created_at = external_created_at
+                existing.external_updated_at = external_updated_at
+                existing.synced_at = now
+                updated_count += 1
+            else:
+                order = Order(
+                    brand_id=brand_id,
+                    external_order_id=external_order_id,
+                    customer_name=customer_name,
+                    status=status,
+                    total_cents=total_cents,
+                    source="leaflink",
+                    external_created_at=external_created_at,
+                    external_updated_at=external_updated_at,
+                    synced_at=now,
+                )
+                db.add(order)
+                created_count += 1
+
+        credential.sync_status = "ok"
+        credential.last_sync_at = now
+        credential.last_error = None
 
         await db.commit()
 
@@ -332,25 +342,23 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
             "ok": True,
             "brand_id": brand_id,
             "source": "leaflink",
-            "orders_received": len(raw_orders),
-            "orders_synced": synced_count,
+            "fetched": len(raw_orders),
+            "created": created_count,
+            "updated": updated_count,
+            "skipped": skipped_count,
+            "last_sync_at": now.isoformat(),
         }
 
     except Exception as exc:
-        await db.rollback()
-
-        try:
-            if hasattr(credentials, "sync_status"):
-                credentials.sync_status = "error"
-            if hasattr(credentials, "last_error"):
-                credentials.last_error = str(exc)
-            await db.commit()
-        except Exception:
-            await db.rollback()
-
+        credential.sync_status = "error"
+        credential.last_error = str(exc)
+        await db.commit()
         logger.exception("LeafLink sync failed for brand_id=%s", brand_id)
-        raise
 
-
-async def sync_leaflink_orders_for_brand(db: AsyncSession, brand_id: str) -> dict[str, Any]:
-    return await sync_leaflink_orders(db, brand_id)
+        return {
+            "ok": False,
+            "brand_id": brand_id,
+            "source": "leaflink",
+            "error": str(exc),
+            "last_sync_at": now.isoformat(),
+        }
