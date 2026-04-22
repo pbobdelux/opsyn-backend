@@ -1,68 +1,71 @@
 import os
+from typing import Any, Dict, List, Optional
+
 import requests
-from requests.auth import HTTPBasicAuth
 
 
-def _get_base_url() -> str:
-    base = os.getenv("LEAFLINK_BASE_URL", "https://api.leaflink.com/v2").strip().rstrip("/")
-    return base
+LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://app.leaflink.com/api/v2").strip().rstrip("/")
+LEAFLINK_VENDOR_KEY = os.getenv("LEAFLINK_VENDOR_KEY", "").strip()
+LEAFLINK_USER_KEY = os.getenv("LEAFLINK_USER_KEY", "").strip()
 
 
-def _get_vendor_key() -> str:
-    return os.getenv("LEAFLINK_VENDOR_KEY", "").strip()
+class LeafLinkClient:
+    def __init__(self) -> None:
+        if not LEAFLINK_VENDOR_KEY:
+            raise ValueError("Missing LEAFLINK_VENDOR_KEY")
+        if not LEAFLINK_USER_KEY:
+            raise ValueError("Missing LEAFLINK_USER_KEY")
+        if not LEAFLINK_BASE_URL:
+            raise ValueError("Missing LEAFLINK_BASE_URL")
 
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Api-Key {LEAFLINK_VENDOR_KEY}",
+            "User-Key": LEAFLINK_USER_KEY,
+        })
 
-def _get_user_key() -> str:
-    return os.getenv("LEAFLINK_USER_KEY", "").strip()
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        url = f"{LEAFLINK_BASE_URL}/{path.lstrip('/')}"
+        resp = self.session.get(url, params=params, timeout=45)
 
+        if not resp.ok:
+            raise RuntimeError(
+                f"LeafLink GET failed: {resp.status_code} {resp.text[:500]}"
+            )
 
-def _preview(text: str, limit: int = 300) -> str:
-    if not text:
-        return ""
-    return text[:limit]
+        return resp.json()
 
-
-def _call(path: str):
-    base_url = _get_base_url()
-    vendor_key = _get_vendor_key()
-    user_key = _get_user_key()
-    url = f"{base_url}{path}"
-
-    try:
-        res = requests.get(
-            url,
-            auth=HTTPBasicAuth(vendor_key, user_key),
-            timeout=30,
-        )
-
-        return {
-            "url": url,
-            "status_code": res.status_code,
-            "response_preview": _preview(res.text),
+    def list_orders(
+        self,
+        page: int = 1,
+        page_size: int = 100,
+        status: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
+            "page": page,
+            "page_size": page_size,
         }
+        if status:
+            params["status"] = status
 
-    except Exception as e:
-        return {
-            "url": url,
-            "error": str(e),
-        }
+        return self._get("/orders", params=params)
 
+    def fetch_recent_orders(self, max_pages: int = 5) -> List[Dict[str, Any]]:
+        all_orders: List[Dict[str, Any]] = []
 
-def test_connection():
-    base_url = _get_base_url()
-    vendor_key = _get_vendor_key()
-    user_key = _get_user_key()
+        for page in range(1, max_pages + 1):
+            payload = self.list_orders(page=page, page_size=100)
 
-    paths = [
-        "/orders",
-        "/products",
-        "/companies",
-    ]
+            results = payload.get("results") or payload.get("data") or []
+            if not results:
+                break
 
-    return {
-        "base_url": base_url,
-        "auth_mode": "basic_auth_vendor_user",
-        "has_vendor_key": bool(vendor_key),
-        "has_user_key": bool(user_key),
-        "results": [_call(p) for p in paths],
-    }
+            all_orders.extend(results)
+
+            next_url = payload.get("next")
+            if not next_url:
+                break
+
+        return all_orders
