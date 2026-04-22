@@ -24,7 +24,7 @@ APP_VERSION = "1.0.0"
 APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENVIRONMENT", "local"))
 
 # =============================================================================
-# Auth and Brand Configuration
+# Auth and Brand Configuration (your original)
 # =============================================================================
 PINS = {
     "1234": {"is_super_admin": False, "org_id": "org_onboarding", "allowed_brands": ["noble-nectar"]},
@@ -124,7 +124,7 @@ def select_brand(data: dict):
     return {"ok": True, "resolved_brand_id": brand_id}
 
 # =============================================================================
-# Orders Endpoint - REAL DATABASE QUERY (this is what the Rork screen needs)
+# Orders Endpoint - Real DB Query
 # =============================================================================
 @app.get("/orders")
 @app.get("/api/orders")
@@ -186,7 +186,7 @@ async def get_orders(
     }
 
 # =============================================================================
-# Sync Endpoint - Safe placeholder (we'll enable real sync next)
+# Sync Endpoint - Safe placeholder
 # =============================================================================
 @app.post("/sync/leaflink/run")
 async def run_leaflink_sync(
@@ -200,7 +200,7 @@ async def run_leaflink_sync(
 
     return {
         "ok": True,
-        "message": "Sync endpoint is active. Triggering full LeafLink sync next.",
+        "message": "Sync endpoint active. Full sync coming next.",
         "org_id": org_id,
         "brand_id": brand_id or get_active_brand_for_org(org_id),
     }
