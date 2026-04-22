@@ -131,6 +131,17 @@ class LeafLinkClient:
             f"url={resp.url} status={resp.status_code} content_type={content_type} body={resp.text[:500]}"
         )
 
+    def get_order_detail(self, order_id: str) -> Dict[str, Any]:
+        resp = self._get_raw(f"orders/{order_id}/")
+        content_type = resp.headers.get("Content-Type", "")
+
+        if resp.ok and "application/json" in content_type.lower():
+            return resp.json()
+
+        raise RuntimeError(
+            f"detail url={resp.url} status={resp.status_code} content_type={content_type} body={resp.text[:500]}"
+        )
+
     def fetch_recent_orders(self, max_pages: int = 5, normalize: bool = False) -> List[Dict[str, Any]]:
         all_orders: List[Dict[str, Any]] = []
 
@@ -153,7 +164,20 @@ class LeafLinkClient:
                 break
 
             if normalize:
-                all_orders.extend([self.normalize_order(order) for order in results])
+                for order in results:
+                    order_id = _first_non_empty(order.get("id"), order.get("uuid"))
+
+                    if not order_id:
+                        all_orders.append(self.normalize_order(order))
+                        continue
+
+                    try:
+                        full_order = self.get_order_detail(order_id)
+                    except Exception as e:
+                        print(f"Failed to fetch detail for order {order_id}: {e}")
+                        full_order = order
+
+                    all_orders.append(self.normalize_order(full_order))
             else:
                 all_orders.extend(results)
 
@@ -252,9 +276,9 @@ class LeafLinkClient:
 
     def extract_status(self, order: Dict[str, Any]) -> Optional[str]:
         return _first_non_empty(
-            order.get("status"),
-            order.get("order_status"),
             _dig(order, "status", "name") if isinstance(order.get("status"), dict) else None,
+            order.get("status") if not isinstance(order.get("status"), dict) else None,
+            order.get("order_status"),
             _dig(order, "fulfillment", "status"),
             _dig(order, "shipping", "status"),
         )
