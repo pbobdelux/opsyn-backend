@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timezone
-from fastapi import FastAPI, HTTPException, Query, Header
+from fastapi import FastAPI, HTTPException, Query, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
@@ -158,7 +158,22 @@ def sync_key(org_id: str, brand_id: str) -> str:
     return f"{org_id}:{brand_id}"
 
 
-def normalize_leaflink_order(raw: Dict[str, Any], org_id: str, brand_id: str) -> Dict[str, Any]:
+def normalize_leaflink_order(raw: Any, org_id: str, brand_id: str) -> Dict[str, Any]:
+    if isinstance(raw, int):
+        raw = {"id": raw}
+    elif isinstance(raw, str):
+        raw = {"id": raw}
+    elif isinstance(raw, list):
+        raw = {
+            "id": f"list_{len(raw)}_{now_iso()}",
+            "raw_list": raw,
+        }
+    elif not isinstance(raw, dict):
+        raw = {
+            "id": f"unknown_{now_iso()}",
+            "raw_value": str(raw),
+        }
+
     external_id = str(
         raw.get("id")
         or raw.get("uuid")
@@ -168,6 +183,9 @@ def normalize_leaflink_order(raw: Dict[str, Any], org_id: str, brand_id: str) ->
     )
 
     customer = raw.get("buyer") or raw.get("customer") or {}
+    if not isinstance(customer, dict):
+        customer = {}
+
     customer_name = (
         customer.get("display_name")
         or customer.get("name")
@@ -195,6 +213,11 @@ def normalize_leaflink_order(raw: Dict[str, Any], org_id: str, brand_id: str) ->
         or 0
     )
 
+    try:
+        amount_value = float(amount or 0)
+    except (TypeError, ValueError):
+        amount_value = 0.0
+
     created_at = raw.get("created_at") or raw.get("created") or now_iso()
     updated_at = raw.get("updated_at") or raw.get("modified") or created_at
     order_number = str(raw.get("number") or raw.get("short_id") or external_id)
@@ -207,7 +230,7 @@ def normalize_leaflink_order(raw: Dict[str, Any], org_id: str, brand_id: str) ->
         "customer_name": customer_name,
         "status": raw_status,
         "review_status": review_status,
-        "amount": float(amount or 0),
+        "amount": amount_value,
         "currency": raw.get("currency") or "USD",
         "created_at": created_at,
         "updated_at": updated_at,
@@ -506,20 +529,27 @@ def run_leaflink_sync(
         client = LeafLinkClient()
         raw_orders = client.fetch_recent_orders(max_pages=5)
 
-        normalized = [
-            normalize_leaflink_order(raw, org_id=org_id, brand_id=effective_brand_id)
-            for raw in raw_orders
-        ]
+        normalized: List[Dict[str, Any]] = []
+        skipped = 0
+
+        for raw in raw_orders:
+            try:
+                normalized.append(
+                    normalize_leaflink_order(raw, org_id=org_id, brand_id=effective_brand_id)
+                )
+            except Exception:
+                skipped += 1
 
         synced_count = replace_orders_for_brand(org_id, effective_brand_id, normalized)
         finished_at = now_iso()
 
         SYNC_STATE[key] = {
             "status": "ok",
-            "message": f"LeafLink sync completed ({synced_count} orders)",
+            "message": f"LeafLink sync completed ({synced_count} orders, {skipped} skipped)",
             "last_synced_at": finished_at,
             "fetched_count": len(raw_orders),
             "synced_count": synced_count,
+            "skipped_count": skipped,
         }
 
         return {
@@ -531,6 +561,7 @@ def run_leaflink_sync(
             "brand_name": get_brand_name(effective_brand_id),
             "fetched_count": len(raw_orders),
             "synced_count": synced_count,
+            "skipped_count": skipped,
             "timestamp": finished_at,
         }
 
@@ -541,7 +572,7 @@ def run_leaflink_sync(
             "last_synced_at": SYNC_STATE.get(key, {}).get("last_synced_at"),
         }
         raise HTTPException(status_code=500, detail=f"LeafLink sync failed: {e}")
-from fastapi import Request
+
 
 @app.post("/ingest/twin/orders")
 async def ingest_twin_orders(
@@ -552,7 +583,6 @@ async def ingest_twin_orders(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     payload = await request.json()
-
     orders = payload.get("orders", [])
 
     inserted = []
@@ -573,15 +603,10 @@ async def ingest_twin_orders(
             "source": "twin",
             "raw": o,
         }
-
         inserted.append(normalized)
 
-    # Replace existing twin orders for this brand/org
     global ORDERS
-    ORDERS = [
-        o for o in ORDERS
-        if o.get("source") != "twin"
-    ] + inserted
+    ORDERS = [o for o in ORDERS if o.get("source") != "twin"] + inserted
 
     return {
         "ok": True,
