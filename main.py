@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import Base, engine, get_db
 from models import BrandAPICredential, Order
+from opsyn.routers.derived import router as derived_router
 from services.leaflink_sync import sync_leaflink_orders
 
 import models  # noqa: F401
@@ -159,6 +160,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(derived_router)
 
 
 @app.exception_handler(Exception)
@@ -451,16 +454,7 @@ async def get_orders(
 
 
 # Stub endpoints so the iOS app gets 200 + empty collections instead of 404s.
-
-
-@app.get("/customers")
-async def list_customers(brand_id: str = Query(..., description="Brand scope")):
-    return stub_envelope("customers", [], brand_id)
-
-
-@app.get("/routes")
-async def list_routes(brand_id: str = Query(..., description="Brand scope")):
-    return stub_envelope("routes", [], brand_id)
+# NOTE: /customers and /routes are now handled by opsyn.routers.derived
 
 
 @app.get("/drivers")
