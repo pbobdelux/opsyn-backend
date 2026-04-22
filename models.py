@@ -1,9 +1,18 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
 
@@ -43,24 +52,73 @@ class Order(Base):
     brand_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
     external_order_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
 
-    # UI needs these
+    # Core order fields used by app/UI
     order_number: Mapped[str | None] = mapped_column(String(120), nullable=True)
     customer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str | None] = mapped_column(String(80), nullable=True)
+
+    # Keep cents for pricing consistency
     total_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Optional convenience/display field if you later want decimal totals too
+    amount: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+
     item_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     unit_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Backward-compatible JSON snapshot of line items
     line_items_json: Mapped[list[dict[str, Any]] | dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     source: Mapped[str] = mapped_column(String(50), nullable=False, default="leaflink")
+    review_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    sync_status: Mapped[str] = mapped_column(String(50), nullable=False, default="ok")
+
     raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     external_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     external_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    last_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+    # Relationship to normalized line items
+    lines: Mapped[list["OrderLine"]] = relationship(
+        "OrderLine",
+        back_populates="order",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class OrderLine(Base):
+    __tablename__ = "order_lines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    sku: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    product_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unit_price_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_price_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Optional decimal mirrors for easier app/API formatting later
+    unit_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    total_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+
+    mapped_product_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    mapping_status: Mapped[str | None] = mapped_column(String(50), nullable=True, default="unknown")
+    mapping_issue: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+    order: Mapped["Order"] = relationship("Order", back_populates="lines")
 
 
 class OrganizationBrandBinding(Base):
