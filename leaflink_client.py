@@ -16,7 +16,7 @@ class LeafLinkClient:
         self.base_url = (base_url or LEAFLINK_BASE_URL).rstrip("/")
         if not api_key:
             raise ValueError("LeafLink API key is required")
-        
+       
         self.api_key = api_key
         self.headers = {
             "Accept": "application/json",
@@ -33,7 +33,7 @@ class LeafLinkClient:
                 resp.raise_for_status()
                 return resp.json()
             except httpx.HTTPStatusError as e:
-                logger.error(f"LeafLink API error {e.response.status_code} for {url}: {e.response.text[:300]}")
+                logger.error(f"LeafLink API error {e.response.status_code} for {url}: {e.response.text[:500]}")
                 raise
             except Exception as e:
                 logger.error(f"LeafLink request failed for {url}: {e}")
@@ -43,16 +43,16 @@ class LeafLinkClient:
         self,
         page: int = 1,
         page_size: int = 100,
-        status: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch orders from LeafLink."""
+        """Fetch orders-received from LeafLink."""
+        company_id = os.getenv("LEAFLINK_COMPANY_ID", "").strip()
+        if not company_id:
+            raise ValueError("LEAFLINK_COMPANY_ID environment variable is required")
+
         params: Dict[str, Any] = {"page": page, "page_size": page_size}
-        if status:
-            params["status"] = status
+        path = f"companies/{company_id}/orders-received/"
 
         all_orders: List[Dict[str, Any]] = []
-        path = f"companies/{os.getenv('LEAFLINK_COMPANY_ID', '')}/orders-received/"
-
         while path:
             data = await self._get(path, params=params)
             if isinstance(data, list):
@@ -64,12 +64,11 @@ class LeafLinkClient:
                 path = data.get("next")
             else:
                 break
-            params = {}
+            params = {}  # clear params for next page
 
         return all_orders
 
     def _extract_customer_name(self, raw: Dict[str, Any]) -> str:
-        """Extract customer name with multiple fallback paths."""
         candidates = [
             raw.get("customer_display_name"),
             raw.get("customer_name"),
@@ -97,7 +96,6 @@ class LeafLinkClient:
         )
         if not isinstance(raw_lines, list):
             return []
-
         normalized = []
         for item in raw_lines:
             if not isinstance(item, dict):
@@ -105,7 +103,6 @@ class LeafLinkClient:
             quantity = int(item.get("quantity") or item.get("qty") or item.get("units") or 0)
             unit_price = float(item.get("ordered_unit_price") or item.get("unit_price") or item.get("price") or 0.0)
             line_total = float(item.get("line_total") or item.get("total") or (unit_price * quantity))
-
             normalized.append({
                 "external_id": str(item.get("id") or item.get("sku") or ""),
                 "sku": str(item.get("sku") or ""),
@@ -120,7 +117,6 @@ class LeafLinkClient:
     def _normalize_order(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         line_items = self._extract_line_items(raw)
         total_amount = sum(li.get("line_total", 0) for li in line_items)
-
         return {
             "external_id": str(raw.get("id") or raw.get("number") or raw.get("short_id") or ""),
             "order_number": str(raw.get("order_number") or raw.get("number") or raw.get("short_id") or ""),
@@ -143,7 +139,6 @@ class LeafLinkClient:
             all_raw.extend(orders)
             if len(orders) < 100:
                 break
-
         if normalize:
             return [self._normalize_order(raw) for raw in all_raw if isinstance(raw, dict)]
         return all_raw
