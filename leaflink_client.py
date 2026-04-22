@@ -45,42 +45,30 @@ class LeafLinkClient:
         page_size: int = 100,
         status: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch orders from LeafLink with pagination support."""
-        params: Dict[str, Any] = {
-            "page": page,
-            "page_size": page_size,
-        }
+        """Fetch orders from LeafLink."""
+        params: Dict[str, Any] = {"page": page, "page_size": page_size}
         if status:
             params["status"] = status
 
         all_orders: List[Dict[str, Any]] = []
-        url_path = f"companies/{os.getenv('LEAFLINK_COMPANY_ID', '')}/orders-received/"
+        path = f"companies/{os.getenv('LEAFLINK_COMPANY_ID', '')}/orders-received/"
 
-        while url_path:
-            data = await self._get(url_path, params=params)
-            
+        while path:
+            data = await self._get(path, params=params)
             if isinstance(data, list):
                 all_orders.extend(data)
                 break
             elif isinstance(data, dict):
-                results = (
-                    data.get("results")
-                    or data.get("data")
-                    or data.get("orders")
-                    or []
-                )
+                results = data.get("results") or data.get("data") or data.get("orders") or []
                 all_orders.extend(results if isinstance(results, list) else [])
-                url_path = data.get("next")
+                path = data.get("next")
             else:
                 break
-
-            # Reset params for next page (pagination usually handled by 'next' URL)
-            params = {}
+            params = {}  # Reset for next page
 
         return all_orders
 
     def _extract_customer_name(self, raw: Dict[str, Any]) -> str:
-        """Extract customer name with multiple fallback paths."""
         candidates = [
             raw.get("customer_display_name"),
             raw.get("customer_name"),
@@ -89,11 +77,26 @@ class LeafLinkClient:
             raw.get("store_name"),
             raw.get("account_name"),
         ]
-        # Deep dig into nested objects
         for nested in ["buyer", "customer", "dispensary", "retailer", "store"]:
             obj = raw.get(nested)
             if isinstance(obj, dict):
                 candidates.extend([
                     obj.get("display_name"),
                     obj.get("name"),
-                    obj.get
+                    obj.get("business_name"),
+                ])
+        return next((str(c).strip() for c in candidates if c and str(c).strip()), "Unknown Customer")
+
+    def _extract_line_items(self, raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw_lines = (
+            raw.get("line_items") or raw.get("items") or raw.get("products") or raw.get("ordered_items") or []
+        )
+        if not isinstance(raw_lines, list):
+            return []
+
+        normalized = []
+        for item in raw_lines:
+            if not isinstance(item, dict):
+                continue
+            quantity = int(item.get("quantity") or item.get("qty") or item.get("units") or 0)
+            unit_price =
