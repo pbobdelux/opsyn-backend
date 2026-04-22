@@ -11,16 +11,8 @@ from leaflink_client import LeafLinkClient
 app = FastAPI(title="Opsyn Backend", version="1.0.0")
 
 
-# -------------------------
-# CONFIG
-# -------------------------
-
 OPSYN_SYNC_SECRET = os.getenv("OPSYN_SYNC_SECRET", "8fj29f8j29fj29fj2fj29f").strip()
 
-
-# -------------------------
-# CORS
-# -------------------------
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,10 +22,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# -------------------------
-# TEMP IN-MEMORY DATA
-# -------------------------
 
 PINS = {
     "1234": {
@@ -75,7 +63,7 @@ ORDERS: List[Dict[str, Any]] = [
         "org_id": "org_onboarding",
         "brand_id": "noble-nectar",
         "customer_name": "Green Leaf Wellness",
-        "status": "ready",
+        "status": "submitted",
         "review_status": "ready",
         "amount": 2450.00,
         "currency": "USD",
@@ -93,8 +81,8 @@ ORDERS: List[Dict[str, Any]] = [
         "org_id": "org_onboarding",
         "brand_id": "noble-nectar",
         "customer_name": "High Plains Dispensary",
-        "status": "needs_review",
-        "review_status": "needs_review",
+        "status": "submitted",
+        "review_status": "ready",
         "amount": 1875.50,
         "currency": "USD",
         "created_at": "2026-04-20T11:30:00Z",
@@ -111,8 +99,8 @@ ORDERS: List[Dict[str, Any]] = [
         "org_id": "org_onboarding",
         "brand_id": "noble-nectar",
         "customer_name": "Red River Relief",
-        "status": "blocked",
-        "review_status": "blocked",
+        "status": "submitted",
+        "review_status": "ready",
         "amount": 920.00,
         "currency": "USD",
         "created_at": "2026-04-21T08:10:00Z",
@@ -128,10 +116,6 @@ ORDERS: List[Dict[str, Any]] = [
 SYNC_STATE: Dict[str, Dict[str, Any]] = {}
 
 
-# -------------------------
-# MODELS
-# -------------------------
-
 class PinLoginRequest(BaseModel):
     pin: str
     org_id: str
@@ -146,10 +130,6 @@ class SyncLeaflinkRequest(BaseModel):
     org_id: Optional[str] = None
     brand_id: Optional[str] = None
 
-
-# -------------------------
-# HELPERS
-# -------------------------
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -196,36 +176,25 @@ def normalize_leaflink_order_from_client(
         or now_iso()
     )
 
-    amount = order.get("total_amount", 0)
     try:
-        amount_value = float(amount or 0)
+        amount_value = float(order.get("total_amount", 0) or 0)
     except (TypeError, ValueError):
         amount_value = 0.0
 
-    item_count = order.get("item_count", 0)
-    unit_count = order.get("unit_count", 0)
-
     try:
-        item_count_value = int(item_count or 0)
+        item_count_value = int(order.get("item_count", 0) or 0)
     except (TypeError, ValueError):
         item_count_value = 0
 
     try:
-        unit_count_value = int(unit_count or 0)
+        unit_count_value = int(order.get("unit_count", 0) or 0)
     except (TypeError, ValueError):
         unit_count_value = 0
 
     status = str(order.get("status") or "unknown").strip().lower()
 
-    created_at = (
-        order.get("submitted_at")
-        or order.get("created_at")
-        or now_iso()
-    )
-    updated_at = (
-        order.get("updated_at")
-        or created_at
-    )
+    created_at = order.get("submitted_at") or order.get("created_at") or now_iso()
+    updated_at = order.get("updated_at") or created_at
 
     return {
         "id": f"leaflink_{external_id}",
@@ -277,7 +246,6 @@ def filter_orders(
     if brand_id:
         results = [o for o in results if o["brand_id"] == brand_id]
 
-    # Hide mock orders whenever live LeafLink orders exist for this scope
     has_live_leaflink = any(o.get("source") == "leaflink" for o in results)
     if has_live_leaflink:
         results = [o for o in results if o.get("source") != "mock"]
@@ -356,10 +324,6 @@ def build_orders_response(
     }
 
 
-# -------------------------
-# BASIC ROUTES
-# -------------------------
-
 @app.get("/")
 def root():
     return {
@@ -377,10 +341,6 @@ def health():
         "status": "healthy",
     }
 
-
-# -------------------------
-# AUTH ROUTES
-# -------------------------
 
 @app.post("/auth/pin-login")
 def pin_login(data: PinLoginRequest):
@@ -435,10 +395,6 @@ def select_brand(data: BrandSelectRequest):
     }
 
 
-# -------------------------
-# ORDERS ROUTES
-# -------------------------
-
 @app.get("/orders")
 def get_orders(
     org_id: Optional[str] = Query(default=None),
@@ -468,10 +424,6 @@ def get_orders_api_v1(
 ):
     return build_orders_response(org_id=org_id, brand_id=brand_id, status=status, q=q)
 
-
-# -------------------------
-# LEAFLINK SYNC ROUTES
-# -------------------------
 
 @app.get("/sync/leaflink")
 def sync_leaflink_status(

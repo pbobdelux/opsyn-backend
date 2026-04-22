@@ -12,21 +12,54 @@ LEAFLINK_USER_AGENT = os.getenv("LEAFLINK_USER_AGENT", "opsyn-backend").strip()
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None or value == "":
-            return default
-        return float(value)
-    except (TypeError, ValueError):
+    if value is None or value == "":
         return default
+
+    if isinstance(value, bool):
+        return default
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        try:
+            return float(value.replace(",", "").replace("$", "").strip())
+        except ValueError:
+            return default
+
+    if isinstance(value, dict):
+        for key in ("amount", "value", "total", "price"):
+            if key in value:
+                return _safe_float(value.get(key), default)
+
+    return default
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        if value is None or value == "":
-            return default
-        return int(float(value))
-    except (TypeError, ValueError):
+    if value is None or value == "":
         return default
+
+    if isinstance(value, bool):
+        return default
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
+        return int(value)
+
+    if isinstance(value, str):
+        try:
+            return int(float(value.replace(",", "").strip()))
+        except ValueError:
+            return default
+
+    if isinstance(value, dict):
+        for key in ("amount", "value", "quantity", "qty"):
+            if key in value:
+                return _safe_int(value.get(key), default)
+
+    return default
 
 
 def _first_non_empty(*values: Any) -> Any:
@@ -34,12 +67,6 @@ def _first_non_empty(*values: Any) -> Any:
         if v is not None and v != "":
             return v
     return None
-
-
-def _as_list(value: Any) -> List[Any]:
-    if isinstance(value, list):
-        return value
-    return []
 
 
 class LeafLinkClient:
@@ -95,6 +122,8 @@ class LeafLinkClient:
         dispensary = raw.get("dispensary") if isinstance(raw.get("dispensary"), dict) else {}
         retailer = raw.get("retailer") if isinstance(raw.get("retailer"), dict) else {}
         store = raw.get("store") if isinstance(raw.get("store"), dict) else {}
+        corporate_address = raw.get("corporate_address") if isinstance(raw.get("corporate_address"), dict) else {}
+        delivery_address = raw.get("delivery_address") if isinstance(raw.get("delivery_address"), dict) else {}
 
         name = _first_non_empty(
             raw.get("customer_name"),
@@ -113,109 +142,116 @@ class LeafLinkClient:
             retailer.get("name"),
             store.get("display_name"),
             store.get("name"),
+            corporate_address.get("name"),
+            delivery_address.get("name"),
+            corporate_address.get("city"),
         )
+
         return str(name) if name else "Unknown Customer"
 
     def _extract_line_items(self, raw: Dict[str, Any]) -> List[Dict[str, Any]]:
-        candidate_lists = [
-            raw.get("line_items"),
-            raw.get("items"),
-            raw.get("products"),
-            raw.get("order_items"),
-        ]
-
-        for candidate in candidate_lists:
-            if isinstance(candidate, list):
-                cleaned: List[Dict[str, Any]] = []
-                for item in candidate:
-                    if isinstance(item, dict):
-                        cleaned.append(item)
-                return cleaned
-
-        return []
-
-    def _extract_item_and_unit_counts(self, raw: Dict[str, Any], line_items: List[Dict[str, Any]]) -> Dict[str, int]:
-        explicit_item_count = _first_non_empty(
-            raw.get("item_count"),
-            raw.get("items_count"),
-            raw.get("product_count"),
-            raw.get("line_item_count"),
+        candidate = (
+            raw.get("line_items")
+            or raw.get("items")
+            or raw.get("products")
+            or raw.get("ordered_items")
+            or []
         )
 
-        explicit_unit_count = _first_non_empty(
-            raw.get("unit_count"),
-            raw.get("units_count"),
-            raw.get("total_units"),
-            raw.get("quantity"),
-        )
+        if not isinstance(candidate, list):
+            return []
 
-        item_count = _safe_int(explicit_item_count, default=len(line_items))
+        normalized: List[Dict[str, Any]] = []
 
-        if explicit_unit_count is not None:
-            unit_count = _safe_int(explicit_unit_count, default=0)
-        else:
-            total_units = 0
-            for item in line_items:
-                qty = _first_non_empty(
+        for item in candidate:
+            if not isinstance(item, dict):
+                continue
+
+            product = item.get("product") if isinstance(item.get("product"), dict) else {}
+            frozen_product = (
+                item.get("frozen_data", {}).get("product")
+                if isinstance(item.get("frozen_data"), dict) and isinstance(item.get("frozen_data", {}).get("product"), dict)
+                else {}
+            )
+
+            quantity = _safe_int(
+                _first_non_empty(
                     item.get("quantity"),
                     item.get("qty"),
                     item.get("units"),
                     item.get("unit_count"),
+                    item.get("bulk_units"),
                     item.get("ordered_quantity"),
-                )
-                total_units += _safe_int(qty, default=0)
-            unit_count = total_units
+                ),
+                0,
+            )
 
-        return {
-            "item_count": item_count,
-            "unit_count": unit_count,
-        }
+            unit_price = _safe_float(
+                _first_non_empty(
+                    item.get("ordered_unit_price"),
+                    item.get("sale_price"),
+                    item.get("unit_price"),
+                    item.get("price"),
+                    item.get("wholesale_price"),
+                    item.get("retail_price"),
+                    item.get("suggested_wholesale_price"),
+                ),
+                0.0,
+            )
+
+            line_total_raw = _first_non_empty(
+                item.get("line_total"),
+                item.get("total_price"),
+                item.get("total"),
+                item.get("extended_total"),
+            )
+
+            if line_total_raw is None:
+                line_total = round(unit_price * quantity, 2)
+            else:
+                line_total = _safe_float(line_total_raw, 0.0)
+
+            normalized.append({
+                "external_id": str(_first_non_empty(item.get("id"), item.get("uuid"), item.get("sku")) or ""),
+                "sku": str(_first_non_empty(item.get("sku"), product.get("sku"), frozen_product.get("sku")) or ""),
+                "name": str(
+                    _first_non_empty(
+                        item.get("name"),
+                        item.get("product_name"),
+                        product.get("name"),
+                        frozen_product.get("name"),
+                    ) or "Unknown Item"
+                ),
+                "quantity": quantity,
+                "unit_price": unit_price,
+                "line_total": line_total,
+                "raw_payload": item,
+            })
+
+        return normalized
 
     def _extract_total_amount(self, raw: Dict[str, Any], line_items: List[Dict[str, Any]]) -> float:
-        amount = _first_non_empty(
+        direct = _first_non_empty(
             raw.get("total_amount"),
             raw.get("total"),
             raw.get("grand_total"),
             raw.get("order_total"),
             raw.get("subtotal"),
             raw.get("amount"),
+            raw.get("payment_balance"),
         )
 
-        amount_value = _safe_float(amount, default=0.0)
-        if amount_value > 0:
-            return amount_value
+        direct_value = _safe_float(direct, 0.0)
+        if direct_value > 0:
+            return round(direct_value, 2)
 
-        calculated = 0.0
-        for item in line_items:
-            line_total = _first_non_empty(
-                item.get("total"),
-                item.get("line_total"),
-                item.get("extended_total"),
-                item.get("subtotal"),
-            )
-            if line_total is not None:
-                calculated += _safe_float(line_total, default=0.0)
-                continue
-
-            price = _first_non_empty(
-                item.get("price"),
-                item.get("unit_price"),
-                item.get("sale_price"),
-            )
-            qty = _first_non_empty(
-                item.get("quantity"),
-                item.get("qty"),
-                item.get("units"),
-                item.get("unit_count"),
-            )
-            calculated += _safe_float(price, default=0.0) * _safe_int(qty, default=0)
-
-        return calculated
+        computed = round(sum(float(li.get("line_total") or 0.0) for li in line_items), 2)
+        return computed
 
     def _normalize_order(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         line_items = self._extract_line_items(raw)
-        counts = self._extract_item_and_unit_counts(raw, line_items)
-        total_amount = self._extract_total_amount(raw, line_items)
+        item_count = len(line_items)
+        unit_count = sum(_safe_int(li.get("quantity"), 0) for li in line_items)
 
         external_id = str(_first_non_empty(
             raw.get("id"),
@@ -226,13 +262,16 @@ class LeafLinkClient:
         ) or "")
 
         order_number = str(_first_non_empty(
-            raw.get("number"),
+            raw.get("order_short_number"),
             raw.get("short_id"),
-            raw.get("external_id"),
+            raw.get("number"),
+            raw.get("order_number"),
+            raw.get("display_id"),
             raw.get("id"),
         ) or external_id)
 
         status = str(_first_non_empty(
+            raw.get("classification"),
             raw.get("status"),
             raw.get("state"),
             raw.get("fulfillment_status"),
@@ -246,8 +285,8 @@ class LeafLinkClient:
         )
 
         updated_at = _first_non_empty(
-            raw.get("updated_at"),
             raw.get("modified"),
+            raw.get("updated_at"),
             raw.get("submitted_at"),
             raw.get("created_at"),
         )
@@ -261,9 +300,9 @@ class LeafLinkClient:
             "submitted_at": submitted_at,
             "created_at": submitted_at,
             "updated_at": updated_at,
-            "total_amount": total_amount,
-            "item_count": counts["item_count"],
-            "unit_count": counts["unit_count"],
+            "total_amount": self._extract_total_amount(raw, line_items),
+            "item_count": item_count,
+            "unit_count": unit_count,
             "line_items": line_items,
             "raw_payload": raw,
         }
