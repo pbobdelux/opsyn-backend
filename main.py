@@ -82,6 +82,9 @@ ORDERS: List[Dict[str, Any]] = [
         "created_at": "2026-04-20T09:15:00Z",
         "updated_at": "2026-04-20T10:00:00Z",
         "source": "mock",
+        "item_count": 0,
+        "unit_count": 0,
+        "raw": {},
     },
     {
         "id": "ord_1002",
@@ -96,6 +99,9 @@ ORDERS: List[Dict[str, Any]] = [
         "created_at": "2026-04-20T11:30:00Z",
         "updated_at": "2026-04-20T11:45:00Z",
         "source": "mock",
+        "item_count": 0,
+        "unit_count": 0,
+        "raw": {},
     },
     {
         "id": "ord_1003",
@@ -110,6 +116,9 @@ ORDERS: List[Dict[str, Any]] = [
         "created_at": "2026-04-21T08:10:00Z",
         "updated_at": "2026-04-21T08:12:00Z",
         "source": "mock",
+        "item_count": 0,
+        "unit_count": 0,
+        "raw": {},
     },
 ]
 
@@ -158,84 +167,80 @@ def sync_key(org_id: str, brand_id: str) -> str:
     return f"{org_id}:{brand_id}"
 
 
-def normalize_leaflink_order(raw: Any, org_id: str, brand_id: str) -> Dict[str, Any]:
-    if isinstance(raw, int):
-        raw = {"id": raw}
-    elif isinstance(raw, str):
-        raw = {"id": raw}
-    elif isinstance(raw, list):
-        raw = {
-            "id": f"list_{len(raw)}_{now_iso()}",
-            "raw_list": raw,
-        }
-    elif not isinstance(raw, dict):
-        raw = {
-            "id": f"unknown_{now_iso()}",
-            "raw_value": str(raw),
-        }
+def review_status_from_status(status: Any) -> str:
+    raw_status = str(status or "unknown").strip().lower()
 
+    if raw_status in {"submitted", "accepted", "approved", "confirmed", "ready"}:
+        return "ready"
+    if raw_status in {"hold", "review", "pending", "needs_review"}:
+        return "needs_review"
+    if raw_status in {"cancelled", "canceled", "rejected", "blocked", "void"}:
+        return "blocked"
+    if raw_status in {"shipped", "fulfilled", "complete", "completed", "closed"}:
+        return "ready"
+    return "ready"
+
+
+def normalize_leaflink_order_from_client(
+    order: Dict[str, Any],
+    org_id: str,
+    brand_id: str,
+) -> Dict[str, Any]:
     external_id = str(
-        raw.get("id")
-        or raw.get("uuid")
-        or raw.get("number")
-        or raw.get("short_id")
+        order.get("external_id")
+        or order.get("order_number")
+        or order.get("id")
         or now_iso()
     )
 
-    customer = raw.get("buyer") or raw.get("customer") or {}
-    if not isinstance(customer, dict):
-        customer = {}
-
-    customer_name = (
-        customer.get("display_name")
-        or customer.get("name")
-        or raw.get("customer_name")
-        or raw.get("dispensary_name")
-        or "Unknown Customer"
-    )
-
-    raw_status = str(raw.get("status") or "unknown").lower()
-
-    if raw_status in {"draft", "submitted", "accepted", "confirmed", "ready"}:
-        review_status = "ready"
-    elif raw_status in {"hold", "review", "pending", "needs_review"}:
-        review_status = "needs_review"
-    elif raw_status in {"cancelled", "rejected", "blocked"}:
-        review_status = "blocked"
-    else:
-        review_status = "ready"
-
-    amount = (
-        raw.get("total")
-        or raw.get("total_amount")
-        or raw.get("subtotal")
-        or raw.get("amount")
-        or 0
-    )
-
+    amount = order.get("total_amount", 0)
     try:
         amount_value = float(amount or 0)
     except (TypeError, ValueError):
         amount_value = 0.0
 
-    created_at = raw.get("created_at") or raw.get("created") or now_iso()
-    updated_at = raw.get("updated_at") or raw.get("modified") or created_at
-    order_number = str(raw.get("number") or raw.get("short_id") or external_id)
+    item_count = order.get("item_count", 0)
+    unit_count = order.get("unit_count", 0)
+
+    try:
+        item_count_value = int(item_count or 0)
+    except (TypeError, ValueError):
+        item_count_value = 0
+
+    try:
+        unit_count_value = int(unit_count or 0)
+    except (TypeError, ValueError):
+        unit_count_value = 0
+
+    status = str(order.get("status") or "unknown").strip().lower()
+
+    created_at = (
+        order.get("submitted_at")
+        or order.get("created_at")
+        or now_iso()
+    )
+    updated_at = (
+        order.get("updated_at")
+        or created_at
+    )
 
     return {
         "id": f"leaflink_{external_id}",
-        "order_number": order_number,
+        "order_number": str(order.get("order_number") or external_id),
         "org_id": org_id,
         "brand_id": brand_id,
-        "customer_name": customer_name,
-        "status": raw_status,
-        "review_status": review_status,
+        "customer_name": order.get("customer_name") or "Unknown Customer",
+        "status": status,
+        "review_status": review_status_from_status(status),
         "amount": amount_value,
-        "currency": raw.get("currency") or "USD",
+        "currency": order.get("currency") or "USD",
         "created_at": created_at,
         "updated_at": updated_at,
         "source": "leaflink",
-        "raw": raw,
+        "item_count": item_count_value,
+        "unit_count": unit_count_value,
+        "line_items": order.get("line_items", []),
+        "raw": order.get("raw_payload") or order,
     }
 
 
@@ -281,10 +286,10 @@ def filter_orders(
         q_lower = q.lower().strip()
         results = [
             o for o in results
-            if q_lower in str(o["order_number"]).lower()
-            or q_lower in str(o["customer_name"]).lower()
-            or q_lower in str(o["status"]).lower()
-            or q_lower in str(o["review_status"]).lower()
+            if q_lower in str(o.get("order_number", "")).lower()
+            or q_lower in str(o.get("customer_name", "")).lower()
+            or q_lower in str(o.get("status", "")).lower()
+            or q_lower in str(o.get("review_status", "")).lower()
         ]
 
     results = sorted(results, key=lambda x: str(x["updated_at"]), reverse=True)
@@ -313,7 +318,7 @@ def build_orders_response(
     ready_count = len([o for o in results if o["review_status"] == "ready"])
     needs_review_count = len([o for o in results if o["review_status"] == "needs_review"])
     blocked_count = len([o for o in results if o["review_status"] == "blocked"])
-    total_amount = round(sum(float(o["amount"]) for o in results), 2)
+    total_amount = round(sum(float(o.get("amount", 0)) for o in results), 2)
 
     sync_meta = SYNC_STATE.get(
         sync_key(org_id, brand_id),
@@ -527,27 +532,31 @@ def run_leaflink_sync(
 
     try:
         client = LeafLinkClient()
-        raw_orders = client.fetch_recent_orders(max_pages=5)
+        normalized_orders = client.fetch_recent_orders(max_pages=5, normalize=True)
 
-        normalized: List[Dict[str, Any]] = []
+        converted_orders: List[Dict[str, Any]] = []
         skipped = 0
 
-        for raw in raw_orders:
+        for order in normalized_orders:
             try:
-                normalized.append(
-                    normalize_leaflink_order(raw, org_id=org_id, brand_id=effective_brand_id)
+                converted_orders.append(
+                    normalize_leaflink_order_from_client(
+                        order,
+                        org_id=org_id,
+                        brand_id=effective_brand_id,
+                    )
                 )
             except Exception:
                 skipped += 1
 
-        synced_count = replace_orders_for_brand(org_id, effective_brand_id, normalized)
+        synced_count = replace_orders_for_brand(org_id, effective_brand_id, converted_orders)
         finished_at = now_iso()
 
         SYNC_STATE[key] = {
             "status": "ok",
             "message": f"LeafLink sync completed ({synced_count} orders, {skipped} skipped)",
             "last_synced_at": finished_at,
-            "fetched_count": len(raw_orders),
+            "fetched_count": len(normalized_orders),
             "synced_count": synced_count,
             "skipped_count": skipped,
         }
@@ -559,7 +568,7 @@ def run_leaflink_sync(
             "org_id": org_id,
             "brand_id": effective_brand_id,
             "brand_name": get_brand_name(effective_brand_id),
-            "fetched_count": len(raw_orders),
+            "fetched_count": len(normalized_orders),
             "synced_count": synced_count,
             "skipped_count": skipped,
             "timestamp": finished_at,
@@ -601,6 +610,9 @@ async def ingest_twin_orders(
             "created_at": o.get("created_at", now_iso()),
             "updated_at": o.get("updated_at", now_iso()),
             "source": "twin",
+            "item_count": int(o.get("item_count", 0) or 0),
+            "unit_count": int(o.get("unit_count", 0) or 0),
+            "line_items": o.get("line_items", []),
             "raw": o,
         }
         inserted.append(normalized)
