@@ -40,7 +40,7 @@ class LeafLinkClient:
         page: int = 1,
         page_size: int = 100,
         status: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> Any:
         params: Dict[str, Any] = {
             "page": page,
             "page_size": page_size,
@@ -63,14 +63,31 @@ class LeafLinkClient:
 
         for page in range(1, max_pages + 1):
             payload = self.list_orders(page=page, page_size=100)
-            results = payload.get("results") or payload.get("data") or payload.get("orders") or []
+
+            if isinstance(payload, list):
+                results = payload
+                next_url = None
+
+            elif isinstance(payload, dict):
+                results = (
+                    payload.get("results")
+                    or payload.get("data")
+                    or payload.get("orders")
+                    or []
+                )
+                next_url = payload.get("next")
+
+            else:
+                raise RuntimeError(f"Unexpected LeafLink response type: {type(payload).__name__}")
+
+            if not isinstance(results, list):
+                raise RuntimeError(f"Unexpected LeafLink results type: {type(results).__name__}")
 
             if not results:
                 break
 
             all_orders.extend(results)
 
-            next_url = payload.get("next")
             if not next_url:
                 break
 
