@@ -541,3 +541,49 @@ def run_leaflink_sync(
             "last_synced_at": SYNC_STATE.get(key, {}).get("last_synced_at"),
         }
         raise HTTPException(status_code=500, detail=f"LeafLink sync failed: {e}")
+from fastapi import Request
+
+@app.post("/ingest/twin/orders")
+async def ingest_twin_orders(
+    request: Request,
+    x_opsyn_secret: Optional[str] = Header(default=None),
+):
+    if x_opsyn_secret != OPSYN_SYNC_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    payload = await request.json()
+
+    orders = payload.get("orders", [])
+
+    inserted = []
+
+    for o in orders:
+        normalized = {
+            "id": f"twin_{o.get('id')}",
+            "order_number": o.get("order_number") or o.get("id"),
+            "org_id": o.get("org_id", "org_onboarding"),
+            "brand_id": o.get("brand_id", "noble-nectar"),
+            "customer_name": o.get("customer_name", "Unknown"),
+            "status": o.get("status", "ready"),
+            "review_status": o.get("review_status", "ready"),
+            "amount": float(o.get("amount", 0)),
+            "currency": o.get("currency", "USD"),
+            "created_at": o.get("created_at", now_iso()),
+            "updated_at": o.get("updated_at", now_iso()),
+            "source": "twin",
+            "raw": o,
+        }
+
+        inserted.append(normalized)
+
+    # Replace existing twin orders for this brand/org
+    global ORDERS
+    ORDERS = [
+        o for o in ORDERS
+        if o.get("source") != "twin"
+    ] + inserted
+
+    return {
+        "ok": True,
+        "ingested": len(inserted),
+    }
