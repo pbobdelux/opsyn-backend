@@ -24,7 +24,7 @@ APP_VERSION = "1.0.0"
 APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENVIRONMENT", "local"))
 
 # =============================================================================
-# Your existing auth and brand configuration
+# Auth and Brand Configuration (your original)
 # =============================================================================
 PINS = {
     "1234": {"is_super_admin": False, "org_id": "org_onboarding", "allowed_brands": ["noble-nectar"]},
@@ -88,10 +88,10 @@ def pin_login(data: dict):
         raise HTTPException(status_code=401, detail="Invalid PIN")
     return {
         "ok": True,
-        "is_super_admin": user["is_super_admin"],
+        "is_super_admin": user.get("is_super_admin", False),
         "signed_in_org_id": org_id,
         "resolved_brand_id": ACTIVE_BRAND.get(org_id),
-        "allowed_brands": user["allowed_brands"],
+        "allowed_brands": user.get("allowed_brands", []),
     }
 
 @app.get("/auth/brand-context")
@@ -124,7 +124,7 @@ def select_brand(data: dict):
     return {"ok": True, "resolved_brand_id": brand_id}
 
 # =============================================================================
-# Orders Endpoint - REAL DATABASE QUERY
+# Orders Endpoint - Real DB Query
 # =============================================================================
 @app.get("/orders")
 @app.get("/api/orders")
@@ -186,7 +186,7 @@ async def get_orders(
     }
 
 # =============================================================================
-# Sync Endpoint - Safe placeholder for now
+# Sync Endpoint - Safe placeholder
 # =============================================================================
 @app.post("/sync/leaflink/run")
 async def run_leaflink_sync(
@@ -200,7 +200,7 @@ async def run_leaflink_sync(
 
     return {
         "ok": True,
-        "message": "Sync endpoint ready. Full LeafLink integration coming next.",
+        "message": "Sync endpoint is active. Full LeafLink sync will be enabled after fixing the sync module.",
         "org_id": org_id,
         "brand_id": brand_id or get_active_brand_for_org(org_id),
     }
