@@ -64,6 +64,17 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
         except (InvalidOperation, ValueError):
             return None
 
+    if isinstance(value, dict):
+        for candidate in (
+            value.get("amount"),
+            value.get("value"),
+            value.get("total"),
+            value.get("price"),
+        ):
+            dec = _to_decimal(candidate)
+            if dec is not None:
+                return dec
+
     return None
 
 
@@ -91,6 +102,16 @@ def _to_int(value: Any, default: int = 0) -> int:
             return int(float(stripped))
         except ValueError:
             return default
+    if isinstance(value, dict):
+        for candidate in (
+            value.get("amount"),
+            value.get("value"),
+            value.get("quantity"),
+            value.get("qty"),
+        ):
+            parsed = _to_int(candidate, default=-999999)
+            if parsed != -999999:
+                return parsed
     return default
 
 
@@ -128,14 +149,17 @@ def extract_customer_name(order: Dict[str, Any]) -> str:
             order.get("store_name"),
             _dig(order, "buyer", "display_name"),
             _dig(order, "buyer", "name"),
+            _dig(order, "buyer", "business_name"),
             _dig(order, "customer", "display_name"),
             _dig(order, "customer", "name"),
+            _dig(order, "customer", "business_name"),
             _dig(order, "retailer", "display_name"),
             _dig(order, "retailer", "name"),
             _dig(order, "dispensary", "display_name"),
             _dig(order, "dispensary", "name"),
             _dig(order, "store", "name"),
             _dig(order, "account", "name"),
+            _dig(order, "corporate_address", "name"),
             order.get("name"),
         )
         or "Unknown Customer"
@@ -156,10 +180,13 @@ def extract_external_id(order: Dict[str, Any]) -> Optional[str]:
 
 def extract_order_number(order: Dict[str, Any]) -> Optional[str]:
     return _first_non_empty(
+        order.get("order_short_number"),
+        order.get("short_id"),
         order.get("number"),
         order.get("order_number"),
         order.get("display_id"),
-        order.get("short_id"),
+        order.get("order_buyer_number"),
+        order.get("order_seller_number"),
         order.get("id"),
         order.get("uuid"),
     )
@@ -168,6 +195,7 @@ def extract_order_number(order: Dict[str, Any]) -> Optional[str]:
 def extract_status(order: Dict[str, Any]) -> str:
     raw_status = _first_non_empty(
         order.get("status"),
+        order.get("classification"),
         order.get("order_status"),
         _dig(order, "status", "name") if isinstance(order.get("status"), dict) else None,
         _dig(order, "fulfillment", "status"),
@@ -199,13 +227,21 @@ def extract_line_items(order: Dict[str, Any]) -> List[Dict[str, Any]]:
             line.get("quantity")
             or line.get("qty")
             or line.get("units")
-            or line.get("count"),
+            or line.get("count")
+            or line.get("bulk_units")
+            or line.get("bulk_units_decimal")
+            or line.get("ordered_quantity"),
             0,
         )
 
         unit_price = _to_decimal(
-            line.get("unit_price")
+            line.get("ordered_unit_price")
+            or line.get("sale_price")
+            or line.get("unit_price")
             or line.get("price")
+            or line.get("wholesale_price")
+            or line.get("retail_price")
+            or line.get("suggested_wholesale_price")
             or _dig(line, "pricing", "unit_price")
         )
 
@@ -230,12 +266,14 @@ def extract_line_items(order: Dict[str, Any]) -> List[Dict[str, Any]]:
                     line.get("sku"),
                     _dig(line, "product", "sku"),
                     _dig(line, "variant", "sku"),
+                    _dig(line, "frozen_data", "product", "sku"),
                 ),
                 "name": _first_non_empty(
                     line.get("name"),
                     line.get("product_name"),
                     _dig(line, "product", "name"),
                     _dig(line, "variant", "name"),
+                    _dig(line, "frozen_data", "product", "name"),
                 )
                 or "Unknown Item",
                 "quantity": quantity,
@@ -256,6 +294,7 @@ def extract_total_cents(order: Dict[str, Any], lines: List[Dict[str, Any]]) -> i
         order.get("amount_total"),
         order.get("total_price"),
         order.get("price_total"),
+        order.get("payment_balance"),
         _dig(order, "pricing", "total"),
         _dig(order, "pricing", "grand_total"),
         _dig(order, "totals", "total"),
@@ -379,6 +418,9 @@ async def sync_leaflink_orders(db, brand_id: str):
             )
             existing = result.scalar_one_or_none()
 
+            item_count_value = len(line_items)
+            unit_count_value = sum(_to_int(li.get("quantity"), 0) for li in line_items)
+
             if existing:
                 existing.customer_name = customer_name
                 existing.status = status
@@ -389,10 +431,10 @@ async def sync_leaflink_orders(db, brand_id: str):
                     existing.order_number = order_number
 
                 if hasattr(existing, "item_count"):
-                    existing.item_count = len(line_items)
+                    existing.item_count = item_count_value
 
                 if hasattr(existing, "unit_count"):
-                    existing.unit_count = sum(_to_int(li.get("quantity"), 0) for li in line_items)
+                    existing.unit_count = unit_count_value
 
                 if hasattr(existing, "raw_payload"):
                     existing.raw_payload = o
@@ -416,10 +458,10 @@ async def sync_leaflink_orders(db, brand_id: str):
                     payload["order_number"] = order_number
 
                 if hasattr(Order, "item_count"):
-                    payload["item_count"] = len(line_items)
+                    payload["item_count"] = item_count_value
 
                 if hasattr(Order, "unit_count"):
-                    payload["unit_count"] = sum(_to_int(li.get("quantity"), 0) for li in line_items)
+                    payload["unit_count"] = unit_count_value
 
                 if hasattr(Order, "raw_payload"):
                     payload["raw_payload"] = o
