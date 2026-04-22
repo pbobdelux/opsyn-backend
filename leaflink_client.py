@@ -4,19 +4,16 @@ from typing import Any, Dict, List, Optional
 import requests
 
 
-LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://app.leaflink.com/api/v2").strip().rstrip("/")
+LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://api.leaflink.com").strip().rstrip("/")
 LEAFLINK_VENDOR_KEY = os.getenv("LEAFLINK_VENDOR_KEY", "").strip()
 LEAFLINK_USER_KEY = os.getenv("LEAFLINK_USER_KEY", "").strip()
 LEAFLINK_COMPANY_ID = os.getenv("LEAFLINK_COMPANY_ID", "").strip()
 LEAFLINK_COMPANY_SLUG = os.getenv("LEAFLINK_COMPANY_SLUG", "").strip()
+LEAFLINK_API_VERSION = os.getenv("LEAFLINK_API_VERSION", "").strip()
 
 
 class LeafLinkClient:
     def __init__(self) -> None:
-        if not LEAFLINK_VENDOR_KEY:
-            raise ValueError("Missing LEAFLINK_VENDOR_KEY")
-        if not LEAFLINK_USER_KEY:
-            raise ValueError("Missing LEAFLINK_USER_KEY")
         if not LEAFLINK_BASE_URL:
             raise ValueError("Missing LEAFLINK_BASE_URL")
 
@@ -24,21 +21,21 @@ class LeafLinkClient:
         self.session.headers.update({
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Authorization": f"Api-Key {LEAFLINK_VENDOR_KEY}",
-            "User-Key": LEAFLINK_USER_KEY,
         })
+
+        # Current docs say bearer JWT for main API.
+        # Your existing keys may still map to a legacy/private integration,
+        # so we keep the old headers too for now while debugging.
+        if LEAFLINK_VENDOR_KEY:
+            self.session.headers["Authorization"] = f"Api-Key {LEAFLINK_VENDOR_KEY}"
+        if LEAFLINK_USER_KEY:
+            self.session.headers["User-Key"] = LEAFLINK_USER_KEY
+        if LEAFLINK_API_VERSION:
+            self.session.headers["LeafLink-Version"] = LEAFLINK_API_VERSION
 
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         url = f"{LEAFLINK_BASE_URL}/{path.lstrip('/')}"
         return self.session.get(url, params=params, timeout=45)
-
-    def _get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        resp = self._get_raw(path, params=params)
-        if not resp.ok:
-            raise RuntimeError(
-                f"LeafLink GET failed | url={resp.url} | status={resp.status_code} | body={resp.text[:500]}"
-            )
-        return resp.json()
 
     def list_orders(
         self,
@@ -54,37 +51,34 @@ class LeafLinkClient:
             params["status"] = status
 
         candidate_paths: List[str] = [
+            "orders",
             "orders/",
         ]
 
         if LEAFLINK_COMPANY_ID:
             candidate_paths.extend([
-                f"companies/{LEAFLINK_COMPANY_ID}/orders/",
-                f"company/{LEAFLINK_COMPANY_ID}/orders/",
+                "orders",
+                "orders/",
             ])
+            params["company_id"] = LEAFLINK_COMPANY_ID
 
         if LEAFLINK_COMPANY_SLUG:
-            candidate_paths.extend([
-                f"companies/{LEAFLINK_COMPANY_SLUG}/orders/",
-                f"company/{LEAFLINK_COMPANY_SLUG}/orders/",
-            ])
+            params["company_slug"] = LEAFLINK_COMPANY_SLUG
 
         errors: List[str] = []
 
         for path in candidate_paths:
             resp = self._get_raw(path, params=params)
-
             content_type = resp.headers.get("Content-Type", "")
-            is_json = "application/json" in content_type.lower()
 
-            if resp.ok and is_json:
+            if resp.ok and "application/json" in content_type.lower():
                 return resp.json()
 
             errors.append(
-                f"path={path} url={resp.url} status={resp.status_code} content_type={content_type} body={resp.text[:180]}"
+                f"url={resp.url} status={resp.status_code} content_type={content_type} body={resp.text[:180]}"
             )
 
-        raise RuntimeError("LeafLink orders lookup failed across candidate paths | " + " || ".join(errors))
+        raise RuntimeError("LeafLink orders lookup failed | " + " || ".join(errors))
 
     def fetch_recent_orders(self, max_pages: int = 5) -> List[Dict[str, Any]]:
         all_orders: List[Dict[str, Any]] = []
