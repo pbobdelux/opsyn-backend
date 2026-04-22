@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,45 +15,8 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
-# -------------------------------
-# 🔥 CORE FIX: DATA EXTRACTION
-# -------------------------------
-def extract_order_totals(order: Dict[str, Any]):
-    total_cents = 0
-    item_count = 0
-    unit_count = 0
-
-    line_items = order.get("line_items") or []
-
-    for item in line_items:
-        qty = item.get("quantity") or 0
-        item_count += 1
-        unit_count += qty
-
-        # PRIORITY 1: line_total
-        if item.get("line_total"):
-            total_cents += int(float(item["line_total"]) * 100)
-            continue
-
-        # PRIORITY 2: sale_price.amount
-        sale_price = item.get("sale_price")
-        if isinstance(sale_price, dict) and sale_price.get("amount"):
-            total_cents += int(float(sale_price["amount"]) * qty * 100)
-            continue
-
-        # PRIORITY 3: price
-        if item.get("price"):
-            total_cents += int(float(item["price"]) * qty * 100)
-
-    return total_cents, item_count, unit_count
-
-
-# -------------------------------
-# MAIN SYNC FUNCTION
-# -------------------------------
-async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> Dict[str, Any]:
+async def sync_leaflink_orders(db: AsyncSession, brand_id: str):
     try:
-        # get credentials
         result = await db.execute(
             select(BrandAPICredential).where(
                 BrandAPICredential.brand_id == brand_id,
@@ -71,29 +34,45 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> Dict[str, Any
             company_id=cred.company_id,
         )
 
-        orders = await client.fetch_recent_orders()
+        # DO NOT await this - it returns a normal list
+        orders = client.fetch_recent_orders(max_pages=5, normalize=True)
 
         created = 0
         updated = 0
         skipped = 0
 
         for o in orders:
-            external_id = str(o.get("id"))
+            if not isinstance(o, dict):
+                skipped += 1
+                continue
 
-            total_cents, item_count, unit_count = extract_order_totals(o)
+            external_id = str(o.get("external_id") or "")
+            if not external_id:
+                skipped += 1
+                continue
 
-            # customer
-            customer_name = None
-            if o.get("customer"):
-                customer_name = o["customer"].get("name")
+            customer_name = o.get("customer_name") or "Unknown Customer"
+            status = (o.get("status") or "submitted").strip().lower()
+            order_number = o.get("order_number")
 
-            if not customer_name:
-                customer_name = o.get("customer_name")
+            try:
+                total_cents = int(float(o.get("total_amount", 0) or 0) * 100)
+            except (TypeError, ValueError):
+                total_cents = 0
 
-            if not customer_name:
-                customer_name = "Unknown Customer"
+            try:
+                item_count = int(o.get("item_count", 0) or 0)
+            except (TypeError, ValueError):
+                item_count = 0
 
-            # check existing
+            try:
+                unit_count = int(o.get("unit_count", 0) or 0)
+            except (TypeError, ValueError):
+                unit_count = 0
+
+            line_items = o.get("line_items", [])
+            raw_payload = o.get("raw_payload") or o
+
             existing = await db.execute(
                 select(Order).where(
                     Order.brand_id == brand_id,
@@ -104,11 +83,13 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> Dict[str, Any
 
             if existing:
                 existing.customer_name = customer_name
-                existing.status = o.get("status")
+                existing.status = status
+                existing.order_number = order_number
                 existing.total_cents = total_cents
                 existing.item_count = item_count
                 existing.unit_count = unit_count
-                existing.raw_payload = o
+                existing.line_items_json = line_items
+                existing.raw_payload = raw_payload
                 existing.synced_at = utc_now()
                 updated += 1
             else:
@@ -116,15 +97,15 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> Dict[str, Any
                     Order(
                         brand_id=brand_id,
                         external_order_id=external_id,
+                        order_number=order_number,
                         customer_name=customer_name,
-                        status=o.get("status"),
+                        status=status,
                         total_cents=total_cents,
                         item_count=item_count,
                         unit_count=unit_count,
+                        line_items_json=line_items,
+                        raw_payload=raw_payload,
                         source="leaflink",
-                        raw_payload=o,
-                        external_created_at=o.get("created_at"),
-                        external_updated_at=o.get("updated_at"),
                         synced_at=utc_now(),
                     )
                 )
@@ -143,4 +124,5 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> Dict[str, Any
 
     except Exception as e:
         logger.exception("LeafLink sync failed")
+        await db.rollback()
         return {"ok": False, "error": str(e)}
