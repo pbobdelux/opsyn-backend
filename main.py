@@ -24,7 +24,7 @@ APP_VERSION = "1.0.0"
 APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENVIRONMENT", "local"))
 
 # =============================================================================
-# Auth and Brand Configuration (your original)
+# Auth and Brand Configuration
 # =============================================================================
 PINS = {
     "1234": {"is_super_admin": False, "org_id": "org_onboarding", "allowed_brands": ["noble-nectar"]},
@@ -124,7 +124,7 @@ def select_brand(data: dict):
     return {"ok": True, "resolved_brand_id": brand_id}
 
 # =============================================================================
-# Orders Endpoint - Real DB Query
+# Orders Endpoint - REAL DATABASE QUERY
 # =============================================================================
 @app.get("/orders")
 @app.get("/api/orders")
@@ -186,7 +186,7 @@ async def get_orders(
     }
 
 # =============================================================================
-# Sync Endpoint - Safe placeholder
+# Sync Endpoint - Placeholder (we'll enable real sync after this works)
 # =============================================================================
 @app.post("/sync/leaflink/run")
 async def run_leaflink_sync(
@@ -200,7 +200,7 @@ async def run_leaflink_sync(
 
     return {
         "ok": True,
-        "message": "Sync endpoint active. Full sync coming next.",
+        "message": "Sync endpoint is active. Full LeafLink sync will be enabled shortly.",
         "org_id": org_id,
         "brand_id": brand_id or get_active_brand_for_org(org_id),
     }
