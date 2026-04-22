@@ -30,6 +30,18 @@ APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENVIRONMENT", "local"))
 PORT = int(os.getenv("PORT", "8000"))
 TWIN_INGEST_SECRET = os.getenv("TWIN_INGEST_SECRET", "").strip()
 
+# TEMP TESTING BRIDGE:
+# Map signed-in org_onboarding to the seeded demo/test tenant that has data.
+TEST_BRAND_OVERRIDES = {
+    "org_onboarding": "test-brand",
+}
+
+
+def resolve_brand_id(brand_id: str | None) -> str | None:
+    if not brand_id:
+        return brand_id
+    return TEST_BRAND_OVERRIDES.get(brand_id, brand_id)
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -73,9 +85,10 @@ def dollars_to_cents(value: Any) -> int:
 
 
 def stub_envelope(key: str, value: Any, brand_id: str) -> dict:
+    effective_brand_id = resolve_brand_id(brand_id) or brand_id
     return {
         "ok": True,
-        "brand_id": brand_id,
+        "brand_id": effective_brand_id,
         key: value,
     }
 
@@ -238,8 +251,10 @@ async def upsert_leaflink_credentials(
     payload: LeafLinkCredentialUpsertRequest,
     db: AsyncSession = Depends(get_db),
 ):
+    effective_brand_id = resolve_brand_id(brand_id) or brand_id
+
     stmt = select(BrandAPICredential).where(
-        BrandAPICredential.brand_id == brand_id,
+        BrandAPICredential.brand_id == effective_brand_id,
         BrandAPICredential.integration_name == "leaflink",
     )
     result = await db.execute(stmt)
@@ -256,7 +271,7 @@ async def upsert_leaflink_credentials(
         action = "updated"
     else:
         existing = BrandAPICredential(
-            brand_id=brand_id,
+            brand_id=effective_brand_id,
             integration_name="leaflink",
             base_url=payload.base_url,
             api_key=payload.api_key,
@@ -286,8 +301,10 @@ async def get_leaflink_credentials_status(
     brand_id: str,
     db: AsyncSession = Depends(get_db),
 ):
+    effective_brand_id = resolve_brand_id(brand_id) or brand_id
+
     stmt = select(BrandAPICredential).where(
-        BrandAPICredential.brand_id == brand_id,
+        BrandAPICredential.brand_id == effective_brand_id,
         BrandAPICredential.integration_name == "leaflink",
     )
     result = await db.execute(stmt)
@@ -316,8 +333,9 @@ async def sync_orders_for_brand(
     brand_id: str,
     db: AsyncSession = Depends(get_db),
 ):
+    effective_brand_id = resolve_brand_id(brand_id) or brand_id
     try:
-        result = await sync_leaflink_orders(db, brand_id)
+        result = await sync_leaflink_orders(db, effective_brand_id)
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -328,8 +346,9 @@ async def sync_leaflink_compat(
     payload: LeafLinkSyncRequest,
     db: AsyncSession = Depends(get_db),
 ):
+    effective_brand_id = resolve_brand_id(payload.brand_id) or payload.brand_id
     try:
-        result = await sync_leaflink_orders(db, payload.brand_id)
+        result = await sync_leaflink_orders(db, effective_brand_id)
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -347,6 +366,8 @@ async def ingest_twin_orders(
     if x_opsyn_secret != TWIN_INGEST_SECRET:
         raise HTTPException(status_code=401, detail="Invalid ingest secret")
 
+    effective_brand_id = resolve_brand_id(payload.brand_id) or payload.brand_id
+
     now = utc_now()
     created = 0
     updated = 0
@@ -359,7 +380,7 @@ async def ingest_twin_orders(
             continue
 
         stmt = select(Order).where(
-            Order.brand_id == payload.brand_id,
+            Order.brand_id == effective_brand_id,
             Order.external_order_id == external_order_id,
         )
         result = await db.execute(stmt)
@@ -386,7 +407,7 @@ async def ingest_twin_orders(
             updated += 1
         else:
             order = Order(
-                brand_id=payload.brand_id,
+                brand_id=effective_brand_id,
                 external_order_id=external_order_id,
                 customer_name=customer_name,
                 status=status,
@@ -403,7 +424,7 @@ async def ingest_twin_orders(
 
     return {
         "ok": True,
-        "brand_id": payload.brand_id,
+        "brand_id": effective_brand_id,
         "source": payload.source,
         "received": len(payload.orders),
         "created": created,
@@ -419,21 +440,24 @@ async def get_orders(
     limit: int = Query(default=100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(Order).order_by(Order.id.desc()).limit(limit)
+    effective_brand_id = resolve_brand_id(brand_id)
 
-    if brand_id:
+    if effective_brand_id:
         stmt = (
             select(Order)
-            .where(Order.brand_id == brand_id)
+            .where(Order.brand_id == effective_brand_id)
             .order_by(Order.id.desc())
             .limit(limit)
         )
+    else:
+        stmt = select(Order).order_by(Order.id.desc()).limit(limit)
 
     result = await db.execute(stmt)
     orders = result.scalars().all()
 
     return {
         "ok": True,
+        "brand_id": effective_brand_id,
         "count": len(orders),
         "orders": [
             {
@@ -454,7 +478,8 @@ async def get_orders(
 
 
 # Stub endpoints so the iOS app gets 200 + empty collections instead of 404s.
-# NOTE: /customers and /routes are now handled by opsyn.routers.derived
+# NOTE: /customers and /routes are handled by opsyn.routers.derived.
+# For testing, derived.py should also use org_onboarding -> test-brand mapping if needed.
 
 
 @app.get("/drivers")
@@ -482,9 +507,10 @@ async def get_package(
     package_id: str,
     brand_id: str = Query(..., description="Brand scope"),
 ):
+    effective_brand_id = resolve_brand_id(brand_id) or brand_id
     return {
         "ok": True,
-        "brand_id": brand_id,
+        "brand_id": effective_brand_id,
         "package": None,
     }
 
