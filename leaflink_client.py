@@ -23,9 +23,7 @@ class LeafLinkClient:
             "Content-Type": "application/json",
         })
 
-        # Current docs say bearer JWT for main API.
-        # Your existing keys may still map to a legacy/private integration,
-        # so we keep the old headers too for now while debugging.
+        # Keeping your current headers because your account appears to use them.
         if LEAFLINK_VENDOR_KEY:
             self.session.headers["Authorization"] = f"Api-Key {LEAFLINK_VENDOR_KEY}"
         if LEAFLINK_USER_KEY:
@@ -50,20 +48,17 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
+        # Brand/seller-side endpoint first
         candidate_paths: List[str] = [
-            "orders",
-            "orders/",
+            "orders-received/",
+            "orders-received",
         ]
 
+        # Optional filters that are more plausible than path nesting
         if LEAFLINK_COMPANY_ID:
-            candidate_paths.extend([
-                "orders",
-                "orders/",
-            ])
-            params["company_id"] = LEAFLINK_COMPANY_ID
-
-        if LEAFLINK_COMPANY_SLUG:
-            params["company_slug"] = LEAFLINK_COMPANY_SLUG
+            params["seller"] = LEAFLINK_COMPANY_ID
+        elif LEAFLINK_COMPANY_SLUG:
+            params["seller__slug__iexact"] = LEAFLINK_COMPANY_SLUG
 
         errors: List[str] = []
 
@@ -78,7 +73,7 @@ class LeafLinkClient:
                 f"url={resp.url} status={resp.status_code} content_type={content_type} body={resp.text[:180]}"
             )
 
-        raise RuntimeError("LeafLink orders lookup failed | " + " || ".join(errors))
+        raise RuntimeError("LeafLink brand orders lookup failed | " + " || ".join(errors))
 
     def fetch_recent_orders(self, max_pages: int = 5) -> List[Dict[str, Any]]:
         all_orders: List[Dict[str, Any]] = []
