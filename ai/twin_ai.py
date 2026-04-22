@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import BrandAPICredential
-from leaflink_sync import sync_leaflink_orders
+from services.leaflink_sync import sync_leaflink_orders   # Corrected path
 
 logger = logging.getLogger("twin_ai")
 
