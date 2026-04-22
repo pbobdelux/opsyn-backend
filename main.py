@@ -24,7 +24,7 @@ APP_VERSION = "1.0.0"
 APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENVIRONMENT", "local"))
 
 # =============================================================================
-# Auth and Brand Configuration (your original)
+# Auth and Brand Configuration
 # =============================================================================
 PINS = {
     "1234": {"is_super_admin": False, "org_id": "org_onboarding", "allowed_brands": ["noble-nectar"]},
@@ -172,43 +172,4 @@ async def get_orders(
         "ok": True,
         "org_id": effective_org_id,
         "brand_id": effective_brand_id,
-        "brand_name": get_brand_name(effective_brand_id),
-        "count": len(order_list),
-        "summary": {
-            "all": len(order_list),
-            "ready": len([o for o in order_list if o.get("review_status") == "ready"]),
-            "needs_review": 0,
-            "blocked": 0,
-            "total_amount": round(total_amount, 2),
-            "currency": "USD",
-        },
-        "orders": order_list,
-    }
-
-# =============================================================================
-# Sync Endpoint - Now calls Twin AI (the brain)
-# =============================================================================
-@app.post("/sync/leaflink/run")
-async def run_leaflink_sync(
-    org_id: str = Query(default="org_onboarding"),
-    brand_id: Optional[str] = Query(default=None),
-    x_opsyn_secret: Optional[str] = Header(default=None),
-):
-    if x_opsyn_secret != os.getenv("OPSYN_SYNC_SECRET"):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    effective_brand_id = brand_id or get_active_brand_for_org(org_id)
-
-    # TODO: Call Twin AI here (the brain)
-    # For now, return a clear message so we can see it's wired
-    return {
-        "ok": True,
-        "message": "Twin AI sync requested for brand " + effective_brand_id,
-        "note": "Twin AI will handle credential lookup and LeafLink call",
-        "org_id": org_id,
-        "brand_id": effective_brand_id,
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+        "brand_name": get_brand_name(effective
