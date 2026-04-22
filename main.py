@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import engine, Base, get_db
 from models import Order
+from ai.twin_ai import handle_twin_sync   # Twin AI as the brain
 
 logger = logging.getLogger("opsyn-backend")
 logging.basicConfig(
@@ -193,20 +194,16 @@ async def run_leaflink_sync(
     org_id: str = Query(default="org_onboarding"),
     brand_id: Optional[str] = Query(default=None),
     x_opsyn_secret: Optional[str] = Header(default=None),
+    db: AsyncSession = Depends(get_db),
 ):
     if x_opsyn_secret != os.getenv("OPSYN_SYNC_SECRET"):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     effective_brand_id = brand_id or get_active_brand_for_org(org_id)
 
-    # Twin AI is the brain - it will lookup credentials and pull LeafLink data
-    return {
-        "ok": True,
-        "message": f"Twin AI sync triggered for brand {effective_brand_id}",
-        "note": "Twin AI will handle credential lookup, call LeafLink, and save orders to DB",
-        "org_id": org_id,
-        "brand_id": effective_brand_id,
-    }
+    # Twin AI is the brain - it will handle credential lookup and LeafLink call
+    result = await handle_twin_sync(db, org_id, effective_brand_id)
+    return result
 
 if __name__ == "__main__":
     import uvicorn
