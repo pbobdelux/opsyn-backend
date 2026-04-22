@@ -8,9 +8,6 @@ logger = logging.getLogger("leaflink_client")
 
 LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://app.leaflink.com/api/v2").strip().rstrip("/")
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
 class LeafLinkClient:
     def __init__(self, api_key: str, base_url: Optional[str] = None):
         self.base_url = (base_url or LEAFLINK_BASE_URL).rstrip("/")
@@ -44,15 +41,20 @@ class LeafLinkClient:
         page: int = 1,
         page_size: int = 100,
     ) -> List[Dict[str, Any]]:
-        """Fetch orders-received from LeafLink."""
+        """Fetch orders-received with line items included."""
         company_id = os.getenv("LEAFLINK_COMPANY_ID", "").strip()
         if not company_id:
             raise ValueError("LEAFLINK_COMPANY_ID environment variable is required")
 
-        params: Dict[str, Any] = {"page": page, "page_size": page_size}
-        path = f"companies/{company_id}/orders-received/"
+        params = {
+            "page": page,
+            "page_size": page_size,
+            "include_children": "line_items,customer",   # This is the key fix
+        }
 
+        path = f"companies/{company_id}/orders-received/"
         all_orders: List[Dict[str, Any]] = []
+
         while path:
             data = await self._get(path, params=params)
             if isinstance(data, list):
@@ -64,7 +66,7 @@ class LeafLinkClient:
                 path = data.get("next")
             else:
                 break
-            params = {}  # clear params for next page
+            params = {}  # clear for pagination
 
         return all_orders
 
@@ -75,7 +77,6 @@ class LeafLinkClient:
             raw.get("buyer_name"),
             raw.get("dispensary_name"),
             raw.get("store_name"),
-            raw.get("account_name"),
         ]
         for nested in ["buyer", "customer", "dispensary", "retailer", "store"]:
             obj = raw.get(nested)
@@ -92,17 +93,37 @@ class LeafLinkClient:
 
     def _extract_line_items(self, raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         raw_lines = (
-            raw.get("line_items") or raw.get("items") or raw.get("products") or raw.get("ordered_items") or []
+            raw.get("line_items")
+            or raw.get("items")
+            or raw.get("products")
+            or raw.get("ordered_items")
+            or []
         )
         if not isinstance(raw_lines, list):
             return []
+
         normalized = []
         for item in raw_lines:
             if not isinstance(item, dict):
                 continue
+
             quantity = int(item.get("quantity") or item.get("qty") or item.get("units") or 0)
-            unit_price = float(item.get("ordered_unit_price") or item.get("unit_price") or item.get("price") or 0.0)
-            line_total = float(item.get("line_total") or item.get("total") or (unit_price * quantity))
+
+            # Prefer sale_price, then ordered_unit_price, then fallback
+            unit_price = float(
+                item.get("sale_price")
+                or item.get("ordered_unit_price")
+                or item.get("unit_price")
+                or item.get("price")
+                or 0.0
+            )
+
+            line_total = float(
+                item.get("line_total")
+                or item.get("total")
+                or (unit_price * quantity)
+            )
+
             normalized.append({
                 "external_id": str(item.get("id") or item.get("sku") or ""),
                 "sku": str(item.get("sku") or ""),
@@ -117,6 +138,7 @@ class LeafLinkClient:
     def _normalize_order(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         line_items = self._extract_line_items(raw)
         total_amount = sum(li.get("line_total", 0) for li in line_items)
+
         return {
             "external_id": str(raw.get("id") or raw.get("number") or raw.get("short_id") or ""),
             "order_number": str(raw.get("order_number") or raw.get("number") or raw.get("short_id") or ""),
@@ -139,6 +161,7 @@ class LeafLinkClient:
             all_raw.extend(orders)
             if len(orders) < 100:
                 break
+
         if normalize:
             return [self._normalize_order(raw) for raw in all_raw if isinstance(raw, dict)]
         return all_raw
