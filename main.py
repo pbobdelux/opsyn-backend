@@ -277,6 +277,7 @@ def filter_orders(
     if brand_id:
         results = [o for o in results if o["brand_id"] == brand_id]
 
+    # Hide mock orders whenever live LeafLink orders exist for this scope
     has_live_leaflink = any(o.get("source") == "leaflink" for o in results)
     if has_live_leaflink:
         results = [o for o in results if o.get("source") != "mock"]
