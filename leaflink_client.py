@@ -32,7 +32,7 @@ class LeafLinkClient:
 
         if not resp.ok:
             raise RuntimeError(
-                f"LeafLink GET failed: {resp.status_code} {resp.text[:500]}"
+                f"LeafLink GET failed | url={resp.url} | status={resp.status_code} | body={resp.text[:500]}"
             )
 
         return resp.json()
@@ -50,7 +50,7 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
-        return self._get("/orders/", params=params)
+        return self._get("orders/", params=params)
 
     def fetch_recent_orders(self, max_pages: int = 5) -> List[Dict[str, Any]]:
         all_orders: List[Dict[str, Any]] = []
