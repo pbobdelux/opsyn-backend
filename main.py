@@ -159,7 +159,13 @@ def sync_key(org_id: str, brand_id: str) -> str:
 
 
 def normalize_leaflink_order(raw: Dict[str, Any], org_id: str, brand_id: str) -> Dict[str, Any]:
-    external_id = str(raw.get("id") or raw.get("uuid") or raw.get("number") or raw.get("short_id") or now_iso())
+    external_id = str(
+        raw.get("id")
+        or raw.get("uuid")
+        or raw.get("number")
+        or raw.get("short_id")
+        or now_iso()
+    )
 
     customer = raw.get("buyer") or raw.get("customer") or {}
     customer_name = (
@@ -215,7 +221,11 @@ def replace_orders_for_brand(org_id: str, brand_id: str, new_orders: List[Dict[s
 
     kept = [
         o for o in ORDERS
-        if not (o.get("org_id") == org_id and o.get("brand_id") == brand_id and o.get("source") == "leaflink")
+        if not (
+            o.get("org_id") == org_id
+            and o.get("brand_id") == brand_id
+            and o.get("source") == "leaflink"
+        )
     ]
 
     ORDERS = kept + new_orders
@@ -240,7 +250,8 @@ def filter_orders(
         normalized = status.lower()
         results = [
             o for o in results
-            if str(o["status"]).lower() == normalized or str(o["review_status"]).lower() == normalized
+            if str(o["status"]).lower() == normalized
+            or str(o["review_status"]).lower() == normalized
         ]
 
     if q:
@@ -281,11 +292,14 @@ def build_orders_response(
     blocked_count = len([o for o in results if o["review_status"] == "blocked"])
     total_amount = round(sum(float(o["amount"]) for o in results), 2)
 
-    sync_meta = SYNC_STATE.get(sync_key(org_id, brand_id), {
-        "status": "idle",
-        "message": "No sync has run yet",
-        "last_synced_at": None,
-    })
+    sync_meta = SYNC_STATE.get(
+        sync_key(org_id, brand_id),
+        {
+            "status": "idle",
+            "message": "No sync has run yet",
+            "last_synced_at": None,
+        },
+    )
 
     return {
         "ok": True,
@@ -431,11 +445,14 @@ def sync_leaflink_status(
     effective_org_id = org_id or "org_onboarding"
     effective_brand_id = brand_id or get_active_brand_for_org(effective_org_id)
 
-    state = SYNC_STATE.get(sync_key(effective_org_id, effective_brand_id), {
-        "status": "idle",
-        "message": "LeafLink sync route is live",
-        "last_synced_at": None,
-    })
+    state = SYNC_STATE.get(
+        sync_key(effective_org_id, effective_brand_id),
+        {
+            "status": "idle",
+            "message": "LeafLink sync route is live",
+            "last_synced_at": None,
+        },
+    )
 
     return {
         "ok": True,
@@ -488,10 +505,12 @@ def run_leaflink_sync(
     try:
         client = LeafLinkClient()
         raw_orders = client.fetch_recent_orders(max_pages=5)
+
         normalized = [
             normalize_leaflink_order(raw, org_id=org_id, brand_id=effective_brand_id)
             for raw in raw_orders
         ]
+
         synced_count = replace_orders_for_brand(org_id, effective_brand_id, normalized)
         finished_at = now_iso()
 
