@@ -84,6 +84,7 @@ ORDERS: List[Dict[str, Any]] = [
         "source": "mock",
         "item_count": 0,
         "unit_count": 0,
+        "line_items": [],
         "raw": {},
     },
     {
@@ -101,6 +102,7 @@ ORDERS: List[Dict[str, Any]] = [
         "source": "mock",
         "item_count": 0,
         "unit_count": 0,
+        "line_items": [],
         "raw": {},
     },
     {
@@ -118,6 +120,7 @@ ORDERS: List[Dict[str, Any]] = [
         "source": "mock",
         "item_count": 0,
         "unit_count": 0,
+        "line_items": [],
         "raw": {},
     },
 ]
@@ -274,12 +277,16 @@ def filter_orders(
     if brand_id:
         results = [o for o in results if o["brand_id"] == brand_id]
 
+    has_live_leaflink = any(o.get("source") == "leaflink" for o in results)
+    if has_live_leaflink:
+        results = [o for o in results if o.get("source") != "mock"]
+
     if status and status.lower() != "all":
         normalized = status.lower()
         results = [
             o for o in results
-            if str(o["status"]).lower() == normalized
-            or str(o["review_status"]).lower() == normalized
+            if str(o.get("status", "")).lower() == normalized
+            or str(o.get("review_status", "")).lower() == normalized
         ]
 
     if q:
