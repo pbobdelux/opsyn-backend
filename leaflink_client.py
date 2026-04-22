@@ -50,7 +50,7 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
-        return self._get("/orders", params=params)
+        return self._get("/orders/", params=params)
 
     def fetch_recent_orders(self, max_pages: int = 5) -> List[Dict[str, Any]]:
         all_orders: List[Dict[str, Any]] = []
