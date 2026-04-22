@@ -64,11 +64,12 @@ class LeafLinkClient:
                 path = data.get("next")
             else:
                 break
-            params = {}  # Reset for next page
+            params = {}
 
         return all_orders
 
     def _extract_customer_name(self, raw: Dict[str, Any]) -> str:
+        """Extract customer name with multiple fallback paths."""
         candidates = [
             raw.get("customer_display_name"),
             raw.get("customer_name"),
@@ -85,7 +86,10 @@ class LeafLinkClient:
                     obj.get("name"),
                     obj.get("business_name"),
                 ])
-        return next((str(c).strip() for c in candidates if c and str(c).strip()), "Unknown Customer")
+        for c in candidates:
+            if c and str(c).strip():
+                return str(c).strip()
+        return "Unknown Customer"
 
     def _extract_line_items(self, raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         raw_lines = (
@@ -99,4 +103,47 @@ class LeafLinkClient:
             if not isinstance(item, dict):
                 continue
             quantity = int(item.get("quantity") or item.get("qty") or item.get("units") or 0)
-            unit_price =
+            unit_price = float(item.get("ordered_unit_price") or item.get("unit_price") or item.get("price") or 0.0)
+            line_total = float(item.get("line_total") or item.get("total") or (unit_price * quantity))
+
+            normalized.append({
+                "external_id": str(item.get("id") or item.get("sku") or ""),
+                "sku": str(item.get("sku") or ""),
+                "name": str(item.get("name") or item.get("product_name") or "Unknown Item"),
+                "quantity": quantity,
+                "unit_price": round(unit_price, 2),
+                "line_total": round(line_total, 2),
+                "raw_payload": item,
+            })
+        return normalized
+
+    def _normalize_order(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        line_items = self._extract_line_items(raw)
+        total_amount = sum(li.get("line_total", 0) for li in line_items)
+
+        return {
+            "external_id": str(raw.get("id") or raw.get("number") or raw.get("short_id") or ""),
+            "order_number": str(raw.get("order_number") or raw.get("number") or raw.get("short_id") or ""),
+            "customer_name": self._extract_customer_name(raw),
+            "status": str(raw.get("status") or raw.get("classification") or "unknown").lower(),
+            "total_amount": round(total_amount, 2),
+            "currency": "USD",
+            "submitted_at": raw.get("submitted_at") or raw.get("created_at"),
+            "updated_at": raw.get("updated_at") or raw.get("modified"),
+            "item_count": len(line_items),
+            "unit_count": sum(li.get("quantity", 0) for li in line_items),
+            "line_items": line_items,
+            "raw_payload": raw,
+        }
+
+    async def fetch_recent_orders(self, max_pages: int = 5, normalize: bool = True) -> List[Dict[str, Any]]:
+        all_raw = []
+        for page in range(1, max_pages + 1):
+            orders = await self.list_orders(page=page, page_size=100)
+            all_raw.extend(orders)
+            if len(orders) < 100:
+                break
+
+        if normalize:
+            return [self._normalize_order(raw) for raw in all_raw if isinstance(raw, dict)]
+        return all_raw
