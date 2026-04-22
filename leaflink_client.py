@@ -23,7 +23,7 @@ class LeafLinkClient:
             "Content-Type": "application/json",
         })
 
-        # Keeping your current headers because your account appears to use them.
+        # Keep your current auth style for now.
         if LEAFLINK_VENDOR_KEY:
             self.session.headers["Authorization"] = f"Api-Key {LEAFLINK_VENDOR_KEY}"
         if LEAFLINK_USER_KEY:
@@ -48,13 +48,12 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
-        # Brand/seller-side endpoint first
+        # Try current-host style first, then legacy v2 style.
         candidate_paths: List[str] = [
-            "orders-received/",
             "orders-received",
+            "api/v2/orders-received",
         ]
 
-        # Optional filters that are more plausible than path nesting
         if LEAFLINK_COMPANY_ID:
             params["seller"] = LEAFLINK_COMPANY_ID
         elif LEAFLINK_COMPANY_SLUG:
