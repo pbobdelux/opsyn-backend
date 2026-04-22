@@ -71,6 +71,14 @@ def dollars_to_cents(value: Any) -> int:
         return 0
 
 
+def stub_envelope(key: str, value: Any, brand_id: str) -> dict:
+    return {
+        "ok": True,
+        "brand_id": brand_id,
+        key: value,
+    }
+
+
 class LeafLinkCredentialUpsertRequest(BaseModel):
     base_url: str | None = "https://app.leaflink.com/api/v2"
     api_key: str
@@ -442,6 +450,66 @@ async def get_orders(
     }
 
 
+# Stub endpoints so the iOS app gets 200 + empty collections instead of 404s.
+
+
+@app.get("/customers")
+async def list_customers(brand_id: str = Query(..., description="Brand scope")):
+    return stub_envelope("customers", [], brand_id)
+
+
+@app.get("/routes")
+async def list_routes(brand_id: str = Query(..., description="Brand scope")):
+    return stub_envelope("routes", [], brand_id)
+
+
+@app.get("/drivers")
+async def list_drivers(brand_id: str = Query(..., description="Brand scope")):
+    return stub_envelope("drivers", [], brand_id)
+
+
+@app.get("/billing")
+async def list_billing(brand_id: str = Query(..., description="Brand scope")):
+    return stub_envelope("billing", [], brand_id)
+
+
+@app.get("/api/inventory")
+async def list_inventory(brand_id: str = Query(..., description="Brand scope")):
+    return stub_envelope("items", [], brand_id)
+
+
+@app.get("/api/packages")
+async def list_packages(brand_id: str = Query(..., description="Brand scope")):
+    return stub_envelope("packages", [], brand_id)
+
+
+@app.get("/api/packages/{package_id}")
+async def get_package(
+    package_id: str,
+    brand_id: str = Query(..., description="Brand scope"),
+):
+    return {
+        "ok": True,
+        "brand_id": brand_id,
+        "package": None,
+    }
+
+
+@app.get("/mappings")
+async def list_mappings(brand_id: str = Query(..., description="Brand scope")):
+    return stub_envelope("mappings", [], brand_id)
+
+
+@app.get("/drafts")
+async def list_drafts(brand_id: str = Query(..., description="Brand scope")):
+    return stub_envelope("drafts", [], brand_id)
+
+
+@app.get("/production/batches")
+async def list_production_batches(brand_id: str = Query(..., description="Brand scope")):
+    return stub_envelope("batches", [], brand_id)
+
+
 @app.get("/api")
 async def api_root():
     return {"ok": True, "message": "Opsyn API root", "timestamp": utc_now_iso()}
@@ -454,4 +522,5 @@ async def api_v1_root():
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
