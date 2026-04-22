@@ -1,10 +1,19 @@
-from fastapi import FastAPI, HTTPException, Query
+import os
+from datetime import datetime, timezone
+from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
 
 app = FastAPI(title="Opsyn Backend", version="1.0.0")
+
+
+# -------------------------
+# CONFIG
+# -------------------------
+
+OPSYN_SYNC_SECRET = os.getenv("OPSYN_SYNC_SECRET", "8fj29f8j29fj29fj2fj29f").strip()
 
 
 # -------------------------
@@ -188,14 +197,15 @@ def build_orders_response(
     status: Optional[str] = None,
     q: Optional[str] = None,
 ) -> Dict[str, Any]:
-    effective_brand_id = brand_id
+    if not org_id:
+        org_id = "org_onboarding"
 
-    if not effective_brand_id and org_id:
-        effective_brand_id = get_active_brand_for_org(org_id)
+    if not brand_id:
+        brand_id = get_active_brand_for_org(org_id)
 
     results = filter_orders(
         org_id=org_id,
-        brand_id=effective_brand_id,
+        brand_id=brand_id,
         status=status,
         q=q,
     )
@@ -208,8 +218,8 @@ def build_orders_response(
     return {
         "ok": True,
         "org_id": org_id,
-        "brand_id": effective_brand_id,
-        "brand_name": get_brand_name(effective_brand_id),
+        "brand_id": brand_id,
+        "brand_name": get_brand_name(brand_id),
         "count": len(results),
         "summary": {
             "all": len(results),
@@ -360,13 +370,14 @@ def sync_leaflink_status(
     org_id: Optional[str] = Query(default=None),
     brand_id: Optional[str] = Query(default=None),
 ):
-    effective_brand_id = brand_id or (get_active_brand_for_org(org_id) if org_id else None)
+    effective_org_id = org_id or "org_onboarding"
+    effective_brand_id = brand_id or get_active_brand_for_org(effective_org_id)
 
     return {
         "ok": True,
         "status": "idle",
         "message": "LeafLink sync route is live",
-        "org_id": org_id,
+        "org_id": effective_org_id,
         "brand_id": effective_brand_id,
         "brand_name": get_brand_name(effective_brand_id),
         "last_synced_at": None,
@@ -375,12 +386,11 @@ def sync_leaflink_status(
 
 @app.post("/sync/leaflink")
 def sync_leaflink(data: SyncLeaflinkRequest):
-    effective_brand_id = data.brand_id or (
-        get_active_brand_for_org(data.org_id) if data.org_id else None
-    )
+    effective_org_id = data.org_id or "org_onboarding"
+    effective_brand_id = data.brand_id or get_active_brand_for_org(effective_org_id)
 
     orders = filter_orders(
-        org_id=data.org_id,
+        org_id=effective_org_id,
         brand_id=effective_brand_id,
     )
 
@@ -388,8 +398,30 @@ def sync_leaflink(data: SyncLeaflinkRequest):
         "ok": True,
         "status": "completed",
         "message": "Temporary mock sync completed",
-        "org_id": data.org_id,
+        "org_id": effective_org_id,
         "brand_id": effective_brand_id,
         "brand_name": get_brand_name(effective_brand_id),
         "synced_order_count": len(orders),
+    }
+
+
+@app.post("/sync/leaflink/run")
+def run_leaflink_sync(
+    org_id: str = Query(default="org_onboarding"),
+    brand_id: Optional[str] = Query(default=None),
+    x_opsyn_secret: Optional[str] = Header(default=None),
+):
+    if x_opsyn_secret != OPSYN_SYNC_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    effective_brand_id = brand_id or get_active_brand_for_org(org_id)
+
+    return {
+        "ok": True,
+        "status": "triggered",
+        "message": "LeafLink sync triggered",
+        "org_id": org_id,
+        "brand_id": effective_brand_id,
+        "brand_name": get_brand_name(effective_brand_id),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
