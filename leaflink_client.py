@@ -1,93 +1,80 @@
 import os
+import base64
 from typing import Any, Dict, List, Optional
 
 import requests
-from requests.auth import HTTPBasicAuth
 
 
 LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://app.leaflink.com/api/v2").strip().rstrip("/")
 LEAFLINK_VENDOR_KEY = os.getenv("LEAFLINK_VENDOR_KEY", "").strip()
 LEAFLINK_USER_KEY = os.getenv("LEAFLINK_USER_KEY", "").strip()
 LEAFLINK_COMPANY_ID = os.getenv("LEAFLINK_COMPANY_ID", "").strip()
-LEAFLINK_API_VERSION = os.getenv("LEAFLINK_API_VERSION", "").strip()
 LEAFLINK_USER_AGENT = os.getenv("LEAFLINK_USER_AGENT", "opsyn-backend").strip()
 
 
 class LeafLinkClient:
     def __init__(self) -> None:
-        if not LEAFLINK_BASE_URL:
-            raise ValueError("Missing LEAFLINK_BASE_URL")
-        if not LEAFLINK_VENDOR_KEY:
-            raise ValueError("Missing LEAFLINK_VENDOR_KEY")
-        if not LEAFLINK_USER_KEY:
-            raise ValueError("Missing LEAFLINK_USER_KEY")
-        if not LEAFLINK_COMPANY_ID:
-            raise ValueError("Missing LEAFLINK_COMPANY_ID")
+        if not LEAFLINK_VENDOR_KEY or not LEAFLINK_USER_KEY:
+            raise ValueError("Missing LeafLink credentials")
+
+        # 🔥 MANUAL BASIC AUTH (THIS IS THE FIX)
+        token = base64.b64encode(
+            f"{LEAFLINK_VENDOR_KEY}:{LEAFLINK_USER_KEY}".encode()
+        ).decode()
 
         self.session = requests.Session()
-        self.session.auth = HTTPBasicAuth(LEAFLINK_VENDOR_KEY, LEAFLINK_USER_KEY)
         self.session.headers.update({
+            "Authorization": f"Basic {token}",
             "Accept": "application/json",
             "Content-Type": "application/json",
             "User-Agent": LEAFLINK_USER_AGENT,
         })
 
-        if LEAFLINK_API_VERSION:
-            self.session.headers["LeafLink-Version"] = LEAFLINK_API_VERSION
-
-    def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None):
         url = f"{LEAFLINK_BASE_URL}/{path.lstrip('/')}"
         return self.session.get(url, params=params, timeout=45)
 
-    def list_orders(
-        self,
-        page: int = 1,
-        page_size: int = 100,
-        status: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        params: Dict[str, Any] = {
+    def list_orders(self, page=1, page_size=100):
+        params = {
             "page": page,
             "page_size": page_size,
         }
-        if status:
-            params["status"] = status
 
-        candidate_paths: List[str] = [
+        paths = [
             f"companies/{LEAFLINK_COMPANY_ID}/orders-received/",
             f"companies/{LEAFLINK_COMPANY_ID}/orders-received",
             "orders-received/",
             "orders-received",
         ]
 
-        errors: List[str] = []
+        errors = []
 
-        for path in candidate_paths:
-            resp = self._get_raw(path, params=params)
-            content_type = resp.headers.get("Content-Type", "")
+        for path in paths:
+            r = self._get(path, params)
 
-            if resp.ok and "application/json" in content_type.lower():
-                return resp.json()
+            if r.ok and "application/json" in r.headers.get("Content-Type", ""):
+                return r.json()
 
             errors.append(
-                f"url={resp.url} status={resp.status_code} content_type={content_type} body={resp.text[:220]}"
+                f"{r.url} | {r.status_code} | {r.text[:200]}"
             )
 
-        raise RuntimeError("LeafLink orders lookup failed | " + " || ".join(errors))
+        raise RuntimeError("LeafLink failed | " + " || ".join(errors))
 
-    def fetch_recent_orders(self, max_pages: int = 5) -> List[Dict[str, Any]]:
-        all_orders: List[Dict[str, Any]] = []
+    def fetch_recent_orders(self, max_pages=5):
+        all_orders = []
 
         for page in range(1, max_pages + 1):
-            payload = self.list_orders(page=page, page_size=100)
+            data = self.list_orders(page=page)
 
-            results = payload.get("results") or payload.get("data") or payload.get("orders") or []
+            results = data.get("results") or data.get("orders") or []
+
             if not results:
                 break
 
             all_orders.extend(results)
 
-            next_url = payload.get("next")
-            if not next_url:
+            if not data.get("next"):
                 break
 
         return all_orders
