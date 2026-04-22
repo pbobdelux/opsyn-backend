@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 import logging
 from sqlalchemy import select
@@ -31,8 +31,11 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str):
         raise Exception(f"No active LeafLink credentials for {brand_id}")
 
     try:
-        # Uses your normalized client output
-        client = LeafLinkClient()
+        client = LeafLinkClient(
+            api_key=cred.api_key,
+            base_url=cred.base_url,
+            company_id=cred.company_id,
+        )
         orders = client.fetch_recent_orders(max_pages=5, normalize=True)
 
         created = 0
