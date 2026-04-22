@@ -7,13 +7,13 @@ from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from ai.twin_ai import handle_twin_sync
 from database import Base, engine, get_db
-from models import Order
+from models import Order, OrderLine
 
 logger = logging.getLogger("opsyn-backend")
 logging.basicConfig(
@@ -87,11 +87,19 @@ def serialize_db_line(line: Any) -> dict[str, Any]:
     if total_price is None and total_price_cents is not None:
         total_price = cents_to_amount(total_price_cents)
 
+    quantity = getattr(line, "quantity", None) or 0
+    pulled_qty = getattr(line, "pulled_qty", 0) or 0
+    packed_qty = getattr(line, "packed_qty", 0) or 0
+    remaining_qty = max(0, quantity - pulled_qty)
+
     return {
         "id": getattr(line, "id", None),
         "sku": getattr(line, "sku", None),
         "product_name": getattr(line, "product_name", None),
-        "quantity": getattr(line, "quantity", None) or 0,
+        "quantity": quantity,
+        "pulled_qty": pulled_qty,
+        "packed_qty": packed_qty,
+        "remaining_qty": remaining_qty,
         "unit_price": unit_price,
         "total_price": total_price,
         "mapped_product_id": getattr(line, "mapped_product_id", None),
@@ -114,11 +122,18 @@ def serialize_json_line(item: dict[str, Any]) -> dict[str, Any]:
     if total_price is None and item.get("total_price_cents") is not None:
         total_price = cents_to_amount(item.get("total_price_cents"))
 
+    pulled_qty = item.get("pulled_qty", 0) or 0
+    packed_qty = item.get("packed_qty", 0) or 0
+    remaining_qty = max(0, (quantity or 0) - pulled_qty)
+
     return {
         "id": item.get("id"),
         "sku": item.get("sku"),
         "product_name": item.get("product_name") or item.get("name"),
         "quantity": quantity or 0,
+        "pulled_qty": pulled_qty,
+        "packed_qty": packed_qty,
+        "remaining_qty": remaining_qty,
         "unit_price": unit_price,
         "total_price": total_price,
         "mapped_product_id": item.get("mapped_product_id"),
@@ -403,6 +418,181 @@ async def get_order_detail(
     return {
         "ok": True,
         "order": serialize_order(order, effective_org_id, effective_brand_id or order.brand_id),
+    }
+
+
+# =============================================================================
+# Order Line Fulfillment Endpoints
+# =============================================================================
+@app.post("/orders/{order_id}/lines/{line_id}/mark-pulled")
+async def mark_line_pulled(
+    order_id: int,
+    line_id: int,
+    data: dict,
+    org_id: Optional[str] = Query(default=None),
+    brand_id: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark an order line as pulled. Increments pulled_qty by the amount specified."""
+    effective_org_id = org_id or "org_onboarding"
+    effective_brand_id = brand_id or get_active_brand_for_org(effective_org_id)
+
+    order_stmt = select(Order).where(Order.id == order_id)
+    if effective_brand_id:
+        order_stmt = order_stmt.where(Order.brand_id == effective_brand_id)
+
+    order_result = await db.execute(order_stmt)
+    order = order_result.scalar_one_or_none()
+
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    line_stmt = select(OrderLine).where(
+        (OrderLine.id == line_id) & (OrderLine.order_id == order_id)
+    )
+    line_result = await db.execute(line_stmt)
+    line = line_result.scalar_one_or_none()
+
+    if not line:
+        raise HTTPException(status_code=404, detail="Order line not found")
+
+    pull_amount = data.get("amount", 0)
+    if pull_amount <= 0:
+        raise HTTPException(status_code=400, detail="Pull amount must be greater than 0")
+
+    max_pullable = (line.quantity or 0) - (line.pulled_qty or 0)
+    if pull_amount > max_pullable:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot pull {pull_amount}. Max pullable: {max_pullable}"
+        )
+
+    line.pulled_qty = (line.pulled_qty or 0) + pull_amount
+    line.updated_at = datetime.now(timezone.utc)
+
+    await db.commit()
+    await db.refresh(line)
+
+    return {
+        "ok": True,
+        "line_id": line.id,
+        "pulled_qty": line.pulled_qty,
+        "packed_qty": line.packed_qty,
+        "remaining_qty": max(0, (line.quantity or 0) - line.pulled_qty),
+    }
+
+
+@app.post("/orders/{order_id}/lines/{line_id}/mark-packed")
+async def mark_line_packed(
+    order_id: int,
+    line_id: int,
+    data: dict,
+    org_id: Optional[str] = Query(default=None),
+    brand_id: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark an order line as packed. Increments packed_qty by the amount specified."""
+    effective_org_id = org_id or "org_onboarding"
+    effective_brand_id = brand_id or get_active_brand_for_org(effective_org_id)
+
+    order_stmt = select(Order).where(Order.id == order_id)
+    if effective_brand_id:
+        order_stmt = order_stmt.where(Order.brand_id == effective_brand_id)
+
+    order_result = await db.execute(order_stmt)
+    order = order_result.scalar_one_or_none()
+
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    line_stmt = select(OrderLine).where(
+        (OrderLine.id == line_id) & (OrderLine.order_id == order_id)
+    )
+    line_result = await db.execute(line_stmt)
+    line = line_result.scalar_one_or_none()
+
+    if not line:
+        raise HTTPException(status_code=404, detail="Order line not found")
+
+    pack_amount = data.get("amount", 0)
+    if pack_amount <= 0:
+        raise HTTPException(status_code=400, detail="Pack amount must be greater than 0")
+
+    max_packable = (line.pulled_qty or 0) - (line.packed_qty or 0)
+    if pack_amount > max_packable:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot pack {pack_amount}. Max packable: {max_packable}"
+        )
+
+    line.packed_qty = (line.packed_qty or 0) + pack_amount
+    line.updated_at = datetime.now(timezone.utc)
+
+    await db.commit()
+    await db.refresh(line)
+
+    return {
+        "ok": True,
+        "line_id": line.id,
+        "pulled_qty": line.pulled_qty,
+        "packed_qty": line.packed_qty,
+        "remaining_qty": max(0, (line.quantity or 0) - line.pulled_qty),
+    }
+
+
+@app.get("/master-pick-list")
+async def get_master_pick_list(
+    org_id: Optional[str] = Query(default=None),
+    brand_id: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns aggregated pick list: SKU + product name grouped with total remaining qty.
+    Remaining qty = quantity - pulled_qty for each line.
+    """
+    effective_org_id = org_id or "org_onboarding"
+    effective_brand_id = brand_id or get_active_brand_for_org(effective_org_id)
+
+    if not effective_brand_id:
+        return {
+            "ok": True,
+            "org_id": effective_org_id,
+            "brand_id": None,
+            "pick_list": [],
+        }
+
+    query_stmt = (
+        select(
+            OrderLine.sku,
+            OrderLine.product_name,
+            func.sum(OrderLine.quantity - OrderLine.pulled_qty).label("remaining_qty"),
+            func.count(OrderLine.id).label("line_count"),
+        )
+        .join(Order)
+        .where(Order.brand_id == effective_brand_id)
+        .group_by(OrderLine.sku, OrderLine.product_name)
+        .having(func.sum(OrderLine.quantity - OrderLine.pulled_qty) > 0)
+        .order_by(OrderLine.sku)
+    )
+
+    result = await db.execute(query_stmt)
+    rows = result.all()
+
+    pick_list = [
+        {
+            "sku": row.sku,
+            "product_name": row.product_name,
+            "remaining_qty": int(row.remaining_qty) if row.remaining_qty else 0,
+            "line_count": row.line_count,
+        }
+        for row in rows
+    ]
+
+    return {
+        "ok": True,
+        "org_id": effective_org_id,
+        "brand_id": effective_brand_id,
+        "pick_list": pick_list,
     }
 
 
