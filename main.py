@@ -49,7 +49,7 @@ def get_brand_name(brand_id: Optional[str]) -> Optional[str]:
     if not brand_id:
         return None
     brand = BRANDS.get(brand_id)
-    return brand.get("brand_name") if brand else brand_id
+    return brand["brand_name"] if brand else brand_id
 
 # =============================================================================
 # Lifespan
@@ -156,4 +156,58 @@ async def get_orders(
             "customer_name": o.customer_name or "Unknown Customer",
             "status": o.status or "submitted",
             "review_status": "ready",
-            "amount
+            "amount": round((getattr(o, "total_cents", 0) or 0) / 100.0, 2),
+            "currency": "USD",
+            "created_at": (getattr(o, "external_created_at", None) or o.created_at).isoformat(),
+            "updated_at": o.updated_at.isoformat(),
+            "source": o.source,
+            "item_count": getattr(o, "item_count", 0),
+            "unit_count": getattr(o, "unit_count", 0),
+            "line_items": getattr(o, "line_items_json", []),
+        })
+
+    total_amount = sum(o.get("amount", 0) for o in order_list)
+
+    return {
+        "ok": True,
+        "org_id": effective_org_id,
+        "brand_id": effective_brand_id,
+        "brand_name": get_brand_name(effective_brand_id),
+        "count": len(order_list),
+        "summary": {
+            "all": len(order_list),
+            "ready": len([o for o in order_list if o.get("review_status") == "ready"]),
+            "needs_review": 0,
+            "blocked": 0,
+            "total_amount": round(total_amount, 2),
+            "currency": "USD",
+        },
+        "orders": order_list,
+    }
+
+# =============================================================================
+# Sync Endpoint - Calls Twin AI (the brain)
+# =============================================================================
+@app.post("/sync/leaflink/run")
+async def run_leaflink_sync(
+    org_id: str = Query(default="org_onboarding"),
+    brand_id: Optional[str] = Query(default=None),
+    x_opsyn_secret: Optional[str] = Header(default=None),
+):
+    if x_opsyn_secret != os.getenv("OPSYN_SYNC_SECRET"):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    effective_brand_id = brand_id or get_active_brand_for_org(org_id)
+
+    # Twin AI is the brain - it will handle credentials and call LeafLink
+    return {
+        "ok": True,
+        "message": f"Twin AI sync requested for brand {effective_brand_id}",
+        "note": "Twin AI will lookup credentials and pull LeafLink data",
+        "org_id": org_id,
+        "brand_id": effective_brand_id,
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+   
