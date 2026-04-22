@@ -5,20 +5,21 @@ import requests
 
 
 LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://app.leaflink.com/api/v2").strip().rstrip("/")
-LEAFLINK_VENDOR_KEY = os.getenv("LEAFLINK_VENDOR_KEY", "").strip()
-LEAFLINK_USER_KEY = os.getenv("LEAFLINK_USER_KEY", "").strip()
+LEAFLINK_API_KEY = (
+    os.getenv("LEAFLINK_API_KEY", "").strip()
+    or os.getenv("LEAFLINK_VENDOR_KEY", "").strip()
+)
 LEAFLINK_COMPANY_ID = os.getenv("LEAFLINK_COMPANY_ID", "").strip()
 LEAFLINK_API_VERSION = os.getenv("LEAFLINK_API_VERSION", "").strip()
+LEAFLINK_USER_AGENT = os.getenv("LEAFLINK_USER_AGENT", "opsyn-backend").strip()
 
 
 class LeafLinkClient:
     def __init__(self) -> None:
         if not LEAFLINK_BASE_URL:
             raise ValueError("Missing LEAFLINK_BASE_URL")
-        if not LEAFLINK_VENDOR_KEY:
-            raise ValueError("Missing LEAFLINK_VENDOR_KEY")
-        if not LEAFLINK_USER_KEY:
-            raise ValueError("Missing LEAFLINK_USER_KEY")
+        if not LEAFLINK_API_KEY:
+            raise ValueError("Missing LEAFLINK_API_KEY or LEAFLINK_VENDOR_KEY")
         if not LEAFLINK_COMPANY_ID:
             raise ValueError("Missing LEAFLINK_COMPANY_ID")
 
@@ -26,8 +27,8 @@ class LeafLinkClient:
         self.session.headers.update({
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Authorization": f"Api-Key {LEAFLINK_VENDOR_KEY}",
-            "User-Key": LEAFLINK_USER_KEY,
+            "Authorization": f"App {LEAFLINK_API_KEY}",
+            "User-Agent": LEAFLINK_USER_AGENT,
         })
 
         if LEAFLINK_API_VERSION:
@@ -52,7 +53,6 @@ class LeafLinkClient:
 
         candidate_paths: List[str] = [
             f"companies/{LEAFLINK_COMPANY_ID}/orders-received/",
-            f"companies/{LEAFLINK_COMPANY_ID}/orders-received",
         ]
 
         errors: List[str] = []
@@ -65,7 +65,7 @@ class LeafLinkClient:
                 return resp.json()
 
             errors.append(
-                f"url={resp.url} status={resp.status_code} content_type={content_type} body={resp.text[:180]}"
+                f"url={resp.url} status={resp.status_code} content_type={content_type} body={resp.text[:220]}"
             )
 
         raise RuntimeError("LeafLink company orders lookup failed | " + " || ".join(errors))
