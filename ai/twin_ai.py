@@ -1,15 +1,12 @@
-import os
-import json
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import BrandAPICredential
-from leaflink_client import LeafLinkClient
-from leaflink_sync import sync_leaflink_orders   # We'll use the sync function
+from leaflink_sync import sync_leaflink_orders
 
 logger = logging.getLogger("twin_ai")
 
@@ -19,7 +16,6 @@ class TwinAI:
     @staticmethod
     async def plan_sync(db: AsyncSession, org_id: str, brand_id: str) -> Dict[str, Any]:
         """Planner: Decides what to do and explains reasoning"""
-        # Get credentials for this brand
         result = await db.execute(
             select(BrandAPICredential).where(
                 BrandAPICredential.brand_id == brand_id,
@@ -44,10 +40,9 @@ class TwinAI:
                 "brand_id": brand_id,
                 "integration": "leaflink",
                 "action": "fetch_and_save_orders",
-                "expected": "Pull recent orders and save to Order table",
             },
             "risk": "low",
-            "requires_approval": False,   # Sync is safe
+            "requires_approval": False,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -56,7 +51,6 @@ class TwinAI:
         """Executor: Actually performs the sync"""
         try:
             result = await sync_leaflink_orders(db, brand_id)
-            
             if result.get("ok"):
                 return {
                     "ok": True,
@@ -78,13 +72,12 @@ class TwinAI:
             }
 
 
-# Simple router-style helper for main.py
 async def handle_twin_sync(db: AsyncSession, org_id: str, brand_id: str) -> Dict[str, Any]:
     """Main entry point for Twin AI sync - Plan -> Execute"""
     plan = await TwinAI.plan_sync(db, org_id, brand_id)
     if not plan["ok"]:
         return plan
 
-    # For now we auto-execute since sync is safe
+    # Auto-execute for now (sync is safe)
     result = await TwinAI.execute_sync(db, org_id, brand_id)
     return result
