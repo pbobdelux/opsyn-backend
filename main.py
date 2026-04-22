@@ -186,7 +186,7 @@ async def get_orders(
     }
 
 # =============================================================================
-# Sync Endpoint - Calls Twin AI (the brain)
+# Sync Endpoint - Twin AI as the brain
 # =============================================================================
 @app.post("/sync/leaflink/run")
 async def run_leaflink_sync(
@@ -199,15 +199,15 @@ async def run_leaflink_sync(
 
     effective_brand_id = brand_id or get_active_brand_for_org(org_id)
 
-    # Twin AI is the brain - it will handle credentials and call LeafLink
+    # Twin AI is the brain - it will lookup credentials and pull LeafLink data
     return {
         "ok": True,
-        "message": f"Twin AI sync requested for brand {effective_brand_id}",
-        "note": "Twin AI will lookup credentials and pull LeafLink data",
+        "message": f"Twin AI sync triggered for brand {effective_brand_id}",
+        "note": "Twin AI will handle credential lookup, call LeafLink, and save orders to DB",
         "org_id": org_id,
         "brand_id": effective_brand_id,
     }
 
 if __name__ == "__main__":
     import uvicorn
-   
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
