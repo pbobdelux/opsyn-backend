@@ -52,3 +52,20 @@ class Order(Base):
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+
+class OrganizationBrandBinding(Base):
+    __tablename__ = "organization_brand_bindings"
+    __table_args__ = (
+        UniqueConstraint("org_id", "brand_id", name="uq_org_brand_binding"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    org_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    brand_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    brand_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(50), nullable=True, default="manual")
+    is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)

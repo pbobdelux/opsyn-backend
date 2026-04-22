@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import Base, engine, get_db
-from models import BrandAPICredential, Order
+from models import BrandAPICredential, Order, OrganizationBrandBinding
 from opsyn.routers.derived import router as derived_router
 from services.leaflink_sync import sync_leaflink_orders
 
@@ -29,18 +29,6 @@ APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENVIRONMENT", "local"))
 PORT = int(os.getenv("PORT", "8000"))
 TWIN_INGEST_SECRET = os.getenv("TWIN_INGEST_SECRET", "").strip()
-
-# TEMP TESTING BRIDGE:
-# Map signed-in org_onboarding to the seeded demo/test tenant that has data.
-TEST_BRAND_OVERRIDES = {
-    "org_onboarding": "test-brand",
-}
-
-
-def resolve_brand_id(brand_id: str | None) -> str | None:
-    if not brand_id:
-        return brand_id
-    return TEST_BRAND_OVERRIDES.get(brand_id, brand_id)
 
 
 def utc_now() -> datetime:
@@ -85,11 +73,70 @@ def dollars_to_cents(value: Any) -> int:
 
 
 def stub_envelope(key: str, value: Any, brand_id: str) -> dict:
-    effective_brand_id = resolve_brand_id(brand_id) or brand_id
     return {
         "ok": True,
-        "brand_id": effective_brand_id,
+        "brand_id": brand_id,
         key: value,
+    }
+
+
+def _binding_to_dict(binding: OrganizationBrandBinding) -> dict:
+    return {
+        "brand_id": binding.brand_id,
+        "brand_name": binding.brand_name or binding.brand_id,
+        "is_default": bool(binding.is_default),
+        "is_active": bool(binding.is_active),
+        "source": binding.source or "manual",
+    }
+
+
+async def _get_active_bindings(db: AsyncSession, org_id: str) -> list[OrganizationBrandBinding]:
+    stmt = (
+        select(OrganizationBrandBinding)
+        .where(
+            OrganizationBrandBinding.org_id == org_id,
+            OrganizationBrandBinding.is_active == True,  # noqa: E712
+        )
+        .order_by(
+            OrganizationBrandBinding.is_default.desc(),
+            OrganizationBrandBinding.id.asc(),
+        )
+    )
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def _get_default_binding(db: AsyncSession, org_id: str) -> OrganizationBrandBinding | None:
+    bindings = await _get_active_bindings(db, org_id)
+    if not bindings:
+        return None
+
+    for binding in bindings:
+        if binding.is_default:
+            return binding
+
+    return bindings[0]
+
+
+async def _resolve_brand_context(db: AsyncSession, org_id: str) -> dict:
+    active_binding = await _get_default_binding(db, org_id)
+    available_bindings = await _get_active_bindings(db, org_id)
+
+    if active_binding:
+        resolved_brand_id = active_binding.brand_id
+        source = "backend_binding"
+    else:
+        resolved_brand_id = org_id
+        source = "signed_in_org"
+
+    return {
+        "ok": True,
+        "signed_in_org_id": org_id,
+        "resolved_brand_id": resolved_brand_id,
+        "source": source,
+        "override": None,
+        "active_binding": _binding_to_dict(active_binding) if active_binding else None,
+        "available_brands": [_binding_to_dict(b) for b in available_bindings],
     }
 
 
@@ -130,6 +177,16 @@ class TwinOrdersIngestRequest(BaseModel):
     brand_id: str
     source: str = "twin"
     orders: list[TwinOrderRecord] = Field(default_factory=list)
+
+
+class BrandContextOverrideRequest(BaseModel):
+    org_id: str
+    override_brand_id: str
+
+
+class BrandContextDefaultRequest(BaseModel):
+    org_id: str
+    brand_id: str
 
 
 @asynccontextmanager
@@ -245,16 +302,96 @@ async def debug_routes():
     }
 
 
+@app.get("/auth/brand-context")
+async def get_brand_context(
+    org_id: str = Query(..., description="Signed-in org id"),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _resolve_brand_context(db, org_id)
+
+
+@app.get("/auth/brand-context/available")
+async def get_available_brand_contexts(
+    org_id: str = Query(..., description="Signed-in org id"),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _resolve_brand_context(db, org_id)
+
+
+@app.post("/auth/brand-context/default")
+async def set_default_brand_context(
+    payload: BrandContextDefaultRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    bindings = await _get_active_bindings(db, payload.org_id)
+
+    if not bindings:
+        raise HTTPException(status_code=404, detail="No active brand bindings found for org")
+
+    matched = None
+    for binding in bindings:
+        if binding.brand_id == payload.brand_id:
+            matched = binding
+            break
+
+    if matched is None:
+        raise HTTPException(status_code=404, detail="Requested brand is not available for this org")
+
+    for binding in bindings:
+        binding.is_default = binding.brand_id == payload.brand_id
+
+    await db.commit()
+    return await _resolve_brand_context(db, payload.org_id)
+
+
+@app.post("/auth/brand-context/override")
+async def set_brand_context_override(
+    payload: BrandContextOverrideRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    bindings = await _get_active_bindings(db, payload.org_id)
+
+    matched = None
+    for binding in bindings:
+        if binding.brand_id == payload.override_brand_id:
+            matched = binding
+            break
+
+    if matched is None:
+        raise HTTPException(status_code=404, detail="Requested override brand is not available for this org")
+
+    for binding in bindings:
+        binding.is_default = binding.brand_id == payload.override_brand_id
+
+    await db.commit()
+    return await _resolve_brand_context(db, payload.org_id)
+
+
+@app.delete("/auth/brand-context/override")
+async def clear_brand_context_override(
+    org_id: str = Query(..., description="Signed-in org id"),
+    db: AsyncSession = Depends(get_db),
+):
+    bindings = await _get_active_bindings(db, org_id)
+    if not bindings:
+        return await _resolve_brand_context(db, org_id)
+
+    found_default = any(b.is_default for b in bindings)
+    if not found_default and bindings:
+        bindings[0].is_default = True
+        await db.commit()
+
+    return await _resolve_brand_context(db, org_id)
+
+
 @app.post("/brands/{brand_id}/credentials/leaflink")
 async def upsert_leaflink_credentials(
     brand_id: str,
     payload: LeafLinkCredentialUpsertRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    effective_brand_id = resolve_brand_id(brand_id) or brand_id
-
     stmt = select(BrandAPICredential).where(
-        BrandAPICredential.brand_id == effective_brand_id,
+        BrandAPICredential.brand_id == brand_id,
         BrandAPICredential.integration_name == "leaflink",
     )
     result = await db.execute(stmt)
@@ -271,7 +408,7 @@ async def upsert_leaflink_credentials(
         action = "updated"
     else:
         existing = BrandAPICredential(
-            brand_id=effective_brand_id,
+            brand_id=brand_id,
             integration_name="leaflink",
             base_url=payload.base_url,
             api_key=payload.api_key,
@@ -301,10 +438,8 @@ async def get_leaflink_credentials_status(
     brand_id: str,
     db: AsyncSession = Depends(get_db),
 ):
-    effective_brand_id = resolve_brand_id(brand_id) or brand_id
-
     stmt = select(BrandAPICredential).where(
-        BrandAPICredential.brand_id == effective_brand_id,
+        BrandAPICredential.brand_id == brand_id,
         BrandAPICredential.integration_name == "leaflink",
     )
     result = await db.execute(stmt)
@@ -333,9 +468,8 @@ async def sync_orders_for_brand(
     brand_id: str,
     db: AsyncSession = Depends(get_db),
 ):
-    effective_brand_id = resolve_brand_id(brand_id) or brand_id
     try:
-        result = await sync_leaflink_orders(db, effective_brand_id)
+        result = await sync_leaflink_orders(db, brand_id)
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -346,9 +480,8 @@ async def sync_leaflink_compat(
     payload: LeafLinkSyncRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    effective_brand_id = resolve_brand_id(payload.brand_id) or payload.brand_id
     try:
-        result = await sync_leaflink_orders(db, effective_brand_id)
+        result = await sync_leaflink_orders(db, payload.brand_id)
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -366,8 +499,6 @@ async def ingest_twin_orders(
     if x_opsyn_secret != TWIN_INGEST_SECRET:
         raise HTTPException(status_code=401, detail="Invalid ingest secret")
 
-    effective_brand_id = resolve_brand_id(payload.brand_id) or payload.brand_id
-
     now = utc_now()
     created = 0
     updated = 0
@@ -380,7 +511,7 @@ async def ingest_twin_orders(
             continue
 
         stmt = select(Order).where(
-            Order.brand_id == effective_brand_id,
+            Order.brand_id == payload.brand_id,
             Order.external_order_id == external_order_id,
         )
         result = await db.execute(stmt)
@@ -407,7 +538,7 @@ async def ingest_twin_orders(
             updated += 1
         else:
             order = Order(
-                brand_id=effective_brand_id,
+                brand_id=payload.brand_id,
                 external_order_id=external_order_id,
                 customer_name=customer_name,
                 status=status,
@@ -424,7 +555,7 @@ async def ingest_twin_orders(
 
     return {
         "ok": True,
-        "brand_id": effective_brand_id,
+        "brand_id": payload.brand_id,
         "source": payload.source,
         "received": len(payload.orders),
         "created": created,
@@ -440,12 +571,10 @@ async def get_orders(
     limit: int = Query(default=100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ):
-    effective_brand_id = resolve_brand_id(brand_id)
-
-    if effective_brand_id:
+    if brand_id:
         stmt = (
             select(Order)
-            .where(Order.brand_id == effective_brand_id)
+            .where(Order.brand_id == brand_id)
             .order_by(Order.id.desc())
             .limit(limit)
         )
@@ -457,7 +586,7 @@ async def get_orders(
 
     return {
         "ok": True,
-        "brand_id": effective_brand_id,
+        "brand_id": brand_id,
         "count": len(orders),
         "orders": [
             {
@@ -479,7 +608,6 @@ async def get_orders(
 
 # Stub endpoints so the iOS app gets 200 + empty collections instead of 404s.
 # NOTE: /customers and /routes are handled by opsyn.routers.derived.
-# For testing, derived.py should also use org_onboarding -> test-brand mapping if needed.
 
 
 @app.get("/drivers")
@@ -507,10 +635,9 @@ async def get_package(
     package_id: str,
     brand_id: str = Query(..., description="Brand scope"),
 ):
-    effective_brand_id = resolve_brand_id(brand_id) or brand_id
     return {
         "ok": True,
-        "brand_id": effective_brand_id,
+        "brand_id": brand_id,
         "package": None,
     }
 
