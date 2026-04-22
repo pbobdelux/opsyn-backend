@@ -42,13 +42,22 @@ class Order(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     brand_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
     external_order_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+
+    # UI needs these
+    order_number: Mapped[str | None] = mapped_column(String(120), nullable=True)
     customer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str | None] = mapped_column(String(80), nullable=True)
     total_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    item_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unit_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    line_items_json: Mapped[list[dict[str, Any]] | dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
     source: Mapped[str] = mapped_column(String(50), nullable=False, default="leaflink")
     raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
     external_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     external_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
