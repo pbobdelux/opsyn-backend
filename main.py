@@ -11,8 +11,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import engine, Base, get_db
-# Temporarily commented to prevent crash - we'll fix leaflink_sync.py next
-# from leaflink_sync import sync_leaflink_orders
 from models import Order
 
 logger = logging.getLogger("opsyn-backend")
@@ -29,39 +27,17 @@ APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENVIRONMENT", "local"))
 # Your existing auth and brand configuration
 # =============================================================================
 PINS = {
-    "1234": {
-        "is_super_admin": False,
-        "org_id": "org_onboarding",
-        "allowed_brands": ["noble-nectar"],
-    },
-    "1263": {
-        "is_super_admin": True,
-        "org_id": "org_onboarding",
-        "allowed_brands": ["noble-nectar", "test-brand"],
-    },
-    "0420": {
-        "is_super_admin": True,
-        "org_id": "org_onboarding",
-        "allowed_brands": ["noble-nectar", "test-brand"],
-    },
+    "1234": {"is_super_admin": False, "org_id": "org_onboarding", "allowed_brands": ["noble-nectar"]},
+    "1263": {"is_super_admin": True, "org_id": "org_onboarding", "allowed_brands": ["noble-nectar", "test-brand"]},
+    "0420": {"is_super_admin": True, "org_id": "org_onboarding", "allowed_brands": ["noble-nectar", "test-brand"]},
 }
 
-ACTIVE_BRAND = {
-    "org_onboarding": "noble-nectar"
-}
+ACTIVE_BRAND = {"org_onboarding": "noble-nectar"}
 
 BRANDS = {
-    "noble-nectar": {
-        "brand_id": "noble-nectar",
-        "brand_name": "Noble Nectar",
-    },
-    "test-brand": {
-        "brand_id": "test-brand",
-        "brand_name": "Test Brand",
-    },
+    "noble-nectar": {"brand_id": "noble-nectar", "brand_name": "Noble Nectar"},
+    "test-brand": {"brand_id": "test-brand", "brand_name": "Test Brand"},
 }
-
-SYNC_STATE: dict = {}
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -76,7 +52,7 @@ def get_brand_name(brand_id: Optional[str]) -> Optional[str]:
     return brand["brand_name"] if brand else brand_id
 
 # =============================================================================
-# Lifespan + App Setup
+# Lifespan
 # =============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -145,13 +121,10 @@ def select_brand(data: dict):
     if brand_id not in BRANDS:
         raise HTTPException(status_code=404, detail="Brand not found")
     ACTIVE_BRAND[org_id] = brand_id
-    return {
-        "ok": True,
-        "resolved_brand_id": brand_id,
-    }
+    return {"ok": True, "resolved_brand_id": brand_id}
 
 # =============================================================================
-# Orders Endpoint - Pulls from real database
+# Orders Endpoint - REAL DATABASE QUERY
 # =============================================================================
 @app.get("/orders")
 @app.get("/api/orders")
@@ -213,7 +186,7 @@ async def get_orders(
     }
 
 # =============================================================================
-# Sync Endpoint - Placeholder until leaflink_sync.py is fixed
+# Sync Endpoint - Safe placeholder for now
 # =============================================================================
 @app.post("/sync/leaflink/run")
 async def run_leaflink_sync(
@@ -225,16 +198,12 @@ async def run_leaflink_sync(
     if x_opsyn_secret != os.getenv("OPSYN_SYNC_SECRET"):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    effective_brand_id = brand_id or get_active_brand_for_org(org_id)
-
     return {
         "ok": True,
-        "message": "Sync endpoint is active. Full LeafLink sync will be enabled after fixing leaflink_sync.py",
+        "message": "Sync endpoint ready. Full LeafLink integration coming next.",
         "org_id": org_id,
-        "brand_id": effective_brand_id,
+        "brand_id": brand_id or get_active_brand_for_org(org_id),
     }
-
-# Keep any other endpoints you have (ingest_twin_orders, etc.)
 
 if __name__ == "__main__":
     import uvicorn
