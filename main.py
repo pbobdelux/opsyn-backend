@@ -11,7 +11,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import engine, Base, get_db
-from leaflink_sync import sync_leaflink_orders
+# Temporarily commented to prevent crash - we'll fix leaflink_sync.py next
+# from leaflink_sync import sync_leaflink_orders
 from models import Order
 
 logger = logging.getLogger("opsyn-backend")
@@ -25,7 +26,7 @@ APP_VERSION = "1.0.0"
 APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENVIRONMENT", "local"))
 
 # =============================================================================
-# Your existing auth / brand data (keep this block exactly as you had it)
+# Your existing auth and brand configuration
 # =============================================================================
 PINS = {
     "1234": {
@@ -100,7 +101,7 @@ app.add_middleware(
 )
 
 # =============================================================================
-# Auth Endpoints (your original logic)
+# Auth Endpoints
 # =============================================================================
 @app.post("/auth/pin-login")
 def pin_login(data: dict):
@@ -150,7 +151,7 @@ def select_brand(data: dict):
     }
 
 # =============================================================================
-# Orders Endpoint - Now pulls from real DB
+# Orders Endpoint - Pulls from real database
 # =============================================================================
 @app.get("/orders")
 @app.get("/api/orders")
@@ -181,7 +182,7 @@ async def get_orders(
             "brand_id": effective_brand_id,
             "customer_name": o.customer_name or "Unknown Customer",
             "status": o.status or "submitted",
-            "review_status": "ready",           # You can improve this later
+            "review_status": "ready",
             "amount": round((getattr(o, "total_cents", 0) or 0) / 100.0, 2),
             "currency": "USD",
             "created_at": (getattr(o, "external_created_at", None) or o.created_at).isoformat(),
@@ -212,7 +213,7 @@ async def get_orders(
     }
 
 # =============================================================================
-# Sync Endpoint
+# Sync Endpoint - Placeholder until leaflink_sync.py is fixed
 # =============================================================================
 @app.post("/sync/leaflink/run")
 async def run_leaflink_sync(
@@ -225,10 +226,15 @@ async def run_leaflink_sync(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     effective_brand_id = brand_id or get_active_brand_for_org(org_id)
-    result = await sync_leaflink_orders(db, effective_brand_id)
-    return result
 
-# Keep any other endpoints you have (ingest, etc.)
+    return {
+        "ok": True,
+        "message": "Sync endpoint is active. Full LeafLink sync will be enabled after fixing leaflink_sync.py",
+        "org_id": org_id,
+        "brand_id": effective_brand_id,
+    }
+
+# Keep any other endpoints you have (ingest_twin_orders, etc.)
 
 if __name__ == "__main__":
     import uvicorn
