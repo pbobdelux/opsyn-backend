@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import APIRouter, Query
+
+router = APIRouter(tags=["stubs"])
+
+
+def _envelope(key: str, value: Any, brand_id: str) -> dict:
+    return {
+        "ok": True,
+        "brand_id": brand_id,
+        key: value,
+    }
+
+
+@router.get("/customers")
+async def list_customers(brand_id: str = Query(..., description="Brand scope")):
+    return _envelope("customers", [], brand_id)
+
+
+@router.get("/routes")
+async def list_routes(brand_id: str = Query(..., description="Brand scope")):
+    return _envelope("routes", [], brand_id)
+
+
+@router.get("/drivers")
+async def list_drivers(brand_id: str = Query(..., description="Brand scope")):
+    return _envelope("drivers", [], brand_id)
+
+
+@router.get("/billing")
+async def list_billing(brand_id: str = Query(..., description="Brand scope")):
+    return _envelope("billing", [], brand_id)
+
+
+@router.get("/api/inventory")
+async def list_inventory(brand_id: str = Query(..., description="Brand scope")):
+    return _envelope("items", [], brand_id)
+
+
+@router.get("/api/packages")
+async def list_packages(brand_id: str = Query(..., description="Brand scope")):
+    return _envelope("packages", [], brand_id)
+
+
+@router.get("/api/packages/{package_id}")
+async def get_package(package_id: str, brand_id: str = Query(..., description="Brand scope")):
+    return {
+        "ok": True,
+        "brand_id": brand_id,
+        "package": None,
+    }
+
+
+@router.get("/mappings")
+async def list_mappings(brand_id: str = Query(..., description="Brand scope")):
+    return _envelope("mappings", [], brand_id)
+
+
+@router.get("/drafts")
+async def list_drafts(brand_id: str = Query(..., description="Brand scope")):
+    return _envelope("drafts", [], brand_id)
+
+
+@router.get("/production/batches")
+async def list_production_batches(brand_id: str = Query(..., description="Brand scope")):
+    return _envelope("batches", [], brand_id)
