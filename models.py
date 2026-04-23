@@ -1,8 +1,10 @@
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Integer,
@@ -11,7 +13,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -86,6 +88,13 @@ class Order(Base):
         passive_deletes=True,
     )
 
+    route_stops: Mapped[list["RouteStop"]] = relationship(
+        "RouteStop",
+        back_populates="order",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
 
 class OrderLine(Base):
     __tablename__ = "order_lines"
@@ -133,3 +142,51 @@ class OrganizationBrandBinding(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+
+class Route(Base):
+    __tablename__ = "routes"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    brand_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="draft")
+    driver_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    route_date: Mapped[Any] = mapped_column(Date, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+    stops: Mapped[list["RouteStop"]] = relationship(
+        "RouteStop",
+        back_populates="route",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="RouteStop.sequence",
+    )
+
+
+class RouteStop(Base):
+    __tablename__ = "route_stops"
+    __table_args__ = (
+        UniqueConstraint("route_id", "sequence", name="uq_route_stop_sequence"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    route_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routes.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    order_id: Mapped[int] = mapped_column(
+        ForeignKey("orders.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+    route: Mapped["Route"] = relationship("Route", back_populates="stops")
+    order: Mapped["Order"] = relationship("Order", back_populates="route_stops")
