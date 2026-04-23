@@ -199,3 +199,18 @@ class RouteStop(Base):
 
     route: Mapped["Route"] = relationship("Route", back_populates="stops")
     order: Mapped["Order | None"] = relationship("Order")
+
+
+# =============================================================================
+# Tenant Auth Model
+# =============================================================================
+
+class TenantCredential(Base):
+    __tablename__ = "tenant_credentials"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    org_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False, unique=True)
+    api_secret: Mapped[str] = mapped_column(String(255), nullable=False)  # hashed secret
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)

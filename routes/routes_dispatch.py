@@ -1,7 +1,8 @@
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,6 +10,9 @@ from sqlalchemy.orm import selectinload
 
 from database import get_db
 from models import Driver, Route, RouteStop
+from services.tenant_auth import get_authenticated_org, verify_tenant_access
+
+logger = logging.getLogger("routes_dispatch")
 
 router = APIRouter(prefix="/routes", tags=["routes"])
 
@@ -76,18 +80,23 @@ def serialize_route(route: Route, include_stops: bool = True) -> dict:
 async def create_route(
     org_id: str,
     body: RouteCreate,
+    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
+    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    verify_tenant_access(authenticated_org, org_id)
+
     # Validate driver belongs to this org if provided
     if body.driver_id is not None:
         driver_result = await db.execute(
-            select(Driver).where(Driver.id == body.driver_id, Driver.org_id == org_id)
+            select(Driver).where(Driver.id == body.driver_id, Driver.org_id == authenticated_org)
         )
         if not driver_result.scalar_one_or_none():
             raise HTTPException(status_code=404, detail="Driver not found")
 
     route = Route(
-        org_id=org_id,
+        org_id=authenticated_org,
         name=body.name,
         driver_id=body.driver_id,
         status=body.status or "pending",
@@ -102,18 +111,23 @@ async def create_route(
 @router.get("")
 async def list_routes(
     org_id: str,
+    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
+    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    verify_tenant_access(authenticated_org, org_id)
+
     result = await db.execute(
         select(Route)
         .options(selectinload(Route.stops))
-        .where(Route.org_id == org_id)
+        .where(Route.org_id == authenticated_org)
         .order_by(Route.created_at.desc())
     )
     routes = result.scalars().all()
     return {
         "ok": True,
-        "org_id": org_id,
+        "org_id": authenticated_org,
         "count": len(routes),
         "routes": [serialize_route(r) for r in routes],
     }
@@ -123,12 +137,17 @@ async def list_routes(
 async def get_route(
     org_id: str,
     route_id: int,
+    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
+    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    verify_tenant_access(authenticated_org, org_id)
+
     result = await db.execute(
         select(Route)
         .options(selectinload(Route.stops))
-        .where(Route.id == route_id, Route.org_id == org_id)
+        .where(Route.id == route_id, Route.org_id == authenticated_org)
     )
     route = result.scalar_one_or_none()
     if not route:
@@ -141,17 +160,22 @@ async def assign_driver(
     org_id: str,
     route_id: int,
     body: AssignDriverBody,
+    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
+    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    verify_tenant_access(authenticated_org, org_id)
+
     route_result = await db.execute(
-        select(Route).where(Route.id == route_id, Route.org_id == org_id)
+        select(Route).where(Route.id == route_id, Route.org_id == authenticated_org)
     )
     route = route_result.scalar_one_or_none()
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
 
     driver_result = await db.execute(
-        select(Driver).where(Driver.id == body.driver_id, Driver.org_id == org_id)
+        select(Driver).where(Driver.id == body.driver_id, Driver.org_id == authenticated_org)
     )
     if not driver_result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Driver not found")
@@ -168,10 +192,15 @@ async def add_stop(
     org_id: str,
     route_id: int,
     body: StopCreate,
+    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
+    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    verify_tenant_access(authenticated_org, org_id)
+
     route_result = await db.execute(
-        select(Route).where(Route.id == route_id, Route.org_id == org_id)
+        select(Route).where(Route.id == route_id, Route.org_id == authenticated_org)
     )
     if not route_result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Route not found")
@@ -195,10 +224,15 @@ async def add_stop(
 async def list_stops(
     org_id: str,
     route_id: int,
+    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
+    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    verify_tenant_access(authenticated_org, org_id)
+
     route_result = await db.execute(
-        select(Route).where(Route.id == route_id, Route.org_id == org_id)
+        select(Route).where(Route.id == route_id, Route.org_id == authenticated_org)
     )
     if not route_result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Route not found")

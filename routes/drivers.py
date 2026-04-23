@@ -2,13 +2,14 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import Driver
+from services.tenant_auth import get_authenticated_org, verify_tenant_access
 from services.twin_events import send_driver_event
 
 logger = logging.getLogger("drivers")
@@ -162,10 +163,15 @@ def _safe_serialize(driver: Driver) -> dict:
 async def create_driver(
     org_id: str,
     body: DriverCreate,
+    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
+    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    verify_tenant_access(authenticated_org, org_id)
+
     driver = Driver(
-        org_id=org_id,
+        org_id=authenticated_org,
         name=body.name,
         email=body.email,
         phone=body.phone,
@@ -184,9 +190,9 @@ async def create_driver(
     # Fire Twin event (fire-and-forget — never raises)
     await send_driver_event(
         event_type="driver_created",
-        org_id=org_id,
-        org_name=_org_name(org_id),
-        org_code=_org_code(org_id),
+        org_id=authenticated_org,
+        org_name=_org_name(authenticated_org),
+        org_code=_org_code(authenticated_org),
         driver_id=driver.id,
         driver_name=driver.name,
         driver_email=driver.email,
@@ -200,6 +206,8 @@ async def create_driver(
 @router.get("")
 async def list_drivers(
     org_id: str,
+    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
+    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
     """List all drivers for an organisation.
@@ -212,7 +220,10 @@ async def list_drivers(
     - The response shape ``{"ok": true, "org_id": ..., "count": N, "drivers": [...]}``
       is guaranteed regardless of what goes wrong.
     """
-    logger.info("list_drivers called for org_id=%s", org_id)
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    verify_tenant_access(authenticated_org, org_id)
+
+    logger.info("list_drivers called for org_id=%s", authenticated_org)
 
     # ------------------------------------------------------------------
     # 1. Fetch rows — isolate DB errors so they never propagate as 500s.
@@ -220,13 +231,13 @@ async def list_drivers(
     raw_drivers: list = []
     try:
         result = await db.execute(
-            select(Driver).where(Driver.org_id == org_id).order_by(Driver.created_at.desc())
+            select(Driver).where(Driver.org_id == authenticated_org).order_by(Driver.created_at.desc())
         )
         raw_drivers = list(result.scalars().all())
     except Exception as exc:
-        logger.error("list_drivers database error for org_id=%s: %s", org_id, exc)
+        logger.error("list_drivers database error for org_id=%s: %s", authenticated_org, exc)
         # Return a valid empty response — do not re-raise.
-        return {"ok": True, "org_id": org_id, "count": 0, "drivers": []}
+        return {"ok": True, "org_id": authenticated_org, "count": 0, "drivers": []}
 
     # ------------------------------------------------------------------
     # 2. Serialize each driver individually so one bad row can't abort
@@ -244,10 +255,10 @@ async def list_drivers(
     # ------------------------------------------------------------------
     # 3. Always return the guaranteed response shape.
     # ------------------------------------------------------------------
-    logger.info("list_drivers returning count=%d for org_id=%s", len(serialized), org_id)
+    logger.info("list_drivers returning count=%d for org_id=%s", len(serialized), authenticated_org)
     return {
         "ok": True,
-        "org_id": org_id,
+        "org_id": authenticated_org,
         "count": len(serialized),
         "drivers": serialized,
     }
@@ -257,10 +268,15 @@ async def list_drivers(
 async def get_driver(
     org_id: str,
     driver_id: int,
+    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
+    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    verify_tenant_access(authenticated_org, org_id)
+
     result = await db.execute(
-        select(Driver).where(Driver.id == driver_id, Driver.org_id == org_id)
+        select(Driver).where(Driver.id == driver_id, Driver.org_id == authenticated_org)
     )
     driver = result.scalar_one_or_none()
     if not driver:
@@ -273,10 +289,15 @@ async def update_driver(
     org_id: str,
     driver_id: int,
     body: DriverUpdate,
+    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
+    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    verify_tenant_access(authenticated_org, org_id)
+
     result = await db.execute(
-        select(Driver).where(Driver.id == driver_id, Driver.org_id == org_id)
+        select(Driver).where(Driver.id == driver_id, Driver.org_id == authenticated_org)
     )
     driver = result.scalar_one_or_none()
     if not driver:
@@ -310,9 +331,9 @@ async def update_driver(
     if pin_changed:
         await send_driver_event(
             event_type="driver_pin_reset",
-            org_id=org_id,
-            org_name=_org_name(org_id),
-            org_code=_org_code(org_id),
+            org_id=authenticated_org,
+            org_name=_org_name(authenticated_org),
+            org_code=_org_code(authenticated_org),
             driver_id=driver.id,
             driver_name=driver.name,
             driver_email=driver.email,
