@@ -1,8 +1,10 @@
 from datetime import datetime, timezone
 from typing import Any
+import uuid
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Integer,
@@ -11,7 +13,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -133,3 +135,170 @@ class OrganizationBrandBinding(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+
+# =============================================================================
+# Driver Auth Models
+# =============================================================================
+
+
+class Organization(Base):
+    """Dispatcher-managed organization. Drivers authenticate via org_code + PIN."""
+
+    __tablename__ = "organizations"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    org_code: Mapped[str] = mapped_column(String(80), nullable=False, unique=True, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+    drivers: Mapped[list["Driver"]] = relationship(
+        "Driver", back_populates="organization", cascade="all, delete-orphan"
+    )
+
+
+class Driver(Base):
+    """A driver belonging to an organization."""
+
+    __tablename__ = "drivers"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    full_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # status: "active" | "inactive" | "suspended"
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="active")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+    organization: Mapped["Organization"] = relationship("Organization", back_populates="drivers")
+    auth: Mapped["DriverAuth | None"] = relationship(
+        "DriverAuth", back_populates="driver", uselist=False, cascade="all, delete-orphan"
+    )
+    routes: Mapped[list["Route"]] = relationship("Route", back_populates="driver")
+
+
+class DriverAuth(Base):
+    """Stores the bcrypt-hashed PIN for a driver."""
+
+    __tablename__ = "driver_auth"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    driver_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("drivers.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    pin_hash: Mapped[str] = mapped_column(Text, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+    driver: Mapped["Driver"] = relationship("Driver", back_populates="auth")
+
+
+# =============================================================================
+# Route Model (from routing PR #2 — referenced here for active_route lookup)
+# =============================================================================
+
+
+class Route(Base):
+    """
+    Delivery route assigned to a driver.
+
+    This model mirrors the schema introduced in routing PR #2.
+    If that PR has not yet been merged, the table may not exist in the database;
+    active_route lookups will fail gracefully and return null.
+    """
+
+    __tablename__ = "routes"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True
+    )
+    driver_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("drivers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    org_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # status: "draft" | "assigned" | "in_progress" | "completed" | "cancelled"
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="draft")
+    route_date: Mapped[datetime | None] = mapped_column(Date, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+    driver: Mapped["Driver | None"] = relationship("Driver", back_populates="routes")
+    stops: Mapped[list["RouteStop"]] = relationship(
+        "RouteStop", back_populates="route", cascade="all, delete-orphan"
+    )
+
+
+class RouteStop(Base):
+    """An individual stop on a delivery route."""
+
+    __tablename__ = "route_stops"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True
+    )
+    route_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routes.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    stop_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    customer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+    route: Mapped["Route"] = relationship("Route", back_populates="stops")

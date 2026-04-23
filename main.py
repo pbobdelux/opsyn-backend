@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 from ai.twin_ai import handle_twin_sync
 from database import Base, engine, get_db
 from models import Order, OrderLine
+from routes.driver_login import router as driver_login_router
 
 logger = logging.getLogger("opsyn-backend")
 logging.basicConfig(
@@ -261,6 +262,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(driver_login_router)
 
 # =============================================================================
 # Auth Endpoints
