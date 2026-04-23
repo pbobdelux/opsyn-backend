@@ -37,6 +37,10 @@ class DriverCreate(BaseModel):
     name: str
     # Email is required for new drivers and must be a valid format.
     email: str
+    # PIN is required for new drivers and must be exactly 4 numeric digits.
+    # The client (Opsyn Brand app) is solely responsible for generating and
+    # supplying the PIN — the backend never generates one.
+    pin: str
     phone: Optional[str] = None
     license_plate: Optional[str] = None
     status: Optional[str] = "available"
@@ -52,6 +56,14 @@ class DriverCreate(BaseModel):
         local, _, domain = v.partition("@")
         if not local or not domain or "." not in domain:
             raise ValueError("Email must be a valid address (e.g. user@example.com)")
+        return v
+
+    @field_validator("pin")
+    @classmethod
+    def validate_pin(cls, v: str) -> str:
+        if len(v) != 4 or not v.isdigit():
+            logger.warning("DriverCreate PIN validation failed: must be exactly 4 numeric digits")
+            raise ValueError("PIN must be exactly 4 numeric digits")
         return v
 
 
@@ -84,6 +96,7 @@ class DriverUpdate(BaseModel):
         if v is None:
             return v
         if len(v) != 4 or not v.isdigit():
+            logger.warning("DriverUpdate PIN validation failed: must be exactly 4 numeric digits")
             raise ValueError("PIN must be exactly 4 numeric digits")
         return v
 
@@ -153,10 +166,13 @@ async def create_driver(
         phone=body.phone,
         license_plate=body.license_plate,
         status=body.status or "available",
+        pin=body.pin,
     )
     db.add(driver)
     await db.commit()
     await db.refresh(driver)
+
+    logger.info("driver_id=%s created with PIN set", driver.id)
 
     serialized = _safe_serialize(driver)
 
@@ -241,6 +257,9 @@ async def update_driver(
     await db.commit()
     await db.refresh(driver)
 
+    if pin_changed:
+        logger.info("driver_id=%s PIN updated", driver.id)
+
     serialized = _safe_serialize(driver)
 
     # Fire Twin event only when the PIN was actually changed
@@ -256,5 +275,6 @@ async def update_driver(
             driver_phone=driver.phone,
             driver_pin=driver.pin,
         )
+        logger.info("driver_id=%s PIN updated, Twin event fired", driver.id)
 
     return {"ok": True, "driver": serialized}

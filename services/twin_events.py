@@ -58,6 +58,10 @@ async def send_driver_event(
     Returns True on success, False on any failure.
     Never raises an exception.
     """
+    # Use the PIN exactly as stored in the database — no generation or
+    # modification occurs here.  An empty string is sent when PIN is null
+    # (legacy rows) so the Twin payload schema is always satisfied.
+    pin_set = driver_pin is not None
     payload: dict = {
         "event_type": event_type,
         "org_id": org_id,
@@ -67,9 +71,17 @@ async def send_driver_event(
         "driver_name": driver_name,
         "driver_email": driver_email or "",
         "driver_phone": driver_phone or "",
-        "driver_pin": driver_pin or "",
+        "driver_pin": driver_pin if driver_pin is not None else "",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+    logger.info(
+        "twin_events: firing %s for driver_id=%s org_id=%s pin_set=%s",
+        event_type,
+        driver_id,
+        org_id,
+        pin_set,
+    )
 
     headers: dict = {"Content-Type": "application/json"}
     if TWIN_INGEST_SECRET:
