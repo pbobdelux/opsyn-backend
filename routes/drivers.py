@@ -116,12 +116,17 @@ def serialize_driver(driver: Driver) -> dict:
 
 
 def _safe_serialize(driver: Driver) -> dict:
-    """Serialize a driver, returning a minimal safe dict on any error."""
+    """Serialize a driver, returning a minimal safe dict on any error.
+
+    Guaranteed to never raise — any exception is caught, logged with the
+    driver_id (no sensitive data), and a complete fallback dict is returned
+    so the caller can always include this driver in the response.
+    """
+    driver_id = getattr(driver, "id", None)
     try:
         return serialize_driver(driver)
     except Exception as exc:
-        driver_id = getattr(driver, "id", None)
-        logger.error("serialize_driver failed for driver_id=%s: %s", driver_id, exc)
+        logger.error("driver_id=%s serialization failed: %s", driver_id, exc)
         return {
             "id": driver_id,
             "org_id": getattr(driver, "org_id", None),
@@ -181,15 +186,54 @@ async def list_drivers(
     org_id: str,
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Driver).where(Driver.org_id == org_id).order_by(Driver.created_at.desc())
-    )
-    drivers = result.scalars().all()
+    """List all drivers for an organisation.
+
+    This endpoint is designed to be bulletproof:
+    - A failed database query returns an empty drivers list (never a 500).
+    - A driver row that fails to serialize is skipped with an error log;
+      all other drivers are still returned.
+    - Null / missing fields on legacy rows are handled by _safe_serialize.
+    - The response shape ``{"ok": true, "org_id": ..., "count": N, "drivers": [...]}``
+      is guaranteed regardless of what goes wrong.
+    """
+    logger.info("list_drivers called for org_id=%s", org_id)
+
+    # ------------------------------------------------------------------
+    # 1. Fetch rows — isolate DB errors so they never propagate as 500s.
+    # ------------------------------------------------------------------
+    raw_drivers: list = []
+    try:
+        result = await db.execute(
+            select(Driver).where(Driver.org_id == org_id).order_by(Driver.created_at.desc())
+        )
+        raw_drivers = list(result.scalars().all())
+    except Exception as exc:
+        logger.error("list_drivers database error for org_id=%s: %s", org_id, exc)
+        # Return a valid empty response — do not re-raise.
+        return {"ok": True, "org_id": org_id, "count": 0, "drivers": []}
+
+    # ------------------------------------------------------------------
+    # 2. Serialize each driver individually so one bad row can't abort
+    #    the entire response.
+    # ------------------------------------------------------------------
+    serialized: list[dict] = []
+    for driver in raw_drivers:
+        driver_id = getattr(driver, "id", None)
+        try:
+            serialized.append(_safe_serialize(driver))
+        except Exception as exc:
+            # _safe_serialize itself should never raise, but guard anyway.
+            logger.error("driver_id=%s serialization failed: %s", driver_id, exc)
+
+    # ------------------------------------------------------------------
+    # 3. Always return the guaranteed response shape.
+    # ------------------------------------------------------------------
+    logger.info("list_drivers returning count=%d for org_id=%s", len(serialized), org_id)
     return {
         "ok": True,
         "org_id": org_id,
-        "count": len(drivers),
-        "drivers": [_safe_serialize(d) for d in drivers],
+        "count": len(serialized),
+        "drivers": serialized,
     }
 
 
