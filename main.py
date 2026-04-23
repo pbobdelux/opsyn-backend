@@ -16,6 +16,7 @@ from database import Base, engine, get_db
 from models import Order, OrderLine
 from routes.drivers import router as drivers_router
 from routes.routes_dispatch import router as routes_dispatch_router
+from services.tenant_auth import get_authenticated_org
 
 logger = logging.getLogger("opsyn-backend")
 logging.basicConfig(
@@ -331,9 +332,15 @@ async def get_orders(
     brand_id: Optional[str] = Query(default=None),
     status: Optional[str] = Query(default=None),
     q: Optional[str] = Query(default=None),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    effective_org_id = org_id or "org_onboarding"
+    if x_opsyn_org and x_opsyn_secret:
+        authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+        effective_org_id = authenticated_org
+    else:
+        effective_org_id = org_id or "org_onboarding"
     effective_brand_id = brand_id or get_active_brand_for_org(effective_org_id)
 
     if not effective_brand_id:
@@ -403,9 +410,15 @@ async def get_order_detail(
     order_id: int,
     org_id: Optional[str] = Query(default=None),
     brand_id: Optional[str] = Query(default=None),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    effective_org_id = org_id or "org_onboarding"
+    if x_opsyn_org and x_opsyn_secret:
+        authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+        effective_org_id = authenticated_org
+    else:
+        effective_org_id = org_id or "org_onboarding"
     effective_brand_id = brand_id or get_active_brand_for_org(effective_org_id)
 
     query_stmt = (
@@ -439,10 +452,16 @@ async def mark_line_pulled(
     data: dict,
     org_id: Optional[str] = Query(default=None),
     brand_id: Optional[str] = Query(default=None),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
     """Mark an order line as pulled. Increments pulled_qty by the amount specified."""
-    effective_org_id = org_id or "org_onboarding"
+    if x_opsyn_org and x_opsyn_secret:
+        authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+        effective_org_id = authenticated_org
+    else:
+        effective_org_id = org_id or "org_onboarding"
     effective_brand_id = brand_id or get_active_brand_for_org(effective_org_id)
 
     order_stmt = select(Order).where(Order.id == order_id)
@@ -497,10 +516,16 @@ async def mark_line_packed(
     data: dict,
     org_id: Optional[str] = Query(default=None),
     brand_id: Optional[str] = Query(default=None),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
     """Mark an order line as packed. Increments packed_qty by the amount specified."""
-    effective_org_id = org_id or "org_onboarding"
+    if x_opsyn_org and x_opsyn_secret:
+        authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+        effective_org_id = authenticated_org
+    else:
+        effective_org_id = org_id or "org_onboarding"
     effective_brand_id = brand_id or get_active_brand_for_org(effective_org_id)
 
     order_stmt = select(Order).where(Order.id == order_id)
@@ -552,13 +577,19 @@ async def mark_line_packed(
 async def get_master_pick_list(
     org_id: Optional[str] = Query(default=None),
     brand_id: Optional[str] = Query(default=None),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Returns aggregated pick list: SKU + product name grouped with total remaining qty.
     Remaining qty = quantity - pulled_qty for each line.
     """
-    effective_org_id = org_id or "org_onboarding"
+    if x_opsyn_org and x_opsyn_secret:
+        authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+        effective_org_id = authenticated_org
+    else:
+        effective_org_id = org_id or "org_onboarding"
     effective_brand_id = brand_id or get_active_brand_for_org(effective_org_id)
 
     if not effective_brand_id:
