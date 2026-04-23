@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -8,8 +9,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import Driver
+from services.twin_events import send_driver_event
+
+logger = logging.getLogger("drivers")
 
 router = APIRouter(prefix="/drivers", tags=["drivers"])
+
+# Org metadata used in Twin event payloads.  Extend as needed.
+_ORG_META: dict[str, dict] = {
+    "org_onboarding": {"name": "Opsyn Onboarding", "code": "org_onboarding"},
+}
+
+
+def _org_name(org_id: str) -> str:
+    return _ORG_META.get(org_id, {}).get("name", org_id)
+
+
+def _org_code(org_id: str) -> str:
+    return _ORG_META.get(org_id, {}).get("code", org_id)
 
 
 # =============================================================================
@@ -18,6 +35,7 @@ router = APIRouter(prefix="/drivers", tags=["drivers"])
 
 class DriverCreate(BaseModel):
     name: str
+    email: Optional[str] = None
     phone: Optional[str] = None
     license_plate: Optional[str] = None
     status: Optional[str] = "available"
@@ -25,6 +43,7 @@ class DriverCreate(BaseModel):
 
 class DriverUpdate(BaseModel):
     name: Optional[str] = None
+    email: Optional[str] = None
     phone: Optional[str] = None
     license_plate: Optional[str] = None
     status: Optional[str] = None
@@ -40,18 +59,52 @@ class DriverUpdate(BaseModel):
         return v
 
 
+# =============================================================================
+# Serialization
+# =============================================================================
+
 def serialize_driver(driver: Driver) -> dict:
+    """
+    Convert a Driver ORM instance to a plain dict.
+
+    All attribute accesses use getattr with safe defaults so that legacy rows
+    missing newer columns (e.g. email) never cause a 500.
+    """
+    created_at = getattr(driver, "created_at", None)
+    updated_at = getattr(driver, "updated_at", None)
     return {
-        "id": driver.id,
-        "org_id": driver.org_id,
-        "name": driver.name,
-        "phone": driver.phone,
-        "license_plate": driver.license_plate,
-        "status": driver.status,
-        "pin": driver.pin,
-        "created_at": driver.created_at.isoformat() if driver.created_at else None,
-        "updated_at": driver.updated_at.isoformat() if driver.updated_at else None,
+        "id": getattr(driver, "id", None),
+        "org_id": getattr(driver, "org_id", None),
+        "name": getattr(driver, "name", None) or "",
+        "email": getattr(driver, "email", None),
+        "phone": getattr(driver, "phone", None),
+        "license_plate": getattr(driver, "license_plate", None),
+        "status": getattr(driver, "status", None) or "available",
+        "pin": getattr(driver, "pin", None),
+        "created_at": created_at.isoformat() if created_at else None,
+        "updated_at": updated_at.isoformat() if updated_at else None,
     }
+
+
+def _safe_serialize(driver: Driver) -> dict:
+    """Serialize a driver, returning a minimal safe dict on any error."""
+    try:
+        return serialize_driver(driver)
+    except Exception as exc:
+        driver_id = getattr(driver, "id", None)
+        logger.error("serialize_driver failed for driver_id=%s: %s", driver_id, exc)
+        return {
+            "id": driver_id,
+            "org_id": getattr(driver, "org_id", None),
+            "name": getattr(driver, "name", None) or "",
+            "email": None,
+            "phone": None,
+            "license_plate": None,
+            "status": "available",
+            "pin": None,
+            "created_at": None,
+            "updated_at": None,
+        }
 
 
 # =============================================================================
@@ -67,6 +120,7 @@ async def create_driver(
     driver = Driver(
         org_id=org_id,
         name=body.name,
+        email=body.email,
         phone=body.phone,
         license_plate=body.license_plate,
         status=body.status or "available",
@@ -74,7 +128,23 @@ async def create_driver(
     db.add(driver)
     await db.commit()
     await db.refresh(driver)
-    return {"ok": True, "driver": serialize_driver(driver)}
+
+    serialized = _safe_serialize(driver)
+
+    # Fire Twin event (fire-and-forget — never raises)
+    await send_driver_event(
+        event_type="driver_created",
+        org_id=org_id,
+        org_name=_org_name(org_id),
+        org_code=_org_code(org_id),
+        driver_id=driver.id,
+        driver_name=driver.name,
+        driver_email=driver.email,
+        driver_phone=driver.phone,
+        driver_pin=driver.pin,
+    )
+
+    return {"ok": True, "driver": serialized}
 
 
 @router.get("")
@@ -90,7 +160,7 @@ async def list_drivers(
         "ok": True,
         "org_id": org_id,
         "count": len(drivers),
-        "drivers": [serialize_driver(d) for d in drivers],
+        "drivers": [_safe_serialize(d) for d in drivers],
     }
 
 
@@ -106,7 +176,7 @@ async def get_driver(
     driver = result.scalar_one_or_none()
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
-    return {"ok": True, "driver": serialize_driver(driver)}
+    return {"ok": True, "driver": _safe_serialize(driver)}
 
 
 @router.patch("/{driver_id}")
@@ -123,8 +193,12 @@ async def update_driver(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
 
+    pin_changed = body.pin is not None and body.pin != driver.pin
+
     if body.name is not None:
         driver.name = body.name
+    if body.email is not None:
+        driver.email = body.email
     if body.phone is not None:
         driver.phone = body.phone
     if body.license_plate is not None:
@@ -137,4 +211,21 @@ async def update_driver(
     driver.updated_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(driver)
-    return {"ok": True, "driver": serialize_driver(driver)}
+
+    serialized = _safe_serialize(driver)
+
+    # Fire Twin event only when the PIN was actually changed
+    if pin_changed:
+        await send_driver_event(
+            event_type="driver_pin_reset",
+            org_id=org_id,
+            org_name=_org_name(org_id),
+            org_code=_org_code(org_id),
+            driver_id=driver.id,
+            driver_name=driver.name,
+            driver_email=driver.email,
+            driver_phone=driver.phone,
+            driver_pin=driver.pin,
+        )
+
+    return {"ok": True, "driver": serialized}
