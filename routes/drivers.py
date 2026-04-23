@@ -35,10 +35,24 @@ def _org_code(org_id: str) -> str:
 
 class DriverCreate(BaseModel):
     name: str
-    email: Optional[str] = None
+    # Email is required for new drivers and must be a valid format.
+    email: str
     phone: Optional[str] = None
     license_plate: Optional[str] = None
     status: Optional[str] = "available"
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        v = v.strip()
+        if len(v) < 5 or len(v) > 254:
+            raise ValueError("Email must be between 5 and 254 characters")
+        if "@" not in v:
+            raise ValueError("Email must contain '@'")
+        local, _, domain = v.partition("@")
+        if not local or not domain or "." not in domain:
+            raise ValueError("Email must be a valid address (e.g. user@example.com)")
+        return v
 
 
 class DriverUpdate(BaseModel):
@@ -48,6 +62,21 @@ class DriverUpdate(BaseModel):
     license_plate: Optional[str] = None
     status: Optional[str] = None
     pin: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip()
+        if len(v) < 5 or len(v) > 254:
+            raise ValueError("Email must be between 5 and 254 characters")
+        if "@" not in v:
+            raise ValueError("Email must contain '@'")
+        local, _, domain = v.partition("@")
+        if not local or not domain or "." not in domain:
+            raise ValueError("Email must be a valid address (e.g. user@example.com)")
+        return v
 
     @field_validator("pin")
     @classmethod
