@@ -163,11 +163,11 @@ def _safe_serialize(driver: Driver) -> dict:
 async def create_driver(
     org_id: str,
     body: DriverCreate,
-    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
-    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
     verify_tenant_access(authenticated_org, org_id)
 
     driver = Driver(
@@ -206,8 +206,8 @@ async def create_driver(
 @router.get("")
 async def list_drivers(
     org_id: str,
-    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
-    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
     """List all drivers for an organisation.
@@ -220,7 +220,7 @@ async def list_drivers(
     - The response shape ``{"ok": true, "org_id": ..., "count": N, "drivers": [...]}``
       is guaranteed regardless of what goes wrong.
     """
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
     verify_tenant_access(authenticated_org, org_id)
 
     logger.info("list_drivers called for org_id=%s", authenticated_org)
@@ -268,11 +268,11 @@ async def list_drivers(
 async def get_driver(
     org_id: str,
     driver_id: int,
-    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
-    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
     verify_tenant_access(authenticated_org, org_id)
 
     result = await db.execute(
@@ -289,11 +289,11 @@ async def update_driver(
     org_id: str,
     driver_id: int,
     body: DriverUpdate,
-    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
-    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
     verify_tenant_access(authenticated_org, org_id)
 
     result = await db.execute(
