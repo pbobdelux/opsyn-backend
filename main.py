@@ -5,13 +5,10 @@ import os
 import traceback
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-# =========================
-# Logging
-# =========================
 logger = logging.getLogger("opsyn-backend")
 logging.basicConfig(
     level=logging.INFO,
@@ -21,17 +18,13 @@ logging.basicConfig(
 APP_NAME = "Opsyn Backend"
 APP_ENV = os.getenv("ENVIRONMENT", "production")
 
+DRIVERS = {}
 
-# =========================
-# Helpers
-# =========================
+
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-# =========================
-# Lifespan
-# =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Starting {APP_NAME} in {APP_ENV}")
@@ -41,10 +34,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
 
-
-# =========================
-# Middleware
-# =========================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -72,32 +61,76 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
-# =========================
-# Routes
-# =========================
 @app.get("/")
 def root():
-    return {
-        "ok": True,
-        "service": APP_NAME,
-        "env": APP_ENV,
-    }
+    return {"ok": True, "service": APP_NAME, "env": APP_ENV}
 
 
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "status": "healthy",
-        "time": utc_now_iso(),
-    }
+    return {"ok": True, "status": "healthy", "time": utc_now_iso()}
 
 
 @app.get("/orders")
 def get_orders():
+    return {"ok": True, "orders": []}
+
+
+@app.post("/orders")
+def receive_orders(body: dict):
+    return {"ok": True, "received": True}
+
+
+@app.post("/error")
+def receive_error(body: dict):
+    logger.error(f"Client reported error: {body}")
+    return {"ok": True, "received": True}
+
+
+@app.post("/api/twin/leaflink/snapshot")
+def receive_leaflink_snapshot(body: dict):
+    return {"ok": True, "received": True}
+
+
+@app.get("/organizations/{org_id}/drivers")
+def get_drivers(org_id: str):
     return {
         "ok": True,
-        "orders": [],
+        "org_id": org_id,
+        "drivers": DRIVERS.get(org_id, []),
+    }
+
+
+@app.post("/organizations/{org_id}/drivers")
+def create_driver(org_id: str, body: dict):
+    required = ["name", "email", "phone", "pin"]
+    missing = [field for field in required if not body.get(field)]
+
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing required driver fields: {', '.join(missing)}",
+        )
+
+    driver = {
+        "id": f"driver_{len(DRIVERS.get(org_id, [])) + 1}",
+        "org_id": org_id,
+        "name": body.get("name"),
+        "email": body.get("email"),
+        "phone": body.get("phone"),
+        "pin": body.get("pin"),
+        "license_plate": body.get("license_plate"),
+        "notes": body.get("notes"),
+        "is_active": body.get("is_active", True),
+        "created_at": utc_now_iso(),
+    }
+
+    DRIVERS.setdefault(org_id, []).append(driver)
+
+    return {
+        "ok": True,
+        "message": "Driver created",
+        "driver": driver,
     }
 
 
@@ -108,15 +141,9 @@ def sync_leaflink(x_opsyn_secret: Optional[str] = Header(None)):
     if expected and x_opsyn_secret != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    return {
-        "ok": True,
-        "message": "Sync endpoint reachable",
-    }
+    return {"ok": True, "message": "Sync endpoint reachable"}
 
 
-# =========================
-# Run
-# =========================
 if __name__ == "__main__":
     import uvicorn
 
