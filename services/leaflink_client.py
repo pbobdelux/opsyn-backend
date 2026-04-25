@@ -225,13 +225,24 @@ class LeafLinkClient:
         return str(name) if name else "Unknown Customer"
 
     def _extract_line_items(self, raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # Try multiple field names for line items (LeafLink API variations)
         candidate = (
             raw.get("line_items")
             or raw.get("items")
+            or raw.get("order_items")
             or raw.get("products")
             or raw.get("ordered_items")
+            or raw.get("line_item_list")
+            or raw.get("order_lines")
             or []
         )
+
+        # Log if we found line items
+        if candidate:
+            logger.info(
+                "leaflink: extract_line_items found candidate count=%s",
+                len(candidate) if isinstance(candidate, list) else 1,
+            )
 
         if not isinstance(candidate, list):
             return []

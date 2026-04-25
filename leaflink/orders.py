@@ -79,9 +79,11 @@ def serialize_json_line(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_line_items(order: Order) -> list[dict[str, Any]]:
+    # Try OrderLine table first (most reliable)
     if getattr(order, "lines", None):
         return [serialize_line(line) for line in order.lines]
 
+    # Try line_items_json (normalized data from sync)
     raw = order.line_items_json
     if isinstance(raw, list):
         return [serialize_json_line(item) for item in raw if isinstance(item, dict)]
@@ -90,6 +92,28 @@ def build_line_items(order: Order) -> list[dict[str, Any]]:
         nested = raw.get("line_items")
         if isinstance(nested, list):
             return [serialize_json_line(item) for item in nested if isinstance(item, dict)]
+
+    # Fallback: extract from raw_payload if line_items_json is empty
+    if order.raw_payload and isinstance(order.raw_payload, dict):
+        raw_payload = order.raw_payload
+        # Try multiple field names
+        candidate = (
+            raw_payload.get("line_items")
+            or raw_payload.get("items")
+            or raw_payload.get("order_items")
+            or raw_payload.get("products")
+            or raw_payload.get("ordered_items")
+            or []
+        )
+        if isinstance(candidate, list):
+            items = [serialize_json_line(item) for item in candidate if isinstance(item, dict)]
+            if items:
+                logger.info(
+                    "leaflink: build_line_items fallback_from_raw_payload order_id=%s count=%s",
+                    order.id,
+                    len(items),
+                )
+                return items
 
     return []
 
