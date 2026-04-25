@@ -17,14 +17,10 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+
 from database import get_db
-from services.ai_service import (
-    build_attention_summary,
-    get_compliance_issues_count,
-    get_low_inventory_count,
-    get_pending_orders_count,
-)
-from services import assistant_action_registry as registry
+from services.attention_engine import get_operational_attention
+
 
 logger = logging.getLogger("ai_routes")
 
@@ -48,9 +44,10 @@ async def get_attention(
       - role (optional)
       - facility_id (optional)
       - app_context (optional)
+      - brand_id (optional)
 
-    Returns a structured summary suitable for ElevenLabs voice responses
-    and Brand App status cards.
+    Returns a comprehensive operational priority report suitable for
+    ElevenLabs voice responses and Brand App status cards.
     """
     org_id: Optional[str] = body.get("org_id")
     user_id: Optional[str] = body.get("user_id")
@@ -70,63 +67,27 @@ async def get_attention(
         )
 
     logger.info(
-        "get_attention org_id=%s user_id=%s app_context=%s",
+        "attention_request_received org_id=%s user_id=%s app_context=%s",
         org_id,
         user_id or "unknown",
         app_context or "unknown",
     )
 
-    errors: list[str] = []
-
     try:
-        pending = await get_pending_orders_count(db, org_id, brand_id)
-        low_inv = await get_low_inventory_count(db, org_id)
-        compliance = await get_compliance_issues_count(db, org_id)
-
-        # Query detailed order breakdowns from the action registry handlers
-        review_result = await registry.execute_action(db, "get_orders_needing_review", org_id, {})
-        packed_result = await registry.execute_action(db, "get_orders_needing_packed", org_id, {})
-        blocked_result = await registry.execute_action(db, "get_blocked_orders", org_id, {})
-
-        orders_needing_review = review_result.get("count", 0) if review_result.get("ok") else 0
-        orders_ready_to_pack = packed_result.get("count", 0) if packed_result.get("ok") else 0
-        blocked_orders = blocked_result.get("count", 0) if blocked_result.get("ok") else 0
-
-        if not review_result.get("ok") and review_result.get("error"):
-            errors.append(f"orders_needing_review: {review_result['error']}")
-        if not packed_result.get("ok") and packed_result.get("error"):
-            errors.append(f"orders_ready_to_pack: {packed_result['error']}")
-        if not blocked_result.get("ok") and blocked_result.get("error"):
-            errors.append(f"blocked_orders: {blocked_result['error']}")
-
-        # Determine data source
-        has_data = (pending + orders_needing_review + orders_ready_to_pack + blocked_orders) > 0
-        data_source = "database" if has_data else "stub"
-
-        summary = build_attention_summary(pending, low_inv, compliance)
+        report = await get_operational_attention(db, org_id, brand_id)
 
         logger.info(
-            "get_attention result org_id=%s pending=%d review=%d pack=%d blocked=%d data_source=%s",
+            "attention_analysis_complete org_id=%s user_id=%s order_count=%d "
+            "priority_count=%d severity=%s data_source=%s",
             org_id,
-            pending,
-            orders_needing_review,
-            orders_ready_to_pack,
-            blocked_orders,
-            data_source,
+            user_id or "unknown",
+            report.get("counts", {}).get("total_orders", 0),
+            len(report.get("top_priorities", [])),
+            report.get("severity", "unknown"),
+            report.get("data_source", "unknown"),
         )
 
-        return {
-            "ok": True,
-            "pending_orders": pending,
-            "orders_needing_review": orders_needing_review,
-            "orders_ready_to_pack": orders_ready_to_pack,
-            "blocked_orders": blocked_orders,
-            "low_inventory": low_inv,
-            "compliance_issues": compliance,
-            "summary": summary,
-            "data_source": data_source,
-            "errors": errors,
-        }
+        return report
 
     except Exception as exc:
         logger.error("get_attention failed for org_id=%s: %s", org_id, exc)

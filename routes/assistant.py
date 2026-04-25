@@ -144,6 +144,14 @@ async def command(
 
     Safe actions are executed immediately. Medium/high-risk actions return
     a confirmation_id that must be confirmed via POST /assistant/confirm.
+
+    Certain natural-language phrases are intercepted before the general
+    orchestrator and routed directly to the attention engine:
+      - "what needs my attention"
+      - "what should I focus on"
+      - "what is wrong today"
+      - "what needs fixed"
+      - "give me my morning report"
     """
     logger.info(
         "assistant/command: org_id=%s user_id=%s intent_message_len=%d",
@@ -152,6 +160,74 @@ async def command(
         len(body.message),
     )
 
+    # ------------------------------------------------------------------
+    # Attention engine trigger — intercept before general orchestrator
+    # ------------------------------------------------------------------
+    _ATTENTION_TRIGGERS = [
+        "what needs my attention",
+        "what should i focus on",
+        "what is wrong today",
+        "what needs fixed",
+        "what needs to be fixed",
+        "give me my morning report",
+        "morning report",
+        "what do i need to do",
+        "what should i work on",
+        "operational status",
+        "daily briefing",
+        "what's going on",
+        "whats going on",
+    ]
+    _lower_message = body.message.lower().strip()
+    if any(trigger in _lower_message for trigger in _ATTENTION_TRIGGERS):
+        logger.info(
+            "attention_request_received org_id=%s user_id=%s trigger=nl_command",
+            body.org_id,
+            body.user_id or "unknown",
+        )
+        try:
+            from services.attention_engine import get_operational_attention
+
+            report = await get_operational_attention(db, body.org_id)
+
+            logger.info(
+                "attention_analysis_complete org_id=%s user_id=%s order_count=%d "
+                "priority_count=%d severity=%s data_source=%s",
+                body.org_id,
+                body.user_id or "unknown",
+                report.get("counts", {}).get("total_orders", 0),
+                len(report.get("top_priorities", [])),
+                report.get("severity", "unknown"),
+                report.get("data_source", "unknown"),
+            )
+
+            return {
+                "ok": True,
+                "intent": "get_attention",
+                "confidence": 1.0,
+                "risk_level": "safe",
+                "requires_confirmation": False,
+                "confirmation_id": None,
+                "proposed_actions": ["get_attention"],
+                "spoken_reply": report.get("spoken_reply", ""),
+                "screen_reply": report.get("screen_reply", ""),
+                "data": report,
+                "errors": report.get("errors", []),
+            }
+        except Exception as exc:
+            logger.exception(
+                "assistant/command: attention engine failed for org_id=%s", body.org_id
+            )
+            return {
+                "ok": False,
+                "error": "attention_engine_error",
+                "message": "Failed to retrieve operational attention report.",
+                "errors": [str(exc)],
+            }
+
+    # ------------------------------------------------------------------
+    # General orchestrator path
+    # ------------------------------------------------------------------
     try:
         result = await orchestrator.process_command(
             db=db,
@@ -384,48 +460,28 @@ async def elevenlabs_tool(
             "error": {"code": "missing_org_id", "message": "org_id is required in parameters or args"},
         }
 
+
     # ------------------------------------------------------------------
-    # Special case: get_attention → call the /ai/get-attention logic
+    # Special case: get_attention → call the attention engine
     # ------------------------------------------------------------------
     if tool_name == "get_attention":
         try:
-            from services.ai_service import (
-                build_attention_summary,
-                get_compliance_issues_count,
-                get_low_inventory_count,
-                get_pending_orders_count,
-            )
+            from services.attention_engine import get_operational_attention
 
             brand_id: Optional[str] = parameters.get("brand_id")
-            pending = await get_pending_orders_count(db, org_id, brand_id)
-            low_inv = await get_low_inventory_count(db, org_id)
-            compliance = await get_compliance_issues_count(db, org_id)
+            report = await get_operational_attention(db, org_id, brand_id)
 
-            review_result = await registry.execute_action(db, "get_orders_needing_review", org_id, {})
-            packed_result = await registry.execute_action(db, "get_orders_needing_packed", org_id, {})
-            blocked_result = await registry.execute_action(db, "get_blocked_orders", org_id, {})
+            logger.info(
+                "attention_analysis_complete org_id=%s order_count=%d "
+                "priority_count=%d severity=%s data_source=%s",
+                org_id,
+                report.get("counts", {}).get("total_orders", 0),
+                len(report.get("top_priorities", [])),
+                report.get("severity", "unknown"),
+                report.get("data_source", "unknown"),
+            )
 
-            orders_needing_review = review_result.get("count", 0) if review_result.get("ok") else 0
-            orders_ready_to_pack = packed_result.get("count", 0) if packed_result.get("ok") else 0
-            blocked_orders = blocked_result.get("count", 0) if blocked_result.get("ok") else 0
-
-            has_data = (pending + orders_needing_review + orders_ready_to_pack + blocked_orders) > 0
-            data_source = "database" if has_data else "stub"
-            summary = build_attention_summary(pending, low_inv, compliance)
-
-            result = {
-                "ok": True,
-                "pending_orders": pending,
-                "orders_needing_review": orders_needing_review,
-                "orders_ready_to_pack": orders_ready_to_pack,
-                "blocked_orders": blocked_orders,
-                "low_inventory": low_inv,
-                "compliance_issues": compliance,
-                "summary": summary,
-                "data_source": data_source,
-                "errors": [],
-            }
-            return {"result": result, "error": None}
+            return {"result": report, "error": None}
         except Exception as exc:
             logger.exception("assistant/elevenlabs/tool: get_attention failed org_id=%s", org_id)
             return {
@@ -451,6 +507,7 @@ async def elevenlabs_tool(
                 risk_level="high",
             )
             await db.commit()
+
             return {
                 "result": {
                     "ok": True,
