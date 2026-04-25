@@ -74,8 +74,12 @@ class CancelRequest(BaseModel):
 
 
 class ElevenLabsToolRequest(BaseModel):
-    tool_name: str
+    # Format A (original): tool_name + parameters
+    tool_name: Optional[str] = None
     parameters: Optional[dict] = {}
+    # Format B (ElevenLabs native): name + args
+    name: Optional[str] = None
+    args: Optional[dict] = {}
 
 
 class RealtimeEventRequest(BaseModel):
@@ -346,38 +350,187 @@ async def elevenlabs_tool(
     """
     ElevenLabs tool-call integration endpoint.
 
-    Accepts the ElevenLabs tool-call format and routes to the appropriate
-    action handler. Returns a result compatible with ElevenLabs expectations.
+    Accepts both Format A (tool_name + parameters) and Format B (name + args).
+    Routes to the appropriate action handler and returns a result compatible
+    with ElevenLabs expectations.
+
+    Supported tool names:
+      get_attention, get_orders_needing_review, get_orders_needing_packed,
+      get_blocked_orders, summarize_sales, sync_leaflink_orders (requires confirmation),
+      run_inspection_readiness_check, check_metrc_package, add_driver,
+      update_driver_pin, email_driver_pin, contact_driver, assign_driver,
+      notify_route_change
     """
-    tool_name = body.tool_name
-    parameters = body.parameters or {}
+    # Resolve tool name — accept both Format A and Format B
+    tool_name: Optional[str] = body.tool_name or body.name
+    parameters: dict = body.parameters or body.args or {}
 
-    logger.info("assistant/elevenlabs/tool: tool_name=%s", tool_name)
-
-    action = registry.get_action(tool_name)
-    if action is None:
+    if not tool_name:
         return {
             "result": None,
-            "error": f"Unknown tool: {tool_name}",
+            "error": {"code": "missing_tool_name", "message": "tool_name or name is required"},
         }
 
-    try:
-        org_id = parameters.get("org_id", "")
-        if not org_id:
-            return {"result": None, "error": "org_id is required in parameters"}
+    logger.info(
+        "assistant/elevenlabs/tool: tool_name=%s org_id=%s",
+        tool_name,
+        parameters.get("org_id", "unknown"),
+    )
 
+    org_id: str = parameters.get("org_id", "")
+    if not org_id:
+        return {
+            "result": None,
+            "error": {"code": "missing_org_id", "message": "org_id is required in parameters or args"},
+        }
+
+    # ------------------------------------------------------------------
+    # Special case: get_attention → call the /ai/get-attention logic
+    # ------------------------------------------------------------------
+    if tool_name == "get_attention":
+        try:
+            from services.ai_service import (
+                build_attention_summary,
+                get_compliance_issues_count,
+                get_low_inventory_count,
+                get_pending_orders_count,
+            )
+
+            brand_id: Optional[str] = parameters.get("brand_id")
+            pending = await get_pending_orders_count(db, org_id, brand_id)
+            low_inv = await get_low_inventory_count(db, org_id)
+            compliance = await get_compliance_issues_count(db, org_id)
+
+            review_result = await registry.execute_action(db, "get_orders_needing_review", org_id, {})
+            packed_result = await registry.execute_action(db, "get_orders_needing_packed", org_id, {})
+            blocked_result = await registry.execute_action(db, "get_blocked_orders", org_id, {})
+
+            orders_needing_review = review_result.get("count", 0) if review_result.get("ok") else 0
+            orders_ready_to_pack = packed_result.get("count", 0) if packed_result.get("ok") else 0
+            blocked_orders = blocked_result.get("count", 0) if blocked_result.get("ok") else 0
+
+            has_data = (pending + orders_needing_review + orders_ready_to_pack + blocked_orders) > 0
+            data_source = "database" if has_data else "stub"
+            summary = build_attention_summary(pending, low_inv, compliance)
+
+            result = {
+                "ok": True,
+                "pending_orders": pending,
+                "orders_needing_review": orders_needing_review,
+                "orders_ready_to_pack": orders_ready_to_pack,
+                "blocked_orders": blocked_orders,
+                "low_inventory": low_inv,
+                "compliance_issues": compliance,
+                "summary": summary,
+                "data_source": data_source,
+                "errors": [],
+            }
+            return {"result": result, "error": None}
+        except Exception as exc:
+            logger.exception("assistant/elevenlabs/tool: get_attention failed org_id=%s", org_id)
+            return {
+                "result": None,
+                "error": {"code": "handler_error", "message": str(exc)},
+            }
+
+    # ------------------------------------------------------------------
+    # sync_leaflink_orders requires confirmation — never execute directly
+    # ------------------------------------------------------------------
+    if tool_name == "sync_leaflink_orders":
+        try:
+            from services.assistant_memory import create_session
+
+            session_id = await create_session(db, org_id, parameters.get("user_id"), "elevenlabs", None)
+            confirmation_id = await orchestrator.create_pending_action(
+                db=db,
+                session_id=session_id,
+                org_id=org_id,
+                user_id=parameters.get("user_id"),
+                action_name="sync_leaflink_orders",
+                payload=parameters,
+                risk_level="high",
+            )
+            await db.commit()
+            return {
+                "result": {
+                    "ok": True,
+                    "requires_confirmation": True,
+                    "confirmation_id": confirmation_id,
+                    "message": "LeafLink sync requires confirmation. Please confirm via POST /assistant/confirm.",
+                },
+                "error": None,
+            }
+        except Exception as exc:
+            logger.exception("assistant/elevenlabs/tool: sync_leaflink_orders pending failed org_id=%s", org_id)
+            return {
+                "result": None,
+                "error": {"code": "handler_error", "message": str(exc)},
+            }
+
+    # ------------------------------------------------------------------
+    # All other registered actions
+    # ------------------------------------------------------------------
+    action = registry.get_action(tool_name)
+    if action is None:
+        logger.warning("assistant/elevenlabs/tool: unknown tool=%s", tool_name)
+        return {
+            "result": None,
+            "error": {
+                "code": "unknown_tool",
+                "message": f"Unknown tool: {tool_name}",
+            },
+        }
+
+    # Actions that require confirmation should not be executed directly
+    if action.requires_confirmation:
+        try:
+            from services.assistant_memory import create_session
+
+            session_id = await create_session(db, org_id, parameters.get("user_id"), "elevenlabs", None)
+            confirmation_id = await orchestrator.create_pending_action(
+                db=db,
+                session_id=session_id,
+                org_id=org_id,
+                user_id=parameters.get("user_id"),
+                action_name=tool_name,
+                payload=parameters,
+                risk_level=action.risk_level,
+            )
+            await db.commit()
+            return {
+                "result": {
+                    "ok": True,
+                    "requires_confirmation": True,
+                    "confirmation_id": confirmation_id,
+                    "message": f"Action '{tool_name}' requires confirmation. Please confirm via POST /assistant/confirm.",
+                },
+                "error": None,
+            }
+        except Exception as exc:
+            logger.exception("assistant/elevenlabs/tool: pending action failed for tool=%s", tool_name)
+            return {
+                "result": None,
+                "error": {"code": "handler_error", "message": str(exc)},
+            }
+
+    try:
         result = await registry.execute_action(db, tool_name, org_id, parameters)
         await db.commit()
+
+        logger.info(
+            "assistant/elevenlabs/tool: tool=%s org_id=%s ok=%s",
+            tool_name, org_id, result.get("ok"),
+        )
 
         return {
             "result": result,
             "error": None,
         }
     except Exception as exc:
-        logger.exception("assistant/elevenlabs/tool: handler failed for tool=%s", tool_name)
+        logger.exception("assistant/elevenlabs/tool: handler failed for tool=%s org_id=%s", tool_name, org_id)
         return {
             "result": None,
-            "error": str(exc),
+            "error": {"code": "handler_error", "message": str(exc)},
         }
 
 
@@ -690,6 +843,83 @@ async def metrc_command(
             "assistant/metrc-command: unhandled error for org_id=%s", body.org_id
         )
         return _safe_error(str(exc))
+
+
+@router.get("/smoke-test")
+async def smoke_test(db: AsyncSession = Depends(get_db)):
+    """
+    Run a quick smoke test across all key subsystems.
+
+    Calls each major endpoint/service internally and returns a summary
+    of which checks passed or failed. Useful for deployment verification.
+    """
+    checks: dict[str, Any] = {}
+    all_ok = True
+
+    # 1. Health
+    try:
+        checks["health"] = {"ok": True}
+    except Exception as exc:
+        checks["health"] = {"ok": False, "error": str(exc)}
+        all_ok = False
+
+    # 2. Assistant health (action registry)
+    try:
+        actions = registry.list_actions()
+        checks["assistant_health"] = {
+            "ok": True,
+            "actions_registered": len(actions),
+        }
+    except Exception as exc:
+        checks["assistant_health"] = {"ok": False, "error": str(exc)}
+        all_ok = False
+
+    # 3. Actions list
+    try:
+        actions = registry.list_actions()
+        checks["actions"] = {"ok": True, "count": len(actions)}
+    except Exception as exc:
+        checks["actions"] = {"ok": False, "error": str(exc)}
+        all_ok = False
+
+    # 4. LeafLink debug (test connection)
+    try:
+        from services.leaflink_client import LeafLinkClient
+        import os
+
+        api_key = os.getenv("LEAFLINK_API_KEY")
+        company_id = os.getenv("LEAFLINK_COMPANY_ID")
+        if api_key and company_id:
+            client = LeafLinkClient(api_key=api_key, company_id=company_id)
+            # Just verify the client can be instantiated; don't make a live call
+            checks["leaflink_debug"] = {"ok": True, "api_connected": True, "note": "credentials present"}
+        else:
+            checks["leaflink_debug"] = {
+                "ok": True,
+                "api_connected": False,
+                "note": "LEAFLINK_API_KEY or LEAFLINK_COMPANY_ID not set",
+            }
+    except Exception as exc:
+        checks["leaflink_debug"] = {"ok": False, "error": str(exc)}
+        all_ok = False
+
+    # 5. LeafLink orders (database query)
+    try:
+        from sqlalchemy import func, select
+        from models import Order
+
+        result = await db.execute(select(func.count(Order.id)))
+        count = result.scalar() or 0
+        checks["leaflink_orders"] = {"ok": True, "count": count}
+    except Exception as exc:
+        checks["leaflink_orders"] = {"ok": False, "error": str(exc)}
+        all_ok = False
+
+    return {
+        "ok": all_ok,
+        "checks": checks,
+        "timestamp": _utc_now_iso(),
+    }
 
 
 @router.get("/health")

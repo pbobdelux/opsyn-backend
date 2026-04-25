@@ -24,6 +24,7 @@ from services.ai_service import (
     get_low_inventory_count,
     get_pending_orders_count,
 )
+from services import assistant_action_registry as registry
 
 logger = logging.getLogger("ai_routes")
 
@@ -75,26 +76,56 @@ async def get_attention(
         app_context or "unknown",
     )
 
+    errors: list[str] = []
+
     try:
         pending = await get_pending_orders_count(db, org_id, brand_id)
         low_inv = await get_low_inventory_count(db, org_id)
         compliance = await get_compliance_issues_count(db, org_id)
+
+        # Query detailed order breakdowns from the action registry handlers
+        review_result = await registry.execute_action(db, "get_orders_needing_review", org_id, {})
+        packed_result = await registry.execute_action(db, "get_orders_needing_packed", org_id, {})
+        blocked_result = await registry.execute_action(db, "get_blocked_orders", org_id, {})
+
+        orders_needing_review = review_result.get("count", 0) if review_result.get("ok") else 0
+        orders_ready_to_pack = packed_result.get("count", 0) if packed_result.get("ok") else 0
+        blocked_orders = blocked_result.get("count", 0) if blocked_result.get("ok") else 0
+
+        if not review_result.get("ok") and review_result.get("error"):
+            errors.append(f"orders_needing_review: {review_result['error']}")
+        if not packed_result.get("ok") and packed_result.get("error"):
+            errors.append(f"orders_ready_to_pack: {packed_result['error']}")
+        if not blocked_result.get("ok") and blocked_result.get("error"):
+            errors.append(f"blocked_orders: {blocked_result['error']}")
+
+        # Determine data source
+        has_data = (pending + orders_needing_review + orders_ready_to_pack + blocked_orders) > 0
+        data_source = "database" if has_data else "stub"
+
         summary = build_attention_summary(pending, low_inv, compliance)
 
         logger.info(
-            "get_attention result org_id=%s pending_orders=%d low_inventory=%d compliance_issues=%d",
+            "get_attention result org_id=%s pending=%d review=%d pack=%d blocked=%d data_source=%s",
             org_id,
             pending,
-            low_inv,
-            compliance,
+            orders_needing_review,
+            orders_ready_to_pack,
+            blocked_orders,
+            data_source,
         )
 
         return {
             "ok": True,
             "pending_orders": pending,
+            "orders_needing_review": orders_needing_review,
+            "orders_ready_to_pack": orders_ready_to_pack,
+            "blocked_orders": blocked_orders,
             "low_inventory": low_inv,
             "compliance_issues": compliance,
             "summary": summary,
+            "data_source": data_source,
+            "errors": errors,
         }
 
     except Exception as exc:
@@ -105,6 +136,7 @@ async def get_attention(
                 "ok": False,
                 "error": "server_error",
                 "message": "An internal error occurred while fetching attention data.",
+                "errors": [str(exc)],
             },
         )
 
