@@ -1,8 +1,9 @@
+import base64
 import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -443,4 +444,419 @@ async def crm_sync_status(db: AsyncSession = Depends(get_db)):
             "data_source": "error",
             "brands": [],
             "count": 0,
+        }
+
+
+@router.get("/sync")
+async def crm_sync(
+    updated_after: Optional[str] = Query(None, description="ISO timestamp - only return records updated after this time"),
+    cursor: Optional[str] = Query(None, description="Pagination cursor from previous response"),
+    limit: int = Query(500, ge=1, le=1000, description="Number of records to return (default 500, max 1000)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get all CRM data (customers and recent orders) for incremental sync.
+
+    Combines customer and order data in a single sync call for efficiency.
+
+    Query params:
+    - updated_after: ISO timestamp (e.g., "2026-04-25T12:30:00Z")
+    - cursor: Pagination cursor from previous response
+    - limit: Number of records (1-1000, default 500)
+
+    Response includes:
+    - customers: Array of customer objects (derived from orders)
+    - orders: Array of order objects
+    - next_cursor: Cursor for next page (if has_more=true)
+    - has_more: Whether more records exist
+    - server_time: Current server time
+    - sync_version: Sync protocol version
+    - last_synced_at: Timestamp of this sync
+    """
+    try:
+        logger.info(
+            "crm: sync_requested updated_after=%s cursor=%s limit=%s",
+            updated_after,
+            cursor[:8] + "..." if cursor else None,
+            limit,
+        )
+
+        # Parse updated_after if provided
+        updated_after_dt = None
+        if updated_after:
+            try:
+                updated_after_dt = datetime.fromisoformat(updated_after.replace("Z", "+00:00"))
+                logger.info("crm: sync_filter updated_after=%s", updated_after_dt.isoformat())
+            except ValueError as e:
+                logger.error("crm: sync_invalid_timestamp error=%s", e)
+                return {
+                    "ok": False,
+                    "error": "Invalid updated_after timestamp format. Use ISO 8601 (e.g., 2026-04-25T12:30:00Z)",
+                    "data_source": "error",
+                }
+
+        # Decode cursor if provided
+        cursor_id = None
+        if cursor:
+            try:
+                cursor_id = int(base64.b64decode(cursor).decode("utf-8"))
+                logger.info("crm: sync_cursor_decoded cursor_id=%s", cursor_id)
+            except Exception as e:
+                logger.error("crm: sync_invalid_cursor error=%s", e)
+                return {
+                    "ok": False,
+                    "error": "Invalid cursor format",
+                    "data_source": "error",
+                }
+
+        # Fetch orders (orders are the source of truth for both customers and orders)
+        order_query = select(Order)
+        if updated_after_dt:
+            order_query = order_query.where(Order.updated_at >= updated_after_dt)
+        if cursor_id is not None:
+            order_query = order_query.where(Order.id > cursor_id)
+        order_query = order_query.order_by(Order.updated_at.asc(), Order.id.asc())
+        order_query = order_query.limit(limit + 1)
+
+        order_result = await db.execute(order_query)
+        orders = order_result.scalars().all()
+
+        # Determine if there are more results
+        has_more = len(orders) > limit
+        if has_more:
+            orders = orders[:limit]
+
+        # Build order response
+        orders_data = []
+        for order in orders:
+            order_dict = {
+                "id": order.id,
+                "external_id": order.external_order_id,
+                "order_number": order.order_number,
+                "customer_name": order.customer_name,
+                "amount": float(order.amount) if order.amount else 0,
+                "item_count": order.item_count,
+                "unit_count": order.unit_count,
+                "status": order.status,
+                "review_status": order.review_status,
+                "created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+                "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+            }
+            orders_data.append(order_dict)
+
+        # Derive unique customers from the fetched orders
+        seen_customers: dict[str, dict] = {}
+        for order in orders:
+            name = order.customer_name
+            if not name or name in seen_customers:
+                continue
+            seen_customers[name] = {
+                "id": name,
+                "name": name,
+                "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+            }
+        customers_data = list(seen_customers.values())
+
+        # Determine next cursor
+        next_cursor = None
+        if has_more and orders:
+            next_cursor = base64.b64encode(str(orders[-1].id).encode()).decode()
+
+        server_time = datetime.now(timezone.utc).isoformat()
+
+        logger.info(
+            "crm: sync_complete customers=%s orders=%s has_more=%s",
+            len(customers_data),
+            len(orders_data),
+            has_more,
+        )
+
+        return make_json_safe({
+            "ok": True,
+            "data_source": "live",
+            "customers": customers_data,
+            "orders": orders_data,
+            "next_cursor": next_cursor if has_more else None,
+            "has_more": has_more,
+            "server_time": server_time,
+            "sync_version": 1,
+            "last_synced_at": server_time,
+        })
+
+    except Exception as e:
+        logger.error("crm: sync_failed error=%s", e, exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e),
+            "data_source": "error",
+        }
+
+
+@router.get("/customers/sync")
+async def crm_customers_sync(
+    updated_after: Optional[str] = Query(None, description="ISO timestamp - only return customers updated after this time"),
+    cursor: Optional[str] = Query(None, description="Pagination cursor from previous response"),
+    limit: int = Query(500, ge=1, le=1000, description="Number of customers to return (default 500, max 1000)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get customers for incremental sync with cursor-based pagination.
+
+    Customers are derived from orders since there is no separate customer table.
+
+    Query params:
+    - updated_after: ISO timestamp (e.g., "2026-04-25T12:30:00Z")
+    - cursor: Pagination cursor from previous response
+    - limit: Number of customers (1-1000, default 500)
+
+    Response includes:
+    - customers: Array of customer objects
+    - next_cursor: Cursor for next page (if has_more=true)
+    - has_more: Whether more customers exist
+    - server_time: Current server time
+    - sync_version: Sync protocol version
+    - last_synced_at: Timestamp of this sync
+    """
+    try:
+        logger.info(
+            "crm: customers_sync_requested updated_after=%s cursor=%s limit=%s",
+            updated_after,
+            cursor[:8] + "..." if cursor else None,
+            limit,
+        )
+
+        # Parse updated_after if provided
+        updated_after_dt = None
+        if updated_after:
+            try:
+                updated_after_dt = datetime.fromisoformat(updated_after.replace("Z", "+00:00"))
+            except ValueError as e:
+                logger.error("crm: customers_sync_invalid_timestamp error=%s", e)
+                return {
+                    "ok": False,
+                    "error": "Invalid updated_after timestamp format. Use ISO 8601 (e.g., 2026-04-25T12:30:00Z)",
+                    "data_source": "error",
+                }
+
+        # Decode cursor if provided
+        cursor_id = None
+        if cursor:
+            try:
+                cursor_id = int(base64.b64decode(cursor).decode("utf-8"))
+            except Exception as e:
+                logger.error("crm: customers_sync_invalid_cursor error=%s", e)
+                return {
+                    "ok": False,
+                    "error": "Invalid cursor format",
+                    "data_source": "error",
+                }
+
+        # Query orders to derive customer data
+        query = select(Order)
+        if updated_after_dt:
+            query = query.where(Order.updated_at >= updated_after_dt)
+        if cursor_id is not None:
+            query = query.where(Order.id > cursor_id)
+        query = query.order_by(Order.updated_at.asc(), Order.id.asc())
+        query = query.limit(limit + 1)
+
+        result = await db.execute(query)
+        orders = result.scalars().all()
+
+        # Determine if there are more results
+        has_more = len(orders) > limit
+        if has_more:
+            orders = orders[:limit]
+
+        # Derive unique customers with aggregated stats
+        customers_data = []
+        seen_names: set[str] = set()
+        for order in orders:
+            name = order.customer_name
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+
+            order_count_result = await db.execute(
+                select(func.count(Order.id)).where(Order.customer_name == name)
+            )
+            order_count = order_count_result.scalar() or 0
+
+            total_spend_result = await db.execute(
+                select(func.sum(Order.amount)).where(Order.customer_name == name)
+            )
+            total_spend = float(total_spend_result.scalar() or 0)
+
+            last_order_result = await db.execute(
+                select(Order.external_created_at)
+                .where(Order.customer_name == name)
+                .order_by(Order.external_created_at.desc())
+                .limit(1)
+            )
+            last_order_at = last_order_result.scalar()
+
+            customers_data.append({
+                "id": name,
+                "name": name,
+                "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+                "order_count": order_count,
+                "total_spend": total_spend,
+                "last_order_at": last_order_at.isoformat() if last_order_at else None,
+            })
+
+        # Determine next cursor
+        next_cursor = None
+        if has_more and orders:
+            next_cursor = base64.b64encode(str(orders[-1].id).encode()).decode()
+
+        server_time = datetime.now(timezone.utc).isoformat()
+
+        logger.info(
+            "crm: customers_sync_complete count=%s has_more=%s",
+            len(customers_data),
+            has_more,
+        )
+
+        return make_json_safe({
+            "ok": True,
+            "data_source": "live",
+            "customers": customers_data,
+            "next_cursor": next_cursor if has_more else None,
+            "has_more": has_more,
+            "server_time": server_time,
+            "sync_version": 1,
+            "last_synced_at": server_time,
+        })
+
+    except Exception as e:
+        logger.error("crm: customers_sync_failed error=%s", e, exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e),
+            "data_source": "error",
+        }
+
+
+@router.get("/recent-orders/sync")
+async def crm_recent_orders_sync(
+    updated_after: Optional[str] = Query(None, description="ISO timestamp - only return orders updated after this time"),
+    cursor: Optional[str] = Query(None, description="Pagination cursor from previous response"),
+    limit: int = Query(500, ge=1, le=1000, description="Number of orders to return (default 500, max 1000)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get recent orders for incremental sync with cursor-based pagination.
+
+    Query params:
+    - updated_after: ISO timestamp (e.g., "2026-04-25T12:30:00Z")
+    - cursor: Pagination cursor from previous response
+    - limit: Number of orders (1-1000, default 500)
+
+    Response includes:
+    - orders: Array of order objects
+    - next_cursor: Cursor for next page (if has_more=true)
+    - has_more: Whether more orders exist
+    - server_time: Current server time
+    - sync_version: Sync protocol version
+    - last_synced_at: Timestamp of this sync
+    """
+    try:
+        logger.info(
+            "crm: recent_orders_sync_requested updated_after=%s cursor=%s limit=%s",
+            updated_after,
+            cursor[:8] + "..." if cursor else None,
+            limit,
+        )
+
+        # Parse updated_after if provided
+        updated_after_dt = None
+        if updated_after:
+            try:
+                updated_after_dt = datetime.fromisoformat(updated_after.replace("Z", "+00:00"))
+            except ValueError as e:
+                logger.error("crm: recent_orders_sync_invalid_timestamp error=%s", e)
+                return {
+                    "ok": False,
+                    "error": "Invalid updated_after timestamp format. Use ISO 8601 (e.g., 2026-04-25T12:30:00Z)",
+                    "data_source": "error",
+                }
+
+        # Decode cursor if provided
+        cursor_id = None
+        if cursor:
+            try:
+                cursor_id = int(base64.b64decode(cursor).decode("utf-8"))
+            except Exception as e:
+                logger.error("crm: recent_orders_sync_invalid_cursor error=%s", e)
+                return {
+                    "ok": False,
+                    "error": "Invalid cursor format",
+                    "data_source": "error",
+                }
+
+        # Build query
+        query = select(Order)
+        if updated_after_dt:
+            query = query.where(Order.updated_at >= updated_after_dt)
+        if cursor_id is not None:
+            query = query.where(Order.id > cursor_id)
+        query = query.order_by(Order.updated_at.asc(), Order.id.asc())
+        query = query.limit(limit + 1)
+
+        result = await db.execute(query)
+        orders = result.scalars().all()
+
+        # Determine if there are more results
+        has_more = len(orders) > limit
+        if has_more:
+            orders = orders[:limit]
+
+        # Build response
+        orders_data = []
+        for order in orders:
+            order_dict = {
+                "id": order.id,
+                "external_id": order.external_order_id,
+                "order_number": order.order_number,
+                "customer_name": order.customer_name,
+                "amount": float(order.amount) if order.amount else 0,
+                "item_count": order.item_count,
+                "unit_count": order.unit_count,
+                "status": order.status,
+                "review_status": order.review_status,
+                "created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+                "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+            }
+            orders_data.append(order_dict)
+
+        # Determine next cursor
+        next_cursor = None
+        if has_more and orders:
+            next_cursor = base64.b64encode(str(orders[-1].id).encode()).decode()
+
+        server_time = datetime.now(timezone.utc).isoformat()
+
+        logger.info(
+            "crm: recent_orders_sync_complete count=%s has_more=%s",
+            len(orders_data),
+            has_more,
+        )
+
+        return make_json_safe({
+            "ok": True,
+            "data_source": "live",
+            "orders": orders_data,
+            "next_cursor": next_cursor if has_more else None,
+            "has_more": has_more,
+            "server_time": server_time,
+            "sync_version": 1,
+            "last_synced_at": server_time,
+        })
+
+    except Exception as e:
+        logger.error("crm: recent_orders_sync_failed error=%s", e, exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e),
+            "data_source": "error",
         }
