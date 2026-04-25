@@ -68,8 +68,10 @@ app = FastAPI(title=APP_NAME, lifespan=lifespan)
 # Routers
 # ---------------------------------------------------------------------------
 from routes.assistant import router as assistant_router  # noqa: E402
+from routes.ingest import router as ingest_router  # noqa: E402
 
 app.include_router(assistant_router)
+app.include_router(ingest_router)
 
 app.add_middleware(
     CORSMiddleware,
