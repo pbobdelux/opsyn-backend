@@ -97,7 +97,7 @@ class LeafLinkClient:
         self.session.headers.update({
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Authorization": f"App {self.api_key}",
+            "Authorization": f"Token {self.api_key}",
             "User-Agent": LEAFLINK_USER_AGENT,
         })
 
@@ -109,6 +109,12 @@ class LeafLinkClient:
             self.base_url,
             self.company_id,
             bool(self.api_key),
+        )
+        logger.info(
+            "leaflink: client_init auth_test key_prefix=%s... base_url=%s company_id=%s",
+            self.api_key[:6] if self.api_key else "NONE",
+            self.base_url,
+            self.company_id,
         )
 
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
@@ -138,10 +144,10 @@ class LeafLinkClient:
             )
         if not resp.ok:
             logger.error(
-                "leaflink: API HTTP error url=%s status=%s body_preview=%s",
+                "leaflink: API HTTP error url=%s status=%s body=%s",
                 url,
                 resp.status_code,
-                resp.text[:200],
+                resp.text[:500],  # Log more of the response body
             )
         return resp
 
@@ -181,6 +187,12 @@ class LeafLinkClient:
             )
             return data
 
+        if not resp.ok:
+            logger.error(
+                "leaflink: list_orders auth_failed status=%s body=%s",
+                resp.status_code,
+                resp.text[:500],
+            )
         logger.error(
             "leaflink: list_orders failed status=%s content_type=%s body_preview=%s",
             resp.status_code,
