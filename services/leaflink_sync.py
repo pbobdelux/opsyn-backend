@@ -233,16 +233,23 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
             normalized_line_items = normalize_line_items(raw_line_items)
 
             if normalized_line_items:
+                unit_count_log = sum(item.get("quantity", 0) or 0 for item in normalized_line_items)
+                skus = [item.get("sku") for item in normalized_line_items if item.get("sku")]
                 logger.info(
-                    "leaflink: sync_line_items_extracted external_id=%s count=%s unit_count=%s",
+                    "leaflink: sync_line_items_extracted external_id=%s order_number=%s customer=%s count=%s unit_count=%s skus=%s",
                     external_id,
+                    order_number,
+                    customer_name,
                     len(normalized_line_items),
-                    sum(item.get("quantity", 0) or 0 for item in normalized_line_items),
+                    unit_count_log,
+                    ",".join(skus) if skus else "(no skus)",
                 )
             else:
                 logger.warning(
-                    "leaflink: sync_line_items_empty external_id=%s — no line items found in order",
+                    "leaflink: sync_line_items_empty external_id=%s order_number=%s customer=%s — no line items found in order",
                     external_id,
+                    order_number,
+                    customer_name,
                 )
 
             if item_count == 0:
