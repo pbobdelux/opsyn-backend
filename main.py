@@ -199,11 +199,15 @@ async def sync_leaflink(
     try:
         from services.leaflink_sync import sync_leaflink_orders
 
-        # Resolve active credentials inside their own transaction so asyncpg
-        # has a proper connection context.  Extract brand_ids as plain strings
-        # before the block exits so we don't hold the connection open during
-        # the (potentially slow) HTTP calls to the LeafLink API.
+        all_results = []
+        total_created = 0
+        total_updated = 0
+        total_skipped = 0
+        total_lines = 0
+
         async with db.begin():
+            # Resolve active credentials and extract brand_ids as plain strings
+            # before the HTTP calls to the LeafLink API.
             cred_result = await db.execute(
                 select(BrandAPICredential).where(
                     BrandAPICredential.integration_name == "leaflink",
@@ -213,32 +217,25 @@ async def sync_leaflink(
             credentials = cred_result.scalars().all()
             brand_ids: list[str] = [c.brand_id for c in credentials]
 
-        if not brand_ids:
-            logger.warning("leaflink: sync_endpoint no active credentials found")
-            return {
-                "ok": False,
-                "error": "No active LeafLink credentials found",
-            }
+            if not brand_ids:
+                logger.warning("leaflink: sync_endpoint no active credentials found")
+                return {
+                    "ok": False,
+                    "error": "No active LeafLink credentials found",
+                }
 
-        logger.info("leaflink: sync_endpoint found %s active credentials", len(brand_ids))
+            logger.info("leaflink: sync_endpoint found %s active credentials", len(brand_ids))
 
-        all_results = []
-        total_created = 0
-        total_updated = 0
-        total_skipped = 0
-        total_lines = 0
+            for brand_id in brand_ids:
+                logger.info(
+                    "leaflink: sync_endpoint syncing brand_id=%s",
+                    brand_id,
+                )
 
-        for brand_id in brand_ids:
-            logger.info(
-                "leaflink: sync_endpoint syncing brand_id=%s",
-                brand_id,
-            )
+                try:
+                    result = await sync_leaflink_orders(db, brand_id)
 
-            try:
-                result = await sync_leaflink_orders(db, brand_id)
-
-                # Update credential sync status in its own transaction.
-                async with db.begin():
+                    # Update credential sync status within the same transaction.
                     cred_update = await db.execute(
                         select(BrandAPICredential).where(
                             BrandAPICredential.brand_id == brand_id,
@@ -254,42 +251,41 @@ async def sync_leaflink(
                         else:
                             cred_row.last_error = None
 
-                logger.info(
-                    "leaflink: sync_endpoint brand_id=%s result=%s created=%s updated=%s skipped=%s lines=%s",
-                    brand_id,
-                    "ok" if result.get("ok") else "failed",
-                    result.get("created", 0),
-                    result.get("updated", 0),
-                    result.get("skipped", 0),
-                    result.get("line_items_written", 0),
-                )
+                    logger.info(
+                        "leaflink: sync_endpoint brand_id=%s result=%s created=%s updated=%s skipped=%s lines=%s",
+                        brand_id,
+                        "ok" if result.get("ok") else "failed",
+                        result.get("created", 0),
+                        result.get("updated", 0),
+                        result.get("skipped", 0),
+                        result.get("line_items_written", 0),
+                    )
 
-                total_created += result.get("created", 0)
-                total_updated += result.get("updated", 0)
-                total_skipped += result.get("skipped", 0)
-                total_lines += result.get("line_items_written", 0)
+                    total_created += result.get("created", 0)
+                    total_updated += result.get("updated", 0)
+                    total_skipped += result.get("skipped", 0)
+                    total_lines += result.get("line_items_written", 0)
 
-                all_results.append({
-                    "brand_id": brand_id,
-                    "ok": result.get("ok"),
-                    "orders_fetched": result.get("orders_fetched", 0),
-                    "created": result.get("created", 0),
-                    "updated": result.get("updated", 0),
-                    "skipped": result.get("skipped", 0),
-                    "line_items_written": result.get("line_items_written", 0),
-                    "error": result.get("error"),
-                })
+                    all_results.append({
+                        "brand_id": brand_id,
+                        "ok": result.get("ok"),
+                        "orders_fetched": result.get("orders_fetched", 0),
+                        "created": result.get("created", 0),
+                        "updated": result.get("updated", 0),
+                        "skipped": result.get("skipped", 0),
+                        "line_items_written": result.get("line_items_written", 0),
+                        "error": result.get("error"),
+                    })
 
-            except Exception as brand_exc:
-                logger.error(
-                    "leaflink: sync_endpoint brand_id=%s error=%s",
-                    brand_id,
-                    brand_exc,
-                    exc_info=True,
-                )
+                except Exception as brand_exc:
+                    logger.error(
+                        "leaflink: sync_endpoint brand_id=%s error=%s",
+                        brand_id,
+                        brand_exc,
+                        exc_info=True,
+                    )
 
-                # Mark credential as failed in its own transaction.
-                async with db.begin():
+                    # Mark credential as failed within the same transaction.
                     cred_update = await db.execute(
                         select(BrandAPICredential).where(
                             BrandAPICredential.brand_id == brand_id,
@@ -302,11 +298,11 @@ async def sync_leaflink(
                         cred_row.last_sync_at = datetime.now(timezone.utc)
                         cred_row.last_error = str(brand_exc)
 
-                all_results.append({
-                    "brand_id": brand_id,
-                    "ok": False,
-                    "error": str(brand_exc),
-                })
+                    all_results.append({
+                        "brand_id": brand_id,
+                        "ok": False,
+                        "error": str(brand_exc),
+                    })
 
         logger.info(
             "leaflink: sync_endpoint complete total_created=%s total_updated=%s total_skipped=%s total_lines=%s",
@@ -339,6 +335,8 @@ async def sync_leaflink(
         }
 
 
+
+
 @app.post("/leaflink/sync-now")
 async def sync_leaflink_now(
     x_opsyn_secret: Optional[str] = Header(None),
@@ -362,11 +360,14 @@ async def sync_leaflink_now(
     try:
         from services.leaflink_sync import sync_leaflink_orders
 
-        # Resolve active credentials inside their own transaction so asyncpg
-        # has a proper connection context.  Extract brand_ids as plain strings
-        # before the block exits so we don't hold the connection open during
-        # the (potentially slow) HTTP calls to the LeafLink API.
+        total_orders_fetched = 0
+        total_created = 0
+        total_updated = 0
+        total_line_items_written = 0
+
         async with db.begin():
+            # Resolve active credentials and extract brand_ids as plain strings
+            # before the HTTP calls to the LeafLink API.
             cred_result = await db.execute(
                 select(BrandAPICredential).where(
                     BrandAPICredential.integration_name == "leaflink",
@@ -376,21 +377,15 @@ async def sync_leaflink_now(
             credentials = cred_result.scalars().all()
             brand_ids: list[str] = [c.brand_id for c in credentials]
 
-        if not brand_ids:
-            logger.warning("leaflink: sync_now no active credentials found")
-            return {"ok": False, "error": "No active LeafLink credentials found"}
+            if not brand_ids:
+                logger.warning("leaflink: sync_now no active credentials found")
+                return {"ok": False, "error": "No active LeafLink credentials found"}
 
-        total_orders_fetched = 0
-        total_created = 0
-        total_updated = 0
-        total_line_items_written = 0
+            for brand_id in brand_ids:
+                logger.info("leaflink: sync_now syncing brand_id=%s", brand_id)
+                result = await sync_leaflink_orders(db, brand_id)
 
-        for brand_id in brand_ids:
-            logger.info("leaflink: sync_now syncing brand_id=%s", brand_id)
-            result = await sync_leaflink_orders(db, brand_id)
-
-            # Persist credential sync status in its own transaction.
-            async with db.begin():
+                # Persist credential sync status within the same transaction.
                 cred_update = await db.execute(
                     select(BrandAPICredential).where(
                         BrandAPICredential.brand_id == brand_id,
@@ -406,11 +401,11 @@ async def sync_leaflink_now(
                     else:
                         cred_row.last_error = None
 
-            if result.get("ok"):
-                total_orders_fetched += result.get("orders_fetched", 0)
-                total_created += result.get("created", 0)
-                total_updated += result.get("updated", 0)
-                total_line_items_written += result.get("line_items_written", 0)
+                if result.get("ok"):
+                    total_orders_fetched += result.get("orders_fetched", 0)
+                    total_created += result.get("created", 0)
+                    total_updated += result.get("updated", 0)
+                    total_line_items_written += result.get("line_items_written", 0)
 
         logger.info(
             "leaflink: sync_now complete orders_fetched=%s created=%s updated=%s line_items_written=%s",
@@ -431,6 +426,7 @@ async def sync_leaflink_now(
     except Exception as e:
         logger.error("leaflink: sync_now failed error=%s", e, exc_info=True)
         return {"ok": False, "error": str(e)}
+
 
 
 if __name__ == "__main__":
