@@ -339,112 +339,161 @@ async def debug_leaflink_auth(
             starts_with_token,
         )
 
-        # Test all four authentication header formats with direct HTTP requests
+        # Test multiple order endpoint paths with Token auth to find which one works
         base_url = DEFAULT_LEAFLINK_BASE_URL
-        company_id = cred.company_id
 
-        auth_tests = [
+        headers = {
+            "Authorization": f"Token {clean_api_key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "opsyn",
+        }
+
+        endpoint_tests = [
             {
-                "auth_type": "App",
-                "headers": {
-                    "Authorization": f"App {clean_api_key}",
-                    "Content-Type": "application/json",
-                }
+                "endpoint": "/companies/",
+                "description": "List companies (baseline - should work)",
+                "params": {"limit": 1},
             },
             {
-                "auth_type": "Token",
-                "headers": {
-                    "Authorization": f"Token {clean_api_key}",
-                    "Content-Type": "application/json",
-                }
+                "endpoint": "/orders/",
+                "description": "List orders",
+                "params": {"limit": 1},
             },
             {
-                "auth_type": "Bearer",
-                "headers": {
-                    "Authorization": f"Bearer {clean_api_key}",
-                    "Content-Type": "application/json",
-                }
+                "endpoint": "/orders-received/",
+                "description": "List orders received",
+                "params": {"limit": 1},
             },
             {
-                "auth_type": "X-API-Key",
-                "headers": {
-                    "X-API-Key": clean_api_key,
-                    "Content-Type": "application/json",
-                }
+                "endpoint": "/purchases/",
+                "description": "List purchases",
+                "params": {"limit": 1},
             },
             {
-                "auth_type": "API-Key",
-                "headers": {
-                    "API-Key": clean_api_key,
-                    "Content-Type": "application/json",
-                }
+                "endpoint": "/sales-orders/",
+                "description": "List sales orders",
+                "params": {"limit": 1},
             },
         ]
 
-        tests = []
-        for test_config in auth_tests:
-            auth_type = test_config["auth_type"]
-            headers = test_config["headers"]
+        endpoint_results = []
+        for endpoint_config in endpoint_tests:
+            endpoint = endpoint_config["endpoint"]
+            description = endpoint_config["description"]
+            params = endpoint_config["params"]
 
             try:
-                url = f"{base_url}/orders-received/"
-                params = {"page": 1, "page_size": 1}
+                url = f"{base_url}{endpoint}"
 
                 logger.info(
-                    "leaflink: auth_debug testing auth_type=%s",
-                    auth_type,
+                    "leaflink: auth_debug testing endpoint=%s description=%s",
+                    endpoint,
+                    description,
                 )
 
                 resp = requests.get(url, headers=headers, params=params, timeout=10)
 
-                test_result = {
-                    "auth_type": auth_type,
+                # Get sample data if successful
+                sample = None
+                if resp.ok:
+                    try:
+                        data = resp.json()
+                        if isinstance(data, list) and len(data) > 0:
+                            sample = f"Got {len(data)} items"
+                        elif isinstance(data, dict):
+                            if "results" in data:
+                                sample = f"Got {len(data.get('results', []))} results"
+                            elif "data" in data:
+                                sample = f"Got {len(data.get('data', []))} data items"
+                            else:
+                                sample = f"Got response with keys: {list(data.keys())[:3]}"
+                    except Exception:
+                        sample = "Response OK but couldn't parse JSON"
+
+                endpoint_result = {
+                    "endpoint": endpoint,
+                    "description": description,
                     "status": resp.status_code,
                     "error": None if resp.ok else resp.text[:200],
+                    "sample": sample,
                 }
 
                 logger.info(
-                    "leaflink: auth_debug test_result auth_type=%s status=%s",
-                    auth_type,
+                    "leaflink: auth_debug endpoint_result endpoint=%s status=%s sample=%s",
+                    endpoint,
                     resp.status_code,
+                    sample,
                 )
 
-                tests.append(test_result)
+                endpoint_results.append(endpoint_result)
 
             except Exception as test_exc:
-                test_result = {
-                    "auth_type": auth_type,
+                endpoint_result = {
+                    "endpoint": endpoint,
+                    "description": description,
                     "status": None,
                     "error": str(test_exc)[:200],
+                    "sample": None,
                 }
 
                 logger.error(
-                    "leaflink: auth_debug test_failed auth_type=%s error=%s",
-                    auth_type,
+                    "leaflink: auth_debug endpoint_test_failed endpoint=%s error=%s",
+                    endpoint,
                     test_exc,
                 )
 
-                tests.append(test_result)
+                endpoint_results.append(endpoint_result)
 
-        return {
-            "ok": True,
-            "credential_found": True,
-            "brand_id": cred.brand_id,
-            "company_id": cred.company_id,
-            "api_key_length": api_key_length,
-            "api_key_prefix": api_key_prefix,
-            "api_key_suffix": api_key_suffix,
-            "has_whitespace": has_whitespace,
-            "has_newlines": has_newlines,
-            "starts_with_token": starts_with_token,
-            "clean_api_key_length": len(clean_api_key),
-            "base_url": base_url,
-            "tests": tests,
-            "created_at": cred.created_at.isoformat() if cred.created_at else None,
-            "updated_at": cred.updated_at.isoformat() if cred.updated_at else None,
-            "last_sync_at": cred.last_sync_at.isoformat() if cred.last_sync_at else None,
-            "sync_status": cred.sync_status,
-        }
+        # Analyse results
+        working_order_endpoints = [
+            r for r in endpoint_results
+            if r["status"] == 200 and "/orders" in r["endpoint"]
+        ]
+
+        working_companies = [
+            r for r in endpoint_results
+            if r["status"] == 200 and r["endpoint"] == "/companies/"
+        ]
+
+        blocked_endpoints = [
+            r["endpoint"] for r in endpoint_results
+            if r["status"] == 403
+        ]
+
+        if working_order_endpoints:
+            return {
+                "ok": True,
+                "credential_found": True,
+                "brand_id": cred.brand_id,
+                "company_id": cred.company_id,
+                "api_key_length": api_key_length,
+                "api_key_prefix": api_key_prefix,
+                "api_key_suffix": api_key_suffix,
+                "base_url": base_url,
+                "working_order_endpoint": working_order_endpoints[0]["endpoint"],
+                "endpoint_results": endpoint_results,
+                "created_at": cred.created_at.isoformat() if cred.created_at else None,
+                "updated_at": cred.updated_at.isoformat() if cred.updated_at else None,
+                "last_sync_at": cred.last_sync_at.isoformat() if cred.last_sync_at else None,
+                "sync_status": cred.sync_status,
+            }
+        elif working_companies:
+            return {
+                "ok": False,
+                "credential_found": True,
+                "reason": "LeafLink token works for companies but not order endpoints",
+                "working_endpoint": "/companies/",
+                "blocked_endpoints": blocked_endpoints,
+                "endpoint_results": endpoint_results,
+            }
+        else:
+            return {
+                "ok": False,
+                "credential_found": True,
+                "reason": "LeafLink token doesn't work for any endpoint",
+                "endpoint_results": endpoint_results,
+            }
 
     except HTTPException:
         raise
