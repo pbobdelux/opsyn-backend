@@ -20,40 +20,51 @@ class ElevenLabsService:
         self.base_url = ELEVENLABS_BASE_URL
         self.configured = bool(self.api_key and self.agent_id)
 
-    async def create_conversation(self) -> dict[str, Any]:
-        """Create a new conversation session with the agent."""
+    async def get_conversation_token(self) -> dict[str, Any]:
+        """Get a conversation token for the agent (WebRTC connection)."""
         if not self.configured:
             logger.error("elevenlabs: not configured")
             raise RuntimeError("ElevenLabs not configured")
 
         try:
+            url = f"{self.base_url}/convai/conversation/token"
+            params = {"agent_id": self.agent_id}
+
+            logger.info("elevenlabs: get_conversation_token url=%s agent_id=%s", url, self.agent_id[:8] + "...")
+
             async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{self.base_url}/convai/conversation",
+                response = await client.get(
+                    url,
+                    params=params,
                     headers={
                         "xi-api-key": self.api_key,
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "agent_id": self.agent_id,
                     },
                     timeout=10,
                 )
 
                 if response.status_code != 200:
                     logger.error(
-                        "elevenlabs: create_conversation failed status=%s body=%s",
+                        "elevenlabs: get_conversation_token failed status=%s body=%s",
                         response.status_code,
                         response.text[:200],
                     )
                     raise RuntimeError(f"ElevenLabs API error: {response.status_code}")
 
                 data = response.json()
-                logger.info("elevenlabs: conversation_created conversation_id=%s", data.get("conversation_id"))
-                return data
+                token = data.get("token")
+
+                if not token:
+                    logger.error("elevenlabs: get_conversation_token no token in response")
+                    raise RuntimeError("No token in ElevenLabs response")
+
+                logger.info("elevenlabs: conversation_token_obtained token_length=%s", len(token))
+                return {
+                    "token": token,
+                    "agent_id": self.agent_id,
+                }
 
         except Exception as e:
-            logger.error("elevenlabs: create_conversation_failed error=%s", e)
+            logger.error("elevenlabs: get_conversation_token_failed error=%s", e)
             raise
 
     async def send_message(
