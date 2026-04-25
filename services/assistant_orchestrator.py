@@ -31,6 +31,20 @@ logger = logging.getLogger("assistant_orchestrator")
 INTENT_MAP: list[tuple[str, list[str], list[str]]] = [
     # (intent_name, keywords, suggested_actions)
     (
+        "get_attention",
+        [
+            "what needs my attention",
+            "what should i focus on",
+            "what is wrong today",
+            "what needs fixed",
+            "give me my morning report",
+            "morning report",
+            "what needs attention",
+            "what do i need to fix",
+        ],
+        ["get_attention"],
+    ),
+    (
         "sync_orders",
         ["sync", "refresh", "update orders", "pull orders", "fetch orders"],
         ["sync_leaflink_orders"],
@@ -623,6 +637,13 @@ def _build_spoken_reply(
 ) -> str:
     if not exec_result.get("ok"):
         return "I ran into an issue completing that request. Please check the details and try again."
+
+    # For get_attention, use the spoken_reply from the report itself
+    if intent == "get_attention":
+        attention_data = exec_result.get("data", {}).get("get_attention", {})
+        spoken = attention_data.get("spoken_reply")
+        if spoken:
+            return spoken
 
     replies = {
         "list_orders": "Here are the orders that need your attention.",

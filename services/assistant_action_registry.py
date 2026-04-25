@@ -507,6 +507,25 @@ async def _handle_run_inspection_readiness_check(
 
 
 # ---------------------------------------------------------------------------
+# Attention handler (delegates to attention_engine)
+# ---------------------------------------------------------------------------
+
+
+async def _handle_get_attention(
+    db: AsyncSession, org_id: str, payload: dict
+) -> dict:
+    """Return the full operational priority report from the attention engine."""
+    try:
+        from services.attention_engine import get_operational_attention
+
+        brand_id = payload.get("brand_id")
+        return await get_operational_attention(db, org_id, brand_id)
+    except Exception as exc:
+        logger.exception("get_attention handler failed org_id=%s", org_id)
+        return {"ok": False, "error": str(exc), "errors": [str(exc)]}
+
+
+# ---------------------------------------------------------------------------
 # Action registry definition
 # ---------------------------------------------------------------------------
 
@@ -563,6 +582,15 @@ def _register(action: ActionDefinition) -> None:
 # ---------------------------------------------------------------------------
 # Register all actions
 # ---------------------------------------------------------------------------
+
+_register(ActionDefinition(
+    name="get_attention",
+    description="Return a full operational priority report: blocked orders, unmapped items, data quality issues, and sync status.",
+    risk_level="safe",
+    requires_confirmation=False,
+    allowed_roles=["admin", "manager", "operator", "viewer"],
+    handler=_handle_get_attention,
+))
 
 _register(ActionDefinition(
     name="sync_leaflink_orders",

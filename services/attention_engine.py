@@ -516,3 +516,16 @@ async def get_operational_attention(
         "data_source": data_source,
         "errors": errors,
     }
+
+
+# ---------------------------------------------------------------------------
+# Alias for backward compatibility
+# ---------------------------------------------------------------------------
+
+async def get_attention_report(
+    db: AsyncSession,
+    org_id: str,
+    brand_id: Optional[str] = None,
+) -> dict:
+    """Alias for get_operational_attention — use that function directly."""
+    return await get_operational_attention(db, org_id, brand_id)
