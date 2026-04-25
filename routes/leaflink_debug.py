@@ -27,7 +27,7 @@ def _env_status(value: str) -> str:
     return "set" if value else "not_set"
 
 
-@router.get("/leaflink/debug")
+@router.get("/debug")
 async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     logger.info("leaflink: debug_endpoint called")
 
