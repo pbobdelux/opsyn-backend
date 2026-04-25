@@ -345,6 +345,13 @@ async def debug_leaflink_auth(
 
         auth_tests = [
             {
+                "auth_type": "App",
+                "headers": {
+                    "Authorization": f"App {clean_api_key}",
+                    "Content-Type": "application/json",
+                }
+            },
+            {
                 "auth_type": "Token",
                 "headers": {
                     "Authorization": f"Token {clean_api_key}",
