@@ -89,28 +89,64 @@ async def voice_session(
     except Exception as e:
         logger.error("voice: session_failed error=%s", e, exc_info=True)
 
-        # Parse ElevenLabs error
+        # Parse ElevenLabs error for detailed response
         error_msg = str(e)
         error_code = "elevenlabs_error"
+        message = "Failed to create voice session"
+        elevenlabs_status_code = None
+        elevenlabs_error_body = None
+        endpoint_path = "/v1/convai/conversation/token"
 
-        if "404" in error_msg:
+        # Extract status code and body from error message
+        if "status=" in error_msg:
+            try:
+                status_part = error_msg.split("status=")[1].split(",")[0]
+                elevenlabs_status_code = int(status_part)
+            except (ValueError, IndexError):
+                pass
+
+        if "body=" in error_msg:
+            try:
+                body_part = error_msg.split("body=")[1]
+                elevenlabs_error_body = body_part
+            except IndexError:
+                pass
+
+        # Determine error code based on status
+        if elevenlabs_status_code == 404:
             error_code = "agent_not_found"
             message = "ElevenLabs agent not found. Check ELEVENLABS_AGENT_ID."
-        elif "401" in error_msg or "Unauthorized" in error_msg:
+        elif elevenlabs_status_code == 401 or "Unauthorized" in error_msg:
             error_code = "elevenlabs_unauthorized"
             message = "ElevenLabs API key is invalid. Check ELEVENLABS_API_KEY."
+        elif elevenlabs_status_code == 400:
+            error_code = "invalid_request"
+            message = "Invalid request to ElevenLabs. Check agent_id format."
+        elif elevenlabs_status_code == 429:
+            error_code = "rate_limited"
+            message = "ElevenLabs rate limit exceeded. Try again later."
+        elif elevenlabs_status_code == 500:
+            error_code = "elevenlabs_server_error"
+            message = "ElevenLabs server error. Try again later."
         elif "not configured" in error_msg:
             error_code = "elevenlabs_not_configured"
             message = "ElevenLabs is not configured."
-        else:
-            message = "Failed to create voice session"
 
-        return {
+        response = {
             "ok": False,
             "error_code": error_code,
             "message": message,
             "data_source": "error",
         }
+
+        # Add debug fields for troubleshooting
+        if elevenlabs_status_code is not None:
+            response["elevenlabs_status_code"] = elevenlabs_status_code
+        if elevenlabs_error_body is not None:
+            response["elevenlabs_error_body"] = elevenlabs_error_body
+        response["endpoint_path"] = endpoint_path
+
+        return response
 
 
 @router.post("/message")

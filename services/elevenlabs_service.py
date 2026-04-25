@@ -42,19 +42,29 @@ class ElevenLabsService:
                     timeout=10,
                 )
 
+                logger.info(
+                    "elevenlabs: get_conversation_token response status=%s",
+                    response.status_code,
+                )
+
                 if response.status_code != 200:
+                    response_body = response.text[:500]  # Truncate to 500 chars
                     logger.error(
                         "elevenlabs: get_conversation_token failed status=%s body=%s",
                         response.status_code,
-                        response.text[:200],
+                        response_body,
                     )
-                    raise RuntimeError(f"ElevenLabs API error: {response.status_code}")
+
+                    # Return error details for debugging
+                    raise RuntimeError(
+                        f"ElevenLabs API error: status={response.status_code}, body={response_body}"
+                    )
 
                 data = response.json()
                 token = data.get("token")
 
                 if not token:
-                    logger.error("elevenlabs: get_conversation_token no token in response")
+                    logger.error("elevenlabs: get_conversation_token no token in response data=%s", data)
                     raise RuntimeError("No token in ElevenLabs response")
 
                 logger.info("elevenlabs: conversation_token_obtained token_length=%s", len(token))
@@ -64,7 +74,7 @@ class ElevenLabsService:
                 }
 
         except Exception as e:
-            logger.error("elevenlabs: get_conversation_token_failed error=%s", e)
+            logger.error("elevenlabs: get_conversation_token_failed error=%s", e, exc_info=True)
             raise
 
     async def send_message(
