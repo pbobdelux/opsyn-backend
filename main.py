@@ -18,6 +18,7 @@ from routes.ai import router as ai_router
 from routes.crm import router as crm_router
 from routes.leaflink_debug import router as leaflink_debug_router
 from routes.voice import router as voice_router
+from routes.voice_brain import router as voice_brain_router
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("opsyn-backend")
@@ -91,6 +92,7 @@ app.include_router(crm_router)
 app.include_router(leaflink_orders_router)
 app.include_router(leaflink_debug_router, prefix="/leaflink")
 app.include_router(voice_router)
+app.include_router(voice_brain_router)
 
 
 @app.middleware("http")
