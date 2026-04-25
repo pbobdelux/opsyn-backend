@@ -60,7 +60,9 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     # ── Try to create client and call API ────────────────────────────────────
     api_connected = False
     credentials_valid = False
+    credentials_source: str | None = None
     last_error: str | None = None
+    api_error: str | None = None
 
     # Look up the first active LeafLink credential from the database,
     # mirroring the same auth path used by the working sync flow.
@@ -80,6 +82,12 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
         logger.error("leaflink: debug cred_api_lookup_failed error=%s", cred_lookup_exc)
 
     if db_cred_for_api is not None:
+        credentials_source = "database"
+        logger.info(
+            "leaflink: debug using_db_credentials brand_id=%s company_id=%s",
+            db_cred_for_api.brand_id,
+            db_cred_for_api.company_id,
+        )
         try:
             client = LeafLinkClient(
                 api_key=db_cred_for_api.api_key,
@@ -97,14 +105,16 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
                 api_connected = True
                 logger.info("leaflink: debug api_connected=true payload_type=%s", type(payload).__name__)
             except Exception as api_exc:
-                last_error = str(api_exc)
+                api_error = str(api_exc)
                 logger.error("leaflink: debug api_call_failed error=%s", api_exc)
 
         except Exception as client_exc:
-            last_error = str(client_exc)
+            api_error = str(client_exc)
             logger.error("leaflink: debug client_init_failed error=%s", client_exc)
     else:
         # No DB credentials — fall back to environment variables (may still fail).
+        credentials_source = "environment"
+        logger.info("leaflink: debug using_env_credentials (no db credentials found)")
         try:
             client = LeafLinkClient()
             credentials_valid = True
@@ -119,11 +129,11 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
                 api_connected = True
                 logger.info("leaflink: debug api_connected=true payload_type=%s", type(payload).__name__)
             except Exception as api_exc:
-                last_error = str(api_exc)
+                api_error = str(api_exc)
                 logger.error("leaflink: debug api_call_failed error=%s", api_exc)
 
         except Exception as client_exc:
-            last_error = str(client_exc)
+            api_error = str(client_exc)
             logger.error("leaflink: debug client_init_failed error=%s", client_exc)
 
     # ── Database: count orders ───────────────────────────────────────────────
@@ -135,16 +145,23 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     except Exception as db_exc:
         logger.error("leaflink: debug db_count_failed error=%s", db_exc)
 
-    # ── Fallback: treat API as connected if orders already exist in DB ────────
-    # This handles the case where the live API call fails (e.g. transient error
-    # or rate-limit) but a previous sync has already populated the database.
-    if not api_connected and orders_in_db > 0:
+    # ── Determine connection_status and apply fallback logic ─────────────────
+    # - live:               API call succeeded
+    # - healthy_from_sync:  API call failed but DB has orders (don't surface error)
+    # - error:              API call failed and DB is empty
+    if api_connected:
+        connection_status = "live"
+    elif orders_in_db > 0:
         api_connected = True
+        connection_status = "healthy_from_sync"
         logger.info(
-            "leaflink: debug api_connected set via fallback orders_in_db=%s last_error=%s",
+            "leaflink: debug fallback_triggered orders_in_db=%s api_error=%s",
             orders_in_db,
-            last_error,
+            api_error,
         )
+    else:
+        connection_status = "error"
+        last_error = api_error
 
     # ── Last sync attempt from BrandAPICredential ────────────────────────────
     last_sync_attempt: str | None = None
@@ -175,19 +192,26 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     except Exception as cred_exc:
         logger.error("leaflink: debug cred_lookup_failed error=%s", cred_exc)
 
-    combined_last_error = last_error or db_last_error
+    # Only surface last_error when connection_status is "error" (i.e. no fallback
+    # succeeded). For "live" and "healthy_from_sync" states last_error is null so
+    # callers don't see transient API failures as actionable problems.
+    # db_last_error is only used when we have no runtime error to report.
+    if last_error is None and connection_status == "error":
+        last_error = db_last_error
 
     result = {
         "ok": True,
         "api_connected": api_connected,
         "credentials_loaded": credentials_loaded,
         "credentials_valid": credentials_valid,
+        "credentials_source": credentials_source,
         "base_url": DEFAULT_LEAFLINK_BASE_URL or base_url_raw or None,
         "company_id": DEFAULT_LEAFLINK_COMPANY_ID or company_id_raw or None,
         "orders_in_db": orders_in_db,
+        "connection_status": connection_status,
         "last_sync_attempt": last_sync_attempt,
         "last_sync_status": last_sync_status,
-        "last_error": combined_last_error,
+        "last_error": last_error,
         "mock_mode_enabled": MOCK_MODE,
         "environment_vars": environment_vars,
     }
