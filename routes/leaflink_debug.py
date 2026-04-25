@@ -7,6 +7,8 @@ import logging
 import os
 from typing import Any, Optional
 
+import requests
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -337,36 +339,85 @@ async def debug_leaflink_auth(
             starts_with_token,
         )
 
-        # Test the authentication with a simple API call
-        test_status = None
-        test_error = None
+        # Test all four authentication header formats with direct HTTP requests
+        base_url = DEFAULT_LEAFLINK_BASE_URL
+        company_id = cred.company_id
 
-        try:
-            client = LeafLinkClient(
-                api_key=clean_api_key,
-                company_id=cred.company_id,
-            )
+        auth_tests = [
+            {
+                "auth_type": "Token",
+                "headers": {
+                    "Authorization": f"Token {clean_api_key}",
+                    "Content-Type": "application/json",
+                }
+            },
+            {
+                "auth_type": "Bearer",
+                "headers": {
+                    "Authorization": f"Bearer {clean_api_key}",
+                    "Content-Type": "application/json",
+                }
+            },
+            {
+                "auth_type": "X-API-Key",
+                "headers": {
+                    "X-API-Key": clean_api_key,
+                    "Content-Type": "application/json",
+                }
+            },
+            {
+                "auth_type": "API-Key",
+                "headers": {
+                    "API-Key": clean_api_key,
+                    "Content-Type": "application/json",
+                }
+            },
+        ]
 
-            # Make a simple test call (list orders with page_size=1)
-            logger.info("leaflink: auth_debug testing API call")
-            payload = client.list_orders(page=1, page_size=1)
-            test_status = 200
-            logger.info("leaflink: auth_debug test_status=200 success")
+        tests = []
+        for test_config in auth_tests:
+            auth_type = test_config["auth_type"]
+            headers = test_config["headers"]
 
-        except Exception as test_exc:
-            test_error = str(test_exc)
-            logger.error(
-                "leaflink: auth_debug test_failed error=%s",
-                test_exc,
-                exc_info=True,
-            )
-            # Try to extract status code from error message
-            if "status=" in test_error:
-                try:
-                    status_str = test_error.split("status=")[1].split()[0]
-                    test_status = int(status_str)
-                except Exception:
-                    test_status = None
+            try:
+                url = f"{base_url}/companies/{company_id}/orders-received/"
+                params = {"page": 1, "page_size": 1}
+
+                logger.info(
+                    "leaflink: auth_debug testing auth_type=%s",
+                    auth_type,
+                )
+
+                resp = requests.get(url, headers=headers, params=params, timeout=10)
+
+                test_result = {
+                    "auth_type": auth_type,
+                    "status": resp.status_code,
+                    "error": None if resp.ok else resp.text[:200],
+                }
+
+                logger.info(
+                    "leaflink: auth_debug test_result auth_type=%s status=%s",
+                    auth_type,
+                    resp.status_code,
+                )
+
+                tests.append(test_result)
+
+            except Exception as test_exc:
+                test_result = {
+                    "auth_type": auth_type,
+                    "status": None,
+                    "error": str(test_exc)[:200],
+                }
+
+                logger.error(
+                    "leaflink: auth_debug test_failed auth_type=%s error=%s",
+                    auth_type,
+                    test_exc,
+                )
+
+                tests.append(test_result)
 
         return {
             "ok": True,
@@ -380,14 +431,12 @@ async def debug_leaflink_auth(
             "has_newlines": has_newlines,
             "starts_with_token": starts_with_token,
             "clean_api_key_length": len(clean_api_key),
-            "auth_header_format": f"Authorization: Token {api_key_prefix}...{api_key_suffix}",
-            "test_status": test_status,
-            "test_error": test_error,
+            "base_url": base_url,
+            "tests": tests,
             "created_at": cred.created_at.isoformat() if cred.created_at else None,
             "updated_at": cred.updated_at.isoformat() if cred.updated_at else None,
             "last_sync_at": cred.last_sync_at.isoformat() if cred.last_sync_at else None,
             "sync_status": cred.sync_status,
-            "last_error": cred.last_error,
         }
 
     except HTTPException:
