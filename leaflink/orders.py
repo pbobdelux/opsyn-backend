@@ -1,8 +1,9 @@
 import logging
+import os
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -12,6 +13,8 @@ from models import Order, OrderLine
 
 logger = logging.getLogger("leaflink_orders")
 router = APIRouter()
+
+MOCK_MODE = os.getenv("MOCK_MODE", "false").strip().lower() == "true"
 
 
 def money_to_float(value: Any) -> float | None:
@@ -126,7 +129,45 @@ def derive_review_status(line_items: list[dict[str, Any]], blockers: list[dict[s
 
 
 @router.get("/orders")
-async def get_orders(db: AsyncSession = Depends(get_db)):
+async def get_orders(
+    mock: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+):
+    use_mock = mock or MOCK_MODE
+    logger.info("leaflink_orders: get_orders called mock=%s", use_mock)
+
+    if use_mock:
+        logger.info("leaflink: get_orders returning mock data")
+        mock_orders = [
+            {
+                "id": 1,
+                "external_id": "mock-001",
+                "order_number": "MOCK-001",
+                "customer_name": "Mock Dispensary",
+                "status": "open",
+                "amount": 500.00,
+                "item_count": 2,
+                "unit_count": 10,
+                "line_items": [],
+                "review_status": "ready",
+                "blockers": [],
+                "sync_status": "ok",
+                "last_synced_at": None,
+                "source": "mock",
+                "external_created_at": None,
+                "external_updated_at": None,
+                "created_at": None,
+                "updated_at": None,
+                "data_source": "mock",
+            }
+        ]
+        return {
+            "success": True,
+            "count": len(mock_orders),
+            "orders": mock_orders,
+            "data_source": "mock",
+        }
+
     logger.info("leaflink: get_orders request start")
     try:
         logger.info("leaflink: get_orders db_query_start")
@@ -181,6 +222,7 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
             "external_updated_at": order.external_updated_at,
             "created_at": order.created_at,
             "updated_at": order.updated_at,
+            "data_source": "database",
         })
 
     if not results:
@@ -196,6 +238,27 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
         "success": True,
         "count": len(results),
         "orders": results,
+        "data_source": "database",
+    }
+
+
+@router.get("/orders/debug")
+async def debug_orders():
+    """
+    Simple debug endpoint for the leaflink orders router.
+    For full diagnostics, see GET /leaflink/debug (routes/leaflink_debug.py).
+    """
+    logger.info("leaflink_orders: debug endpoint called")
+    return {
+        "ok": True,
+        "router": "leaflink_orders",
+        "mock_mode_enabled": MOCK_MODE,
+        "endpoints": [
+            "GET /leaflink/orders",
+            "GET /leaflink/orders/{order_id}",
+            "GET /leaflink/orders/debug (this endpoint)",
+            "GET /leaflink/debug (comprehensive diagnostics)",
+        ],
     }
 
 
@@ -265,12 +328,3 @@ async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
             "updated_at": order.updated_at,
         }
     }
-
-
-@router.get("/leaflink/orders")
-async def get_orders_legacy(db: AsyncSession = Depends(get_db)):
-    """
-    Backward-compatible route so older frontend code that still calls
-    /leaflink/orders keeps working while you transition to /orders.
-    """
-    return await get_orders(db)
