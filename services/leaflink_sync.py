@@ -198,9 +198,32 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
             status = (safe_str(o.get("status")) or "submitted").lower()
             order_number = safe_str(o.get("order_number"))
 
+            # Try multiple field names with fallbacks.
+            # total_amount is the primary key set by the normalized LeafLink client;
+            # the remaining fields cover raw/un-normalized payloads.
+            # TODO: Backfill existing orders with null amount from raw_payload
+            # Run: UPDATE orders SET amount = extracted_value WHERE amount IS NULL AND raw_payload IS NOT NULL
             amount_decimal = safe_decimal(
-                o.get("amount", o.get("total_amount"))
+                o.get("total_amount")  # Primary: from normalized client
+                or o.get("amount")
+                or o.get("total")
+                or o.get("subtotal")
+                or o.get("price")
             )
+
+            # Log the mapping result
+            if amount_decimal is not None:
+                logger.info(
+                    "leaflink: sync_amount_mapped external_id=%s amount=%s",
+                    external_id,
+                    amount_decimal,
+                )
+            else:
+                logger.warning(
+                    "leaflink: sync_amount_missing external_id=%s — no pricing field found in order",
+                    external_id,
+                )
+
             total_cents = decimal_to_cents(amount_decimal) or 0
 
             item_count = safe_int(o.get("item_count"), default=0)
