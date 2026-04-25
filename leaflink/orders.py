@@ -1,13 +1,19 @@
+import logging
+import os
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from database import get_db
 from models import Order, OrderLine
+from services.leaflink_debug import get_debug_info
+
+logger = logging.getLogger("leaflink_orders")
+MOCK_MODE = os.getenv("MOCK_MODE", "false").strip().lower() == "true"
 
 router = APIRouter()
 
@@ -123,14 +129,68 @@ def derive_review_status(line_items: list[dict[str, Any]], blockers: list[dict[s
     return "ready"
 
 
+@router.get("/debug")
+async def get_leaflink_debug(db: AsyncSession = Depends(get_db)):
+    logger.info("leaflink_orders: debug endpoint called")
+    info = await get_debug_info(db)
+    return info
+
+
 @router.get("/orders")
-async def get_orders(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(Order)
-        .options(selectinload(Order.lines))
-        .order_by(Order.external_updated_at.desc().nullslast(), Order.updated_at.desc())
-    )
-    orders = result.scalars().all()
+async def get_orders(
+    db: AsyncSession = Depends(get_db),
+    mock: bool = Query(default=False, description="Return mock data instead of querying the database"),
+):
+    use_mock = mock or MOCK_MODE
+    logger.info("leaflink_orders: get_orders called mock=%s", use_mock)
+
+    if use_mock:
+        logger.info("leaflink_orders: returning mock orders")
+        return {
+            "success": True,
+            "count": 1,
+            "data_source": "mock",
+            "orders": [
+                {
+                    "id": 0,
+                    "external_id": "MOCK-001",
+                    "order_number": "MOCK-001",
+                    "customer_name": "Mock Customer",
+                    "status": "open",
+                    "amount": 100.0,
+                    "item_count": 1,
+                    "unit_count": 1,
+                    "line_items": [],
+                    "review_status": "ready",
+                    "blockers": [],
+                    "sync_status": "ok",
+                    "last_synced_at": None,
+                    "source": "mock",
+                    "external_created_at": None,
+                    "external_updated_at": None,
+                    "created_at": None,
+                    "updated_at": None,
+                }
+            ],
+        }
+
+    try:
+        result = await db.execute(
+            select(Order)
+            .options(selectinload(Order.lines))
+            .order_by(Order.external_updated_at.desc().nullslast(), Order.updated_at.desc())
+        )
+        orders = result.scalars().all()
+        logger.info("leaflink_orders: fetched %d orders from database", len(orders))
+    except Exception as exc:
+        logger.error("leaflink_orders: database error in get_orders: %s", exc)
+        return {
+            "success": False,
+            "count": 0,
+            "data_source": "error",
+            "error": str(exc),
+            "orders": [],
+        }
 
     results: list[dict[str, Any]] = []
 
@@ -176,22 +236,35 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
     return {
         "success": True,
         "count": len(results),
+        "data_source": "database",
         "orders": results,
     }
 
 
 @router.get("/orders/{order_id}")
 async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(Order)
-        .options(selectinload(Order.lines))
-        .where(Order.id == order_id)
-    )
-    order = result.scalar_one_or_none()
+    logger.info("leaflink_orders: get_order_detail called order_id=%s", order_id)
 
-    if not order:
+    try:
+        result = await db.execute(
+            select(Order)
+            .options(selectinload(Order.lines))
+            .where(Order.id == order_id)
+        )
+        order = result.scalar_one_or_none()
+    except Exception as exc:
+        logger.error("leaflink_orders: database error in get_order_detail order_id=%s: %s", order_id, exc)
         return {
             "success": False,
+            "data_source": "error",
+            "error": str(exc),
+        }
+
+    if not order:
+        logger.info("leaflink_orders: order not found order_id=%s", order_id)
+        return {
+            "success": False,
+            "data_source": "database",
             "error": "Order not found",
         }
 
@@ -209,6 +282,7 @@ async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
 
     return {
         "success": True,
+        "data_source": "database",
         "order": {
             "id": order.id,
             "external_id": order.external_order_id,
