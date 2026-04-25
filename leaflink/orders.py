@@ -1,3 +1,4 @@
+import logging
 from decimal import Decimal
 from typing import Any
 
@@ -9,6 +10,7 @@ from sqlalchemy.orm import selectinload
 from database import get_db
 from models import Order, OrderLine
 
+logger = logging.getLogger("leaflink_orders")
 router = APIRouter()
 
 
@@ -125,14 +127,21 @@ def derive_review_status(line_items: list[dict[str, Any]], blockers: list[dict[s
 
 @router.get("/orders")
 async def get_orders(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(Order)
-        .options(selectinload(Order.lines))
-        .order_by(Order.external_updated_at.desc().nullslast(), Order.updated_at.desc())
-    )
-    orders = result.scalars().all()
+    logger.info("leaflink: get_orders request start")
+    try:
+        logger.info("leaflink: get_orders db_query_start")
+        result = await db.execute(
+            select(Order)
+            .options(selectinload(Order.lines))
+            .order_by(Order.external_updated_at.desc().nullslast(), Order.updated_at.desc())
+        )
+        orders = result.scalars().all()
+    except Exception as exc:
+        logger.error("leaflink: get_orders db_query_failed error=%s", exc, exc_info=True)
+        raise
 
     results: list[dict[str, Any]] = []
+    review_status_counts: dict[str, int] = {}
 
     for order in orders:
         line_items = build_line_items(order)
@@ -151,6 +160,7 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
 
         blockers = derive_blockers(line_items)
         review_status = derive_review_status(line_items, blockers, order)
+        review_status_counts[review_status] = review_status_counts.get(review_status, 0) + 1
 
         results.append({
             "id": order.id,
@@ -173,6 +183,15 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
             "updated_at": order.updated_at,
         })
 
+    if not results:
+        logger.info("leaflink: get_orders no_orders_found (not an error)")
+    else:
+        logger.info(
+            "leaflink: get_orders results count=%s review_status_distribution=%s",
+            len(results),
+            review_status_counts,
+        )
+
     return {
         "success": True,
         "count": len(results),
@@ -182,6 +201,7 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
 
 @router.get("/orders/{order_id}")
 async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
+    logger.info("leaflink: get_order_detail request order_id=%s", order_id)
     result = await db.execute(
         select(Order)
         .options(selectinload(Order.lines))
@@ -190,10 +210,18 @@ async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
     order = result.scalar_one_or_none()
 
     if not order:
+        logger.info("leaflink: get_order_detail not_found order_id=%s", order_id)
         return {
             "success": False,
             "error": "Order not found",
         }
+
+    logger.info(
+        "leaflink: get_order_detail found order_id=%s external_id=%s status=%s",
+        order_id,
+        order.external_order_id,
+        order.status,
+    )
 
     line_items = build_line_items(order)
 
@@ -206,6 +234,13 @@ async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
 
     blockers = derive_blockers(line_items)
     review_status = derive_review_status(line_items, blockers, order)
+
+    logger.info(
+        "leaflink: get_order_detail serialized order_id=%s line_items=%s review_status=%s",
+        order_id,
+        len(line_items),
+        review_status,
+    )
 
     return {
         "success": True,
