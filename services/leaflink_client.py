@@ -1,14 +1,17 @@
+import logging
 import os
 from typing import Any, Dict, List, Optional
 
 import requests
 
+logger = logging.getLogger("leaflink_client")
 
 DEFAULT_LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://app.leaflink.com/api/v2").strip().rstrip("/")
 DEFAULT_LEAFLINK_API_KEY = os.getenv("LEAFLINK_API_KEY", "").strip()
 DEFAULT_LEAFLINK_COMPANY_ID = os.getenv("LEAFLINK_COMPANY_ID", "").strip()
 LEAFLINK_API_VERSION = os.getenv("LEAFLINK_API_VERSION", "").strip()
 LEAFLINK_USER_AGENT = os.getenv("LEAFLINK_USER_AGENT", "opsyn-backend").strip()
+MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -81,10 +84,13 @@ class LeafLinkClient:
         self.company_id = str(company_id or DEFAULT_LEAFLINK_COMPANY_ID).strip()
 
         if not self.base_url:
+            logger.warning("leaflink: client_init missing LEAFLINK_BASE_URL")
             raise ValueError("Missing LEAFLINK_BASE_URL")
         if not self.api_key:
+            logger.warning("leaflink: client_init missing LEAFLINK_API_KEY")
             raise ValueError("Missing LEAFLINK_API_KEY")
         if not self.company_id:
+            logger.warning("leaflink: client_init missing LEAFLINK_COMPANY_ID")
             raise ValueError("Missing LEAFLINK_COMPANY_ID")
 
         self.session = requests.Session()
@@ -98,9 +104,46 @@ class LeafLinkClient:
         if LEAFLINK_API_VERSION:
             self.session.headers["LeafLink-Version"] = LEAFLINK_API_VERSION
 
+        logger.info(
+            "leaflink: client_init base_url=%s company_id=%s api_key_set=%s",
+            self.base_url,
+            self.company_id,
+            bool(self.api_key),
+        )
+
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         url = f"{self.base_url}/{path.lstrip('/')}"
-        return self.session.get(url, params=params, timeout=45)
+        safe_params = {k: v for k, v in (params or {}).items() if k not in ("api_key", "token", "secret")}
+        logger.info("leaflink: API request method=GET url=%s params=%s", url, safe_params)
+        try:
+            resp = self.session.get(url, params=params, timeout=45)
+        except Exception as exc:
+            logger.error("leaflink: API request failed url=%s error=%s", url, exc)
+            raise
+        content_type = resp.headers.get("Content-Type", "")
+        logger.info(
+            "leaflink: API response url=%s status=%s content_type=%s size=%s",
+            url,
+            resp.status_code,
+            content_type,
+            len(resp.content),
+        )
+        if "application/json" not in content_type.lower():
+            logger.warning(
+                "leaflink: API response is not JSON url=%s status=%s content_type=%s body_preview=%s",
+                url,
+                resp.status_code,
+                content_type,
+                resp.text[:200],
+            )
+        if not resp.ok:
+            logger.error(
+                "leaflink: API HTTP error url=%s status=%s body_preview=%s",
+                url,
+                resp.status_code,
+                resp.text[:200],
+            )
+        return resp
 
     def list_orders(
         self,
@@ -108,6 +151,13 @@ class LeafLinkClient:
         page_size: int = 100,
         status: Optional[str] = None,
     ) -> Any:
+        logger.info(
+            "leaflink: list_orders start company_id=%s page=%s page_size=%s status=%s",
+            self.company_id,
+            page,
+            page_size,
+            status,
+        )
         params: Dict[str, Any] = {
             "page": page,
             "page_size": page_size,
@@ -120,10 +170,25 @@ class LeafLinkClient:
         content_type = resp.headers.get("Content-Type", "")
 
         if resp.ok and "application/json" in content_type.lower():
-            return resp.json()
+            data = resp.json()
+            result_type = type(data).__name__
+            result_count = len(data) if isinstance(data, list) else len(data.get("results") or data.get("data") or data.get("orders") or [])
+            logger.info(
+                "leaflink: list_orders success page=%s result_type=%s result_count=%s",
+                page,
+                result_type,
+                result_count,
+            )
+            return data
 
+        logger.error(
+            "leaflink: list_orders failed status=%s content_type=%s body_preview=%s",
+            resp.status_code,
+            content_type,
+            resp.text[:220],
+        )
         raise RuntimeError(
-            f"url={resp.url} status={resp.status_code} content_type={content_type} body={resp.text[:220]}"
+            f"LeafLink API error: status={resp.status_code} content_type={content_type} body={resp.text[:220]}"
         )
 
     def _extract_customer_name(self, raw: Dict[str, Any]) -> str:
@@ -321,41 +386,79 @@ class LeafLinkClient:
         }
 
     def fetch_recent_orders(self, max_pages: int = 5, normalize: bool = False) -> List[Dict[str, Any]]:
+        logger.info(
+            "leaflink: fetch_recent_orders start max_pages=%s normalize=%s mock_mode=%s",
+            max_pages,
+            normalize,
+            MOCK_MODE,
+        )
         all_orders: List[Dict[str, Any]] = []
 
-        for page in range(1, max_pages + 1):
-            payload = self.list_orders(page=page, page_size=100)
+        try:
+            for page in range(1, max_pages + 1):
+                logger.info("leaflink: fetch_recent_orders fetching page=%s", page)
+                payload = self.list_orders(page=page, page_size=100)
 
-            if isinstance(payload, list):
-                results = payload
-                next_url = None
-            elif isinstance(payload, dict):
-                results = (
-                    payload.get("results")
-                    or payload.get("data")
-                    or payload.get("orders")
-                    or []
+                if isinstance(payload, list):
+                    results = payload
+                    next_url = None
+                elif isinstance(payload, dict):
+                    results = (
+                        payload.get("results")
+                        or payload.get("data")
+                        or payload.get("orders")
+                        or []
+                    )
+                    next_url = payload.get("next")
+                else:
+                    raise RuntimeError(f"Unexpected LeafLink response type: {type(payload).__name__}")
+
+                if not isinstance(results, list):
+                    raise RuntimeError(f"Unexpected LeafLink results type: {type(results).__name__}")
+
+                logger.info(
+                    "leaflink: fetch_recent_orders page=%s results_count=%s has_next=%s",
+                    page,
+                    len(results),
+                    bool(next_url),
                 )
-                next_url = payload.get("next")
-            else:
-                raise RuntimeError(f"Unexpected LeafLink response type: {type(payload).__name__}")
 
-            if not isinstance(results, list):
-                raise RuntimeError(f"Unexpected LeafLink results type: {type(results).__name__}")
+                if not results:
+                    break
 
-            if not results:
-                break
+                if normalize:
+                    for raw in results:
+                        if isinstance(raw, dict):
+                            all_orders.append(self._normalize_order(raw))
+                else:
+                    for raw in results:
+                        if isinstance(raw, dict):
+                            all_orders.append(raw)
 
-            if normalize:
-                for raw in results:
-                    if isinstance(raw, dict):
-                        all_orders.append(self._normalize_order(raw))
-            else:
-                for raw in results:
-                    if isinstance(raw, dict):
-                        all_orders.append(raw)
+                if not next_url:
+                    break
 
-            if not next_url:
-                break
+        except Exception as exc:
+            logger.error(
+                "leaflink: fetch_recent_orders API call failed error=%s mock_mode=%s",
+                exc,
+                MOCK_MODE,
+            )
+            if MOCK_MODE:
+                logger.warning(
+                    "leaflink: fetch_recent_orders API failed, falling back to mock data (MOCK_MODE=true)"
+                )
+                mock_orders: List[Dict[str, Any]] = [{"mock_data": True}]
+                return mock_orders
+            raise
+
+        total = len(all_orders)
+        logger.info(
+            "leaflink: fetch_recent_orders complete total_orders=%s normalize=%s",
+            total,
+            normalize,
+        )
+        if normalize:
+            logger.info("leaflink: fetch_recent_orders normalized_order_count=%s", total)
 
         return all_orders

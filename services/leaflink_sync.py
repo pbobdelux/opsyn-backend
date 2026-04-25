@@ -124,7 +124,9 @@ def derive_review_status(line_items: list[dict[str, Any]]) -> str:
 
 
 async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any]:
+    logger.info("leaflink: sync_start brand_id=%s", brand_id)
     try:
+        logger.info("leaflink: sync_credential_lookup brand_id=%s integration=leaflink", brand_id)
         result = await db.execute(
             select(BrandAPICredential).where(
                 BrandAPICredential.brand_id == brand_id,
@@ -135,21 +137,52 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
         cred = result.scalar_one_or_none()
 
         if not cred:
+            logger.warning(
+                "leaflink: sync_credential_not_found brand_id=%s — no active LeafLink credentials",
+                brand_id,
+            )
             return {"ok": False, "error": "No active LeafLink credentials found"}
 
+        logger.info(
+            "leaflink: sync_credential_found brand_id=%s company_id=%s api_key_set=%s",
+            brand_id,
+            cred.company_id,
+            bool(cred.api_key),
+        )
+
+        logger.info("leaflink: sync_client_init brand_id=%s", brand_id)
         client = LeafLinkClient(
             api_key=cred.api_key,
             company_id=cred.company_id,
         )
 
+        logger.info("leaflink: sync_api_call_start brand_id=%s", brand_id)
         orders = client.fetch_recent_orders(max_pages=5, normalize=True)
+
+        using_mock = any(isinstance(o, dict) and o.get("mock_data") for o in orders)
+        if using_mock:
+            logger.warning(
+                "leaflink: sync_using_mock_data brand_id=%s — real API unavailable, MOCK_MODE active",
+                brand_id,
+            )
+        else:
+            logger.info(
+                "leaflink: sync_using_real_api_data brand_id=%s orders_fetched=%s",
+                brand_id,
+                len(orders),
+            )
 
         created = 0
         updated = 0
         skipped = 0
         total_lines_written = 0
 
-        logger.info("LeafLink returned %s orders for brand_id=%s", len(orders), brand_id)
+        logger.info(
+            "leaflink: sync_api_response brand_id=%s orders_count=%s mock_data=%s",
+            brand_id,
+            len(orders),
+            using_mock,
+        )
 
         for o in orders:
             if not isinstance(o, dict):
@@ -267,6 +300,17 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
 
         await db.commit()
 
+        logger.info(
+            "leaflink: sync_complete brand_id=%s fetched=%s created=%s updated=%s skipped=%s lines_written=%s mock_data=%s",
+            brand_id,
+            len(orders),
+            created,
+            updated,
+            skipped,
+            total_lines_written,
+            using_mock,
+        )
+
         return {
             "ok": True,
             "fetched": len(orders),
@@ -274,10 +318,16 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
             "updated": updated,
             "skipped": skipped,
             "lines_written": total_lines_written,
+            "mock_data": using_mock,
             "message": f"Synced {len(orders)} orders and wrote {total_lines_written} line items",
         }
 
     except Exception as e:
-        logger.exception("LeafLink sync failed")
+        logger.error(
+            "leaflink: sync_failed brand_id=%s error=%s",
+            brand_id,
+            e,
+            exc_info=True,
+        )
         await db.rollback()
         return {"ok": False, "error": str(e)}
