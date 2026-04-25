@@ -1,21 +1,22 @@
+import logging
+import os
 from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from database import SessionLocal
+from database import get_db
 from models import Order, OrderLine
+from services.leaflink_debug import get_debug_info
+
+logger = logging.getLogger("leaflink_orders")
 
 router = APIRouter()
 
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+MOCK_MODE = os.getenv("MOCK_MODE", "false").strip().lower() == "true"
 
 
 def money_to_float(value: Any) -> float | None:
@@ -129,119 +130,161 @@ def derive_review_status(line_items: list[dict[str, Any]], blockers: list[dict[s
     return "ready"
 
 
+@router.get("/debug")
+async def get_leaflink_debug(db: AsyncSession = Depends(get_db)):
+    """Check LeafLink API connectivity and return diagnostic information."""
+    logger.info("leaflink_orders: debug endpoint called")
+    info = await get_debug_info(db)
+    return info
+
+
 @router.get("/orders")
-def get_orders(db: Session = Depends(get_db)):
-    orders = (
-        db.query(Order)
-        .options(joinedload(Order.lines))
-        .order_by(Order.external_updated_at.desc().nullslast(), Order.updated_at.desc())
-        .all()
-    )
+async def get_orders(mock: bool = False, db: AsyncSession = Depends(get_db)):
+    use_mock = MOCK_MODE or mock
 
-    results: list[dict[str, Any]] = []
+    if use_mock:
+        logger.info("leaflink_orders: returning mock data (MOCK_MODE=%s, ?mock=%s)", MOCK_MODE, mock)
+        return {
+            "ok": True,
+            "count": 0,
+            "data_source": "mock",
+            "orders": [],
+        }
 
-    for order in orders:
+    try:
+        stmt = (
+            select(Order)
+            .options(selectinload(Order.lines))
+            .order_by(Order.external_updated_at.desc().nullslast(), Order.updated_at.desc())
+        )
+        result = await db.execute(stmt)
+        orders = result.scalars().all()
+
+        logger.info("leaflink_orders: fetched %d orders from database", len(orders))
+
+        results: list[dict[str, Any]] = []
+
+        for order in orders:
+            line_items = build_line_items(order)
+
+            amount = money_to_float(order.amount)
+            if amount is None and order.total_cents is not None:
+                amount = cents_to_amount(order.total_cents)
+
+            item_count = order.item_count
+            if item_count is None:
+                item_count = len(line_items)
+
+            unit_count = order.unit_count
+            if unit_count is None:
+                unit_count = sum((item.get("quantity") or 0) for item in line_items)
+
+            blockers = derive_blockers(line_items)
+            review_status = derive_review_status(line_items, blockers, order)
+
+            results.append({
+                "id": order.id,
+                "order_number": order.order_number,
+                "customer_name": order.customer_name,
+                "status": order.status,
+                "review_status": review_status,
+                "amount": amount,
+                "item_count": item_count,
+                "unit_count": unit_count,
+                "line_items": line_items,
+                # Extended fields
+                "external_id": order.external_order_id,
+                "blockers": blockers,
+                "sync_status": order.sync_status or "ok",
+                "last_synced_at": order.last_synced_at or order.synced_at,
+                "source": order.source,
+                "external_created_at": order.external_created_at,
+                "external_updated_at": order.external_updated_at,
+                "created_at": order.created_at,
+                "updated_at": order.updated_at,
+            })
+
+        logger.info("leaflink_orders: returning %d orders, data_source=database", len(results))
+
+        return {
+            "ok": True,
+            "count": len(results),
+            "data_source": "database",
+            "orders": results,
+        }
+
+    except Exception as exc:
+        logger.error("leaflink_orders: database error: %s", str(exc))
+        return {
+            "ok": False,
+            "error": str(exc),
+            "data_source": "error",
+        }
+
+
+@router.get("/orders/{order_id}")
+async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
+    try:
+        stmt = (
+            select(Order)
+            .options(selectinload(Order.lines))
+            .where(Order.id == order_id)
+        )
+        result = await db.execute(stmt)
+        order = result.scalar_one_or_none()
+
+        if not order:
+            logger.info("leaflink_orders: order id=%d not found", order_id)
+            return {
+                "ok": False,
+                "error": "Order not found",
+                "data_source": "database",
+            }
+
         line_items = build_line_items(order)
 
         amount = money_to_float(order.amount)
         if amount is None and order.total_cents is not None:
             amount = cents_to_amount(order.total_cents)
 
-        item_count = order.item_count
-        if item_count is None:
-            item_count = len(line_items)
-
-        unit_count = order.unit_count
-        if unit_count is None:
-            unit_count = sum((item.get("quantity") or 0) for item in line_items)
+        item_count = order.item_count if order.item_count is not None else len(line_items)
+        unit_count = order.unit_count if order.unit_count is not None else sum((item.get("quantity") or 0) for item in line_items)
 
         blockers = derive_blockers(line_items)
         review_status = derive_review_status(line_items, blockers, order)
 
-        results.append({
-            "id": order.id,
-            "external_id": order.external_order_id,
-            "order_number": order.order_number,
-            "customer_name": order.customer_name,
-            "status": order.status,
-            "amount": amount,
-            "item_count": item_count,
-            "unit_count": unit_count,
-            "line_items": line_items,
-            "review_status": review_status,
-            "blockers": blockers,
-            "sync_status": order.sync_status or "ok",
-            "last_synced_at": order.last_synced_at or order.synced_at,
-            "source": order.source,
-            "external_created_at": order.external_created_at,
-            "external_updated_at": order.external_updated_at,
-            "created_at": order.created_at,
-            "updated_at": order.updated_at,
-        })
+        logger.info("leaflink_orders: returning order id=%d, data_source=database", order_id)
 
-    return {
-        "success": True,
-        "count": len(results),
-        "orders": results,
-    }
-
-
-@router.get("/orders/{order_id}")
-def get_order_detail(order_id: int, db: Session = Depends(get_db)):
-    order = (
-        db.query(Order)
-        .options(joinedload(Order.lines))
-        .filter(Order.id == order_id)
-        .first()
-    )
-
-    if not order:
         return {
-            "success": False,
-            "error": "Order not found",
+            "ok": True,
+            "data_source": "database",
+            "order": {
+                "id": order.id,
+                "order_number": order.order_number,
+                "customer_name": order.customer_name,
+                "status": order.status,
+                "review_status": review_status,
+                "amount": amount,
+                "item_count": item_count,
+                "unit_count": unit_count,
+                "line_items": line_items,
+                # Extended fields
+                "external_id": order.external_order_id,
+                "blockers": blockers,
+                "sync_status": order.sync_status or "ok",
+                "last_synced_at": order.last_synced_at or order.synced_at,
+                "source": order.source,
+                "external_created_at": order.external_created_at,
+                "external_updated_at": order.external_updated_at,
+                "created_at": order.created_at,
+                "updated_at": order.updated_at,
+            },
         }
 
-    line_items = build_line_items(order)
-
-    amount = money_to_float(order.amount)
-    if amount is None and order.total_cents is not None:
-        amount = cents_to_amount(order.total_cents)
-
-    item_count = order.item_count if order.item_count is not None else len(line_items)
-    unit_count = order.unit_count if order.unit_count is not None else sum((item.get("quantity") or 0) for item in line_items)
-
-    blockers = derive_blockers(line_items)
-    review_status = derive_review_status(line_items, blockers, order)
-
-    return {
-        "success": True,
-        "order": {
-            "id": order.id,
-            "external_id": order.external_order_id,
-            "order_number": order.order_number,
-            "customer_name": order.customer_name,
-            "status": order.status,
-            "amount": amount,
-            "item_count": item_count,
-            "unit_count": unit_count,
-            "line_items": line_items,
-            "review_status": review_status,
-            "blockers": blockers,
-            "sync_status": order.sync_status or "ok",
-            "last_synced_at": order.last_synced_at or order.synced_at,
-            "source": order.source,
-            "external_created_at": order.external_created_at,
-            "external_updated_at": order.external_updated_at,
-            "created_at": order.created_at,
-            "updated_at": order.updated_at,
+    except Exception as exc:
+        logger.error("leaflink_orders: database error fetching order id=%d: %s", order_id, str(exc))
+        return {
+            "ok": False,
+            "error": str(exc),
+            "data_source": "error",
         }
-    }
-
-
-@router.get("/leaflink/orders")
-def get_orders_legacy(db: Session = Depends(get_db)):
-    """
-    Backward-compatible route so older frontend code that still calls
-    /leaflink/orders keeps working while you transition to /orders.
-    """
-    return get_orders(db)

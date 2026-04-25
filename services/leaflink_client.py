@@ -1,8 +1,10 @@
+import logging
 import os
 from typing import Any, Dict, List, Optional
 
 import requests
 
+logger = logging.getLogger("leaflink_client")
 
 DEFAULT_LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://app.leaflink.com/api/v2").strip().rstrip("/")
 DEFAULT_LEAFLINK_API_KEY = os.getenv("LEAFLINK_API_KEY", "").strip()
@@ -116,12 +118,30 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
+        url = f"{self.base_url}/companies/{self.company_id}/orders-received/"
+        logger.info("leaflink_client: GET %s page=%d company_id=%s", url, page, self.company_id)
+
         resp = self._get_raw(f"companies/{self.company_id}/orders-received/", params=params)
         content_type = resp.headers.get("Content-Type", "")
 
-        if resp.ok and "application/json" in content_type.lower():
-            return resp.json()
+        logger.info("leaflink_client: GET %s status=%d", url, resp.status_code)
 
+        if resp.ok and "application/json" in content_type.lower():
+            payload = resp.json()
+            if isinstance(payload, list):
+                results = payload
+            elif isinstance(payload, dict):
+                results = payload.get("results") or payload.get("data") or payload.get("orders") or []
+            else:
+                results = []
+            logger.info("leaflink_client: received %d orders on page=%d", len(results), page)
+            return payload
+
+        logger.error(
+            "leaflink_client: API error status=%d: %s",
+            resp.status_code,
+            resp.text[:200],
+        )
         raise RuntimeError(
             f"url={resp.url} status={resp.status_code} content_type={content_type} body={resp.text[:220]}"
         )
@@ -321,6 +341,11 @@ class LeafLinkClient:
         }
 
     def fetch_recent_orders(self, max_pages: int = 5, normalize: bool = False) -> List[Dict[str, Any]]:
+        logger.info(
+            "leaflink_client: fetching recent orders max_pages=%d normalize=%s",
+            max_pages,
+            normalize,
+        )
         all_orders: List[Dict[str, Any]] = []
 
         for page in range(1, max_pages + 1):
@@ -358,4 +383,9 @@ class LeafLinkClient:
             if not next_url:
                 break
 
+        logger.info(
+            "leaflink_client: fetched %d total orders across %d pages",
+            len(all_orders),
+            page,
+        )
         return all_orders
