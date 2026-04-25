@@ -1,12 +1,13 @@
 """
 LeafLink debug endpoint — returns full connectivity and configuration diagnostics.
 GET /leaflink/debug
+GET /leaflink/auth-debug
 """
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -266,3 +267,134 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     )
 
     return result
+
+
+@router.get("/auth-debug")
+async def debug_leaflink_auth(
+    x_opsyn_secret: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Safe debug endpoint for LeafLink authentication.
+    Requires X-OPSYN-SECRET header.
+
+    Returns credential metadata (no full secrets) and tests authentication.
+    """
+    expected = os.getenv("OPSYN_SYNC_SECRET")
+    if not expected or x_opsyn_secret != expected:
+        logger.warning("leaflink: auth_debug unauthorized attempt")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    logger.info("leaflink: auth_debug endpoint called")
+
+    try:
+        # Query the first active LeafLink credential
+        cred_result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+            ).limit(1)
+        )
+        cred = cred_result.scalar_one_or_none()
+
+        if not cred:
+            logger.warning("leaflink: auth_debug no active credentials found")
+            return {
+                "ok": True,
+                "credential_found": False,
+                "error": "No active LeafLink credentials found",
+            }
+
+        # Extract and clean the API key
+        raw_api_key = cred.api_key or ""
+        api_key_length = len(raw_api_key)
+
+        # Check for whitespace issues
+        has_whitespace = any(c.isspace() for c in raw_api_key)
+        has_newlines = "\n" in raw_api_key or "\r" in raw_api_key
+
+        # Check if it already starts with "Token "
+        starts_with_token = raw_api_key.startswith("Token ")
+
+        # Clean the key: strip whitespace and remove "Token " prefix if present
+        clean_api_key = raw_api_key.strip()
+        if clean_api_key.startswith("Token "):
+            clean_api_key = clean_api_key[6:].strip()
+
+        # Get safe prefix/suffix
+        api_key_prefix = clean_api_key[:6] if clean_api_key else "NONE"
+        api_key_suffix = clean_api_key[-4:] if len(clean_api_key) >= 4 else "NONE"
+
+        logger.info(
+            "leaflink: auth_debug credential_found=true brand_id=%s company_id=%s key_length=%s key_prefix=%s key_suffix=%s has_whitespace=%s has_newlines=%s starts_with_token=%s",
+            cred.brand_id,
+            cred.company_id,
+            api_key_length,
+            api_key_prefix,
+            api_key_suffix,
+            has_whitespace,
+            has_newlines,
+            starts_with_token,
+        )
+
+        # Test the authentication with a simple API call
+        test_status = None
+        test_error = None
+
+        try:
+            client = LeafLinkClient(
+                api_key=clean_api_key,
+                company_id=cred.company_id,
+            )
+
+            # Make a simple test call (list orders with page_size=1)
+            logger.info("leaflink: auth_debug testing API call")
+            payload = client.list_orders(page=1, page_size=1)
+            test_status = 200
+            logger.info("leaflink: auth_debug test_status=200 success")
+
+        except Exception as test_exc:
+            test_error = str(test_exc)
+            logger.error(
+                "leaflink: auth_debug test_failed error=%s",
+                test_exc,
+                exc_info=True,
+            )
+            # Try to extract status code from error message
+            if "status=" in test_error:
+                try:
+                    status_str = test_error.split("status=")[1].split()[0]
+                    test_status = int(status_str)
+                except Exception:
+                    test_status = None
+
+        return {
+            "ok": True,
+            "credential_found": True,
+            "brand_id": cred.brand_id,
+            "company_id": cred.company_id,
+            "api_key_length": api_key_length,
+            "api_key_prefix": api_key_prefix,
+            "api_key_suffix": api_key_suffix,
+            "has_whitespace": has_whitespace,
+            "has_newlines": has_newlines,
+            "starts_with_token": starts_with_token,
+            "clean_api_key_length": len(clean_api_key),
+            "auth_header_format": f"Authorization: Token {api_key_prefix}...{api_key_suffix}",
+            "test_status": test_status,
+            "test_error": test_error,
+            "created_at": cred.created_at.isoformat() if cred.created_at else None,
+            "updated_at": cred.updated_at.isoformat() if cred.updated_at else None,
+            "last_sync_at": cred.last_sync_at.isoformat() if cred.last_sync_at else None,
+            "sync_status": cred.sync_status,
+            "last_error": cred.last_error,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("leaflink: auth_debug failed error=%s", e, exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e),
+        }
