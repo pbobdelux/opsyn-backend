@@ -28,14 +28,42 @@ def utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+async def _create_assistant_tables() -> None:
+    """Create assistant tables if they don't exist (idempotent)."""
+    try:
+        from database import Base, engine
+
+        if engine is None:
+            logger.warning("startup: DATABASE_URL not set — skipping assistant table creation")
+            return
+
+        # Import assistant models so SQLAlchemy registers them with Base.metadata
+        import models.assistant_models  # noqa: F401
+
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        logger.info("startup: assistant tables created/verified")
+    except Exception as exc:
+        logger.error("startup: failed to create assistant tables: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Starting {APP_NAME} in {APP_ENV}")
+    await _create_assistant_tables()
     yield
     logger.info("Shutting down")
 
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
+
+# ---------------------------------------------------------------------------
+# Routers
+# ---------------------------------------------------------------------------
+from routes.assistant import router as assistant_router  # noqa: E402
+
+app.include_router(assistant_router)
 
 app.add_middleware(
     CORSMiddleware,
