@@ -5,10 +5,14 @@ import os
 import traceback
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import Depends, FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from database import get_db
+from models import BrandAPICredential
 from leaflink.orders import router as leaflink_orders_router
 from routes.ai import router as ai_router
 from routes.leaflink_debug import router as leaflink_debug_router
@@ -174,13 +178,165 @@ def create_driver(org_id: str, body: dict):
 
 
 @app.post("/sync/leaflink/run")
-def sync_leaflink(x_opsyn_secret: Optional[str] = Header(None)):
+async def sync_leaflink(
+    x_opsyn_secret: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Sync LeafLink orders for all active brands.
+    Requires X-OPSYN-SECRET header for external calls.
+    Internal worker calls can omit the header.
+    """
     expected = os.getenv("OPSYN_SYNC_SECRET")
 
+    # Require auth for external calls; allow internal calls without header
     if expected and x_opsyn_secret != expected:
+        logger.warning("leaflink: sync_endpoint unauthorized attempt")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    return {"ok": True, "message": "Sync endpoint reachable"}
+    logger.info("leaflink: sync_endpoint called")
+
+    try:
+        from services.leaflink_sync import sync_leaflink_orders
+
+        # Find all active LeafLink credentials
+        cred_result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+            )
+        )
+        credentials = cred_result.scalars().all()
+
+        if not credentials:
+            logger.warning("leaflink: sync_endpoint no active credentials found")
+            return {
+                "ok": False,
+                "error": "No active LeafLink credentials found",
+            }
+
+        logger.info("leaflink: sync_endpoint found %s active credentials", len(credentials))
+
+        all_results = []
+        total_created = 0
+        total_updated = 0
+        total_skipped = 0
+        total_lines = 0
+
+        for cred in credentials:
+            logger.info(
+                "leaflink: sync_endpoint syncing brand_id=%s",
+                cred.brand_id,
+            )
+
+            try:
+                result = await sync_leaflink_orders(db, cred.brand_id)
+
+                # Update credential sync status
+                cred.sync_status = "ok" if result.get("ok") else "failed"
+                cred.last_sync_at = datetime.now(timezone.utc)
+                if not result.get("ok"):
+                    cred.last_error = result.get("error", "Unknown error")
+                else:
+                    cred.last_error = None
+
+                await db.commit()
+
+                logger.info(
+                    "leaflink: sync_endpoint brand_id=%s result=%s created=%s updated=%s skipped=%s lines=%s",
+                    cred.brand_id,
+                    "ok" if result.get("ok") else "failed",
+                    result.get("created", 0),
+                    result.get("updated", 0),
+                    result.get("skipped", 0),
+                    result.get("lines_written", 0),
+                )
+
+                total_created += result.get("created", 0)
+                total_updated += result.get("updated", 0)
+                total_skipped += result.get("skipped", 0)
+                total_lines += result.get("lines_written", 0)
+
+                all_results.append({
+                    "brand_id": cred.brand_id,
+                    "ok": result.get("ok"),
+                    "created": result.get("created", 0),
+                    "updated": result.get("updated", 0),
+                    "skipped": result.get("skipped", 0),
+                    "lines_written": result.get("lines_written", 0),
+                    "error": result.get("error"),
+                })
+
+            except Exception as brand_exc:
+                logger.error(
+                    "leaflink: sync_endpoint brand_id=%s error=%s",
+                    cred.brand_id,
+                    brand_exc,
+                    exc_info=True,
+                )
+
+                # Mark credential as failed
+                cred.sync_status = "failed"
+                cred.last_sync_at = datetime.now(timezone.utc)
+                cred.last_error = str(brand_exc)
+                await db.commit()
+
+                all_results.append({
+                    "brand_id": cred.brand_id,
+                    "ok": False,
+                    "error": str(brand_exc),
+                })
+
+        logger.info(
+            "leaflink: sync_endpoint complete total_created=%s total_updated=%s total_skipped=%s total_lines=%s",
+            total_created,
+            total_updated,
+            total_skipped,
+            total_lines,
+        )
+
+        return {
+            "ok": True,
+            "total_created": total_created,
+            "total_updated": total_updated,
+            "total_skipped": total_skipped,
+            "total_lines_written": total_lines,
+            "brands_synced": len([r for r in all_results if r.get("ok")]),
+            "brands_failed": len([r for r in all_results if not r.get("ok")]),
+            "results": all_results,
+        }
+
+    except Exception as e:
+        logger.error(
+            "leaflink: sync_endpoint failed error=%s",
+            e,
+            exc_info=True,
+        )
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+
+@app.post("/leaflink/sync-now")
+async def sync_leaflink_now(
+    x_opsyn_secret: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Manually trigger LeafLink sync.
+    Requires X-OPSYN-SECRET header.
+    """
+    expected = os.getenv("OPSYN_SYNC_SECRET")
+
+    if not expected or x_opsyn_secret != expected:
+        logger.warning("leaflink: sync_now unauthorized attempt")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    logger.info("leaflink: sync_now manual trigger")
+
+    # Delegate to the main sync endpoint
+    return await sync_leaflink(x_opsyn_secret=x_opsyn_secret, db=db)
 
 
 if __name__ == "__main__":
