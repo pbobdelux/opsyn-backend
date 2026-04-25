@@ -7,11 +7,17 @@ Every protected endpoint must:
      the org_id in the request path.
 
 All queries must then use the authenticated org_id — never the raw path value.
+
+TEMPORARY GRACE PERIOD: If both headers are missing AND the requested org_id is
+"org_onboarding", the request is allowed through with a warning log.  This
+exists solely to unblock existing test/UI clients that have not yet been updated
+to send the new auth headers.  It WILL be removed once all clients are updated.
 """
 
 import hashlib
 import hmac
 import logging
+from typing import Optional
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -33,8 +39,9 @@ def _hash_secret(secret: str) -> str:
 
 
 async def get_authenticated_org(
-    x_opsyn_org: str,
-    x_opsyn_secret: str,
+    x_opsyn_org: Optional[str],
+    x_opsyn_secret: Optional[str],
+    org_id: str,  # from path parameter — used for the org_onboarding grace period
     db: AsyncSession,
 ) -> str:
     """Validate X-OPSYN-ORG + X-OPSYN-SECRET headers against the database.
@@ -43,15 +50,36 @@ async def get_authenticated_org(
     Raises HTTP 401 for missing/invalid credentials.
     Raises HTTP 403 for inactive tenants.
 
-    This function is intentionally called with explicit arguments rather than
-    as a FastAPI Depends so that callers can pass the already-resolved db
-    session and header values — keeping the dependency graph flat and making
-    the auth call explicit and auditable at each endpoint.
+    TEMPORARY: If both headers are absent and org_id == "org_onboarding", the
+    request is allowed through with a warning log.  Remove this block once all
+    clients send X-OPSYN-ORG / X-OPSYN-SECRET.
     """
-    if not x_opsyn_org or not x_opsyn_secret:
-        logger.warning("tenant_auth: missing auth headers")
+    # ------------------------------------------------------------------
+    # Case 1: Both headers missing
+    # ------------------------------------------------------------------
+    if not x_opsyn_org and not x_opsyn_secret:
+        if org_id == "org_onboarding":
+            # TEMPORARY: allow org_onboarding without headers during transition.
+            # Remove this block once all clients send X-OPSYN-ORG / X-OPSYN-SECRET.
+            logger.warning(
+                "tenant_auth: missing headers for org_id=%s, defaulting to org_onboarding (TEMPORARY)",
+                org_id,
+            )
+            return "org_onboarding"
+        else:
+            logger.warning("tenant_auth: missing auth headers for org_id=%s", org_id)
+            raise HTTPException(status_code=401, detail="Missing authentication headers")
+
+    # ------------------------------------------------------------------
+    # Case 2: Exactly one header present — partial auth is always invalid
+    # ------------------------------------------------------------------
+    if (x_opsyn_org and not x_opsyn_secret) or (not x_opsyn_org and x_opsyn_secret):
+        logger.warning("tenant_auth: incomplete auth headers for org_id=%s", org_id)
         raise HTTPException(status_code=401, detail="Missing authentication headers")
 
+    # ------------------------------------------------------------------
+    # Case 3: Both headers present — validate against the database
+    # ------------------------------------------------------------------
     result = await db.execute(
         select(TenantCredential).where(TenantCredential.org_id == x_opsyn_org)
     )

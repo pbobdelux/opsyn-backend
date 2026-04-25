@@ -80,11 +80,11 @@ def serialize_route(route: Route, include_stops: bool = True) -> dict:
 async def create_route(
     org_id: str,
     body: RouteCreate,
-    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
-    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
     verify_tenant_access(authenticated_org, org_id)
 
     # Validate driver belongs to this org if provided
@@ -111,11 +111,11 @@ async def create_route(
 @router.get("")
 async def list_routes(
     org_id: str,
-    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
-    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
     verify_tenant_access(authenticated_org, org_id)
 
     result = await db.execute(
@@ -137,11 +137,11 @@ async def list_routes(
 async def get_route(
     org_id: str,
     route_id: int,
-    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
-    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
     verify_tenant_access(authenticated_org, org_id)
 
     result = await db.execute(
@@ -160,11 +160,11 @@ async def assign_driver(
     org_id: str,
     route_id: int,
     body: AssignDriverBody,
-    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
-    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
     verify_tenant_access(authenticated_org, org_id)
 
     route_result = await db.execute(
@@ -192,11 +192,11 @@ async def add_stop(
     org_id: str,
     route_id: int,
     body: StopCreate,
-    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
-    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
     verify_tenant_access(authenticated_org, org_id)
 
     route_result = await db.execute(
@@ -224,11 +224,11 @@ async def add_stop(
 async def list_stops(
     org_id: str,
     route_id: int,
-    x_opsyn_org: str = Header(..., alias="x-opsyn-org"),
-    x_opsyn_secret: str = Header(..., alias="x-opsyn-secret"),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, db)
+    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
     verify_tenant_access(authenticated_org, org_id)
 
     route_result = await db.execute(
