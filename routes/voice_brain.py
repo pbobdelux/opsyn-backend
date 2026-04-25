@@ -268,6 +268,52 @@ async def voice_message(
         }
 
 
+@router.post("/callback")
+async def voice_brain_callback(
+    body: dict[str, Any],
+):
+    """
+    Receive callbacks from Twin Voice Brain.
+    No authentication required for now (Twin will call this).
+
+    Body:
+    {
+      "run_id": "...",
+      "status": "completed",
+      "output": {...},
+      "error": null
+    }
+    """
+    try:
+        run_id = body.get("run_id", "unknown")
+        status = body.get("status", "unknown")
+
+        logger.info(
+            "voice_brain: callback_received run_id=%s status=%s",
+            run_id[:8] + "..." if len(run_id) > 8 else run_id,
+            status,
+        )
+
+        # Log full payload for debugging (safe - no secrets in callback)
+        logger.debug("voice_brain: callback_payload=%s", body)
+
+        # TODO: Store callback result in database or cache for later retrieval
+        # For now, just acknowledge receipt
+
+        return make_json_safe({
+            "ok": True,
+            "received": True,
+            "run_id": run_id,
+        })
+
+    except Exception as e:
+        logger.error("voice_brain: callback_failed error=%s", e, exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+
 @router.post("/action/confirm")
 async def voice_action_confirm(
     body: dict[str, Any],
