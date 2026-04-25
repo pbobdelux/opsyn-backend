@@ -15,6 +15,7 @@ from database import get_db
 from models import BrandAPICredential
 from leaflink.orders import router as leaflink_orders_router
 from routes.ai import router as ai_router
+from routes.crm import router as crm_router
 from routes.leaflink_debug import router as leaflink_debug_router
 from utils.json_utils import make_json_safe
 
@@ -85,6 +86,7 @@ app.add_middleware(
 # Routers
 # ---------------------------------------------------------------------------
 app.include_router(ai_router, prefix="/ai")
+app.include_router(crm_router)
 app.include_router(leaflink_orders_router)
 app.include_router(leaflink_debug_router, prefix="/leaflink")
 
