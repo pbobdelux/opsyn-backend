@@ -362,6 +362,7 @@ async def sync_leaflink_now(
         total_created = 0
         total_updated = 0
         total_line_items_written = 0
+        newest_order_date = None
 
         async with db.begin():
             # Step 1: Resolve active credentials inside the transaction.
@@ -407,6 +408,9 @@ async def sync_leaflink_now(
                     total_created += result.get("created", 0)
                     total_updated += result.get("updated", 0)
                     total_line_items_written += result.get("line_items_written", 0)
+                    result_date = result.get("newest_order_date")
+                    if result_date and (newest_order_date is None or result_date > newest_order_date):
+                        newest_order_date = result_date
 
         # Transaction commits here — return results after the block.
         logger.info(
@@ -424,7 +428,7 @@ async def sync_leaflink_now(
             "updated": total_updated,
             "skipped": 0,
             "line_items_written": total_line_items_written,
-            "newest_order_date": None,
+            "newest_order_date": newest_order_date,
             "errors": [],
         })
 

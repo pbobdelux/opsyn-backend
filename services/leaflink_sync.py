@@ -16,6 +16,18 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def parse_dt(val: Any) -> datetime | None:
+    """Parse an ISO datetime string to a datetime object, or pass through if already datetime."""
+    if isinstance(val, str):
+        try:
+            return datetime.fromisoformat(val.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if isinstance(val, datetime):
+        return val
+    return None
+
+
 def safe_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -253,23 +265,14 @@ async def sync_leaflink_orders(
             )
             existing = existing_result.scalar_one_or_none()
 
-            external_created_at = o.get("created_at")
-            external_updated_at = o.get("updated_at")
+            external_created_at = parse_dt(o.get("created_at"))
+            external_updated_at = parse_dt(o.get("updated_at"))
 
             # Track the newest order date for the response.
-            for ts in (external_updated_at, external_created_at):
-                if ts:
-                    try:
-                        if isinstance(ts, str):
-                            ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        elif isinstance(ts, datetime):
-                            ts_dt = ts
-                        else:
-                            ts_dt = None
-                        if ts_dt and (newest_order_date is None or ts_dt > newest_order_date):
-                            newest_order_date = ts_dt
-                    except Exception:
-                        pass
+            for ts_dt in (external_updated_at, external_created_at):
+                if ts_dt:
+                    if newest_order_date is None or ts_dt > newest_order_date:
+                        newest_order_date = ts_dt
                     break
 
             if existing:
