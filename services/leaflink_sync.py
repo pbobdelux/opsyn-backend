@@ -7,6 +7,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Order, OrderLine
+from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("leaflink_sync")
 
@@ -138,6 +139,7 @@ async def sync_leaflink_orders(
     or db.rollback() here.
     """
     logger.info("leaflink: sync_start brand_id=%s", brand_id)
+    logger.info("leaflink: sync_json_sanitized brand_id=%s", brand_id)
 
     using_mock = any(isinstance(o, dict) and o.get("mock_data") for o in orders)
     if using_mock:
@@ -278,8 +280,8 @@ async def sync_leaflink_orders(
                 existing.amount = amount_decimal
                 existing.item_count = item_count
                 existing.unit_count = unit_count
-                existing.line_items_json = normalized_line_items
-                existing.raw_payload = raw_payload
+                existing.line_items_json = make_json_safe(normalized_line_items)
+                existing.raw_payload = make_json_safe(raw_payload)
                 existing.review_status = review_status
                 existing.sync_status = "ok"
                 existing.synced_at = now
@@ -299,8 +301,8 @@ async def sync_leaflink_orders(
                     amount=amount_decimal,
                     item_count=item_count,
                     unit_count=unit_count,
-                    line_items_json=normalized_line_items,
-                    raw_payload=raw_payload,
+                    line_items_json=make_json_safe(normalized_line_items),
+                    raw_payload=make_json_safe(raw_payload),
                     source="leaflink",
                     review_status=review_status,
                     sync_status="ok",
@@ -333,7 +335,7 @@ async def sync_leaflink_orders(
                         mapped_product_id=item.get("mapped_product_id"),
                         mapping_status=item.get("mapping_status"),
                         mapping_issue=item.get("mapping_issue"),
-                        raw_payload=item.get("raw_payload"),
+                        raw_payload=make_json_safe(item.get("raw_payload")),
                     )
                 )
 

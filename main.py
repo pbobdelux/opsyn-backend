@@ -16,6 +16,7 @@ from models import BrandAPICredential
 from leaflink.orders import router as leaflink_orders_router
 from routes.ai import router as ai_router
 from routes.leaflink_debug import router as leaflink_debug_router
+from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("opsyn-backend")
 logging.basicConfig(
@@ -308,7 +309,7 @@ async def sync_leaflink(
             total_lines,
         )
 
-        return {
+        return make_json_safe({
             "ok": True,
             "total_created": total_created,
             "total_updated": total_updated,
@@ -317,7 +318,7 @@ async def sync_leaflink(
             "brands_synced": len([r for r in all_results if r.get("ok")]),
             "brands_failed": len([r for r in all_results if not r.get("ok")]),
             "results": all_results,
-        }
+        })
 
     except Exception as e:
         logger.error(
@@ -325,10 +326,10 @@ async def sync_leaflink(
             e,
             exc_info=True,
         )
-        return {
+        return make_json_safe({
             "ok": False,
             "error": str(e),
-        }
+        })
 
 
 
@@ -416,17 +417,30 @@ async def sync_leaflink_now(
             total_line_items_written,
         )
 
-        return {
+        return make_json_safe({
             "ok": True,
             "orders_fetched": total_orders_fetched,
             "created": total_created,
             "updated": total_updated,
+            "skipped": 0,
             "line_items_written": total_line_items_written,
-        }
+            "newest_order_date": None,
+            "errors": [],
+        })
 
     except Exception as e:
         logger.error("leaflink: sync_now failed error=%s", e, exc_info=True)
-        return {"ok": False, "error": str(e)}
+        return make_json_safe({
+            "ok": False,
+            "error": str(e),
+            "orders_fetched": 0,
+            "created": 0,
+            "updated": 0,
+            "skipped": 0,
+            "line_items_written": 0,
+            "newest_order_date": None,
+            "errors": [str(e)],
+        })
 
 
 if __name__ == "__main__":
