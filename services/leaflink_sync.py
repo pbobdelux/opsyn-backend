@@ -126,37 +126,62 @@ def derive_review_status(line_items: list[dict[str, Any]]) -> str:
 async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any]:
     logger.info("leaflink: sync_start brand_id=%s", brand_id)
 
-    # Resolve credentials and fetch orders outside the transaction so we don't
-    # hold a DB connection open during the (potentially slow) HTTP call to the
-    # LeafLink API.
+    # ------------------------------------------------------------------
+    # Step 1: Resolve credentials inside their own transaction so asyncpg
+    # has a proper connection context.  Extract scalar values before the
+    # block exits so we don't hold the connection open during the HTTP call.
+    # ------------------------------------------------------------------
     logger.info("leaflink: sync_credential_lookup brand_id=%s integration=leaflink", brand_id)
-    cred_result = await db.execute(
-        select(BrandAPICredential).where(
-            BrandAPICredential.brand_id == brand_id,
-            BrandAPICredential.integration_name == "leaflink",
-            BrandAPICredential.is_active == True,
-        )
-    )
-    cred = cred_result.scalar_one_or_none()
 
-    if not cred:
-        logger.warning(
-            "leaflink: sync_credential_not_found brand_id=%s — no active LeafLink credentials",
-            brand_id,
+    api_key: str | None = None
+    company_id: str | None = None
+
+    async with db.begin():
+        cred_result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.brand_id == brand_id,
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+            )
         )
-        return {"ok": False, "error": "No active LeafLink credentials found"}
+        cred = cred_result.scalar_one_or_none()
+
+        if not cred:
+            logger.warning(
+                "leaflink: sync_credential_not_found brand_id=%s — no active LeafLink credentials",
+                brand_id,
+            )
+            # Return early; begin() rolls back the read-only txn cleanly.
+            return {
+                "ok": False,
+                "error": "No active LeafLink credentials found",
+                "orders_fetched": 0,
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "line_items_written": 0,
+                "newest_order_date": None,
+                "errors": ["No active LeafLink credentials found"],
+            }
+
+        # Copy scalar values out before the transaction closes.
+        api_key = cred.api_key
+        company_id = cred.company_id
 
     logger.info(
         "leaflink: sync_credential_found brand_id=%s company_id=%s api_key_set=%s",
         brand_id,
-        cred.company_id,
-        bool(cred.api_key),
+        company_id,
+        bool(api_key),
     )
 
+    # ------------------------------------------------------------------
+    # Step 2: Fetch orders from the LeafLink API (pure HTTP, no DB).
+    # ------------------------------------------------------------------
     logger.info("leaflink: sync_client_init brand_id=%s", brand_id)
     client = LeafLinkClient(
-        api_key=cred.api_key,
-        company_id=cred.company_id,
+        api_key=api_key,
+        company_id=company_id,
     )
 
     logger.info("leaflink: sync_api_call_start brand_id=%s", brand_id)
@@ -181,7 +206,13 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
     updated = 0
     skipped = 0
     total_lines_written = 0
+    errors: list[str] = []
+    newest_order_date: datetime | None = None
 
+    # ------------------------------------------------------------------
+    # Step 3: Upsert orders and write line items inside a single transaction.
+    # The begin() context manager commits on success and rolls back on error.
+    # ------------------------------------------------------------------
     try:
         async with db.begin():
             logger.info(
@@ -208,8 +239,6 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
                 # Try multiple field names with fallbacks.
                 # total_amount is the primary key set by the normalized LeafLink client;
                 # the remaining fields cover raw/un-normalized payloads.
-                # TODO: Backfill existing orders with null amount from raw_payload
-                # Run: UPDATE orders SET amount = extracted_value WHERE amount IS NULL AND raw_payload IS NOT NULL
                 amount_decimal = safe_decimal(
                     o.get("total_amount")  # Primary: from normalized client
                     or o.get("amount")
@@ -274,6 +303,22 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
                 external_created_at = o.get("created_at")
                 external_updated_at = o.get("updated_at")
 
+                # Track the newest order date for the response.
+                for ts in (external_updated_at, external_created_at):
+                    if ts:
+                        try:
+                            if isinstance(ts, str):
+                                ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                            elif isinstance(ts, datetime):
+                                ts_dt = ts
+                            else:
+                                ts_dt = None
+                            if ts_dt and (newest_order_date is None or ts_dt > newest_order_date):
+                                newest_order_date = ts_dt
+                        except Exception:
+                            pass
+                        break
+
                 if existing:
                     existing.customer_name = customer_name
                     existing.status = status
@@ -314,9 +359,11 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
                         external_updated_at=external_updated_at,
                     )
                     db.add(order_row)
+                    # Flush to get the auto-generated order_row.id before writing lines.
                     await db.flush()
                     created += 1
 
+                # Delete stale line items then insert fresh ones.
                 await db.execute(
                     delete(OrderLine).where(OrderLine.order_id == order_row.id)
                 )
@@ -349,13 +396,6 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
             total_lines_written,
         )
         logger.info(
-            "leaflink: sync_complete brand_id=%s created=%s updated=%s lines=%s",
-            brand_id,
-            created,
-            updated,
-            total_lines_written,
-        )
-        logger.info(
             "leaflink: sync_complete brand_id=%s fetched=%s created=%s updated=%s skipped=%s lines_written=%s mock_data=%s",
             brand_id,
             len(orders),
@@ -373,6 +413,8 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
             "updated": updated,
             "skipped": skipped,
             "line_items_written": total_lines_written,
+            "newest_order_date": newest_order_date,
+            "errors": errors,
             "mock_data": using_mock,
             "message": f"Synced {len(orders)} orders and wrote {total_lines_written} line items",
         }
@@ -385,4 +427,14 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
             exc_info=True,
         )
         # begin() context manager rolls back automatically on exception.
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "error": str(e),
+            "orders_fetched": len(orders),
+            "created": created,
+            "updated": updated,
+            "skipped": skipped,
+            "line_items_written": total_lines_written,
+            "newest_order_date": newest_order_date,
+            "errors": [str(e)],
+        }
