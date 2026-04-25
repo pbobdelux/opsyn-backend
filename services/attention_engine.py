@@ -4,6 +4,13 @@ Attention Engine — comprehensive operational priority analysis.
 Queries real database data to produce a structured attention report
 suitable for voice (ElevenLabs) and screen (Brand App) consumption.
 
+Brand-ID filtering behaviour
+-----------------------------
+When brand_id is explicitly provided the engine filters all queries to that
+brand.  When brand_id is None (the default) the engine queries ALL orders —
+matching the behaviour of the /leaflink/orders endpoint — so that the
+attention counts always reflect the full picture visible in the UI.
+
 Public API
 ----------
     async def get_operational_attention(
@@ -78,11 +85,9 @@ def _build_spoken_reply(counts: dict, severity: str) -> str:
     missing_amt = counts.get("missing_amount", 0)
     total = counts.get("total_orders", 0)
 
-    if severity == "clear":
-        return (
-            f"Everything looks good. You have {total} active order{'s' if total != 1 else ''} "
-            "and no items requiring immediate attention."
-        )
+    # Only report "all clear" when there are genuinely zero orders AND no issues.
+    if severity == "clear" and total == 0:
+        return "No active orders found. Everything is clear."
 
     if blocked:
         parts.append(f"{blocked} blocked order{'s' if blocked != 1 else ''}")
@@ -96,7 +101,10 @@ def _build_spoken_reply(counts: dict, severity: str) -> str:
         parts.append(f"{missing_amt} order{'s' if missing_amt != 1 else ''} missing amount")
 
     if not parts:
-        return f"You have {total} active order{'s' if total != 1 else ''}. No critical issues found."
+        return (
+            f"You have {total} active order{'s' if total != 1 else ''}. "
+            "No critical issues found."
+        )
 
     summary = ", ".join(parts[:-1])
     if len(parts) > 1:
@@ -112,13 +120,19 @@ def _build_spoken_reply(counts: dict, severity: str) -> str:
     elif review:
         recommendation = " I recommend reviewing the flagged orders."
 
-    return f"You have {summary}.{recommendation}"
+    return (
+        f"You have {total} active order{'s' if total != 1 else ''} in the system. "
+        f"{summary[0].upper() + summary[1:]}.{recommendation}"
+    )
 
 
 def _build_screen_reply(counts: dict, severity: str) -> str:
     """Build a compact screen-friendly reply for the Brand App."""
     if severity == "clear":
-        return f"{counts.get('total_orders', 0)} active orders • All clear"
+        total = counts.get("total_orders", 0)
+        if total == 0:
+            return "No active orders • All clear"
+        return f"{total} active order{'s' if total != 1 else ''} • All clear"
 
     parts: list[str] = []
     if counts.get("blocked_orders"):
@@ -138,7 +152,10 @@ def _build_screen_reply(counts: dict, severity: str) -> str:
 def _build_summary(severity: str, counts: dict) -> str:
     """Build a one-sentence operational summary."""
     if severity == "clear":
-        return "All systems are clear. No pending orders or issues."
+        total = counts.get("total_orders", 0)
+        if total == 0:
+            return "All systems are clear. No active orders or issues."
+        return f"All systems are clear. {total} active order{'s' if total != 1 else ''} with no issues requiring attention."
     if severity == "low":
         return "Minor attention needed. Review flagged items when convenient."
     if severity == "medium":
@@ -272,9 +289,11 @@ async def get_operational_attention(
     db:
         Active async SQLAlchemy session.
     org_id:
-        The organisation identifier. Used as brand_id filter when brand_id is None.
+        The organisation identifier.
     brand_id:
-        Optional explicit brand_id override. Falls back to org_id when not provided.
+        Optional explicit brand_id filter. When provided, only orders with this
+        brand_id are counted. When None, ALL orders are queried (matching the
+        behaviour of the /leaflink/orders endpoint).
 
     Returns
     -------
@@ -282,12 +301,17 @@ async def get_operational_attention(
     top_priorities, counts, suggested_actions, data_source, and errors.
     """
     errors: list[str] = []
-    effective_brand_id = brand_id or org_id
+
+    # Determine whether to apply a brand_id filter.
+    # If brand_id is explicitly provided we filter; otherwise we query ALL orders
+    # (same as /leaflink/orders which has no brand_id filter).
+    filter_by_brand = brand_id is not None
 
     logger.info(
-        "attention_request_received org_id=%s user_id=system brand_id=%s",
+        "attention_request_received org_id=%s brand_id=%s filter_by_brand=%s",
         org_id,
-        effective_brand_id,
+        brand_id,
+        filter_by_brand,
     )
 
     # ------------------------------------------------------------------
@@ -307,18 +331,30 @@ async def get_operational_attention(
     }
 
     data_source = "database"
-    using_mock = False
+
+    # ------------------------------------------------------------------
+    # Helper: build the base Order WHERE clauses
+    # ------------------------------------------------------------------
+    def _order_base_filters():
+        """Return the common filters applied to every Order query."""
+        filters = [~Order.status.in_(_TERMINAL_STATUSES)]
+        if filter_by_brand:
+            filters.append(Order.brand_id == brand_id)
+        return filters
 
     # ------------------------------------------------------------------
     # 1. Total active orders
     # ------------------------------------------------------------------
     try:
-        stmt = select(func.count(Order.id)).where(
-            Order.brand_id == effective_brand_id,
-            ~Order.status.in_(_TERMINAL_STATUSES),
-        )
+        stmt = select(func.count(Order.id)).where(*_order_base_filters())
         result = await db.execute(stmt)
         counts["total_orders"] = int(result.scalar() or 0)
+        logger.info(
+            "attention_engine: total_orders=%d org_id=%s filter_by_brand=%s",
+            counts["total_orders"],
+            org_id,
+            filter_by_brand,
+        )
     except Exception as exc:
         logger.error("attention_engine: total_orders query failed org_id=%s: %s", org_id, exc)
         errors.append(f"total_orders: {exc}")
@@ -328,8 +364,7 @@ async def get_operational_attention(
     # ------------------------------------------------------------------
     try:
         stmt = select(func.count(Order.id)).where(
-            Order.brand_id == effective_brand_id,
-            ~Order.status.in_(_TERMINAL_STATUSES),
+            *_order_base_filters(),
             Order.review_status.in_(list(_REVIEW_STATUSES_NEEDING_ATTENTION)),
         )
         result = await db.execute(stmt)
@@ -343,8 +378,7 @@ async def get_operational_attention(
     # ------------------------------------------------------------------
     try:
         stmt = select(func.count(Order.id)).where(
-            Order.brand_id == effective_brand_id,
-            ~Order.status.in_(_TERMINAL_STATUSES),
+            *_order_base_filters(),
             Order.review_status == "blocked",
         )
         result = await db.execute(stmt)
@@ -358,8 +392,7 @@ async def get_operational_attention(
     # ------------------------------------------------------------------
     try:
         stmt = select(func.count(Order.id)).where(
-            Order.brand_id == effective_brand_id,
-            ~Order.status.in_(_TERMINAL_STATUSES),
+            *_order_base_filters(),
             Order.review_status == "ready",
         )
         result = await db.execute(stmt)
@@ -373,8 +406,7 @@ async def get_operational_attention(
     # ------------------------------------------------------------------
     try:
         stmt = select(func.count(Order.id)).where(
-            Order.brand_id == effective_brand_id,
-            ~Order.status.in_(_TERMINAL_STATUSES),
+            *_order_base_filters(),
             (Order.customer_name.is_(None)) | (Order.customer_name == ""),
         )
         result = await db.execute(stmt)
@@ -384,13 +416,12 @@ async def get_operational_attention(
         errors.append(f"missing_customer_name: {exc}")
 
     # ------------------------------------------------------------------
-    # 6. Orders missing amount
+    # 6. Orders missing amount (null or zero)
     # ------------------------------------------------------------------
     try:
         stmt = select(func.count(Order.id)).where(
-            Order.brand_id == effective_brand_id,
-            ~Order.status.in_(_TERMINAL_STATUSES),
-            Order.amount.is_(None),
+            *_order_base_filters(),
+            (Order.amount.is_(None)) | (Order.amount == 0),
         )
         result = await db.execute(stmt)
         counts["missing_amount"] = int(result.scalar() or 0)
@@ -399,13 +430,12 @@ async def get_operational_attention(
         errors.append(f"missing_amount: {exc}")
 
     # ------------------------------------------------------------------
-    # 7. Orders missing line_items
+    # 7. Orders missing line_items (null or empty list)
     # ------------------------------------------------------------------
     try:
         stmt = select(func.count(Order.id)).where(
-            Order.brand_id == effective_brand_id,
-            ~Order.status.in_(_TERMINAL_STATUSES),
-            Order.line_items_json.is_(None),
+            *_order_base_filters(),
+            (Order.line_items_json.is_(None)) | (Order.line_items_json == []),
         )
         result = await db.execute(stmt)
         counts["missing_line_items"] = int(result.scalar() or 0)
@@ -414,23 +444,41 @@ async def get_operational_attention(
         errors.append(f"missing_line_items: {exc}")
 
     # ------------------------------------------------------------------
-    # 8. Unmapped line items (mapping_status != "mapped")
+    # 8. Unmapped line items (mapping_status != "mapped" or null)
     # ------------------------------------------------------------------
     try:
+        unmapped_filters = [
+            ~Order.status.in_(_TERMINAL_STATUSES),
+            (OrderLine.mapping_status != "mapped") | OrderLine.mapping_status.is_(None),
+        ]
+        if filter_by_brand:
+            unmapped_filters.append(Order.brand_id == brand_id)
+
         stmt = (
             select(func.count(OrderLine.id))
             .join(Order, OrderLine.order_id == Order.id)
-            .where(
-                Order.brand_id == effective_brand_id,
-                ~Order.status.in_(_TERMINAL_STATUSES),
-                (OrderLine.mapping_status != "mapped") | OrderLine.mapping_status.is_(None),
-            )
+            .where(*unmapped_filters)
         )
         result = await db.execute(stmt)
         counts["unmapped_line_items"] = int(result.scalar() or 0)
     except Exception as exc:
         logger.error("attention_engine: unmapped_line_items query failed org_id=%s: %s", org_id, exc)
         errors.append(f"unmapped_line_items: {exc}")
+
+    logger.info(
+        "attention_engine: counts_loaded org_id=%s total_orders=%d orders_needing_review=%d "
+        "blocked_orders=%d orders_ready_to_pack=%d unmapped_line_items=%d "
+        "missing_customer_name=%d missing_amount=%d missing_line_items=%d",
+        org_id,
+        counts["total_orders"],
+        counts["orders_needing_review"],
+        counts["blocked_orders"],
+        counts["orders_ready_to_pack"],
+        counts["unmapped_line_items"],
+        counts["missing_customer_name"],
+        counts["missing_amount"],
+        counts["missing_line_items"],
+    )
 
     # ------------------------------------------------------------------
     # 9. Inventory / compliance — not yet wired, return 0 with note
@@ -444,10 +492,11 @@ async def get_operational_attention(
     sync_status: Optional[str] = None
     last_sync_at: Optional[str] = None
     try:
-        stmt = select(BrandAPICredential).where(
-            BrandAPICredential.brand_id == effective_brand_id,
-            BrandAPICredential.is_active.is_(True),
-        ).limit(1)
+        cred_filters = [BrandAPICredential.is_active.is_(True)]
+        if filter_by_brand:
+            cred_filters.append(BrandAPICredential.brand_id == brand_id)
+
+        stmt = select(BrandAPICredential).where(*cred_filters).limit(1)
         result = await db.execute(stmt)
         cred = result.scalar_one_or_none()
         if cred:
@@ -457,14 +506,7 @@ async def get_operational_attention(
         logger.error("attention_engine: sync_status query failed org_id=%s: %s", org_id, exc)
         errors.append(f"sync_status: {exc}")
 
-    # ------------------------------------------------------------------
-    # 11. Determine data_source
-    # ------------------------------------------------------------------
-    any_real_data = any(
-        counts[k] > 0
-        for k in ("total_orders", "orders_needing_review", "blocked_orders", "unmapped_line_items")
-    )
-    data_source = "database" if any_real_data else "database"  # always database; mock flag separate
+    # data_source is always "database" — we query real data, never mock.
 
     # ------------------------------------------------------------------
     # 12. Calculate attention_score
@@ -478,6 +520,11 @@ async def get_operational_attention(
     attention_score = min(score, 100)
 
     severity = _severity_from_score(attention_score)
+    # Per spec: only return "clear" when total_orders == 0 AND no issues.
+    # If there are real orders but no scored issues, use "low" so the reply
+    # always reports the actual order count rather than faking "all clear".
+    if severity == "clear" and counts["total_orders"] > 0:
+        severity = "low"
 
     # ------------------------------------------------------------------
     # 13. Build reply strings and priority list
