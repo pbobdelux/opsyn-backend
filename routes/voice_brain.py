@@ -246,7 +246,23 @@ async def voice_message(
                 "data_source": "error",
             }
 
-        # Parse Twin output
+        # Handle pending responses (async mode)
+        if twin_result.get("status") == "pending":
+            logger.info("voice_brain: async_mode_pending correlation_id=%s", twin_result.get("correlation_id", "unknown")[:8] + "...")
+            response = {
+                "ok": True,
+                "session_id": session_id,
+                "kind": "pending",
+                "speak_text": twin_result.get("speak_text", "I'm checking that now."),
+                "display_text": twin_result.get("display_text", "Processing your request..."),
+                "data": twin_result.get("data", {}),
+                "data_source": "pending",
+            }
+            if twin_result.get("correlation_id"):
+                response["correlation_id"] = twin_result.get("correlation_id")
+            return make_json_safe(response)
+
+        # Handle completed responses (sync mode)
         output = twin_result.get("output", {})
         speak_text = output.get("speak_text", "")
         display_text = output.get("display_text", "")
@@ -301,37 +317,37 @@ async def voice_brain_callback(
     body: dict[str, Any],
 ):
     """
-    Receive callbacks from Twin Voice Brain.
+    Receive callbacks from Twin Voice Brain (async mode).
     No authentication required for now (Twin will call this).
 
     Body:
     {
-      "run_id": "...",
+      "correlation_id": "...",
       "status": "completed",
       "output": {...},
       "error": null
     }
     """
     try:
-        run_id = body.get("run_id", "unknown")
+        correlation_id = body.get("correlation_id", "unknown")
         status = body.get("status", "unknown")
 
         logger.info(
-            "voice_brain: callback_received run_id=%s status=%s",
-            run_id[:8] + "..." if len(run_id) > 8 else run_id,
+            "voice_brain: callback_received correlation_id=%s status=%s",
+            correlation_id[:8] + "..." if len(correlation_id) > 8 else correlation_id,
             status,
         )
 
         # Log full payload for debugging (safe - no secrets in callback)
         logger.debug("voice_brain: callback_payload=%s", body)
 
-        # TODO: Store callback result in database or cache for later retrieval
-        # For now, just acknowledge receipt
+        # Store callback result for later retrieval
+        twin_voice_service.store_callback_result(correlation_id, body)
 
         return make_json_safe({
             "ok": True,
             "received": True,
-            "run_id": run_id,
+            "correlation_id": correlation_id,
         })
 
     except Exception as e:
