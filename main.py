@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from leaflink.orders import router as leaflink_router
+
 logger = logging.getLogger("opsyn-backend")
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +35,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
+
+app.include_router(leaflink_router, prefix="/leaflink")
 
 app.add_middleware(
     CORSMiddleware,
