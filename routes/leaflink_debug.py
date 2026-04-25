@@ -387,7 +387,7 @@ async def debug_leaflink_auth(
             headers = test_config["headers"]
 
             try:
-                url = f"{base_url}/companies/{company_id}/orders-received/"
+                url = f"{base_url}/orders-received/"
                 params = {"page": 1, "page_size": 1}
 
                 logger.info(
