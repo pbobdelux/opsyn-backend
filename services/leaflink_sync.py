@@ -125,217 +125,236 @@ def derive_review_status(line_items: list[dict[str, Any]]) -> str:
 
 async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any]:
     logger.info("leaflink: sync_start brand_id=%s", brand_id)
-    try:
-        logger.info("leaflink: sync_credential_lookup brand_id=%s integration=leaflink", brand_id)
-        result = await db.execute(
-            select(BrandAPICredential).where(
-                BrandAPICredential.brand_id == brand_id,
-                BrandAPICredential.integration_name == "leaflink",
-                BrandAPICredential.is_active == True,
-            )
+
+    # Resolve credentials and fetch orders outside the transaction so we don't
+    # hold a DB connection open during the (potentially slow) HTTP call to the
+    # LeafLink API.
+    logger.info("leaflink: sync_credential_lookup brand_id=%s integration=leaflink", brand_id)
+    cred_result = await db.execute(
+        select(BrandAPICredential).where(
+            BrandAPICredential.brand_id == brand_id,
+            BrandAPICredential.integration_name == "leaflink",
+            BrandAPICredential.is_active == True,
         )
-        cred = result.scalar_one_or_none()
+    )
+    cred = cred_result.scalar_one_or_none()
 
-        if not cred:
-            logger.warning(
-                "leaflink: sync_credential_not_found brand_id=%s — no active LeafLink credentials",
-                brand_id,
-            )
-            return {"ok": False, "error": "No active LeafLink credentials found"}
-
-        logger.info(
-            "leaflink: sync_credential_found brand_id=%s company_id=%s api_key_set=%s",
+    if not cred:
+        logger.warning(
+            "leaflink: sync_credential_not_found brand_id=%s — no active LeafLink credentials",
             brand_id,
-            cred.company_id,
-            bool(cred.api_key),
         )
+        return {"ok": False, "error": "No active LeafLink credentials found"}
 
-        logger.info("leaflink: sync_client_init brand_id=%s", brand_id)
-        client = LeafLinkClient(
-            api_key=cred.api_key,
-            company_id=cred.company_id,
+    logger.info(
+        "leaflink: sync_credential_found brand_id=%s company_id=%s api_key_set=%s",
+        brand_id,
+        cred.company_id,
+        bool(cred.api_key),
+    )
+
+    logger.info("leaflink: sync_client_init brand_id=%s", brand_id)
+    client = LeafLinkClient(
+        api_key=cred.api_key,
+        company_id=cred.company_id,
+    )
+
+    logger.info("leaflink: sync_api_call_start brand_id=%s", brand_id)
+    orders = client.fetch_recent_orders(max_pages=5, normalize=True)
+
+    using_mock = any(isinstance(o, dict) and o.get("mock_data") for o in orders)
+    if using_mock:
+        logger.warning(
+            "leaflink: sync_using_mock_data brand_id=%s — real API unavailable, MOCK_MODE active",
+            brand_id,
         )
-
-        logger.info("leaflink: sync_api_call_start brand_id=%s", brand_id)
-        orders = client.fetch_recent_orders(max_pages=5, normalize=True)
-
-        using_mock = any(isinstance(o, dict) and o.get("mock_data") for o in orders)
-        if using_mock:
-            logger.warning(
-                "leaflink: sync_using_mock_data brand_id=%s — real API unavailable, MOCK_MODE active",
-                brand_id,
-            )
-        else:
-            logger.info(
-                "leaflink: sync_using_real_api_data brand_id=%s orders_fetched=%s",
-                brand_id,
-                len(orders),
-            )
-
-        created = 0
-        updated = 0
-        skipped = 0
-        total_lines_written = 0
-
+    else:
         logger.info(
-            "leaflink: sync_api_response brand_id=%s orders_count=%s mock_data=%s",
+            "leaflink: sync_using_real_api_data brand_id=%s orders_fetched=%s",
             brand_id,
             len(orders),
-            using_mock,
         )
 
-        for o in orders:
-            if not isinstance(o, dict):
-                skipped += 1
-                continue
+    logger.info("leaflink: sync_orders_processed brand_id=%s count=%s", brand_id, len(orders))
 
-            external_id = safe_str(o.get("external_id"))
-            if not external_id:
-                skipped += 1
-                continue
+    created = 0
+    updated = 0
+    skipped = 0
+    total_lines_written = 0
 
-            customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
-            status = (safe_str(o.get("status")) or "submitted").lower()
-            order_number = safe_str(o.get("order_number"))
-
-            # Try multiple field names with fallbacks.
-            # total_amount is the primary key set by the normalized LeafLink client;
-            # the remaining fields cover raw/un-normalized payloads.
-            # TODO: Backfill existing orders with null amount from raw_payload
-            # Run: UPDATE orders SET amount = extracted_value WHERE amount IS NULL AND raw_payload IS NOT NULL
-            amount_decimal = safe_decimal(
-                o.get("total_amount")  # Primary: from normalized client
-                or o.get("amount")
-                or o.get("total")
-                or o.get("subtotal")
-                or o.get("price")
+    try:
+        async with db.begin():
+            logger.info(
+                "leaflink: sync_api_response brand_id=%s orders_count=%s mock_data=%s",
+                brand_id,
+                len(orders),
+                using_mock,
             )
 
-            # Log the mapping result
-            if amount_decimal is not None:
-                logger.info(
-                    "leaflink: sync_amount_mapped external_id=%s amount=%s",
-                    external_id,
-                    amount_decimal,
-                )
-            else:
-                logger.warning(
-                    "leaflink: sync_amount_missing external_id=%s — no pricing field found in order",
-                    external_id,
-                )
+            for o in orders:
+                if not isinstance(o, dict):
+                    skipped += 1
+                    continue
 
-            total_cents = decimal_to_cents(amount_decimal) or 0
+                external_id = safe_str(o.get("external_id"))
+                if not external_id:
+                    skipped += 1
+                    continue
 
-            item_count = safe_int(o.get("item_count"), default=0)
-            unit_count = safe_int(o.get("unit_count"), default=0)
+                customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
+                status = (safe_str(o.get("status")) or "submitted").lower()
+                order_number = safe_str(o.get("order_number"))
 
-            raw_line_items = o.get("line_items", [])
-            normalized_line_items = normalize_line_items(raw_line_items)
-
-            if normalized_line_items:
-                logger.info(
-                    "leaflink: sync_line_items_extracted external_id=%s count=%s unit_count=%s",
-                    external_id,
-                    len(normalized_line_items),
-                    sum(item.get("quantity", 0) or 0 for item in normalized_line_items),
-                )
-            else:
-                logger.warning(
-                    "leaflink: sync_line_items_empty external_id=%s — no line items found in order",
-                    external_id,
+                # Try multiple field names with fallbacks.
+                # total_amount is the primary key set by the normalized LeafLink client;
+                # the remaining fields cover raw/un-normalized payloads.
+                # TODO: Backfill existing orders with null amount from raw_payload
+                # Run: UPDATE orders SET amount = extracted_value WHERE amount IS NULL AND raw_payload IS NOT NULL
+                amount_decimal = safe_decimal(
+                    o.get("total_amount")  # Primary: from normalized client
+                    or o.get("amount")
+                    or o.get("total")
+                    or o.get("subtotal")
+                    or o.get("price")
                 )
 
-            if item_count == 0:
-                item_count = len(normalized_line_items)
+                # Log the mapping result
+                if amount_decimal is not None:
+                    logger.info(
+                        "leaflink: sync_amount_mapped external_id=%s amount=%s",
+                        external_id,
+                        amount_decimal,
+                    )
+                else:
+                    logger.warning(
+                        "leaflink: sync_amount_missing external_id=%s — no pricing field found in order",
+                        external_id,
+                    )
 
-            if unit_count == 0:
-                unit_count = sum(item.get("quantity", 0) or 0 for item in normalized_line_items)
+                total_cents = decimal_to_cents(amount_decimal) or 0
 
-            review_status = derive_review_status(normalized_line_items)
-            now = utc_now()
+                item_count = safe_int(o.get("item_count"), default=0)
+                unit_count = safe_int(o.get("unit_count"), default=0)
 
-            raw_payload = o.get("raw_payload") if isinstance(o.get("raw_payload"), dict) else o
+                raw_line_items = o.get("line_items", [])
+                normalized_line_items = normalize_line_items(raw_line_items)
 
-            existing_result = await db.execute(
-                select(Order).where(
-                    Order.brand_id == brand_id,
-                    Order.external_order_id == external_id,
-                )
-            )
-            existing = existing_result.scalar_one_or_none()
+                if normalized_line_items:
+                    logger.info(
+                        "leaflink: sync_line_items_extracted external_id=%s count=%s unit_count=%s",
+                        external_id,
+                        len(normalized_line_items),
+                        sum(item.get("quantity", 0) or 0 for item in normalized_line_items),
+                    )
+                else:
+                    logger.warning(
+                        "leaflink: sync_line_items_empty external_id=%s — no line items found in order",
+                        external_id,
+                    )
 
-            external_created_at = o.get("created_at")
-            external_updated_at = o.get("updated_at")
+                if item_count == 0:
+                    item_count = len(normalized_line_items)
 
-            if existing:
-                existing.customer_name = customer_name
-                existing.status = status
-                existing.order_number = order_number
-                existing.total_cents = total_cents
-                existing.amount = amount_decimal
-                existing.item_count = item_count
-                existing.unit_count = unit_count
-                existing.line_items_json = normalized_line_items
-                existing.raw_payload = raw_payload
-                existing.review_status = review_status
-                existing.sync_status = "ok"
-                existing.synced_at = now
-                existing.last_synced_at = now
-                existing.external_created_at = external_created_at
-                existing.external_updated_at = external_updated_at
-                order_row = existing
-                updated += 1
-            else:
-                order_row = Order(
-                    brand_id=brand_id,
-                    external_order_id=external_id,
-                    order_number=order_number,
-                    customer_name=customer_name,
-                    status=status,
-                    total_cents=total_cents,
-                    amount=amount_decimal,
-                    item_count=item_count,
-                    unit_count=unit_count,
-                    line_items_json=normalized_line_items,
-                    raw_payload=raw_payload,
-                    source="leaflink",
-                    review_status=review_status,
-                    sync_status="ok",
-                    synced_at=now,
-                    last_synced_at=now,
-                    external_created_at=external_created_at,
-                    external_updated_at=external_updated_at,
-                )
-                db.add(order_row)
-                await db.flush()
-                created += 1
+                if unit_count == 0:
+                    unit_count = sum(item.get("quantity", 0) or 0 for item in normalized_line_items)
 
-            await db.execute(
-                delete(OrderLine).where(OrderLine.order_id == order_row.id)
-            )
+                review_status = derive_review_status(normalized_line_items)
+                now = utc_now()
 
-            for item in normalized_line_items:
-                db.add(
-                    OrderLine(
-                        order_id=order_row.id,
-                        sku=item.get("sku"),
-                        product_name=item.get("product_name"),
-                        quantity=item.get("quantity"),
-                        unit_price=item.get("unit_price"),
-                        total_price=item.get("total_price"),
-                        unit_price_cents=item.get("unit_price_cents"),
-                        total_price_cents=item.get("total_price_cents"),
-                        mapped_product_id=item.get("mapped_product_id"),
-                        mapping_status=item.get("mapping_status"),
-                        mapping_issue=item.get("mapping_issue"),
-                        raw_payload=item.get("raw_payload"),
+                raw_payload = o.get("raw_payload") if isinstance(o.get("raw_payload"), dict) else o
+
+                existing_result = await db.execute(
+                    select(Order).where(
+                        Order.brand_id == brand_id,
+                        Order.external_order_id == external_id,
                     )
                 )
+                existing = existing_result.scalar_one_or_none()
 
-            total_lines_written += len(normalized_line_items)
+                external_created_at = o.get("created_at")
+                external_updated_at = o.get("updated_at")
 
-        await db.commit()
+                if existing:
+                    existing.customer_name = customer_name
+                    existing.status = status
+                    existing.order_number = order_number
+                    existing.total_cents = total_cents
+                    existing.amount = amount_decimal
+                    existing.item_count = item_count
+                    existing.unit_count = unit_count
+                    existing.line_items_json = normalized_line_items
+                    existing.raw_payload = raw_payload
+                    existing.review_status = review_status
+                    existing.sync_status = "ok"
+                    existing.synced_at = now
+                    existing.last_synced_at = now
+                    existing.external_created_at = external_created_at
+                    existing.external_updated_at = external_updated_at
+                    order_row = existing
+                    updated += 1
+                else:
+                    order_row = Order(
+                        brand_id=brand_id,
+                        external_order_id=external_id,
+                        order_number=order_number,
+                        customer_name=customer_name,
+                        status=status,
+                        total_cents=total_cents,
+                        amount=amount_decimal,
+                        item_count=item_count,
+                        unit_count=unit_count,
+                        line_items_json=normalized_line_items,
+                        raw_payload=raw_payload,
+                        source="leaflink",
+                        review_status=review_status,
+                        sync_status="ok",
+                        synced_at=now,
+                        last_synced_at=now,
+                        external_created_at=external_created_at,
+                        external_updated_at=external_updated_at,
+                    )
+                    db.add(order_row)
+                    await db.flush()
+                    created += 1
 
+                await db.execute(
+                    delete(OrderLine).where(OrderLine.order_id == order_row.id)
+                )
+
+                for item in normalized_line_items:
+                    db.add(
+                        OrderLine(
+                            order_id=order_row.id,
+                            sku=item.get("sku"),
+                            product_name=item.get("product_name"),
+                            quantity=item.get("quantity"),
+                            unit_price=item.get("unit_price"),
+                            total_price=item.get("total_price"),
+                            unit_price_cents=item.get("unit_price_cents"),
+                            total_price_cents=item.get("total_price_cents"),
+                            mapped_product_id=item.get("mapped_product_id"),
+                            mapping_status=item.get("mapping_status"),
+                            mapping_issue=item.get("mapping_issue"),
+                            raw_payload=item.get("raw_payload"),
+                        )
+                    )
+
+                total_lines_written += len(normalized_line_items)
+
+            # begin() context manager commits on successful exit; no manual commit needed.
+
+        logger.info(
+            "leaflink: sync_line_items_written brand_id=%s count=%s",
+            brand_id,
+            total_lines_written,
+        )
+        logger.info(
+            "leaflink: sync_complete brand_id=%s created=%s updated=%s lines=%s",
+            brand_id,
+            created,
+            updated,
+            total_lines_written,
+        )
         logger.info(
             "leaflink: sync_complete brand_id=%s fetched=%s created=%s updated=%s skipped=%s lines_written=%s mock_data=%s",
             brand_id,
@@ -349,11 +368,11 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
 
         return {
             "ok": True,
-            "fetched": len(orders),
+            "orders_fetched": len(orders),
             "created": created,
             "updated": updated,
             "skipped": skipped,
-            "lines_written": total_lines_written,
+            "line_items_written": total_lines_written,
             "mock_data": using_mock,
             "message": f"Synced {len(orders)} orders and wrote {total_lines_written} line items",
         }
@@ -365,5 +384,5 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
             e,
             exc_info=True,
         )
-        await db.rollback()
+        # begin() context manager rolls back automatically on exception.
         return {"ok": False, "error": str(e)}
