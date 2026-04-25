@@ -80,7 +80,13 @@ class LeafLinkClient:
         company_id: Optional[str] = None,
     ) -> None:
         self.base_url = (base_url or DEFAULT_LEAFLINK_BASE_URL).strip().rstrip("/")
+
+        # Clean the API key: strip whitespace and remove "Token " prefix if present
         self.api_key = (api_key or DEFAULT_LEAFLINK_API_KEY).strip()
+        if self.api_key.startswith("Token "):
+            logger.warning("leaflink: client_init api_key starts with 'Token ' prefix, removing it")
+            self.api_key = self.api_key[6:].strip()
+
         self.company_id = str(company_id or DEFAULT_LEAFLINK_COMPANY_ID).strip()
 
         if not self.base_url:
@@ -115,6 +121,11 @@ class LeafLinkClient:
             self.api_key[:6] if self.api_key else "NONE",
             self.base_url,
             self.company_id,
+        )
+        logger.info(
+            "leaflink: client_init api_key_normalized key_prefix=%s... key_length=%s",
+            self.api_key[:6] if self.api_key else "NONE",
+            len(self.api_key),
         )
 
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
