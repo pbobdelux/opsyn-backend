@@ -226,25 +226,44 @@ class LeafLinkClient:
 
     def _extract_line_items(self, raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         # Try multiple field names for line items (LeafLink API variations)
-        candidate = (
-            raw.get("line_items")
-            or raw.get("items")
-            or raw.get("order_items")
-            or raw.get("products")
-            or raw.get("ordered_items")
-            or raw.get("line_item_list")
-            or raw.get("order_lines")
-            or []
-        )
+        # Check in order of likelihood
+        candidate = None
+        found_key = None
 
-        # Log if we found line items
+        for key in (
+            "line_items",
+            "items",
+            "order_items",
+            "products",
+            "ordered_items",
+            "line_item_list",
+            "order_lines",
+        ):
+            if key in raw and raw[key]:
+                candidate = raw[key]
+                found_key = key
+                break
+
+        if candidate is None:
+            candidate = []
+
+        # Log which field was found
         if candidate:
             logger.info(
-                "leaflink: extract_line_items found candidate count=%s",
+                "leaflink: extract_line_items found candidate field=%s count=%s",
+                found_key or "unknown",
                 len(candidate) if isinstance(candidate, list) else 1,
+            )
+        else:
+            logger.debug(
+                "leaflink: extract_line_items no line items found in order"
             )
 
         if not isinstance(candidate, list):
+            logger.warning(
+                "leaflink: extract_line_items candidate is not list type=%s",
+                type(candidate).__name__,
+            )
             return []
 
         normalized: List[Dict[str, Any]] = []
@@ -253,12 +272,17 @@ class LeafLinkClient:
             if not isinstance(item, dict):
                 continue
 
+            # Extract product object (may be nested in various ways)
             product = item.get("product") if isinstance(item.get("product"), dict) else {}
             frozen_product = (
                 item.get("frozen_data", {}).get("product")
                 if isinstance(item.get("frozen_data"), dict) and isinstance(item.get("frozen_data", {}).get("product"), dict)
                 else {}
             )
+
+            # Also check for product_data or variant
+            product_data = item.get("product_data") if isinstance(item.get("product_data"), dict) else {}
+            variant = item.get("variant") if isinstance(item.get("variant"), dict) else {}
 
             quantity = _safe_int(
                 _first_non_empty(
@@ -300,17 +324,55 @@ class LeafLinkClient:
             else:
                 line_total = _safe_float(line_total_raw, 0.0)
 
+            sku = str(_first_non_empty(
+                item.get("sku"),
+                item.get("product_sku"),
+                item.get("external_sku"),
+                product.get("sku"),
+                product.get("external_sku"),
+                product_data.get("sku"),
+                variant.get("sku"),
+                frozen_product.get("sku"),
+            ) or "")
+
+            name = str(
+                _first_non_empty(
+                    item.get("name"),
+                    item.get("product_name"),
+                    item.get("display_name"),
+                    product.get("name"),
+                    product.get("display_name"),
+                    product.get("variant_name"),
+                    product_data.get("name"),
+                    product_data.get("display_name"),
+                    variant.get("name"),
+                    variant.get("display_name"),
+                    frozen_product.get("name"),
+                ) or "Unknown Item"
+            )
+
+            product_id = str(_first_non_empty(
+                item.get("product_id"),
+                product.get("id"),
+                product.get("product_id"),
+                product_data.get("id"),
+                variant.get("id"),
+            ) or "")
+
+            # Log extracted item
+            logger.debug(
+                "leaflink: extract_line_items item sku=%s name=%s qty=%s unit_price=%s",
+                sku or "(empty)",
+                name or "(empty)",
+                quantity,
+                unit_price,
+            )
+
             normalized.append({
                 "external_id": str(_first_non_empty(item.get("id"), item.get("uuid"), item.get("sku")) or ""),
-                "sku": str(_first_non_empty(item.get("sku"), product.get("sku"), frozen_product.get("sku")) or ""),
-                "name": str(
-                    _first_non_empty(
-                        item.get("name"),
-                        item.get("product_name"),
-                        product.get("name"),
-                        frozen_product.get("name"),
-                    ) or "Unknown Item"
-                ),
+                "sku": sku,
+                "name": name,
+                "product_id": product_id,
                 "quantity": quantity,
                 "unit_price": unit_price,
                 "line_total": line_total,
