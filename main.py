@@ -59,13 +59,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
 
-# ---------------------------------------------------------------------------
-# Routers
-# ---------------------------------------------------------------------------
-from routes.assistant import router as assistant_router  # noqa: E402
-
-app.include_router(assistant_router)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -77,6 +70,9 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
+from routes.assistant import router as assistant_router  # noqa: E402
+
+app.include_router(assistant_router)
 app.include_router(ai_router, prefix="/ai")
 app.include_router(leaflink_orders_router)
 app.include_router(leaflink_debug_router)
