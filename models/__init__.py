@@ -1,3 +1,14 @@
+"""
+models package — re-exports all ORM models from both the root models.py
+(now moved here as _base_models) and the assistant sub-module.
+
+All existing imports of the form `from models import Order` continue to work
+because this __init__.py re-exports everything that was previously in models.py.
+"""
+
+# ---------------------------------------------------------------------------
+# Base / existing models (previously in root models.py)
+# ---------------------------------------------------------------------------
 from datetime import datetime, timezone
 from typing import Any
 
@@ -214,3 +225,15 @@ class TenantCredential(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+
+# ---------------------------------------------------------------------------
+# Assistant models
+# ---------------------------------------------------------------------------
+from models.assistant_models import (  # noqa: F401, E402
+    AssistantAuditLog,
+    AssistantMessage,
+    AssistantPendingAction,
+    AssistantSession,
+)
+
