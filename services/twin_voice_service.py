@@ -4,6 +4,7 @@ from typing import Any, Optional
 import httpx
 import json
 import uuid
+from datetime import datetime, timezone
 
 logger = logging.getLogger("twin_voice_service")
 
@@ -196,10 +197,30 @@ class TwinVoiceService:
     def store_callback_result(self, correlation_id: str, result: dict[str, Any]) -> None:
         """Store callback result for async mode."""
         logger.info("twin_voice: storing_callback_result correlation_id=%s", correlation_id[:8] + "...")
+
+        # Extract relevant fields from callback
+        speak_text = result.get("speak_text", "")
+        display_text = result.get("display_text", "")
+        kind = result.get("kind", "answer")
+        data = result.get("data", {})
+        error = result.get("error")
+
         TWIN_CALLBACK_RESULTS[correlation_id] = {
-            "result": result,
-            "received_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+            "ok": True,
+            "kind": kind,
+            "speak_text": speak_text,
+            "display_text": display_text,
+            "data": data,
+            "error": error,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            "raw_callback": result,  # Store full callback for debugging
         }
+
+        logger.info(
+            "twin_voice: callback_stored correlation_id=%s kind=%s",
+            correlation_id[:8] + "...",
+            kind,
+        )
 
     def get_callback_result(self, correlation_id: str) -> Optional[dict[str, Any]]:
         """Retrieve callback result for async mode."""
