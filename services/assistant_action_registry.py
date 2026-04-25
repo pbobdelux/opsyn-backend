@@ -48,10 +48,23 @@ async def _handle_sync_leaflink_orders(
         from services.leaflink_sync import sync_leaflink_orders
 
         brand_id = payload.get("brand_id") or org_id
-        return await sync_leaflink_orders(db, brand_id)
+        result = await sync_leaflink_orders(db, brand_id)
+        # Enrich with data_source and standard fields
+        result.setdefault("data_source", "leaflink")
+        result.setdefault("errors", [])
+        if result.get("ok") and "count" not in result:
+            result["count"] = result.get("fetched", 0)
+        if result.get("ok") and "summary" not in result:
+            fetched = result.get("fetched", 0)
+            result["summary"] = f"Synced {fetched} orders from LeafLink."
+        logger.info(
+            "sync_leaflink_orders org_id=%s fetched=%s data_source=leaflink",
+            org_id, result.get("fetched", 0),
+        )
+        return result
     except Exception as exc:
-        logger.exception("sync_leaflink_orders handler failed")
-        return {"ok": False, "error": str(exc)}
+        logger.exception("sync_leaflink_orders handler failed org_id=%s", org_id)
+        return {"ok": False, "error": str(exc), "data_source": "leaflink", "errors": [str(exc)]}
 
 
 async def _handle_get_orders_needing_review(
@@ -73,9 +86,12 @@ async def _handle_get_orders_needing_review(
             .limit(50)
         )
         orders = result.scalars().all()
+        count = len(orders)
+        logger.info("get_orders_needing_review org_id=%s count=%d data_source=database", org_id, count)
         return {
             "ok": True,
-            "count": len(orders),
+            "count": count,
+            "data_source": "database",
             "orders": [
                 {
                     "id": o.id,
@@ -87,10 +103,12 @@ async def _handle_get_orders_needing_review(
                 }
                 for o in orders
             ],
+            "summary": f"{count} order{'s' if count != 1 else ''} need{'s' if count == 1 else ''} review.",
+            "errors": [],
         }
     except Exception as exc:
-        logger.exception("get_orders_needing_review handler failed")
-        return {"ok": False, "error": str(exc)}
+        logger.exception("get_orders_needing_review handler failed org_id=%s", org_id)
+        return {"ok": False, "error": str(exc), "data_source": "database", "errors": [str(exc)]}
 
 
 async def _handle_get_orders_needing_packed(
@@ -112,9 +130,12 @@ async def _handle_get_orders_needing_packed(
             .limit(50)
         )
         orders = result.scalars().all()
+        count = len(orders)
+        logger.info("get_orders_needing_packed org_id=%s count=%d data_source=database", org_id, count)
         return {
             "ok": True,
-            "count": len(orders),
+            "count": count,
+            "data_source": "database",
             "orders": [
                 {
                     "id": o.id,
@@ -126,10 +147,12 @@ async def _handle_get_orders_needing_packed(
                 }
                 for o in orders
             ],
+            "summary": f"{count} order{'s' if count != 1 else ''} ready to pack.",
+            "errors": [],
         }
     except Exception as exc:
-        logger.exception("get_orders_needing_packed handler failed")
-        return {"ok": False, "error": str(exc)}
+        logger.exception("get_orders_needing_packed handler failed org_id=%s", org_id)
+        return {"ok": False, "error": str(exc), "data_source": "database", "errors": [str(exc)]}
 
 
 async def _handle_get_blocked_orders(
@@ -151,9 +174,12 @@ async def _handle_get_blocked_orders(
             .limit(50)
         )
         orders = result.scalars().all()
+        count = len(orders)
+        logger.info("get_blocked_orders org_id=%s count=%d data_source=database", org_id, count)
         return {
             "ok": True,
-            "count": len(orders),
+            "count": count,
+            "data_source": "database",
             "orders": [
                 {
                     "id": o.id,
@@ -165,10 +191,12 @@ async def _handle_get_blocked_orders(
                 }
                 for o in orders
             ],
+            "summary": f"{count} order{'s' if count != 1 else ''} blocked.",
+            "errors": [],
         }
     except Exception as exc:
-        logger.exception("get_blocked_orders handler failed")
-        return {"ok": False, "error": str(exc)}
+        logger.exception("get_blocked_orders handler failed org_id=%s", org_id)
+        return {"ok": False, "error": str(exc), "data_source": "database", "errors": [str(exc)]}
 
 
 async def _handle_summarize_sales(
@@ -189,15 +217,23 @@ async def _handle_summarize_sales(
         row = result.one()
         total_orders = row.total_orders or 0
         total_cents = row.total_cents or 0
+        total_revenue = round(total_cents / 100, 2)
+        logger.info(
+            "summarize_sales org_id=%s total_orders=%d data_source=database",
+            org_id, total_orders,
+        )
         return {
             "ok": True,
             "total_orders": total_orders,
-            "total_revenue": round(total_cents / 100, 2),
+            "total_revenue": total_revenue,
             "currency": "USD",
+            "data_source": "database",
+            "summary": f"{total_orders} total orders, ${total_revenue:.2f} revenue.",
+            "errors": [],
         }
     except Exception as exc:
-        logger.exception("summarize_sales handler failed")
-        return {"ok": False, "error": str(exc)}
+        logger.exception("summarize_sales handler failed org_id=%s", org_id)
+        return {"ok": False, "error": str(exc), "data_source": "database", "errors": [str(exc)]}
 
 
 async def _handle_add_driver(
@@ -242,6 +278,231 @@ async def _handle_add_driver(
         }
     except Exception as exc:
         logger.exception("add_driver handler failed")
+        return {"ok": False, "error": str(exc)}
+
+
+async def _handle_update_driver_pin(
+    db: AsyncSession, org_id: str, payload: dict
+) -> dict:
+    """Update the PIN for an existing driver."""
+    try:
+        from sqlalchemy import select
+
+        from models import Driver
+
+        driver_id = payload.get("driver_id")
+        new_pin = str(payload.get("pin") or payload.get("new_pin") or "")
+
+        if not driver_id:
+            return {"ok": False, "error": "driver_id is required"}
+
+        if len(new_pin) != 4 or not new_pin.isdigit():
+            return {"ok": False, "error": "PIN must be exactly 4 numeric digits"}
+
+        result = await db.execute(
+            select(Driver).where(
+                Driver.id == driver_id,
+                Driver.org_id == org_id,
+            )
+        )
+        driver = result.scalar_one_or_none()
+
+        if driver is None:
+            return {"ok": False, "error": f"Driver {driver_id} not found for org {org_id}"}
+
+        driver.pin = new_pin
+        await db.flush()
+
+        logger.info(
+            "update_driver_pin org_id=%s driver_id=%s — PIN updated (value not logged)",
+            org_id, driver_id,
+        )
+        return {
+            "ok": True,
+            "driver_id": driver_id,
+            "message": "Driver PIN updated successfully.",
+        }
+    except Exception as exc:
+        logger.exception("update_driver_pin handler failed org_id=%s driver_id=%s", org_id, payload.get("driver_id"))
+        return {"ok": False, "error": str(exc)}
+
+
+async def _handle_email_driver_pin(
+    db: AsyncSession, org_id: str, payload: dict
+) -> dict:
+    """Email a driver their current PIN via the email service."""
+    try:
+        from sqlalchemy import select
+
+        from models import Driver
+        from services.email_service import send_driver_pin_email
+
+        driver_id = payload.get("driver_id")
+        if not driver_id:
+            return {"ok": False, "error": "driver_id is required"}
+
+        result = await db.execute(
+            select(Driver).where(
+                Driver.id == driver_id,
+                Driver.org_id == org_id,
+            )
+        )
+        driver = result.scalar_one_or_none()
+
+        if driver is None:
+            return {"ok": False, "error": f"Driver {driver_id} not found for org {org_id}"}
+
+        if not driver.email:
+            return {"ok": False, "error": "Driver has no email address on file"}
+
+        if not driver.pin:
+            return {"ok": False, "error": "Driver has no PIN set"}
+
+        logger.info(
+            "email_driver_pin org_id=%s driver_id=%s email=***",
+            org_id, driver_id,
+        )
+        email_result = await send_driver_pin_email(
+            driver_email=driver.email,
+            driver_name=driver.name,
+            org_code=org_id,
+            pin=driver.pin,
+        )
+        return email_result
+    except Exception as exc:
+        logger.exception("email_driver_pin handler failed org_id=%s", org_id)
+        return {"ok": False, "error": str(exc)}
+
+
+async def _handle_contact_driver(
+    db: AsyncSession, org_id: str, payload: dict
+) -> dict:
+    """Send an SMS message to a driver."""
+    try:
+        from sqlalchemy import select
+
+        from models import Driver
+        from services.sms_service import send_driver_sms
+
+        driver_id = payload.get("driver_id")
+        message = payload.get("message", "")
+
+        if not driver_id:
+            return {"ok": False, "error": "driver_id is required"}
+
+        if not message:
+            return {"ok": False, "error": "message is required"}
+
+        result = await db.execute(
+            select(Driver).where(
+                Driver.id == driver_id,
+                Driver.org_id == org_id,
+            )
+        )
+        driver = result.scalar_one_or_none()
+
+        if driver is None:
+            return {"ok": False, "error": f"Driver {driver_id} not found for org {org_id}"}
+
+        if not driver.phone:
+            return {"ok": False, "error": "Driver has no phone number on file"}
+
+        logger.info(
+            "contact_driver org_id=%s driver_id=%s phone=***",
+            org_id, driver_id,
+        )
+        sms_result = await send_driver_sms(phone=driver.phone, message=message)
+        return sms_result
+    except Exception as exc:
+        logger.exception("contact_driver handler failed org_id=%s", org_id)
+        return {"ok": False, "error": str(exc)}
+
+
+async def _handle_notify_route_change(
+    db: AsyncSession, org_id: str, payload: dict
+) -> dict:
+    """Notify a driver of a route change via SMS."""
+    try:
+        from sqlalchemy import select
+
+        from models import Driver
+        from services.sms_service import send_driver_sms
+
+        driver_id = payload.get("driver_id")
+        change_detail = payload.get("change_detail") or payload.get("message") or "Your route has been updated."
+
+        if not driver_id:
+            return {"ok": False, "error": "driver_id is required"}
+
+        result = await db.execute(
+            select(Driver).where(
+                Driver.id == driver_id,
+                Driver.org_id == org_id,
+            )
+        )
+        driver = result.scalar_one_or_none()
+
+        if driver is None:
+            return {"ok": False, "error": f"Driver {driver_id} not found for org {org_id}"}
+
+        if not driver.phone:
+            return {"ok": False, "error": "Driver has no phone number on file"}
+
+        sms_message = f"Route update: {change_detail}"
+        logger.info(
+            "notify_route_change org_id=%s driver_id=%s phone=***",
+            org_id, driver_id,
+        )
+        sms_result = await send_driver_sms(phone=driver.phone, message=sms_message)
+        return sms_result
+    except Exception as exc:
+        logger.exception("notify_route_change handler failed org_id=%s", org_id)
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# METRC handlers (Phase 7 — safe MVP stubs)
+# ---------------------------------------------------------------------------
+
+_METRC_NOT_CONNECTED = {
+    "ok": False,
+    "needs_integration": True,
+    "integration": "metrc",
+    "message": "METRC integration not yet connected",
+}
+
+
+async def _handle_check_metrc_package(
+    db: AsyncSession, org_id: str, payload: dict
+) -> dict:
+    """Return needs_integration until METRC is wired."""
+    logger.info("check_metrc_package org_id=%s — needs_integration=metrc", org_id)
+    return _METRC_NOT_CONNECTED.copy()
+
+
+async def _handle_prepare_manifest(
+    db: AsyncSession, org_id: str, payload: dict
+) -> dict:
+    """Return needs_integration until METRC is wired."""
+    logger.info("prepare_manifest org_id=%s — needs_integration=metrc", org_id)
+    return _METRC_NOT_CONNECTED.copy()
+
+
+# ---------------------------------------------------------------------------
+# Compliance handler (Phase 8)
+# ---------------------------------------------------------------------------
+
+
+async def _handle_run_inspection_readiness_check(
+    db: AsyncSession, org_id: str, payload: dict
+) -> dict:
+    """Run a compliance inspection readiness check."""
+    try:
+        from services.compliance_service import run_inspection_readiness_check
+
+        return await run_inspection_readiness_check(db, org_id)
+    except Exception as exc:
+        logger.exception("run_inspection_readiness_check handler failed org_id=%s", org_id)
         return {"ok": False, "error": str(exc)}
 
 
@@ -381,7 +642,7 @@ _register(ActionDefinition(
     risk_level="medium",
     requires_confirmation=True,
     allowed_roles=["admin", "manager"],
-    handler=_stub_handler,
+    handler=_handle_update_driver_pin,
 ))
 
 _register(ActionDefinition(
@@ -390,7 +651,7 @@ _register(ActionDefinition(
     risk_level="medium",
     requires_confirmation=True,
     allowed_roles=["admin", "manager"],
-    handler=_stub_handler,
+    handler=_handle_email_driver_pin,
 ))
 
 _register(ActionDefinition(
@@ -399,7 +660,7 @@ _register(ActionDefinition(
     risk_level="medium",
     requires_confirmation=False,
     allowed_roles=["admin", "manager", "operator"],
-    handler=_stub_handler,
+    handler=_handle_contact_driver,
 ))
 
 _register(ActionDefinition(
@@ -408,7 +669,7 @@ _register(ActionDefinition(
     risk_level="medium",
     requires_confirmation=True,
     allowed_roles=["admin", "manager"],
-    handler=_stub_handler,
+    handler=_handle_notify_route_change,
 ))
 
 _register(ActionDefinition(
@@ -417,7 +678,7 @@ _register(ActionDefinition(
     risk_level="safe",
     requires_confirmation=False,
     allowed_roles=["admin", "manager", "operator", "compliance", "viewer"],
-    handler=_stub_handler,
+    handler=_handle_check_metrc_package,
 ))
 
 _register(ActionDefinition(
@@ -426,7 +687,7 @@ _register(ActionDefinition(
     risk_level="high",
     requires_confirmation=True,
     allowed_roles=["admin", "manager", "compliance"],
-    handler=_stub_handler,
+    handler=_handle_prepare_manifest,
 ))
 
 _register(ActionDefinition(
@@ -435,7 +696,7 @@ _register(ActionDefinition(
     risk_level="safe",
     requires_confirmation=False,
     allowed_roles=["admin", "manager", "operator", "compliance", "viewer"],
-    handler=_stub_handler,
+    handler=_handle_run_inspection_readiness_check,
 ))
 
 _register(ActionDefinition(
