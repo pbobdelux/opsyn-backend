@@ -24,16 +24,42 @@ VOICE_SESSIONS = {}
 
 
 def verify_agent_secret(authorization: Optional[str] = Header(None)) -> bool:
-    """Verify the agent shared secret."""
-    if not OPSYN_AGENT_SHARED_SECRET:
-        logger.warning("voice_brain: shared_secret not configured")
+    """Verify the agent shared secret with safe debug logging."""
+    # Get the expected secret from env var (trim whitespace)
+    expected_secret = OPSYN_AGENT_SHARED_SECRET.strip()
+
+    # Log whether Authorization header exists (safe - no secrets)
+    if not authorization:
+        logger.warning("voice_brain: auth_missing no_authorization_header")
         return False
 
-    if not authorization or not authorization.startswith("Bearer "):
+    logger.debug("voice_brain: auth_check authorization_header_length=%s", len(authorization))
+
+    # Check Bearer prefix
+    if not authorization.startswith("Bearer "):
+        logger.warning("voice_brain: auth_invalid missing_bearer_prefix")
         return False
 
-    token = authorization[7:]
-    return token == OPSYN_AGENT_SHARED_SECRET
+    # Extract token and trim whitespace
+    token = authorization[7:].strip()
+
+    logger.debug(
+        "voice_brain: auth_check token_length=%s expected_secret_length=%s",
+        len(token),
+        len(expected_secret),
+    )
+
+    # Compare tokens
+    if not expected_secret:
+        logger.error("voice_brain: auth_not_configured opsyn_agent_shared_secret_not_set")
+        return False
+
+    if token != expected_secret:
+        logger.warning("voice_brain: auth_failed token_mismatch")
+        return False
+
+    logger.debug("voice_brain: auth_success")
+    return True
 
 
 @router.get("/health")
