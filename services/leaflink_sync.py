@@ -232,6 +232,19 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
             raw_line_items = o.get("line_items", [])
             normalized_line_items = normalize_line_items(raw_line_items)
 
+            if normalized_line_items:
+                logger.info(
+                    "leaflink: sync_line_items_extracted external_id=%s count=%s unit_count=%s",
+                    external_id,
+                    len(normalized_line_items),
+                    sum(item.get("quantity", 0) or 0 for item in normalized_line_items),
+                )
+            else:
+                logger.warning(
+                    "leaflink: sync_line_items_empty external_id=%s — no line items found in order",
+                    external_id,
+                )
+
             if item_count == 0:
                 item_count = len(normalized_line_items)
 
@@ -262,7 +275,7 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
                 existing.amount = amount_decimal
                 existing.item_count = item_count
                 existing.unit_count = unit_count
-                existing.line_items_json = raw_line_items
+                existing.line_items_json = normalized_line_items
                 existing.raw_payload = raw_payload
                 existing.review_status = review_status
                 existing.sync_status = "ok"
@@ -283,7 +296,7 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
                     amount=amount_decimal,
                     item_count=item_count,
                     unit_count=unit_count,
-                    line_items_json=raw_line_items,
+                    line_items_json=normalized_line_items,
                     raw_payload=raw_payload,
                     source="leaflink",
                     review_status=review_status,
