@@ -24,7 +24,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import BrandAPICredential, Order, OrderLine
@@ -62,6 +62,68 @@ _SCORE_MISSING_AMOUNT = 1
 # ---------------------------------------------------------------------------
 
 
+async def _check_for_unmapped_amount_fields(
+    db: AsyncSession,
+    filter_by_brand: bool,
+    brand_id: Optional[str] = None,
+) -> dict[str, bool]:
+    """
+    Check if raw LeafLink fields exist in order data but aren't mapped to
+    Order.amount.
+
+    Queries the raw_payload JSONB column to detect whether LeafLink sends
+    pricing fields that are simply not being mapped into the Order model.
+
+    Returns
+    -------
+    {
+        "has_total_field": bool,
+        "has_subtotal_field": bool,
+        "has_price_field": bool,
+        "has_amount_field": bool,
+    }
+    """
+    result: dict[str, bool] = {
+        "has_total_field": False,
+        "has_subtotal_field": False,
+        "has_price_field": False,
+        "has_amount_field": False,
+    }
+
+    brand_clause = "AND brand_id = :brand_id" if filter_by_brand else ""
+    params: dict = {"brand_id": brand_id} if filter_by_brand else {}
+
+    field_map = {
+        "has_total_field": "total",
+        "has_subtotal_field": "subtotal",
+        "has_price_field": "price",
+        "has_amount_field": "amount",
+    }
+
+    for result_key, json_field in field_map.items():
+        try:
+            sql = text(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1 FROM orders
+                    WHERE raw_payload ? :field
+                    {brand_clause}
+                    LIMIT 1
+                )
+                """
+            )
+            row = await db.execute(sql, {**params, "field": json_field})
+            result[result_key] = bool(row.scalar())
+        except Exception as exc:
+            logger.warning(
+                "attention_engine: unmapped_field_check failed field=%s: %s",
+                json_field,
+                exc,
+            )
+
+    return result
+
+
 def _severity_from_score(score: int) -> str:
     if score == 0:
         return "clear"
@@ -74,7 +136,7 @@ def _severity_from_score(score: int) -> str:
     return "critical"
 
 
-def _build_spoken_reply(counts: dict, severity: str) -> str:
+def _build_spoken_reply(counts: dict, severity: str, is_system_issue: bool = False) -> str:
     """Build a concise, voice-friendly reply for ElevenLabs."""
     parts: list[str] = []
 
@@ -84,6 +146,15 @@ def _build_spoken_reply(counts: dict, severity: str) -> str:
     missing_name = counts.get("missing_customer_name", 0)
     missing_amt = counts.get("missing_amount", 0)
     total = counts.get("total_orders", 0)
+
+    # System issue: all orders are missing amount — this is a mapping problem,
+    # not a real business issue. Return a diagnostic message instead.
+    if is_system_issue:
+        return (
+            "All orders are missing pricing data, which likely indicates a system "
+            "mapping issue rather than actual missing data. "
+            "Check the LeafLink sync configuration."
+        )
 
     # Only report "all clear" when there are genuinely zero orders AND no issues.
     if severity == "clear" and total == 0:
@@ -126,8 +197,11 @@ def _build_spoken_reply(counts: dict, severity: str) -> str:
     )
 
 
-def _build_screen_reply(counts: dict, severity: str) -> str:
+def _build_screen_reply(counts: dict, severity: str, is_system_issue: bool = False) -> str:
     """Build a compact screen-friendly reply for the Brand App."""
+    if is_system_issue:
+        return "System mapping issue detected • Check LeafLink sync"
+
     if severity == "clear":
         total = counts.get("total_orders", 0)
         if total == 0:
@@ -143,14 +217,20 @@ def _build_screen_reply(counts: dict, severity: str) -> str:
         parts.append(f"{counts['unmapped_line_items']} unmapped items")
     if counts.get("missing_customer_name"):
         parts.append(f"{counts['missing_customer_name']} missing name")
-    if counts.get("missing_amount"):
+    if counts.get("missing_amount") and not is_system_issue:
         parts.append(f"{counts['missing_amount']} missing amount")
 
     return " • ".join(parts) if parts else f"{counts.get('total_orders', 0)} active orders"
 
 
-def _build_summary(severity: str, counts: dict) -> str:
+def _build_summary(severity: str, counts: dict, is_system_issue: bool = False) -> str:
     """Build a one-sentence operational summary."""
+    if is_system_issue:
+        return (
+            "System issue detected: all orders are missing pricing data. "
+            "This is likely a LeafLink data mapping problem, not a real business issue. "
+            "Verify the LeafLink sync configuration."
+        )
     if severity == "clear":
         total = counts.get("total_orders", 0)
         if total == 0:
@@ -168,10 +248,33 @@ def _build_summary(severity: str, counts: dict) -> str:
     return "Critical attention required. Multiple blocking issues detected — act now."
 
 
-def _build_top_priorities(counts: dict) -> list[dict]:
+def _build_top_priorities(counts: dict, is_system_issue: bool = False) -> list[dict]:
     """Build the ranked priority list."""
     priorities: list[dict] = []
     rank = 1
+
+    missing_amt = counts.get("missing_amount", 0)
+    total = counts.get("total_orders", 0)
+
+    # When all orders are missing amount, surface a system-level diagnostic
+    # priority at rank 1 and skip the normal "Missing Order Amounts" entry.
+    if is_system_issue:
+        priorities.append({
+            "rank": rank,
+            "severity": "critical",
+            "title": "Order Amount Mapping Issue",
+            "detail": (
+                f"All {total} order{'s are' if total != 1 else ' is'} missing pricing data. "
+                "This indicates a data ingestion or mapping issue from LeafLink."
+            ),
+            "recommended_action": (
+                "Verify LeafLink API response fields and ensure amount/total is "
+                "correctly mapped during sync."
+            ),
+            "action_key": "diagnose_order_amount_mapping",
+            "is_system_issue": True,
+        })
+        rank += 1
 
     blocked = counts.get("blocked_orders", 0)
     if blocked:
@@ -221,8 +324,9 @@ def _build_top_priorities(counts: dict) -> list[dict]:
         })
         rank += 1
 
-    missing_amt = counts.get("missing_amount", 0)
-    if missing_amt:
+    # Only add the normal "Missing Order Amounts" priority when it is NOT a
+    # system-wide mapping issue (i.e. only some orders are missing amount).
+    if missing_amt and not is_system_issue:
         priorities.append({
             "rank": rank,
             "severity": "low",
@@ -509,14 +613,46 @@ async def get_operational_attention(
     # data_source is always "database" — we query real data, never mock.
 
     # ------------------------------------------------------------------
-    # 12. Calculate attention_score
+    # 12. Detect system-level issues
+    # ------------------------------------------------------------------
+    # When every active order is missing an amount this is almost certainly a
+    # data mapping problem from LeafLink rather than a real business issue.
+    # We classify it separately so the attention system doesn't inflate the
+    # score or mislead the operator.
+    is_system_issue = (
+        counts["total_orders"] > 0
+        and counts["missing_amount"] == counts["total_orders"]
+    )
+
+    if is_system_issue:
+        logger.info(
+            "attention_engine: system_issue_detected org_id=%s missing_amount=%d total_orders=%d",
+            org_id,
+            counts["missing_amount"],
+            counts["total_orders"],
+        )
+        # Run the unmapped-field check to give operators more diagnostic detail.
+        unmapped_fields = await _check_for_unmapped_amount_fields(
+            db, filter_by_brand, brand_id
+        )
+        logger.info(
+            "attention_engine: unmapped_field_check org_id=%s result=%s",
+            org_id,
+            unmapped_fields,
+        )
+
+    # ------------------------------------------------------------------
+    # 13. Calculate attention_score
     # ------------------------------------------------------------------
     score = 0
     score += counts["blocked_orders"] * _SCORE_BLOCKED
     score += counts["orders_needing_review"] * _SCORE_NEEDS_REVIEW
     score += counts["unmapped_line_items"] * _SCORE_UNMAPPED_LINE_ITEM
     score += counts["missing_customer_name"] * _SCORE_MISSING_CUSTOMER
-    score += counts["missing_amount"] * _SCORE_MISSING_AMOUNT
+    # When it's a system issue, exclude missing_amount from the score so the
+    # severity is not artificially inflated by a mapping problem.
+    if not is_system_issue:
+        score += counts["missing_amount"] * _SCORE_MISSING_AMOUNT
     attention_score = min(score, 100)
 
     severity = _severity_from_score(attention_score)
@@ -526,32 +662,40 @@ async def get_operational_attention(
     if severity == "clear" and counts["total_orders"] > 0:
         severity = "low"
 
+    # When the only issue is the system mapping problem (no other scored
+    # issues), cap severity at "medium" so it doesn't read as "all clear"
+    # but also doesn't over-alarm the operator.
+    if is_system_issue and score == 0:
+        severity = "medium"
+
     # ------------------------------------------------------------------
-    # 13. Build reply strings and priority list
+    # 14. Build reply strings and priority list
     # ------------------------------------------------------------------
-    spoken_reply = _build_spoken_reply(counts, severity)
-    screen_reply = _build_screen_reply(counts, severity)
-    summary = _build_summary(severity, counts)
-    top_priorities = _build_top_priorities(counts)
+    spoken_reply = _build_spoken_reply(counts, severity, is_system_issue=is_system_issue)
+    screen_reply = _build_screen_reply(counts, severity, is_system_issue=is_system_issue)
+    summary = _build_summary(severity, counts, is_system_issue=is_system_issue)
+    top_priorities = _build_top_priorities(counts, is_system_issue=is_system_issue)
     suggested_actions = _build_suggested_actions(counts)
 
     priority_count = len(top_priorities)
 
     logger.info(
         "attention_analysis_complete org_id=%s order_count=%d priority_count=%d "
-        "severity=%s data_source=%s attention_score=%d",
+        "severity=%s data_source=%s attention_score=%d is_system_issue=%s",
         org_id,
         counts["total_orders"],
         priority_count,
         severity,
         data_source,
         attention_score,
+        is_system_issue,
     )
 
     return {
         "ok": True,
         "attention_score": attention_score,
         "severity": severity,
+        "is_system_issue": is_system_issue,
         "spoken_reply": spoken_reply,
         "screen_reply": screen_reply,
         "summary": summary,
