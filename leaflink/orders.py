@@ -2,20 +2,14 @@ from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from database import SessionLocal
+from database import get_db
 from models import Order, OrderLine
 
 router = APIRouter()
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 def money_to_float(value: Any) -> float | None:
@@ -130,13 +124,13 @@ def derive_review_status(line_items: list[dict[str, Any]], blockers: list[dict[s
 
 
 @router.get("/orders")
-def get_orders(db: Session = Depends(get_db)):
-    orders = (
-        db.query(Order)
-        .options(joinedload(Order.lines))
+async def get_orders(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Order)
+        .options(selectinload(Order.lines))
         .order_by(Order.external_updated_at.desc().nullslast(), Order.updated_at.desc())
-        .all()
     )
+    orders = result.scalars().all()
 
     results: list[dict[str, Any]] = []
 
@@ -187,13 +181,13 @@ def get_orders(db: Session = Depends(get_db)):
 
 
 @router.get("/orders/{order_id}")
-def get_order_detail(order_id: int, db: Session = Depends(get_db)):
-    order = (
-        db.query(Order)
-        .options(joinedload(Order.lines))
-        .filter(Order.id == order_id)
-        .first()
+async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Order)
+        .options(selectinload(Order.lines))
+        .where(Order.id == order_id)
     )
+    order = result.scalar_one_or_none()
 
     if not order:
         return {
@@ -239,9 +233,9 @@ def get_order_detail(order_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/leaflink/orders")
-def get_orders_legacy(db: Session = Depends(get_db)):
+async def get_orders_legacy(db: AsyncSession = Depends(get_db)):
     """
     Backward-compatible route so older frontend code that still calls
     /leaflink/orders keeps working while you transition to /orders.
     """
-    return get_orders(db)
+    return await get_orders(db)

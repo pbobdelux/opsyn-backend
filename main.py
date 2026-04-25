@@ -9,6 +9,9 @@ from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from leaflink.orders import router as leaflink_orders_router
+from routes.ai import router as ai_router
+
 logger = logging.getLogger("opsyn-backend")
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +44,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Routers
+# ---------------------------------------------------------------------------
+app.include_router(ai_router, prefix="/ai")
+app.include_router(leaflink_orders_router)
 
 
 @app.middleware("http")
