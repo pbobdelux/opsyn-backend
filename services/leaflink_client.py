@@ -6,7 +6,7 @@ import requests
 
 logger = logging.getLogger("leaflink_client")
 
-DEFAULT_LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://app.leaflink.com/api/v2").strip().rstrip("/")
+DEFAULT_LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://www.leaflink.com/api/v2").strip().rstrip("/")
 DEFAULT_LEAFLINK_API_KEY = os.getenv("LEAFLINK_API_KEY", "").strip()
 DEFAULT_LEAFLINK_COMPANY_ID = os.getenv("LEAFLINK_COMPANY_ID", "").strip()
 LEAFLINK_API_VERSION = os.getenv("LEAFLINK_API_VERSION", "").strip()
@@ -101,9 +101,8 @@ class LeafLinkClient:
 
         self.session = requests.Session()
         self.session.headers.update({
-            "Accept": "application/json",
-            "Content-Type": "application/json",
             "Authorization": f"Token {self.api_key}",
+            "Content-Type": "application/json",
             "User-Agent": LEAFLINK_USER_AGENT,
         })
 
@@ -169,8 +168,7 @@ class LeafLinkClient:
         status: Optional[str] = None,
     ) -> Any:
         logger.info(
-            "leaflink: list_orders start company_id=%s page=%s page_size=%s status=%s",
-            self.company_id,
+            "leaflink: list_orders start page=%s page_size=%s status=%s",
             page,
             page_size,
             status,
@@ -183,7 +181,7 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
-        resp = self._get_raw(f"companies/{self.company_id}/orders-received/", params=params)
+        resp = self._get_raw("orders-received/", params=params)
         content_type = resp.headers.get("Content-Type", "")
 
         if resp.ok and "application/json" in content_type.lower():
