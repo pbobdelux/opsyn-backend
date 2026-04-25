@@ -87,6 +87,8 @@ async def voice_status(
         return make_json_safe({
             "ok": True,
             "service": "voice_brain",
+            "twin_brain_webhook_url_set": bool(os.getenv("TWIN_BRAIN_WEBHOOK_URL", "").strip()),
+            "twin_brain_webhook_secret_set": bool(os.getenv("TWIN_BRAIN_WEBHOOK_SECRET", "").strip()),
             "twin_brain_configured": twin_voice_service.is_healthy(),
             "elevenlabs_stt_configured": elevenlabs_stt_tts_service.is_stt_healthy(),
             "elevenlabs_tts_configured": elevenlabs_stt_tts_service.is_tts_healthy(),
@@ -223,12 +225,12 @@ async def voice_message(
             return {
                 "ok": False,
                 "error_code": "twin_brain_not_configured",
-                "message": "Twin Voice Brain is not configured.",
+                "message": "Twin Voice Brain webhook is not configured.",
                 "data_source": "error",
             }
 
-        # Send to Twin
-        logger.info("voice_brain: sending_to_twin")
+        # Send to Twin via webhook
+        logger.info("voice_brain: sending_to_twin_webhook")
         twin_result = await twin_voice_service.send_message(
             message=user_text,
             tenant_org_id=tenant_org_id,
@@ -386,7 +388,7 @@ async def voice_action_confirm(
             return {
                 "ok": False,
                 "error_code": "twin_brain_not_configured",
-                "message": "Twin Voice Brain is not configured.",
+                "message": "Twin Voice Brain webhook is not configured.",
                 "data_source": "error",
             }
 
