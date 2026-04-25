@@ -312,6 +312,80 @@ async def voice_message(
         }
 
 
+@router.get("/result/{correlation_id}")
+async def voice_result(
+    correlation_id: str,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Retrieve the result of an async voice message.
+    Requires Bearer token matching OPSYN_AGENT_SHARED_SECRET.
+
+    Returns:
+    - Final result if ready (kind: answer, plan, clarify, etc.)
+    - Pending response if still processing
+    """
+    if not verify_agent_secret(authorization):
+        logger.warning("voice_brain: result_unauthorized")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        logger.info("voice_brain: result_requested correlation_id=%s", correlation_id[:8] + "...")
+
+        # Try to retrieve the result
+        result = twin_voice_service.get_callback_result(correlation_id)
+
+        if result:
+            # Result is ready
+            logger.info(
+                "voice_brain: result_found correlation_id=%s kind=%s",
+                correlation_id[:8] + "...",
+                result.get("kind"),
+            )
+
+            response = {
+                "ok": True,
+                "kind": result.get("kind", "answer"),
+                "speak_text": result.get("speak_text", ""),
+                "display_text": result.get("display_text", ""),
+                "data": result.get("data", {}),
+                "data_source": "live",
+            }
+
+            if result.get("error"):
+                response["error"] = result.get("error")
+
+            return make_json_safe(response)
+        else:
+            # Result not ready yet
+            logger.info("voice_brain: result_pending correlation_id=%s", correlation_id[:8] + "...")
+
+            return make_json_safe({
+                "ok": True,
+                "kind": "pending",
+                "display_text": "Still working on your request...",
+                "pending": True,
+                "data_source": "pending",
+            })
+
+    except Exception as e:
+        logger.error(
+            "voice_brain: result_failed correlation_id=%s error=%s",
+            correlation_id[:8] + "...",
+            e,
+            exc_info=True,
+        )
+
+        # Never crash - always return safe pending
+        return make_json_safe({
+            "ok": True,
+            "kind": "pending",
+            "display_text": "Still working on your request...",
+            "pending": True,
+            "data_source": "pending",
+        })
+
+
 @router.post("/callback")
 async def voice_brain_callback(
     body: dict[str, Any],
@@ -324,18 +398,23 @@ async def voice_brain_callback(
     {
       "correlation_id": "...",
       "status": "completed",
-      "output": {...},
+      "kind": "answer",
+      "speak_text": "...",
+      "display_text": "...",
+      "data": {...},
       "error": null
     }
     """
     try:
         correlation_id = body.get("correlation_id", "unknown")
         status = body.get("status", "unknown")
+        kind = body.get("kind", "answer")
 
         logger.info(
-            "voice_brain: callback_received correlation_id=%s status=%s",
+            "voice_brain: callback_received correlation_id=%s status=%s kind=%s",
             correlation_id[:8] + "..." if len(correlation_id) > 8 else correlation_id,
             status,
+            kind,
         )
 
         # Log full payload for debugging (safe - no secrets in callback)
