@@ -58,25 +58,48 @@ async def crm_dashboard(db: AsyncSession = Depends(get_db)):
         )
         recent_order = recent_order_result.scalar_one_or_none()
 
+        # Safely extract datetime values
+        last_order_at = None
+        last_synced_at = None
+
+        if recent_order:
+            if recent_order.external_updated_at:
+                last_order_at = recent_order.external_updated_at.isoformat()
+                logger.info("crm: dashboard_last_order_at=%s", last_order_at)
+            else:
+                logger.warning("crm: dashboard_recent_order_has_no_external_updated_at")
+
+            if recent_order.last_synced_at:
+                last_synced_at = recent_order.last_synced_at.isoformat()
+                logger.info("crm: dashboard_last_synced_at=%s", last_synced_at)
+            else:
+                logger.warning("crm: dashboard_recent_order_has_no_last_synced_at")
+        else:
+            logger.warning("crm: dashboard_no_orders_found")
+
+        # Determine data source
+        data_source = "live" if (customer_count > 0 or order_count > 0) else "empty"
+
         logger.info(
-            "crm: dashboard_complete customers=%s orders=%s total_spend=%s",
+            "crm: dashboard_complete customers=%s orders=%s total_spend=%s data_source=%s",
             customer_count,
             order_count,
             total_spend,
+            data_source,
         )
 
         return make_json_safe({
             "ok": True,
-            "data_source": "live",
+            "data_source": data_source,
             "customer_count": customer_count,
             "order_count": order_count,
             "total_spend": total_spend,
-            "last_order_at": recent_order.external_updated_at.isoformat() if recent_order else None,
-            "last_synced_at": recent_order.last_synced_at.isoformat() if recent_order else None,
+            "last_order_at": last_order_at,
+            "last_synced_at": last_synced_at,
         })
 
     except Exception as e:
-        logger.error("crm: dashboard_failed error=%s", e)
+        logger.error("crm: dashboard_failed error=%s", e, exc_info=True)
         return {
             "ok": False,
             "error": str(e),
