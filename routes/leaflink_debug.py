@@ -199,6 +199,42 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     if last_error is None and connection_status == "error":
         last_error = db_last_error
 
+    # ── Sync freshness metrics ──────────────────────────────────────────────
+    orders_with_line_items = 0
+    orders_without_line_items = 0
+    total_line_items = 0
+    newest_order_date = None
+    oldest_order_date = None
+
+    try:
+        # Count orders with/without line items
+        all_orders_result = await db.execute(select(Order))
+        all_orders = all_orders_result.scalars().all()
+
+        for order in all_orders:
+            line_items = order.line_items_json
+            if isinstance(line_items, list) and len(line_items) > 0:
+                orders_with_line_items += 1
+                total_line_items += len(line_items)
+            else:
+                orders_without_line_items += 1
+
+            # Track date range
+            if order.external_updated_at:
+                if newest_order_date is None or order.external_updated_at > newest_order_date:
+                    newest_order_date = order.external_updated_at
+                if oldest_order_date is None or order.external_updated_at < oldest_order_date:
+                    oldest_order_date = order.external_updated_at
+
+        logger.info(
+            "leaflink: debug orders_with_items=%s without_items=%s total_items=%s",
+            orders_with_line_items,
+            orders_without_line_items,
+            total_line_items,
+        )
+    except Exception as metrics_exc:
+        logger.error("leaflink: debug metrics_failed error=%s", metrics_exc)
+
     result = {
         "ok": True,
         "api_connected": api_connected,
@@ -208,6 +244,11 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
         "base_url": DEFAULT_LEAFLINK_BASE_URL or base_url_raw or None,
         "company_id": DEFAULT_LEAFLINK_COMPANY_ID or company_id_raw or None,
         "orders_in_db": orders_in_db,
+        "orders_with_line_items": orders_with_line_items,
+        "orders_without_line_items": orders_without_line_items,
+        "total_line_items": total_line_items,
+        "newest_order_date": newest_order_date.isoformat() if newest_order_date else None,
+        "oldest_order_date": oldest_order_date.isoformat() if oldest_order_date else None,
         "connection_status": connection_status,
         "last_sync_attempt": last_sync_attempt,
         "last_sync_status": last_sync_status,
