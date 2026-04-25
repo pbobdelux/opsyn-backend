@@ -46,8 +46,16 @@ async def voice_session(
     authorization: Optional[str] = Header(None),
 ):
     """
-    Create or return a valid ElevenLabs conversation session.
+    Create or return a valid ElevenLabs conversation token.
     Requires Bearer token matching OPSYN_AGENT_SHARED_SECRET.
+
+    Returns:
+    {
+      "ok": true,
+      "token": "...",
+      "agent_id": "...",
+      "connection_type": "webrtc"
+    }
     """
     if not verify_agent_secret(authorization):
         logger.warning("voice: session_unauthorized")
@@ -58,27 +66,50 @@ async def voice_session(
 
         if not elevenlabs_service.is_healthy():
             logger.error("voice: elevenlabs_not_configured")
-            raise HTTPException(status_code=503, detail="ElevenLabs not configured")
+            return {
+                "ok": False,
+                "error_code": "elevenlabs_not_configured",
+                "message": "ElevenLabs is not configured",
+                "data_source": "error",
+            }
 
-        # Create a new conversation
-        conversation = await elevenlabs_service.create_conversation()
+        # Get conversation token from ElevenLabs
+        token_response = await elevenlabs_service.get_conversation_token()
 
-        logger.info("voice: session_created conversation_id=%s", conversation.get("conversation_id"))
+        logger.info("voice: session_created token_length=%s", len(token_response.get("token", "")))
 
         return make_json_safe({
             "ok": True,
-            "conversation_id": conversation.get("conversation_id"),
-            "session_token": conversation.get("session_token"),
-            "expires_at": conversation.get("expires_at"),
+            "token": token_response.get("token"),
+            "agent_id": token_response.get("agent_id"),
+            "connection_type": "webrtc",
+            "data_source": "live",
         })
 
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error("voice: session_failed error=%s", e)
+        logger.error("voice: session_failed error=%s", e, exc_info=True)
+
+        # Parse ElevenLabs error
+        error_msg = str(e)
+        error_code = "elevenlabs_error"
+
+        if "404" in error_msg:
+            error_code = "agent_not_found"
+            message = "ElevenLabs agent not found. Check ELEVENLABS_AGENT_ID."
+        elif "401" in error_msg or "Unauthorized" in error_msg:
+            error_code = "elevenlabs_unauthorized"
+            message = "ElevenLabs API key is invalid. Check ELEVENLABS_API_KEY."
+        elif "not configured" in error_msg:
+            error_code = "elevenlabs_not_configured"
+            message = "ElevenLabs is not configured."
+        else:
+            message = "Failed to create voice session"
+
         return {
             "ok": False,
-            "error": str(e),
+            "error_code": error_code,
+            "message": message,
+            "data_source": "error",
         }
 
 
