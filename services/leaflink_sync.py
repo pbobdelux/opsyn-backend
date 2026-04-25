@@ -6,8 +6,7 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import BrandAPICredential, Order, OrderLine
-from services.leaflink_client import LeafLinkClient
+from models import Order, OrderLine
 
 logger = logging.getLogger("leaflink_sync")
 
@@ -123,63 +122,22 @@ def derive_review_status(line_items: list[dict[str, Any]]) -> str:
     return "ready"
 
 
-async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any]:
+async def sync_leaflink_orders(
+    db: AsyncSession,
+    brand_id: str,
+    orders: list[dict],
+) -> dict[str, Any]:
+    """Upsert *pre-fetched* LeafLink orders and their line items.
+
+    The caller is responsible for:
+    - Credential lookup and API fetch (before calling this function)
+    - Owning the surrounding ``async with db.begin():`` transaction block
+
+    This function performs only DB writes (no credential lookup, no HTTP).
+    It must be called inside an active transaction — do NOT call db.commit()
+    or db.rollback() here.
+    """
     logger.info("leaflink: sync_start brand_id=%s", brand_id)
-
-    # ------------------------------------------------------------------
-    # Step 1: Resolve credentials using the caller's transaction.
-    # Extract scalar values immediately to avoid lazy-loading issues.
-    # ------------------------------------------------------------------
-    logger.info("leaflink: sync_credential_lookup brand_id=%s integration=leaflink", brand_id)
-
-    cred_result = await db.execute(
-        select(BrandAPICredential).where(
-            BrandAPICredential.brand_id == brand_id,
-            BrandAPICredential.integration_name == "leaflink",
-            BrandAPICredential.is_active == True,
-        )
-    )
-    cred = cred_result.scalar_one_or_none()
-
-    if not cred:
-        logger.warning(
-            "leaflink: sync_credential_not_found brand_id=%s — no active LeafLink credentials",
-            brand_id,
-        )
-        return {
-            "ok": False,
-            "error": "No active LeafLink credentials found",
-            "orders_fetched": 0,
-            "created": 0,
-            "updated": 0,
-            "skipped": 0,
-            "line_items_written": 0,
-            "newest_order_date": None,
-            "errors": ["No active LeafLink credentials found"],
-        }
-
-    # Extract scalar values immediately to avoid lazy-loading issues.
-    api_key: str | None = cred.api_key
-    company_id: str | None = cred.company_id
-
-    logger.info(
-        "leaflink: sync_credential_found brand_id=%s company_id=%s api_key_set=%s",
-        brand_id,
-        company_id,
-        bool(api_key),
-    )
-
-    # ------------------------------------------------------------------
-    # Step 2: Fetch orders from the LeafLink API (pure HTTP, no DB).
-    # ------------------------------------------------------------------
-    logger.info("leaflink: sync_client_init brand_id=%s", brand_id)
-    client = LeafLinkClient(
-        api_key=api_key,
-        company_id=company_id,
-    )
-
-    logger.info("leaflink: sync_api_call_start brand_id=%s", brand_id)
-    orders = client.fetch_recent_orders(max_pages=5, normalize=True)
 
     using_mock = any(isinstance(o, dict) and o.get("mock_data") for o in orders)
     if using_mock:
@@ -204,8 +162,8 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
     newest_order_date: datetime | None = None
 
     # ------------------------------------------------------------------
-    # Step 3: Upsert orders and write line items using the caller's
-    # transaction.  No begin() here — the route handler owns the transaction.
+    # Upsert orders and write line items using the caller's transaction.
+    # No begin() here — the route handler owns the transaction.
     # ------------------------------------------------------------------
     try:
         logger.info(
