@@ -336,6 +336,21 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
 
         await db.commit()
 
+        # Track newest order date for response
+        newest_order_date = None
+        try:
+            newest_result = await db.execute(
+                select(Order)
+                .where(Order.brand_id == brand_id)
+                .order_by(Order.external_updated_at.desc().nullslast())
+                .limit(1)
+            )
+            newest_order = newest_result.scalar_one_or_none()
+            if newest_order and newest_order.external_updated_at:
+                newest_order_date = newest_order.external_updated_at.isoformat()
+        except Exception as date_exc:
+            logger.warning("leaflink: sync_newest_date_lookup_failed error=%s", date_exc)
+
         logger.info(
             "leaflink: sync_complete brand_id=%s fetched=%s created=%s updated=%s skipped=%s lines_written=%s mock_data=%s",
             brand_id,
@@ -355,6 +370,7 @@ async def sync_leaflink_orders(db: AsyncSession, brand_id: str) -> dict[str, Any
             "skipped": skipped,
             "lines_written": total_lines_written,
             "mock_data": using_mock,
+            "newest_order_date": newest_order_date,
             "message": f"Synced {len(orders)} orders and wrote {total_lines_written} line items",
         }
 
