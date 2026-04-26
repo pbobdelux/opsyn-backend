@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,6 +27,9 @@ def get_orders():
 
 @router.get("/sync")
 async def orders_sync(
+    request: Request,
+    brand_id: Optional[str] = Query(None, description="Brand slug or ID to filter orders (e.g., 'noble-nectar')"),
+    brand_slug: Optional[str] = Query(None, description="Alias for brand_id — brand slug or ID"),
     updated_after: Optional[str] = Query(None, description="ISO timestamp - only return orders updated after this time"),
     cursor: Optional[str] = Query(None, description="Pagination cursor from previous response"),
     limit: int = Query(500, ge=1, le=1000, description="Number of orders to return (default 500, max 1000)"),
@@ -42,6 +45,8 @@ async def orders_sync(
     - Including stable order ID fields for deduplication
 
     Query params:
+    - brand_id: Brand slug or ID to filter orders (e.g., "noble-nectar")
+    - brand_slug: Alias for brand_id
     - updated_after: ISO timestamp (e.g., "2026-04-25T12:30:00Z")
     - cursor: Pagination cursor from previous response
     - limit: Number of orders (1-1000, default 500)
@@ -55,8 +60,19 @@ async def orders_sync(
     - last_synced_at: Timestamp of this sync
     """
     try:
+        # Resolve brand filter — accept brand_id, brand_slug, or camelCase brandId
+        # from query params. brand_slug is an alias; brandId is tolerated for iOS clients.
+        brand_filter: Optional[str] = (
+            brand_id
+            or brand_slug
+            or request.query_params.get("brandId")
+        )
+
         logger.info(
-            "orders: sync_requested updated_after=%s cursor=%s limit=%s",
+            "[OrdersSync] request_start path=%s brand=%s org=%s updated_after=%s cursor=%s limit=%s",
+            request.url.path,
+            brand_filter,
+            request.headers.get("x-opsyn-org") or request.headers.get("x-org-id"),
             updated_after,
             cursor[:8] + "..." if cursor else None,
             limit,
@@ -67,9 +83,9 @@ async def orders_sync(
         if updated_after:
             try:
                 updated_after_dt = datetime.fromisoformat(updated_after.replace("Z", "+00:00"))
-                logger.info("orders: sync_filter updated_after=%s", updated_after_dt.isoformat())
+                logger.info("[OrdersSync] filter updated_after=%s", updated_after_dt.isoformat())
             except ValueError as e:
-                logger.error("orders: sync_invalid_timestamp error=%s", e)
+                logger.error("[OrdersSync] validation_error detail=invalid_updated_after error=%s", e)
                 return {
                     "ok": False,
                     "error": "Invalid updated_after timestamp format. Use ISO 8601 (e.g., 2026-04-25T12:30:00Z)",
@@ -81,9 +97,9 @@ async def orders_sync(
         if cursor:
             try:
                 cursor_id = int(base64.b64decode(cursor).decode("utf-8"))
-                logger.info("orders: sync_cursor_decoded cursor_id=%s", cursor_id)
+                logger.info("[OrdersSync] cursor_decoded cursor_id=%s", cursor_id)
             except Exception as e:
-                logger.error("orders: sync_invalid_cursor error=%s", e)
+                logger.error("[OrdersSync] validation_error detail=invalid_cursor error=%s", e)
                 return {
                     "ok": False,
                     "error": "Invalid cursor format",
@@ -92,6 +108,11 @@ async def orders_sync(
 
         # Build query
         query = select(Order)
+
+        # Filter by brand when provided (brand_id column stores the brand slug/ID)
+        if brand_filter:
+            query = query.where(Order.brand_id == brand_filter)
+            logger.info("[OrdersSync] filter brand=%s", brand_filter)
 
         # Filter by updated_after
         if updated_after_dt:
@@ -147,10 +168,10 @@ async def orders_sync(
         server_time = datetime.now(timezone.utc).isoformat()
 
         logger.info(
-            "orders: sync_complete count=%s has_more=%s server_time=%s",
+            "[OrdersSync] response count=%s has_more=%s brand=%s",
             len(orders_data),
             has_more,
-            server_time,
+            brand_filter,
         )
 
         return make_json_safe({
@@ -165,7 +186,7 @@ async def orders_sync(
         })
 
     except Exception as e:
-        logger.error("orders: sync_failed error=%s", e, exc_info=True)
+        logger.error("[OrdersSync] validation_error detail=%s", e, exc_info=True)
         return {
             "ok": False,
             "error": str(e),
