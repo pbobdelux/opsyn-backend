@@ -80,18 +80,20 @@ async def crm_dashboard(db: AsyncSession = Depends(get_db)):
 
         # Determine data source
         data_source = "live" if (customer_count > 0 or order_count > 0) else "empty"
+        synced_at = datetime.now(timezone.utc).isoformat()
 
         logger.info(
-            "crm: dashboard_complete customers=%s orders=%s total_spend=%s data_source=%s",
+            "[CRM] dashboard_complete customers=%s orders=%s source=%s",
             customer_count,
             order_count,
-            total_spend,
             data_source,
         )
 
         return make_json_safe({
             "ok": True,
+            "source": data_source,
             "data_source": data_source,
+            "synced_at": synced_at,
             "customer_count": customer_count,
             "order_count": order_count,
             "total_spend": total_spend,
@@ -104,7 +106,9 @@ async def crm_dashboard(db: AsyncSession = Depends(get_db)):
         return {
             "ok": False,
             "error": str(e),
+            "source": "error",
             "data_source": "error",
+            "synced_at": datetime.now(timezone.utc).isoformat(),
         }
 
 
@@ -145,21 +149,29 @@ async def crm_customers(
                 "last_order_at": row.last_order_at.isoformat() if row.last_order_at else None,
             })
 
-        logger.info("crm: customers_complete count=%s", len(customers))
+        synced_at = datetime.now(timezone.utc).isoformat()
+        source = "live" if customers else "empty"
+
+        logger.info("[CRM] customers_query count=%s", len(customers))
 
         return make_json_safe({
             "ok": True,
-            "data_source": "live",
+            "source": source,
+            "data_source": source,
+            "synced_at": synced_at,
             "customers": customers,
             "count": len(customers),
         })
 
     except Exception as e:
         logger.error("crm: customers_failed error=%s", e)
+        # Never return empty array on error — return structured error with count
         return {
             "ok": False,
             "error": str(e),
+            "source": "error",
             "data_source": "error",
+            "synced_at": datetime.now(timezone.utc).isoformat(),
             "customers": [],
             "count": 0,
         }
@@ -190,7 +202,9 @@ async def crm_customer_detail(
             return {
                 "ok": False,
                 "error": "Customer not found",
+                "source": "empty",
                 "data_source": "empty",
+                "synced_at": datetime.now(timezone.utc).isoformat(),
             }
 
         # Aggregate customer data
@@ -205,9 +219,13 @@ async def crm_customer_detail(
             total_spend,
         )
 
+        synced_at = datetime.now(timezone.utc).isoformat()
+
         return make_json_safe({
             "ok": True,
+            "source": "live",
             "data_source": "live",
+            "synced_at": synced_at,
             "id": customer_id,
             "name": customer_id,
             "order_count": order_count,
@@ -224,7 +242,9 @@ async def crm_customer_detail(
         return {
             "ok": False,
             "error": str(e),
+            "source": "error",
             "data_source": "error",
+            "synced_at": datetime.now(timezone.utc).isoformat(),
         }
 
 
@@ -272,11 +292,16 @@ async def crm_customer_orders(
                 "updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
             })
 
-        logger.info("crm: customer_orders_complete customer_id=%s count=%s", customer_id, len(orders_data))
+        synced_at = datetime.now(timezone.utc).isoformat()
+        source = "live" if orders_data else "empty"
+
+        logger.info("[CRM] orders_query count=%s customer_id=%s", len(orders_data), customer_id)
 
         return make_json_safe({
             "ok": True,
-            "data_source": "live",
+            "source": source,
+            "data_source": source,
+            "synced_at": synced_at,
             "customer_id": customer_id,
             "orders": orders_data,
             "count": len(orders_data),
@@ -284,10 +309,14 @@ async def crm_customer_orders(
 
     except Exception as e:
         logger.error("crm: customer_orders_failed customer_id=%s error=%s", customer_id, e)
+        # Never return empty array on error
         return {
             "ok": False,
             "error": str(e),
+            "source": "error",
             "data_source": "error",
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+            "customer_id": customer_id,
             "orders": [],
             "count": 0,
         }
@@ -325,11 +354,16 @@ async def crm_customer_activity(
                 "amount": float(order.amount or 0),
             })
 
+        synced_at = datetime.now(timezone.utc).isoformat()
+        source = "live" if activity else "empty"
+
         logger.info("crm: customer_activity_complete customer_id=%s count=%s", customer_id, len(activity))
 
         return make_json_safe({
             "ok": True,
-            "data_source": "live",
+            "source": source,
+            "data_source": source,
+            "synced_at": synced_at,
             "customer_id": customer_id,
             "activity": activity,
             "count": len(activity),
@@ -337,10 +371,14 @@ async def crm_customer_activity(
 
     except Exception as e:
         logger.error("crm: customer_activity_failed customer_id=%s error=%s", customer_id, e)
+        # Never return empty array on error
         return {
             "ok": False,
             "error": str(e),
+            "source": "error",
             "data_source": "error",
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+            "customer_id": customer_id,
             "activity": [],
             "count": 0,
         }
@@ -380,21 +418,29 @@ async def crm_recent_orders(
                 "updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
             })
 
-        logger.info("crm: recent_orders_complete count=%s", len(orders_data))
+        synced_at = datetime.now(timezone.utc).isoformat()
+        source = "live" if orders_data else "empty"
+
+        logger.info("[CRM] orders_query count=%s source=%s", len(orders_data), source)
 
         return make_json_safe({
             "ok": True,
-            "data_source": "live",
+            "source": source,
+            "data_source": source,
+            "synced_at": synced_at,
             "orders": orders_data,
             "count": len(orders_data),
         })
 
     except Exception as e:
         logger.error("crm: recent_orders_failed error=%s", e)
+        # Never return empty array on error
         return {
             "ok": False,
             "error": str(e),
+            "source": "error",
             "data_source": "error",
+            "synced_at": datetime.now(timezone.utc).isoformat(),
             "orders": [],
             "count": 0,
         }
@@ -427,21 +473,29 @@ async def crm_sync_status(db: AsyncSession = Depends(get_db)):
                 "last_error": cred.last_error,
             })
 
+        synced_at = datetime.now(timezone.utc).isoformat()
+        source = "live" if brands else "empty"
+
         logger.info("crm: sync_status_complete brands=%s", len(brands))
 
         return make_json_safe({
             "ok": True,
-            "data_source": "live",
+            "source": source,
+            "data_source": source,
+            "synced_at": synced_at,
             "brands": brands,
             "count": len(brands),
         })
 
     except Exception as e:
         logger.error("crm: sync_status_failed error=%s", e)
+        # Never return empty array on error
         return {
             "ok": False,
             "error": str(e),
+            "source": "error",
             "data_source": "error",
+            "synced_at": datetime.now(timezone.utc).isoformat(),
             "brands": [],
             "count": 0,
         }
@@ -492,7 +546,9 @@ async def crm_sync(
                 return {
                     "ok": False,
                     "error": "Invalid updated_after timestamp format. Use ISO 8601 (e.g., 2026-04-25T12:30:00Z)",
+                    "source": "error",
                     "data_source": "error",
+                    "synced_at": datetime.now(timezone.utc).isoformat(),
                 }
 
         # Decode cursor if provided
@@ -506,7 +562,9 @@ async def crm_sync(
                 return {
                     "ok": False,
                     "error": "Invalid cursor format",
+                    "source": "error",
                     "data_source": "error",
+                    "synced_at": datetime.now(timezone.utc).isoformat(),
                 }
 
         # Fetch orders (orders are the source of truth for both customers and orders)
@@ -564,18 +622,23 @@ async def crm_sync(
 
         server_time = datetime.now(timezone.utc).isoformat()
 
+        source = "live" if (orders_data or customers_data) else "empty"
+
         logger.info(
-            "crm: sync_complete customers=%s orders=%s has_more=%s",
+            "[CRM] dashboard_complete customers=%s orders=%s source=%s",
             len(customers_data),
             len(orders_data),
-            has_more,
+            source,
         )
 
         return make_json_safe({
             "ok": True,
-            "data_source": "live",
+            "source": source,
+            "data_source": source,
+            "synced_at": server_time,
             "customers": customers_data,
             "orders": orders_data,
+            "count": len(orders_data),
             "next_cursor": next_cursor if has_more else None,
             "has_more": has_more,
             "server_time": server_time,
@@ -588,7 +651,12 @@ async def crm_sync(
         return {
             "ok": False,
             "error": str(e),
+            "source": "error",
             "data_source": "error",
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+            "customers": [],
+            "orders": [],
+            "count": 0,
         }
 
 
@@ -635,7 +703,9 @@ async def crm_customers_sync(
                 return {
                     "ok": False,
                     "error": "Invalid updated_after timestamp format. Use ISO 8601 (e.g., 2026-04-25T12:30:00Z)",
+                    "source": "error",
                     "data_source": "error",
+                    "synced_at": datetime.now(timezone.utc).isoformat(),
                 }
 
         # Decode cursor if provided
@@ -648,7 +718,9 @@ async def crm_customers_sync(
                 return {
                     "ok": False,
                     "error": "Invalid cursor format",
+                    "source": "error",
                     "data_source": "error",
+                    "synced_at": datetime.now(timezone.utc).isoformat(),
                 }
 
         # Query orders to derive customer data
@@ -711,15 +783,21 @@ async def crm_customers_sync(
 
         server_time = datetime.now(timezone.utc).isoformat()
 
+        source = "live" if customers_data else "empty"
+
         logger.info(
-            "crm: customers_sync_complete count=%s has_more=%s",
+            "[CRM] customers_query count=%s has_more=%s source=%s",
             len(customers_data),
             has_more,
+            source,
         )
 
         return make_json_safe({
             "ok": True,
-            "data_source": "live",
+            "source": source,
+            "data_source": source,
+            "synced_at": server_time,
+            "count": len(customers_data),
             "customers": customers_data,
             "next_cursor": next_cursor if has_more else None,
             "has_more": has_more,
@@ -730,10 +808,15 @@ async def crm_customers_sync(
 
     except Exception as e:
         logger.error("crm: customers_sync_failed error=%s", e, exc_info=True)
+        # Never return empty array on error
         return {
             "ok": False,
             "error": str(e),
+            "source": "error",
             "data_source": "error",
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+            "count": 0,
+            "customers": [],
         }
 
 
@@ -778,7 +861,9 @@ async def crm_recent_orders_sync(
                 return {
                     "ok": False,
                     "error": "Invalid updated_after timestamp format. Use ISO 8601 (e.g., 2026-04-25T12:30:00Z)",
+                    "source": "error",
                     "data_source": "error",
+                    "synced_at": datetime.now(timezone.utc).isoformat(),
                 }
 
         # Decode cursor if provided
@@ -791,7 +876,9 @@ async def crm_recent_orders_sync(
                 return {
                     "ok": False,
                     "error": "Invalid cursor format",
+                    "source": "error",
                     "data_source": "error",
+                    "synced_at": datetime.now(timezone.utc).isoformat(),
                 }
 
         # Build query
@@ -836,15 +923,21 @@ async def crm_recent_orders_sync(
 
         server_time = datetime.now(timezone.utc).isoformat()
 
+        source = "live" if orders_data else "empty"
+
         logger.info(
-            "crm: recent_orders_sync_complete count=%s has_more=%s",
+            "[CRM] orders_query count=%s has_more=%s source=%s",
             len(orders_data),
             has_more,
+            source,
         )
 
         return make_json_safe({
             "ok": True,
-            "data_source": "live",
+            "source": source,
+            "data_source": source,
+            "synced_at": server_time,
+            "count": len(orders_data),
             "orders": orders_data,
             "next_cursor": next_cursor if has_more else None,
             "has_more": has_more,
@@ -855,8 +948,13 @@ async def crm_recent_orders_sync(
 
     except Exception as e:
         logger.error("crm: recent_orders_sync_failed error=%s", e, exc_info=True)
+        # Never return empty array on error
         return {
             "ok": False,
             "error": str(e),
+            "source": "error",
             "data_source": "error",
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+            "count": 0,
+            "orders": [],
         }
