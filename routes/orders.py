@@ -115,6 +115,24 @@ async def orders_sync(
                         force_full,
                     )
 
+                    # Log incremental sync window when updated_after is provided.
+                    # For 30-minute incremental syncs, window_start = updated_after and
+                    # window_end = now. This is a no-op for full backfills (force_full=True).
+                    if updated_after and not force_full:
+                        window_end = datetime.now(timezone.utc).isoformat()
+                        logger.info(
+                            "[OrdersSync] incremental_sync brand=%s window_start=%s window_end=%s",
+                            brand_filter,
+                            updated_after,
+                            window_end,
+                        )
+
+                    # Batch processing strategy:
+                    # - HTTP timeout: 45 seconds (sufficient for large backfills of 15,000+ orders)
+                    # - DB transaction timeout: not set (uses PostgreSQL default — no cap)
+                    # - Orders are processed in pages of 100 from LeafLink, upserted in a single
+                    #   DB transaction per sync call. This ensures atomicity: if the sync fails
+                    #   midway, no partial writes are committed (transaction rollback).
                     client = LeafLinkClient(api_key=api_key, company_id=company_id)
 
                     # force_full=True → fetch all pages (unlimited); otherwise fetch recent (5 pages)
@@ -150,6 +168,9 @@ async def orders_sync(
 
                     newest = sync_result.get("newest_order_date")
                     sync_metadata["latest_order_date"] = newest.isoformat() if newest else None
+
+                    oldest = sync_result.get("oldest_order_date")
+                    sync_metadata["oldest_order_date"] = oldest.isoformat() if oldest else None
                 else:
                     logger.info(
                         "[OrdersSync] no_leaflink_credentials brand=%s — serving from DB only",
@@ -282,6 +303,7 @@ async def orders_sync(
         sync_metadata.setdefault("pages_fetched", None)
         sync_metadata.setdefault("sync_duration_seconds", None)
         sync_metadata.setdefault("latest_order_date", None)
+        sync_metadata.setdefault("oldest_order_date", None)
         sync_metadata["total_in_database"] = total_in_database
         sync_metadata["total_returned"] = len(orders_data)
 
@@ -289,6 +311,8 @@ async def orders_sync(
         logger.info("[OrdersSync] returned_to_ios=%s brand=%s", len(orders_data), brand_filter)
         if sync_metadata.get("latest_order_date"):
             logger.info("[OrdersSync] latest_order_date=%s brand=%s", sync_metadata["latest_order_date"], brand_filter)
+        if sync_metadata.get("oldest_order_date"):
+            logger.info("[OrdersSync] oldest_order_date=%s brand=%s", sync_metadata["oldest_order_date"], brand_filter)
 
         logger.info(
             "[OrdersSync] response count=%s has_more=%s brand=%s total_in_db=%s",
