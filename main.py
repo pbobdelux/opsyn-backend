@@ -247,10 +247,12 @@ async def sync_leaflink(
                     logger.info("leaflink: sync_client_init brand_id=%s", brand_id)
                     client = LeafLinkClient(api_key=api_key, company_id=company_id)
                     logger.info("leaflink: sync_api_call_start brand_id=%s", brand_id)
-                    orders = client.fetch_recent_orders(max_pages=5, normalize=True)
+                    fetch_result = client.fetch_recent_orders(normalize=True, brand=brand_id)
+                    orders = fetch_result["orders"]
+                    pages_fetched = fetch_result["pages_fetched"]
 
                     # Step 3: Upsert orders and line items inside the same transaction.
-                    result = await sync_leaflink_orders(db, brand_id, orders)
+                    result = await sync_leaflink_orders(db, brand_id, orders, pages_fetched=pages_fetched)
 
                     # Step 4: Update credential sync status inside the same transaction.
                     cred.sync_status = "ok" if result.get("ok") else "failed"
@@ -261,13 +263,14 @@ async def sync_leaflink(
                         cred.last_error = None
 
                     logger.info(
-                        "leaflink: sync_endpoint brand_id=%s result=%s created=%s updated=%s skipped=%s lines=%s",
+                        "leaflink: sync_endpoint brand_id=%s result=%s created=%s updated=%s skipped=%s lines=%s pages=%s",
                         brand_id,
                         "ok" if result.get("ok") else "failed",
                         result.get("created", 0),
                         result.get("updated", 0),
                         result.get("skipped", 0),
                         result.get("line_items_written", 0),
+                        result.get("pages_fetched", 0),
                     )
 
                     total_created += result.get("created", 0)
@@ -279,6 +282,7 @@ async def sync_leaflink(
                         "brand_id": brand_id,
                         "ok": result.get("ok"),
                         "orders_fetched": result.get("orders_fetched", 0),
+                        "pages_fetched": result.get("pages_fetched", 0),
                         "created": result.get("created", 0),
                         "updated": result.get("updated", 0),
                         "skipped": result.get("skipped", 0),
@@ -395,10 +399,12 @@ async def sync_leaflink_now(
                 logger.info("leaflink: sync_client_init brand_id=%s", brand_id)
                 client = LeafLinkClient(api_key=api_key, company_id=company_id)
                 logger.info("leaflink: sync_api_call_start brand_id=%s", brand_id)
-                orders = client.fetch_recent_orders(max_pages=5, normalize=True)
+                fetch_result = client.fetch_recent_orders(normalize=True, brand=brand_id)
+                orders = fetch_result["orders"]
+                pages_fetched = fetch_result["pages_fetched"]
 
                 # Step 3: Upsert orders and line items inside the same transaction.
-                result = await sync_leaflink_orders(db, brand_id, orders)
+                result = await sync_leaflink_orders(db, brand_id, orders, pages_fetched=pages_fetched)
 
                 # Step 4: Persist credential sync status inside the same transaction.
                 cred.sync_status = "ok" if result.get("ok") else "failed"

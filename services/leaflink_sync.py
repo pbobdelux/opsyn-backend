@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -139,6 +140,7 @@ async def sync_leaflink_orders(
     db: AsyncSession,
     brand_id: str,
     orders: list[dict],
+    pages_fetched: int = 0,
 ) -> dict[str, Any]:
     """Upsert *pre-fetched* LeafLink orders and their line items.
 
@@ -149,8 +151,15 @@ async def sync_leaflink_orders(
     This function performs only DB writes (no credential lookup, no HTTP).
     It must be called inside an active transaction — do NOT call db.commit()
     or db.rollback() here.
+
+    Args:
+        db: Active async database session (inside a transaction).
+        brand_id: Brand slug / ID used to scope orders.
+        orders: Pre-fetched, normalised order dicts from LeafLink.
+        pages_fetched: Number of API pages retrieved (for metadata).
     """
-    logger.info("leaflink: sync_start brand_id=%s", brand_id)
+    sync_start = time.monotonic()
+    logger.info("leaflink: sync_start brand_id=%s orders=%s pages_fetched=%s", brand_id, len(orders), pages_fetched)
     logger.info("leaflink: sync_json_sanitized brand_id=%s", brand_id)
 
     using_mock = any(isinstance(o, dict) and o.get("mock_data") for o in orders)
@@ -349,14 +358,17 @@ async def sync_leaflink_orders(
             brand_id,
             total_lines_written,
         )
+        sync_duration = round(time.monotonic() - sync_start, 2)
         logger.info(
-            "leaflink: sync_complete brand_id=%s fetched=%s created=%s updated=%s skipped=%s lines_written=%s mock_data=%s",
+            "leaflink: sync_complete brand_id=%s fetched=%s created=%s updated=%s skipped=%s lines_written=%s pages_fetched=%s duration_seconds=%s mock_data=%s",
             brand_id,
             len(orders),
             created,
             updated,
             skipped,
             total_lines_written,
+            pages_fetched,
+            sync_duration,
             using_mock,
         )
 
@@ -368,16 +380,20 @@ async def sync_leaflink_orders(
             "skipped": skipped,
             "line_items_written": total_lines_written,
             "newest_order_date": newest_order_date,
+            "pages_fetched": pages_fetched,
+            "sync_duration_seconds": sync_duration,
             "errors": errors,
             "mock_data": using_mock,
             "message": f"Synced {len(orders)} orders and wrote {total_lines_written} line items",
         }
 
     except Exception as e:
+        sync_duration = round(time.monotonic() - sync_start, 2)
         logger.error(
-            "leaflink: sync_failed brand_id=%s error=%s",
+            "leaflink: sync_failed brand_id=%s error=%s duration_seconds=%s",
             brand_id,
             e,
+            sync_duration,
             exc_info=True,
         )
         return {
@@ -389,5 +405,7 @@ async def sync_leaflink_orders(
             "skipped": skipped,
             "line_items_written": total_lines_written,
             "newest_order_date": newest_order_date,
+            "pages_fetched": pages_fetched,
+            "sync_duration_seconds": sync_duration,
             "errors": [str(e)],
         }
