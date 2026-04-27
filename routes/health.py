@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import BrandAPICredential, Order
+from services import leaflink_auth
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("health")
@@ -65,11 +66,33 @@ async def health_data(db: AsyncSession = Depends(get_db)):
 
         data_source = "live" if (orders_count > 0 or customers_count > 0) else "empty"
 
+        # LeafLink auth health (non-blocking — failures don't break the endpoint)
+        try:
+            ll_health = leaflink_auth.get_auth_health()
+            leaflink_auth_ok = ll_health["auth_present"] and ll_health["can_fetch_orders"]
+            leaflink_last_success_at = ll_health["last_success_at"]
+            leaflink_last_error = ll_health["last_error"]
+
+            if leaflink_auth_ok:
+                leaflink_sync_state = "healthy"
+            elif ll_health["auth_present"] and not ll_health["can_fetch_orders"]:
+                leaflink_sync_state = "degraded"
+            else:
+                leaflink_sync_state = "failed"
+        except Exception as ll_exc:
+            logger.warning("[Health] leaflink_auth_check_failed error=%s", ll_exc)
+            leaflink_auth_ok = False
+            leaflink_last_success_at = None
+            leaflink_last_error = str(ll_exc)
+            leaflink_sync_state = "failed"
+
         logger.info(
-            "[Health] data_endpoint_hit orders=%s customers=%s last_sync=%s",
+            "[Health] data_endpoint_hit orders=%s customers=%s last_sync=%s leaflink_auth_ok=%s last_error=%s",
             orders_count,
             customers_count,
             last_sync,
+            leaflink_auth_ok,
+            leaflink_last_error or "none",
         )
 
         return make_json_safe({
@@ -80,6 +103,10 @@ async def health_data(db: AsyncSession = Depends(get_db)):
             "last_error": last_error,
             "data_source": data_source,
             "synced_at": synced_at,
+            "leaflink_auth_ok": leaflink_auth_ok,
+            "leaflink_last_success_at": leaflink_last_success_at,
+            "leaflink_last_error": leaflink_last_error,
+            "leaflink_sync_state": leaflink_sync_state,
         })
 
     except Exception as e:
@@ -94,4 +121,8 @@ async def health_data(db: AsyncSession = Depends(get_db)):
             "last_error": str(e),
             "data_source": "error",
             "synced_at": synced_at,
+            "leaflink_auth_ok": False,
+            "leaflink_last_success_at": None,
+            "leaflink_last_error": str(e),
+            "leaflink_sync_state": "failed",
         })

@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from services import leaflink_auth
+
 logger = logging.getLogger("leaflink_client")
 
 DEFAULT_LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://www.leaflink.com/api/v2").strip().rstrip("/")
@@ -99,9 +101,19 @@ class LeafLinkClient:
             logger.warning("leaflink: client_init missing LEAFLINK_COMPANY_ID")
             raise ValueError("Missing LEAFLINK_COMPANY_ID")
 
+        # Validate credentials and log result (never logs actual secrets)
+        cred_check = leaflink_auth.validate_leaflink_credentials()
+        logger.info(
+            "[LeafLinkAuth] credentials_check valid=%s auth_mode=%s missing=%s",
+            cred_check["valid"],
+            cred_check["auth_mode"],
+            cred_check["missing_vars"] or "none",
+        )
+
         self.session = requests.Session()
+        # Base session headers — Authorization is injected per-request via
+        # get_auth_headers() so that token refreshes are picked up automatically.
         self.session.headers.update({
-            "Authorization": f"Token {self.api_key}",
             "Content-Type": "application/json",
             "User-Agent": LEAFLINK_USER_AGENT,
         })
@@ -131,11 +143,27 @@ class LeafLinkClient:
         url = f"{self.base_url}/{path.lstrip('/')}"
         safe_params = {k: v for k, v in (params or {}).items() if k not in ("api_key", "token", "secret")}
         logger.info("leaflink: API request method=GET url=%s params=%s", url, safe_params)
-        try:
-            resp = self.session.get(url, params=params, timeout=45)
-        except Exception as exc:
-            logger.error("leaflink: API request failed url=%s error=%s", url, exc)
-            raise
+
+        def _do_request() -> requests.Response:
+            auth_headers = leaflink_auth.get_auth_headers()
+            try:
+                return self.session.get(url, params=params, timeout=45, headers=auth_headers)
+            except Exception as exc:
+                logger.error("leaflink: API request failed url=%s error=%s", url, exc)
+                raise
+
+        resp = _do_request()
+
+        # Auto-retry once on auth failure after attempting recovery
+        if resp.status_code in (401, 403):
+            recovered = leaflink_auth.handle_auth_failure(resp.status_code, resp.text)
+            if recovered:
+                logger.info(
+                    "[LeafLinkAuth] retrying request after token refresh url=%s",
+                    url,
+                )
+                resp = _do_request()
+
         content_type = resp.headers.get("Content-Type", "")
         logger.info(
             "leaflink: API response url=%s status=%s content_type=%s size=%s",
@@ -152,13 +180,26 @@ class LeafLinkClient:
                 content_type,
                 resp.text[:200],
             )
-        if not resp.ok:
-            logger.error(
-                "leaflink: API HTTP error url=%s status=%s body=%s",
-                url,
-                resp.status_code,
-                resp.text[:500],  # Log more of the response body
-            )
+        if resp.ok:
+            leaflink_auth.record_success()
+            logger.info("[LeafLinkAuth] request_authorized=true url=%s", url)
+        else:
+            err_msg = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            leaflink_auth.record_error(err_msg)
+            if resp.status_code in (401, 403):
+                logger.error(
+                    "[LeafLinkAuth] auth_failed status=%s reason=%s url=%s",
+                    resp.status_code,
+                    resp.text[:200],
+                    url,
+                )
+            else:
+                logger.error(
+                    "leaflink: API HTTP error url=%s status=%s body=%s",
+                    url,
+                    resp.status_code,
+                    resp.text[:500],
+                )
         return resp
 
     def list_orders(
@@ -181,7 +222,15 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
-        resp = self._get_raw("orders-received/", params=params)
+        try:
+            resp = self._get_raw("orders-received/", params=params)
+        except Exception as exc:
+            logger.error(
+                "[LeafLinkAuth] list_orders_request_failed error=%s",
+                exc,
+            )
+            raise
+
         content_type = resp.headers.get("Content-Type", "")
 
         if resp.ok and "application/json" in content_type.lower():
@@ -196,18 +245,19 @@ class LeafLinkClient:
             )
             return data
 
-        if not resp.ok:
+        if resp.status_code in (401, 403):
             logger.error(
-                "leaflink: list_orders auth_failed status=%s body=%s",
+                "[LeafLinkAuth] list_orders_auth_failed status=%s body=%s",
                 resp.status_code,
                 resp.text[:500],
             )
-        logger.error(
-            "leaflink: list_orders failed status=%s content_type=%s body_preview=%s",
-            resp.status_code,
-            content_type,
-            resp.text[:220],
-        )
+        else:
+            logger.error(
+                "leaflink: list_orders failed status=%s content_type=%s body_preview=%s",
+                resp.status_code,
+                content_type,
+                resp.text[:220],
+            )
         raise RuntimeError(
             f"LeafLink API error: status={resp.status_code} content_type={content_type} body={resp.text[:220]}"
         )

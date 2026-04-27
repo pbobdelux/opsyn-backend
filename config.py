@@ -22,6 +22,14 @@ class Config:
         self.OPSYN_WATCHDOG_SECRET = os.getenv("OPSYN_WATCHDOG_SECRET", "")
         self.OPSYN_WATCHDOG_WEBHOOK_URL = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL", "")
 
+        # LeafLink OAuth (optional, for token refresh)
+        self.LEAFLINK_AUTH_MODE = os.getenv("LEAFLINK_AUTH_MODE", "api_key")  # "api_key" or "oauth"
+        self.LEAFLINK_ACCESS_TOKEN = os.getenv("LEAFLINK_ACCESS_TOKEN", "")
+        self.LEAFLINK_REFRESH_TOKEN = os.getenv("LEAFLINK_REFRESH_TOKEN", "")
+        self.LEAFLINK_CLIENT_ID = os.getenv("LEAFLINK_CLIENT_ID", "")
+        self.LEAFLINK_CLIENT_SECRET = os.getenv("LEAFLINK_CLIENT_SECRET", "")
+        self.LEAFLINK_TOKEN_ENDPOINT = os.getenv("LEAFLINK_TOKEN_ENDPOINT", "https://www.leaflink.com/api/oauth/token")
+
         # Sampling rules
         self.SAMPLING_RULES = {
             "concentrate": {"test_qty": 5.0, "reserve_qty": 5.0, "unit": "Grams"},
