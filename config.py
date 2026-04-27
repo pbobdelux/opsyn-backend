@@ -14,6 +14,14 @@ class Config:
         self.CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
         self.SESSION_TIMEOUT_HOURS = int(os.getenv("SESSION_TIMEOUT_HOURS", "24"))
 
+        # Opsyn Watchdog integration
+        # OPSYN_WATCHDOG_SECRET: shared Bearer token for inbound webhook auth and
+        #   outbound event signing.  Must be set in the environment — never hardcoded.
+        # OPSYN_WATCHDOG_WEBHOOK_URL: optional outbound webhook destination.
+        #   If unset, outbound events are silently skipped.
+        self.OPSYN_WATCHDOG_SECRET = os.getenv("OPSYN_WATCHDOG_SECRET", "")
+        self.OPSYN_WATCHDOG_WEBHOOK_URL = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL", "")
+
         # Sampling rules
         self.SAMPLING_RULES = {
             "concentrate": {"test_qty": 5.0, "reserve_qty": 5.0, "unit": "Grams"},
