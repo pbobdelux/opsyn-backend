@@ -183,6 +183,7 @@ async def sync_leaflink_orders(
     total_lines_written = 0
     errors: list[str] = []
     newest_order_date: datetime | None = None
+    oldest_order_date: datetime | None = None
 
     # ------------------------------------------------------------------
     # Upsert orders and write line items using the caller's transaction.
@@ -277,11 +278,13 @@ async def sync_leaflink_orders(
             external_created_at = parse_dt(o.get("created_at"))
             external_updated_at = parse_dt(o.get("updated_at"))
 
-            # Track the newest order date for the response.
+            # Track the newest and oldest order dates for the response.
             for ts_dt in (external_updated_at, external_created_at):
                 if ts_dt:
                     if newest_order_date is None or ts_dt > newest_order_date:
                         newest_order_date = ts_dt
+                    if oldest_order_date is None or ts_dt < oldest_order_date:
+                        oldest_order_date = ts_dt
                     break
 
             if existing:
@@ -371,6 +374,17 @@ async def sync_leaflink_orders(
             sync_duration,
             using_mock,
         )
+        logger.info(
+            "leaflink: sync_date_range brand_id=%s oldest_order_date=%s newest_order_date=%s",
+            brand_id,
+            oldest_order_date.isoformat() if oldest_order_date else None,
+            newest_order_date.isoformat() if newest_order_date else None,
+        )
+        logger.info(
+            "leaflink: upsert_behavior brand_id=%s — orders upserted by (brand_id, external_order_id); "
+            "raw_payload preserved on every sync; line items deleted and re-inserted (not merged)",
+            brand_id,
+        )
 
         return {
             "ok": True,
@@ -380,6 +394,7 @@ async def sync_leaflink_orders(
             "skipped": skipped,
             "line_items_written": total_lines_written,
             "newest_order_date": newest_order_date,
+            "oldest_order_date": oldest_order_date,
             "pages_fetched": pages_fetched,
             "sync_duration_seconds": sync_duration,
             "errors": errors,
@@ -405,6 +420,7 @@ async def sync_leaflink_orders(
             "skipped": skipped,
             "line_items_written": total_lines_written,
             "newest_order_date": newest_order_date,
+            "oldest_order_date": oldest_order_date,
             "pages_fetched": pages_fetched,
             "sync_duration_seconds": sync_duration,
             "errors": [str(e)],
