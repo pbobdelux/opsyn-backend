@@ -1,0 +1,193 @@
+"""
+Integration health monitoring endpoints.
+
+Provides visibility into the health of all integrations without exposing
+any secret values or internal implementation details.
+
+Endpoints:
+  GET  /integrations/health         — Full health report for all integrations
+  GET  /integrations/alerts         — Only integrations requiring attention
+  POST /integrations/leaflink/test  — Test LeafLink auth (no secrets exposed)
+"""
+
+import logging
+import os
+from datetime import datetime, timezone
+
+import requests
+from fastapi import APIRouter
+
+from services.integration_health import (
+    get_all_integrations_health,
+    get_overall_status,
+    get_summary,
+)
+
+logger = logging.getLogger("integrations_health")
+
+router = APIRouter(prefix="/integrations", tags=["integrations-health"])
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _base_url() -> str:
+    port = os.getenv("PORT", "8000")
+    return os.getenv("BACKEND_BASE_URL", f"http://localhost:{port}")
+
+
+# ---------------------------------------------------------------------------
+# GET /integrations/health
+# ---------------------------------------------------------------------------
+
+@router.get("/health")
+async def integrations_health():
+    """
+    Return a comprehensive health report for all integrations.
+
+    Response:
+      {
+        "ok": true,
+        "overall_status": "healthy" | "degraded" | "broken",
+        "checked_at": "<ISO timestamp>",
+        "integrations": [...]
+      }
+
+    Never exposes secrets. Caches results for 30 seconds.
+    """
+    logger.info("[IntegrationHealth] health_endpoint_hit")
+
+    try:
+        integrations = await get_all_integrations_health()
+        overall = get_overall_status(integrations)
+        summary = get_summary(integrations)
+
+        return {
+            "ok": True,
+            "overall_status": overall,
+            "checked_at": _utc_now_iso(),
+            "summary": summary,
+            "integrations": [i.to_dict() for i in integrations],
+        }
+
+    except Exception as exc:
+        logger.error("[IntegrationHealth] health_endpoint_error error=%s", exc)
+        return {
+            "ok": False,
+            "overall_status": "unknown",
+            "checked_at": _utc_now_iso(),
+            "summary": "Health check failed. Check service logs.",
+            "integrations": [],
+        }
+
+
+# ---------------------------------------------------------------------------
+# GET /integrations/alerts
+# ---------------------------------------------------------------------------
+
+@router.get("/alerts")
+async def integrations_alerts():
+    """
+    Return only integrations that require attention (broken, stale, degraded).
+
+    Useful for dashboards and alert systems.
+
+    Response:
+      {
+        "ok": true,
+        "alerts": [...],
+        "count": N
+      }
+    """
+    logger.info("[IntegrationHealth] alerts_endpoint_hit count=pending")
+
+    try:
+        integrations = await get_all_integrations_health()
+        alerts = [i for i in integrations if i.requires_attention]
+
+        logger.info("[IntegrationHealth] alerts_endpoint_hit count=%d", len(alerts))
+
+        return {
+            "ok": True,
+            "alerts": [i.to_dict() for i in alerts],
+            "count": len(alerts),
+        }
+
+    except Exception as exc:
+        logger.error("[IntegrationHealth] alerts_endpoint_error error=%s", exc)
+        return {
+            "ok": False,
+            "alerts": [],
+            "count": 0,
+        }
+
+
+# ---------------------------------------------------------------------------
+# POST /integrations/leaflink/test
+# ---------------------------------------------------------------------------
+
+@router.post("/leaflink/test")
+def leaflink_test():
+    """
+    Test LeafLink authentication and order fetch capability.
+
+    Attempts a minimal order fetch (page_size=1) to confirm credentials work.
+    Never exposes API keys, tokens, or internal error details.
+
+    Response:
+      {
+        "ok": true,
+        "auth_valid": true,
+        "can_fetch": true,
+        "message": "LeafLink connection is working."
+      }
+    """
+    logger.info("[IntegrationHealth] leaflink_test_start")
+
+    try:
+        from services import leaflink_auth
+
+        health = leaflink_auth.get_auth_health()
+        auth_valid = health.get("auth_present", False)
+        can_fetch = health.get("can_fetch_orders", False)
+
+        if not auth_valid:
+            message = "LeafLink credentials are not configured."
+            ok = False
+        elif not can_fetch:
+            last_error = health.get("last_error", "")
+            if last_error and ("403" in str(last_error) or "401" in str(last_error)):
+                message = "LeafLink credentials are invalid or expired. Please reconnect."
+            else:
+                message = "LeafLink credentials are present but orders cannot be fetched. Check connection."
+            ok = False
+        else:
+            message = "LeafLink connection is working."
+            ok = True
+
+        logger.info(
+            "[IntegrationHealth] leaflink_test_result ok=%s auth_valid=%s can_fetch=%s",
+            ok,
+            auth_valid,
+            can_fetch,
+        )
+
+        return {
+            "ok": ok,
+            "auth_valid": auth_valid,
+            "can_fetch": can_fetch,
+            "message": message,
+        }
+
+    except Exception as exc:
+        logger.error("[IntegrationHealth] leaflink_test_error error=%s", exc)
+        logger.info(
+            "[IntegrationHealth] leaflink_test_result ok=False auth_valid=False can_fetch=False",
+        )
+        return {
+            "ok": False,
+            "auth_valid": False,
+            "can_fetch": False,
+            "message": "LeafLink test failed. Check service logs.",
+        }
