@@ -223,7 +223,7 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.get("/orders/{order_id}")
+@router.get("/orders/id/{order_id}")
 async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
     logger.info("leaflink: get_order_detail request order_id=%s", order_id)
     result = await db.execute(
