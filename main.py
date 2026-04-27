@@ -47,8 +47,9 @@ async def _create_assistant_tables() -> None:
             logger.warning("startup: DATABASE_URL not set — skipping assistant table creation")
             return
 
-        # Import assistant models so SQLAlchemy registers them with Base.metadata
+        # Import all models so SQLAlchemy registers them with Base.metadata
         import models.assistant_models  # noqa: F401
+        import models.sync_status  # noqa: F401
 
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

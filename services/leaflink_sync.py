@@ -8,7 +8,10 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Order, OrderLine
+from services.watchdog import WatchdogClient
 from utils.json_utils import make_json_safe
+
+_watchdog = WatchdogClient()
 
 logger = logging.getLogger("leaflink_sync")
 
@@ -161,6 +164,9 @@ async def sync_leaflink_orders(
     sync_start = time.monotonic()
     logger.info("leaflink: sync_start brand_id=%s orders=%s pages_fetched=%s", brand_id, len(orders), pages_fetched)
     logger.info("leaflink: sync_json_sanitized brand_id=%s", brand_id)
+
+    # Watchdog: emit sync_started from the sync service layer.
+    _watchdog.sync_started(brand_id)
 
     using_mock = any(isinstance(o, dict) and o.get("mock_data") for o in orders)
     if using_mock:
@@ -353,6 +359,18 @@ async def sync_leaflink_orders(
 
             total_lines_written += len(normalized_line_items)
 
+            # Watchdog: emit sync_progress every 100 orders processed.
+            _processed = created + updated + skipped
+            if _processed > 0 and _processed % 100 == 0:
+                _total = len(orders)
+                _pct = int((_processed / max(1, _total)) * 100)
+                _watchdog.sync_progress(
+                    brand_id,
+                    total_fetched=_total,
+                    total_in_database=_processed,
+                    percent_complete=_pct,
+                )
+
         logger.info(
             "leaflink: sync_line_items_written brand_id=%s count=%s",
             brand_id,
@@ -370,6 +388,13 @@ async def sync_leaflink_orders(
             pages_fetched,
             sync_duration,
             using_mock,
+        )
+
+        # Watchdog: emit sync_completed from the sync service layer.
+        _watchdog.sync_completed(
+            brand_id,
+            total_fetched=len(orders),
+            total_in_database=created + updated,
         )
 
         return {
@@ -396,6 +421,15 @@ async def sync_leaflink_orders(
             sync_duration,
             exc_info=True,
         )
+
+        # Watchdog: emit sync_failed from the sync service layer.
+        _watchdog.sync_failed(
+            brand_id,
+            error=str(e),
+            total_fetched=len(orders),
+            total_in_database=created + updated,
+        )
+
         return {
             "ok": False,
             "error": str(e),
