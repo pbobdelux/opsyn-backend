@@ -122,6 +122,34 @@ async def orders_sync(
                         force_full,
                     )
 
+                    # ── Auth pre-check ────────────────────────────────────────
+                    logger.info(
+                        "[LeafLink] sync_auth_check_start brand=%s",
+                        brand_filter,
+                    )
+                    _auth_client = LeafLinkClient(api_key=api_key, company_id=company_id)
+                    _auth_ok, _auth_reason = _auth_client._validate_auth()
+                    logger.info(
+                        "[LeafLink] sync_auth_check_result success=%s brand=%s reason=%s",
+                        _auth_ok,
+                        brand_filter,
+                        _auth_reason,
+                    )
+                    if not _auth_ok:
+                        logger.error(
+                            "[LeafLink] sync_auth_check_failed brand=%s reason=%s — aborting sync",
+                            brand_filter,
+                            _auth_reason,
+                        )
+                        sync_metadata["sync_error"] = f"auth_failed:{_auth_reason}"
+                        sync_metadata["used_force_full"] = force_full
+                        # Fall through to serve existing DB data rather than crash
+                        raise RuntimeError(
+                            f"LeafLink authentication failed for brand={brand_filter}: {_auth_reason}"
+                        )
+                    # Re-use the already-validated client (auth format already negotiated)
+                    client = _auth_client
+
                     # Watchdog: emit sync_started
                     _watchdog_url = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
                     await emit_watchdog_event(
@@ -137,8 +165,6 @@ async def orders_sync(
                         },
                         webhook_url=_watchdog_url,
                     )
-
-                    client = LeafLinkClient(api_key=api_key, company_id=company_id)
 
                     # force_full=True → fetch all pages (unlimited); otherwise fetch recent (5 pages)
                     max_pages_arg = None if force_full else 5
