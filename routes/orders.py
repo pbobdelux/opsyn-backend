@@ -1,5 +1,6 @@
 import base64
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import BrandAPICredential, Order
+from services.watchdog_client import emit_watchdog_event
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("orders")
@@ -115,6 +117,22 @@ async def orders_sync(
                         force_full,
                     )
 
+                    # Watchdog: emit sync_started
+                    _watchdog_url = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
+                    await emit_watchdog_event(
+                        event_type="sync_started",
+                        brand_id=brand_filter,
+                        sync_metadata={
+                            "total_fetched_from_leaflink": 0,
+                            "total_in_database": 0,
+                            "percent_complete": 0.0,
+                            "latest_order_date": None,
+                            "oldest_order_date": None,
+                            "sync_error": None,
+                        },
+                        webhook_url=_watchdog_url,
+                    )
+
                     client = LeafLinkClient(api_key=api_key, company_id=company_id)
 
                     # force_full=True → fetch all pages (unlimited); otherwise fetch recent (5 pages)
@@ -135,6 +153,21 @@ async def orders_sync(
                         force_full,
                     )
 
+                    # Watchdog: emit sync_progress after fetch
+                    await emit_watchdog_event(
+                        event_type="sync_progress",
+                        brand_id=brand_filter,
+                        sync_metadata={
+                            "total_fetched_from_leaflink": len(orders_from_leaflink),
+                            "total_in_database": None,
+                            "percent_complete": None,
+                            "latest_order_date": None,
+                            "oldest_order_date": None,
+                            "sync_error": None,
+                        },
+                        webhook_url=_watchdog_url,
+                    )
+
                     async with db.begin():
                         sync_result = await sync_leaflink_orders(
                             db,
@@ -150,6 +183,36 @@ async def orders_sync(
 
                     newest = sync_result.get("newest_order_date")
                     sync_metadata["latest_order_date"] = newest.isoformat() if newest else None
+
+                    # Watchdog: emit sync_completed or sync_failed based on result
+                    if sync_result.get("ok"):
+                        await emit_watchdog_event(
+                            event_type="sync_completed",
+                            brand_id=brand_filter,
+                            sync_metadata={
+                                "total_fetched_from_leaflink": sync_result.get("orders_fetched", 0),
+                                "total_in_database": sync_result.get("created", 0) + sync_result.get("updated", 0),
+                                "percent_complete": 100.0,
+                                "latest_order_date": sync_metadata.get("latest_order_date"),
+                                "oldest_order_date": None,
+                                "sync_error": None,
+                            },
+                            webhook_url=_watchdog_url,
+                        )
+                    else:
+                        await emit_watchdog_event(
+                            event_type="sync_failed",
+                            brand_id=brand_filter,
+                            sync_metadata={
+                                "total_fetched_from_leaflink": sync_result.get("orders_fetched", 0),
+                                "total_in_database": sync_result.get("created", 0) + sync_result.get("updated", 0),
+                                "percent_complete": None,
+                                "latest_order_date": sync_metadata.get("latest_order_date"),
+                                "oldest_order_date": None,
+                                "sync_error": sync_result.get("error"),
+                            },
+                            webhook_url=_watchdog_url,
+                        )
                 else:
                     logger.info(
                         "[OrdersSync] no_leaflink_credentials brand=%s — serving from DB only",
@@ -166,6 +229,22 @@ async def orders_sync(
                 )
                 sync_metadata["sync_error"] = str(sync_exc)
                 sync_metadata["used_force_full"] = force_full
+
+                # Watchdog: emit sync_failed on exception
+                _watchdog_url_exc = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
+                await emit_watchdog_event(
+                    event_type="sync_failed",
+                    brand_id=brand_filter,
+                    sync_metadata={
+                        "total_fetched_from_leaflink": None,
+                        "total_in_database": None,
+                        "percent_complete": None,
+                        "latest_order_date": None,
+                        "oldest_order_date": None,
+                        "sync_error": str(sync_exc),
+                    },
+                    webhook_url=_watchdog_url_exc,
+                )
         else:
             sync_metadata["used_force_full"] = force_full
 
