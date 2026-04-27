@@ -237,3 +237,8 @@ from models.assistant_models import (  # noqa: F401, E402
     AssistantSession,
 )
 
+# ---------------------------------------------------------------------------
+# Watchdog / sync-status model
+# ---------------------------------------------------------------------------
+from models.sync_status import SyncStatus  # noqa: F401, E402
+

@@ -8,13 +8,17 @@ from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from auth.watchdog_auth import require_watchdog_auth
 from database import get_db
-from models import BrandAPICredential, Order
+from models import BrandAPICredential, Order, SyncStatus
+from services.watchdog import WatchdogClient
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("orders")
 
 router = APIRouter(prefix="/orders", tags=["orders"])
+
+watchdog = WatchdogClient()
 
 
 @router.get("")
@@ -23,6 +27,66 @@ def get_orders():
         "items": [],
         "count": 0,
         "message": "Orders endpoint is live",
+    }
+
+
+@router.get("/sync/{brand_id}/status")
+async def get_sync_status(
+    brand_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_watchdog_auth),
+):
+    """
+    Return the current sync status for a brand.
+
+    Requires ``Authorization: Bearer <OPSYN_WATCHDOG_SECRET>`` header.
+
+    Response shape:
+    {
+      "onboarding_status": "connecting | syncing | processing | complete | failed",
+      "total_in_database": 15921,
+      "total_fetched_from_leaflink": 15921,
+      "percent_complete": 100,
+      "last_progress_timestamp": "2026-04-27T10:31:42Z",
+      "latest_order_date": "2026-04-26T23:59:59Z",
+      "oldest_order_date": "2020-01-01T00:00:00Z",
+      "sync_error": null
+    }
+    """
+    logger.info("[Watchdog] status_endpoint_hit brand=%s", brand_id)
+
+    result = await db.execute(
+        select(SyncStatus).where(SyncStatus.brand_id == brand_id)
+    )
+    sync_status = result.scalar_one_or_none()
+
+    if sync_status is None:
+        # No sync has been initiated yet for this brand.
+        return {
+            "onboarding_status": "connecting",
+            "total_in_database": 0,
+            "total_fetched_from_leaflink": 0,
+            "percent_complete": 0,
+            "last_progress_timestamp": None,
+            "latest_order_date": None,
+            "oldest_order_date": None,
+            "sync_error": None,
+        }
+
+    def _iso(dt: datetime | None) -> str | None:
+        if dt is None:
+            return None
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return {
+        "onboarding_status": sync_status.status,
+        "total_in_database": sync_status.total_in_database,
+        "total_fetched_from_leaflink": sync_status.total_fetched,
+        "percent_complete": sync_status.percent_complete,
+        "last_progress_timestamp": _iso(sync_status.last_progress_timestamp),
+        "latest_order_date": _iso(sync_status.latest_order_date),
+        "oldest_order_date": _iso(sync_status.oldest_order_date),
+        "sync_error": sync_status.sync_error,
     }
 
 
@@ -115,6 +179,27 @@ async def orders_sync(
                         force_full,
                     )
 
+                    # -------------------------------------------------- #
+                    # Watchdog: create/reset SyncStatus and emit started  #
+                    # -------------------------------------------------- #
+                    _now = datetime.now(timezone.utc)
+                    _ss_result = await db.execute(
+                        select(SyncStatus).where(SyncStatus.brand_id == brand_filter)
+                    )
+                    _ss = _ss_result.scalar_one_or_none()
+                    if _ss is None:
+                        _ss = SyncStatus(brand_id=brand_filter)
+                        db.add(_ss)
+                    _ss.status = "syncing"
+                    _ss.total_fetched = 0
+                    _ss.percent_complete = 0
+                    _ss.sync_error = None
+                    _ss.last_progress_timestamp = _now
+                    await db.flush()
+                    await db.commit()
+
+                    watchdog.sync_started(brand_filter)
+
                     client = LeafLinkClient(api_key=api_key, company_id=company_id)
 
                     # force_full=True → fetch all pages (unlimited); otherwise fetch recent (5 pages)
@@ -135,6 +220,18 @@ async def orders_sync(
                         force_full,
                     )
 
+                    # -------------------------------------------------- #
+                    # Watchdog: emit progress after fetch                 #
+                    # -------------------------------------------------- #
+                    _total_fetched = len(orders_from_leaflink)
+                    _pct = min(50, int((_total_fetched / max(1, _total_fetched)) * 50)) if _total_fetched else 0
+                    watchdog.sync_progress(
+                        brand_filter,
+                        total_fetched=_total_fetched,
+                        total_in_database=0,
+                        percent_complete=_pct,
+                    )
+
                     async with db.begin():
                         sync_result = await sync_leaflink_orders(
                             db,
@@ -150,6 +247,58 @@ async def orders_sync(
 
                     newest = sync_result.get("newest_order_date")
                     sync_metadata["latest_order_date"] = newest.isoformat() if newest else None
+
+                    # -------------------------------------------------- #
+                    # Watchdog: count DB total and emit completed/failed  #
+                    # -------------------------------------------------- #
+                    _count_res = await db.execute(
+                        select(func.count(Order.id)).where(Order.brand_id == brand_filter)
+                    )
+                    _db_total = _count_res.scalar_one()
+                    _latest_iso = sync_metadata.get("latest_order_date")
+
+                    if sync_result.get("ok"):
+                        # Update SyncStatus to complete.
+                        _ss_result2 = await db.execute(
+                            select(SyncStatus).where(SyncStatus.brand_id == brand_filter)
+                        )
+                        _ss2 = _ss_result2.scalar_one_or_none()
+                        if _ss2:
+                            _ss2.status = "complete"
+                            _ss2.total_fetched = _total_fetched
+                            _ss2.total_in_database = _db_total
+                            _ss2.percent_complete = 100
+                            _ss2.sync_error = None
+                            _ss2.last_progress_timestamp = datetime.now(timezone.utc)
+                            if newest:
+                                _ss2.latest_order_date = newest
+                            await db.commit()
+
+                        watchdog.sync_completed(
+                            brand_filter,
+                            total_fetched=_total_fetched,
+                            total_in_database=_db_total,
+                            latest_order_date=_latest_iso,
+                        )
+                    else:
+                        _err = sync_result.get("error", "unknown error")
+                        # Update SyncStatus to failed.
+                        _ss_result3 = await db.execute(
+                            select(SyncStatus).where(SyncStatus.brand_id == brand_filter)
+                        )
+                        _ss3 = _ss_result3.scalar_one_or_none()
+                        if _ss3:
+                            _ss3.status = "failed"
+                            _ss3.sync_error = _err
+                            _ss3.last_progress_timestamp = datetime.now(timezone.utc)
+                            await db.commit()
+
+                        watchdog.sync_failed(
+                            brand_filter,
+                            error=_err,
+                            total_fetched=_total_fetched,
+                            total_in_database=_db_total,
+                        )
                 else:
                     logger.info(
                         "[OrdersSync] no_leaflink_credentials brand=%s — serving from DB only",
@@ -166,6 +315,22 @@ async def orders_sync(
                 )
                 sync_metadata["sync_error"] = str(sync_exc)
                 sync_metadata["used_force_full"] = force_full
+
+                # Watchdog: mark sync as failed in DB and emit event.
+                try:
+                    _ss_err_result = await db.execute(
+                        select(SyncStatus).where(SyncStatus.brand_id == brand_filter)
+                    )
+                    _ss_err = _ss_err_result.scalar_one_or_none()
+                    if _ss_err:
+                        _ss_err.status = "failed"
+                        _ss_err.sync_error = str(sync_exc)
+                        _ss_err.last_progress_timestamp = datetime.now(timezone.utc)
+                        await db.commit()
+                except Exception:
+                    pass  # Don't let watchdog DB writes mask the original error.
+
+                watchdog.sync_failed(brand_filter, error=str(sync_exc))
         else:
             sync_metadata["used_force_full"] = force_full
 
