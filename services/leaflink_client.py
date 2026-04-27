@@ -417,19 +417,73 @@ class LeafLinkClient:
             "raw_payload": raw,
         }
 
-    def fetch_recent_orders(self, max_pages: int = 5, normalize: bool = False) -> List[Dict[str, Any]]:
+    def fetch_recent_orders(
+        self,
+        max_pages: Optional[int] = None,
+        normalize: bool = False,
+        brand: str = "unknown",
+    ) -> Dict[str, Any]:
+        """Fetch all orders from LeafLink, paginating until no ``next`` URL is returned.
+
+        Args:
+            max_pages: Maximum number of pages to fetch. ``None`` (default) means
+                unlimited — fetch every page until LeafLink returns no ``next`` URL.
+                Pass an integer to cap the number of pages (e.g. for testing).
+            normalize: When ``True``, run each raw order through ``_normalize_order``.
+            brand: Brand slug used only for structured log messages.
+
+        Returns:
+            A dict with keys:
+                ``orders``       – list of order dicts
+                ``pages_fetched`` – number of pages retrieved
+        """
+        effective_max = max_pages if max_pages is not None else 10_000
         logger.info(
-            "leaflink: fetch_recent_orders start max_pages=%s normalize=%s mock_mode=%s",
-            max_pages,
+            "[LeafLinkSync] start brand=%s max_pages=%s normalize=%s mock_mode=%s",
+            brand,
+            max_pages if max_pages is not None else "unlimited",
             normalize,
             MOCK_MODE,
         )
         all_orders: List[Dict[str, Any]] = []
+        pages_fetched = 0
 
         try:
-            for page in range(1, max_pages + 1):
-                logger.info("leaflink: fetch_recent_orders fetching page=%s", page)
-                payload = self.list_orders(page=page, page_size=100)
+            page = 1
+            next_url: Optional[str] = None
+
+            while page <= effective_max:
+                pages_fetched += 1
+
+                if next_url:
+                    # Use the full ``next`` URL returned by LeafLink directly.
+                    logger.info(
+                        "[LeafLinkSync] page=%s fetching next_url=%s",
+                        page,
+                        next_url,
+                    )
+                    try:
+                        resp = self.session.get(next_url, timeout=45)
+                    except Exception as exc:
+                        logger.error(
+                            "[LeafLinkSync] page=%s request_failed error=%s",
+                            page,
+                            exc,
+                        )
+                        raise
+                    if not resp.ok:
+                        logger.error(
+                            "[LeafLinkSync] page=%s http_error status=%s body=%s",
+                            page,
+                            resp.status_code,
+                            resp.text[:500],
+                        )
+                        raise RuntimeError(
+                            f"LeafLink API error: status={resp.status_code} body={resp.text[:220]}"
+                        )
+                    payload = resp.json()
+                else:
+                    payload = self.list_orders(page=page, page_size=100)
 
                 if isinstance(payload, list):
                     results = payload
@@ -448,14 +502,11 @@ class LeafLinkClient:
                 if not isinstance(results, list):
                     raise RuntimeError(f"Unexpected LeafLink results type: {type(results).__name__}")
 
-                logger.info(
-                    "leaflink: fetch_recent_orders page=%s results_count=%s has_next=%s",
-                    page,
-                    len(results),
-                    bool(next_url),
-                )
-
                 if not results:
+                    logger.info(
+                        "[LeafLinkSync] page=%s empty_results — stopping pagination",
+                        page,
+                    )
                     break
 
                 if normalize:
@@ -467,30 +518,42 @@ class LeafLinkClient:
                         if isinstance(raw, dict):
                             all_orders.append(raw)
 
+                total_so_far = len(all_orders)
+                logger.info(
+                    "[LeafLinkSync] page=%s count=%s total_so_far=%s next=%s",
+                    page,
+                    len(results),
+                    total_so_far,
+                    next_url or "None",
+                )
+
                 if not next_url:
                     break
 
+                page += 1
+
         except Exception as exc:
             logger.error(
-                "leaflink: fetch_recent_orders API call failed error=%s mock_mode=%s",
+                "[LeafLinkSync] API call failed brand=%s error=%s mock_mode=%s",
+                brand,
                 exc,
                 MOCK_MODE,
             )
             if MOCK_MODE:
                 logger.warning(
-                    "leaflink: fetch_recent_orders API failed, falling back to mock data (MOCK_MODE=true)"
+                    "[LeafLinkSync] API failed, falling back to mock data (MOCK_MODE=true)"
                 )
                 mock_orders: List[Dict[str, Any]] = [{"mock_data": True}]
-                return mock_orders
+                return {"orders": mock_orders, "pages_fetched": 1}
             raise
 
         total = len(all_orders)
         logger.info(
-            "leaflink: fetch_recent_orders complete total_orders=%s normalize=%s",
+            "[LeafLinkSync] finished brand=%s total_fetched=%s pages_fetched=%s normalize=%s",
+            brand,
             total,
+            pages_fetched,
             normalize,
         )
-        if normalize:
-            logger.info("leaflink: fetch_recent_orders normalized_order_count=%s", total)
 
-        return all_orders
+        return {"orders": all_orders, "pages_fetched": pages_fetched}

@@ -1,14 +1,15 @@
 import base64
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, Request
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
-from models import Order
+from models import BrandAPICredential, Order
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("orders")
@@ -30,9 +31,10 @@ async def orders_sync(
     request: Request,
     brand_id: Optional[str] = Query(None, description="Brand slug or ID to filter orders (e.g., 'noble-nectar')"),
     brand_slug: Optional[str] = Query(None, description="Alias for brand_id — brand slug or ID"),
-    updated_after: Optional[str] = Query(None, description="ISO timestamp - only return orders updated after this time"),
+    updated_after: Optional[str] = Query(None, description="ISO timestamp - only return orders updated after this time (ignored when force_full=true)"),
     cursor: Optional[str] = Query(None, description="Pagination cursor from previous response"),
     limit: int = Query(500, ge=1, le=1000, description="Number of orders to return (default 500, max 1000)"),
+    force_full: bool = Query(False, description="Force a complete backfill from LeafLink, ignoring updated_after"),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -47,18 +49,22 @@ async def orders_sync(
     Query params:
     - brand_id: Brand slug or ID to filter orders (e.g., "noble-nectar")
     - brand_slug: Alias for brand_id
-    - updated_after: ISO timestamp (e.g., "2026-04-25T12:30:00Z")
+    - updated_after: ISO timestamp (e.g., "2026-04-25T12:30:00Z") — ignored when force_full=true
     - cursor: Pagination cursor from previous response
     - limit: Number of orders (1-1000, default 500)
+    - force_full: true/false — force complete backfill from LeafLink (default false)
 
     Response includes:
     - orders: Array of order objects
+    - sync_metadata: Sync statistics (total fetched, pages, duration, etc.)
     - next_cursor: Cursor for next page (if has_more=true)
     - has_more: Whether more orders exist
     - server_time: Current server time
     - sync_version: Sync protocol version
     - last_synced_at: Timestamp of this sync
     """
+    endpoint_start = time.monotonic()
+
     try:
         # Resolve brand filter — accept brand_id, brand_slug, or camelCase brandId
         # from query params. brand_slug is an alias; brandId is tolerated for iOS clients.
@@ -69,18 +75,105 @@ async def orders_sync(
         )
 
         logger.info(
-            "[OrdersSync] request_start path=%s brand=%s org=%s updated_after=%s cursor=%s limit=%s",
+            "[OrdersSync] request_start path=%s brand=%s org=%s updated_after=%s cursor=%s limit=%s force_full=%s",
             request.url.path,
             brand_filter,
             request.headers.get("x-opsyn-org") or request.headers.get("x-org-id"),
             updated_after,
             cursor[:8] + "..." if cursor else None,
             limit,
+            force_full,
         )
 
-        # Parse updated_after if provided
+        # ------------------------------------------------------------------ #
+        # Optional LeafLink sync before serving data                          #
+        # ------------------------------------------------------------------ #
+        sync_metadata: dict = {}
+
+        if brand_filter:
+            try:
+                from services.leaflink_client import LeafLinkClient
+                from services.leaflink_sync import sync_leaflink_orders
+
+                # Look up credentials for this brand.
+                cred_result = await db.execute(
+                    select(BrandAPICredential).where(
+                        BrandAPICredential.brand_id == brand_filter,
+                        BrandAPICredential.integration_name == "leaflink",
+                        BrandAPICredential.is_active == True,
+                    )
+                )
+                cred = cred_result.scalar_one_or_none()
+
+                if cred:
+                    api_key: str = cred.api_key or ""
+                    company_id: str = cred.company_id or ""
+
+                    logger.info(
+                        "[OrdersSync] triggering_leaflink_sync brand=%s force_full=%s",
+                        brand_filter,
+                        force_full,
+                    )
+
+                    client = LeafLinkClient(api_key=api_key, company_id=company_id)
+
+                    # force_full=True → fetch all pages (unlimited); otherwise fetch recent (5 pages)
+                    max_pages_arg = None if force_full else 5
+                    fetch_result = client.fetch_recent_orders(
+                        max_pages=max_pages_arg,
+                        normalize=True,
+                        brand=brand_filter,
+                    )
+                    orders_from_leaflink = fetch_result["orders"]
+                    pages_fetched = fetch_result["pages_fetched"]
+
+                    logger.info(
+                        "[OrdersSync] leaflink_fetch_complete brand=%s orders=%s pages=%s force_full=%s",
+                        brand_filter,
+                        len(orders_from_leaflink),
+                        pages_fetched,
+                        force_full,
+                    )
+
+                    async with db.begin():
+                        sync_result = await sync_leaflink_orders(
+                            db,
+                            brand_filter,
+                            orders_from_leaflink,
+                            pages_fetched=pages_fetched,
+                        )
+
+                    sync_metadata["total_fetched_from_leaflink"] = sync_result.get("orders_fetched", 0)
+                    sync_metadata["pages_fetched"] = sync_result.get("pages_fetched", pages_fetched)
+                    sync_metadata["sync_duration_seconds"] = sync_result.get("sync_duration_seconds", 0)
+                    sync_metadata["used_force_full"] = force_full
+
+                    newest = sync_result.get("newest_order_date")
+                    sync_metadata["latest_order_date"] = newest.isoformat() if newest else None
+                else:
+                    logger.info(
+                        "[OrdersSync] no_leaflink_credentials brand=%s — serving from DB only",
+                        brand_filter,
+                    )
+                    sync_metadata["used_force_full"] = force_full
+
+            except Exception as sync_exc:
+                logger.warning(
+                    "[OrdersSync] leaflink_sync_failed brand=%s error=%s — serving from DB",
+                    brand_filter,
+                    sync_exc,
+                    exc_info=True,
+                )
+                sync_metadata["sync_error"] = str(sync_exc)
+                sync_metadata["used_force_full"] = force_full
+        else:
+            sync_metadata["used_force_full"] = force_full
+
+        # ------------------------------------------------------------------ #
+        # Parse updated_after (ignored when force_full=true)                  #
+        # ------------------------------------------------------------------ #
         updated_after_dt = None
-        if updated_after:
+        if updated_after and not force_full:
             try:
                 updated_after_dt = datetime.fromisoformat(updated_after.replace("Z", "+00:00"))
                 logger.info("[OrdersSync] filter updated_after=%s", updated_after_dt.isoformat())
@@ -91,8 +184,12 @@ async def orders_sync(
                     "error": "Invalid updated_after timestamp format. Use ISO 8601 (e.g., 2026-04-25T12:30:00Z)",
                     "data_source": "error",
                 }
+        elif force_full and updated_after:
+            logger.info("[OrdersSync] force_full=true — ignoring updated_after=%s", updated_after)
 
-        # Decode cursor if provided
+        # ------------------------------------------------------------------ #
+        # Decode cursor                                                        #
+        # ------------------------------------------------------------------ #
         cursor_id = None
         if cursor:
             try:
@@ -106,7 +203,9 @@ async def orders_sync(
                     "data_source": "error",
                 }
 
-        # Build query
+        # ------------------------------------------------------------------ #
+        # Build DB query                                                       #
+        # ------------------------------------------------------------------ #
         query = select(Order)
 
         # Filter by brand when provided (brand_id column stores the brand slug/ID)
@@ -114,7 +213,7 @@ async def orders_sync(
             query = query.where(Order.brand_id == brand_filter)
             logger.info("[OrdersSync] filter brand=%s", brand_filter)
 
-        # Filter by updated_after
+        # Filter by updated_after (skipped when force_full=true)
         if updated_after_dt:
             query = query.where(Order.updated_at >= updated_after_dt)
 
@@ -136,7 +235,18 @@ async def orders_sync(
         if has_more:
             orders = orders[:limit]
 
-        # Build response
+        # ------------------------------------------------------------------ #
+        # Count total orders in DB for this brand                             #
+        # ------------------------------------------------------------------ #
+        count_query = select(func.count(Order.id))
+        if brand_filter:
+            count_query = count_query.where(Order.brand_id == brand_filter)
+        count_result = await db.execute(count_query)
+        total_in_database = count_result.scalar_one()
+
+        # ------------------------------------------------------------------ #
+        # Build response                                                       #
+        # ------------------------------------------------------------------ #
         orders_data = []
         next_cursor = None
 
@@ -167,17 +277,32 @@ async def orders_sync(
 
         server_time = datetime.now(timezone.utc).isoformat()
 
+        # Populate remaining sync_metadata fields with defaults for any missing keys
+        sync_metadata.setdefault("total_fetched_from_leaflink", None)
+        sync_metadata.setdefault("pages_fetched", None)
+        sync_metadata.setdefault("sync_duration_seconds", None)
+        sync_metadata.setdefault("latest_order_date", None)
+        sync_metadata["total_in_database"] = total_in_database
+        sync_metadata["total_returned"] = len(orders_data)
+
+        logger.info("[OrdersSync] db_total_orders=%s brand=%s", total_in_database, brand_filter)
+        logger.info("[OrdersSync] returned_to_ios=%s brand=%s", len(orders_data), brand_filter)
+        if sync_metadata.get("latest_order_date"):
+            logger.info("[OrdersSync] latest_order_date=%s brand=%s", sync_metadata["latest_order_date"], brand_filter)
+
         logger.info(
-            "[OrdersSync] response count=%s has_more=%s brand=%s",
+            "[OrdersSync] response count=%s has_more=%s brand=%s total_in_db=%s",
             len(orders_data),
             has_more,
             brand_filter,
+            total_in_database,
         )
 
         return make_json_safe({
             "ok": True,
             "data_source": "live",
             "orders": orders_data,
+            "sync_metadata": sync_metadata,
             "next_cursor": next_cursor if has_more else None,
             "has_more": has_more,
             "server_time": server_time,
