@@ -112,6 +112,11 @@ async def orders_sync(
                     company_id: str = cred.company_id or ""
 
                     logger.info(
+                        "[LeafLink] sync_start brand=%s force_full=%s",
+                        brand_filter,
+                        force_full,
+                    )
+                    logger.info(
                         "[OrdersSync] triggering_leaflink_sync brand=%s force_full=%s",
                         brand_filter,
                         force_full,
@@ -152,6 +157,12 @@ async def orders_sync(
                         pages_fetched,
                         force_full,
                     )
+                    logger.info(
+                        "[LeafLink] fetched=%s pages=%s brand=%s",
+                        len(orders_from_leaflink),
+                        pages_fetched,
+                        brand_filter,
+                    )
 
                     # Watchdog: emit sync_progress after fetch
                     await emit_watchdog_event(
@@ -183,6 +194,14 @@ async def orders_sync(
 
                     newest = sync_result.get("newest_order_date")
                     sync_metadata["latest_order_date"] = newest.isoformat() if newest else None
+
+                    logger.info(
+                        "[LeafLink] upserted=%s created=%s updated=%s brand=%s",
+                        sync_result.get("orders_fetched", 0),
+                        sync_result.get("created", 0),
+                        sync_result.get("updated", 0),
+                        brand_filter,
+                    )
 
                     # Watchdog: emit sync_completed or sync_failed based on result
                     if sync_result.get("ok"):
@@ -377,9 +396,23 @@ async def orders_sync(
             total_in_database,
         )
 
+        source = "live" if sync_metadata.get("total_fetched_from_leaflink") else "db_cache"
+        if total_in_database == 0:
+            source = "empty"
+
+        logger.info(
+            "[Orders] query_count=%s source=%s brand=%s",
+            len(orders_data),
+            source,
+            brand_filter,
+        )
+
         return make_json_safe({
             "ok": True,
-            "data_source": "live",
+            "source": source,
+            "data_source": source,
+            "count": len(orders_data),
+            "synced_at": server_time,
             "orders": orders_data,
             "sync_metadata": sync_metadata,
             "next_cursor": next_cursor if has_more else None,
@@ -390,9 +423,80 @@ async def orders_sync(
         })
 
     except Exception as e:
-        logger.error("[OrdersSync] validation_error detail=%s", e, exc_info=True)
-        return {
-            "ok": False,
-            "error": str(e),
-            "data_source": "error",
-        }
+        logger.error("[OrdersSync] fatal_error detail=%s", e, exc_info=True)
+
+        # Never return empty on error — attempt to serve last known DB data
+        fallback_synced_at = datetime.now(timezone.utc).isoformat()
+        try:
+            fallback_query = select(Order)
+            if brand_id or brand_slug or (hasattr(request, "query_params") and request.query_params.get("brandId")):
+                _brand = (
+                    brand_id
+                    or brand_slug
+                    or request.query_params.get("brandId")
+                )
+                if _brand:
+                    fallback_query = fallback_query.where(Order.brand_id == _brand)
+            fallback_query = fallback_query.order_by(Order.updated_at.desc()).limit(limit)
+            fallback_result = await db.execute(fallback_query)
+            fallback_orders = fallback_result.scalars().all()
+
+            fallback_data = []
+            for order in fallback_orders:
+                fallback_data.append({
+                    "id": order.id,
+                    "external_order_id": order.external_order_id,
+                    "order_number": order.order_number,
+                    "customer_name": order.customer_name,
+                    "amount": float(order.amount) if order.amount else 0,
+                    "status": order.status,
+                    "brand_id": order.brand_id,
+                    "source": order.source,
+                    "review_status": order.review_status,
+                    "item_count": order.item_count,
+                    "unit_count": order.unit_count,
+                    "external_created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+                    "external_updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
+                    "created_at": order.created_at.isoformat() if order.created_at else None,
+                    "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+                    "last_synced_at": order.last_synced_at.isoformat() if order.last_synced_at else None,
+                })
+
+            logger.warning(
+                "[OrdersSync] serving_fallback_db_data count=%s error=%s",
+                len(fallback_data),
+                e,
+            )
+
+            return make_json_safe({
+                "ok": False,
+                "status": "error",
+                "source": "backend",
+                "data_source": "backend",
+                "message": str(e),
+                "count": len(fallback_data),
+                "synced_at": fallback_synced_at,
+                "orders": fallback_data,
+                "has_more": False,
+                "next_cursor": None,
+                "sync_metadata": {"sync_error": str(e)},
+            })
+
+        except Exception as fallback_exc:
+            logger.error(
+                "[OrdersSync] fallback_query_failed error=%s original_error=%s",
+                fallback_exc,
+                e,
+            )
+            return {
+                "ok": False,
+                "status": "error",
+                "source": "error",
+                "data_source": "error",
+                "message": str(e),
+                "count": 0,
+                "synced_at": fallback_synced_at,
+                "orders": [],
+                "has_more": False,
+                "next_cursor": None,
+            }

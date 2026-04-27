@@ -159,6 +159,12 @@ async def sync_leaflink_orders(
         pages_fetched: Number of API pages retrieved (for metadata).
     """
     sync_start = time.monotonic()
+    logger.info(
+        "[LeafLink] sync_start brand=%s orders=%s pages_fetched=%s",
+        brand_id,
+        len(orders),
+        pages_fetched,
+    )
     logger.info("leaflink: sync_start brand_id=%s orders=%s pages_fetched=%s", brand_id, len(orders), pages_fetched)
     logger.info("leaflink: sync_json_sanitized brand_id=%s", brand_id)
 
@@ -359,6 +365,20 @@ async def sync_leaflink_orders(
             total_lines_written,
         )
         sync_duration = round(time.monotonic() - sync_start, 2)
+        logger.info(
+            "[LeafLink] upserted=%s created=%s updated=%s skipped=%s brand=%s",
+            len(orders),
+            created,
+            updated,
+            skipped,
+            brand_id,
+        )
+        logger.info(
+            "[LeafLink] sync_complete duration=%ss brand=%s pages=%s",
+            sync_duration,
+            brand_id,
+            pages_fetched,
+        )
         logger.info(
             "leaflink: sync_complete brand_id=%s fetched=%s created=%s updated=%s skipped=%s lines_written=%s pages_fetched=%s duration_seconds=%s mock_data=%s",
             brand_id,

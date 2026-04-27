@@ -439,6 +439,11 @@ class LeafLinkClient:
         """
         effective_max = max_pages if max_pages is not None else 10_000
         logger.info(
+            "[LeafLink] fetch_start brand=%s max_pages=%s",
+            brand,
+            max_pages if max_pages is not None else "unlimited",
+        )
+        logger.info(
             "[LeafLinkSync] start brand=%s max_pages=%s normalize=%s mock_mode=%s",
             brand,
             max_pages if max_pages is not None else "unlimited",
@@ -520,6 +525,12 @@ class LeafLinkClient:
 
                 total_so_far = len(all_orders)
                 logger.info(
+                    "[LeafLink] page=%s count=%s total_so_far=%s",
+                    page,
+                    len(results),
+                    total_so_far,
+                )
+                logger.info(
                     "[LeafLinkSync] page=%s count=%s total_so_far=%s next=%s",
                     page,
                     len(results),
@@ -548,6 +559,12 @@ class LeafLinkClient:
             raise
 
         total = len(all_orders)
+        logger.info(
+            "[LeafLink] fetch_complete total=%s pages=%s brand=%s",
+            total,
+            pages_fetched,
+            brand,
+        )
         logger.info(
             "[LeafLinkSync] finished brand=%s total_fetched=%s pages_fetched=%s normalize=%s",
             brand,
