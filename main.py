@@ -90,9 +90,9 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 app.include_router(ai_router, prefix="/ai")
 app.include_router(crm_router)
+app.include_router(orders_router)
 app.include_router(leaflink_orders_router)
 app.include_router(leaflink_debug_router, prefix="/leaflink")
-app.include_router(orders_router)
 app.include_router(voice_router)
 app.include_router(voice_brain_router)
 
