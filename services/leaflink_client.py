@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -12,6 +12,34 @@ DEFAULT_LEAFLINK_COMPANY_ID = os.getenv("LEAFLINK_COMPANY_ID", "").strip()
 LEAFLINK_API_VERSION = os.getenv("LEAFLINK_API_VERSION", "").strip()
 LEAFLINK_USER_AGENT = os.getenv("LEAFLINK_USER_AGENT", "opsyn-backend").strip()
 MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
+
+# Auth formats tried in order during fallback negotiation
+_AUTH_FORMATS = ["Token", "Bearer", "X-API-Key"]
+
+
+def _classify_auth_error(resp: "requests.Response") -> str:
+    """Return a structured reason string for a 401/403 response.
+
+    Possible values: credentials_not_provided | invalid_token | expired_token |
+    forbidden | other
+    """
+    if resp.status_code not in (401, 403):
+        return "other"
+    try:
+        body = resp.json()
+        detail = str(body.get("detail", "")).lower()
+    except Exception:
+        detail = resp.text[:200].lower()
+
+    if "not provided" in detail or "no credentials" in detail:
+        return "credentials_not_provided"
+    if "expired" in detail:
+        return "expired_token"
+    if "invalid" in detail or "incorrect" in detail:
+        return "invalid_token"
+    if resp.status_code == 403:
+        return "forbidden"
+    return "invalid_token"
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -82,33 +110,45 @@ class LeafLinkClient:
         self.base_url = (base_url or DEFAULT_LEAFLINK_BASE_URL).strip().rstrip("/")
 
         # Clean the API key: strip whitespace and remove "Token " prefix if present
-        self.api_key = (api_key or DEFAULT_LEAFLINK_API_KEY).strip()
-        if self.api_key.startswith("Token "):
+        raw_key = (api_key or DEFAULT_LEAFLINK_API_KEY).strip()
+        if raw_key.startswith("Token "):
             logger.warning("leaflink: client_init api_key starts with 'Token ' prefix, removing it")
-            self.api_key = self.api_key[6:].strip()
+            raw_key = raw_key[6:].strip()
+        self.api_key = raw_key
 
         self.company_id = str(company_id or DEFAULT_LEAFLINK_COMPANY_ID).strip()
 
+        # ── Validate required fields ─────────────────────────────────────────
         if not self.base_url:
             logger.warning("leaflink: client_init missing LEAFLINK_BASE_URL")
             raise ValueError("Missing LEAFLINK_BASE_URL")
         if not self.api_key:
-            logger.warning("leaflink: client_init missing LEAFLINK_API_KEY")
+            logger.warning("[LeafLink] auth_present=false reason=empty_api_key")
             raise ValueError("Missing LEAFLINK_API_KEY")
         if not self.company_id:
             logger.warning("leaflink: client_init missing LEAFLINK_COMPANY_ID")
             raise ValueError("Missing LEAFLINK_COMPANY_ID")
 
+        # ── Active auth format (may be updated by _try_auth_formats) ─────────
+        # Starts with "Token" (LeafLink default); falls back to "Bearer" or
+        # "X-API-Key" if the initial request returns 401/403.
+        self._auth_format: str = "Token"
+
         self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Token {self.api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": LEAFLINK_USER_AGENT,
-        })
+        self._apply_auth_headers()
 
         if LEAFLINK_API_VERSION:
             self.session.headers["LeafLink-Version"] = LEAFLINK_API_VERSION
 
+        # ── Structured auth-presence log (no secret value) ───────────────────
+        auth_header_value: str = self.session.headers.get("Authorization", "")
+        auth_format_logged = auth_header_value.split(" ")[0] if auth_header_value else "none"
+        logger.info("[LeafLink] auth_present=true")
+        logger.info(
+            "[LeafLink] request_headers_valid auth_format=%s key_length=%s",
+            auth_format_logged,
+            len(self.api_key),
+        )
         logger.info(
             "leaflink: client_init base_url=%s company_id=%s api_key_set=%s",
             self.base_url,
@@ -116,26 +156,112 @@ class LeafLinkClient:
             bool(self.api_key),
         )
         logger.info(
-            "leaflink: client_init auth_test key_prefix=%s... base_url=%s company_id=%s",
-            self.api_key[:6] if self.api_key else "NONE",
-            self.base_url,
-            self.company_id,
-        )
-        logger.info(
             "leaflink: client_init api_key_normalized key_prefix=%s... key_length=%s",
             self.api_key[:6] if self.api_key else "NONE",
             len(self.api_key),
         )
 
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _apply_auth_headers(self) -> None:
+        """Write the correct auth header(s) for the current ``_auth_format``."""
+        # Remove any previously set auth headers before applying the new format.
+        self.session.headers.pop("Authorization", None)
+        self.session.headers.pop("X-API-Key", None)
+
+        if self._auth_format == "X-API-Key":
+            self.session.headers["X-API-Key"] = self.api_key
+        else:
+            self.session.headers["Authorization"] = f"{self._auth_format} {self.api_key}"
+
+        self.session.headers.setdefault("Content-Type", "application/json")
+        self.session.headers.setdefault("User-Agent", LEAFLINK_USER_AGENT)
+
+    def _validate_auth(self) -> Tuple[bool, str]:
+        """Make a lightweight request to verify the current credentials.
+
+        Returns:
+            (success: bool, reason: str)
+            reason is one of: "ok", "credentials_not_provided", "invalid_token",
+            "expired_token", "forbidden", "other"
+        """
+        probe_url = f"{self.base_url}/orders-received/"
+        logger.info(
+            "[LeafLink] auth_validate_start url=%s auth_format=%s",
+            probe_url,
+            self._auth_format,
+        )
+        try:
+            resp = self.session.get(probe_url, params={"page_size": 1}, timeout=15)
+        except Exception as exc:
+            logger.error("[LeafLink] auth_validate_request_failed error=%s", exc)
+            return False, "other"
+
+        if resp.ok:
+            logger.info("[LeafLink] auth_validate_success status=%s", resp.status_code)
+            return True, "ok"
+
+        reason = _classify_auth_error(resp)
+        logger.warning(
+            "[LeafLink] auth_validate_failed status=%s reason=%s",
+            resp.status_code,
+            reason,
+        )
+        return False, reason
+
+    def _try_auth_formats(self, probe_path: str = "orders-received/") -> bool:
+        """Attempt each auth format in order; update ``_auth_format`` on success.
+
+        Returns True if any format succeeds, False if all fail.
+        """
+        probe_url = f"{self.base_url}/{probe_path.lstrip('/')}"
+        for fmt in _AUTH_FORMATS:
+            self._auth_format = fmt
+            self._apply_auth_headers()
+            logger.info("[LeafLink] auth_format_attempt format=%s url=%s", fmt, probe_url)
+            try:
+                resp = self.session.get(probe_url, params={"page_size": 1}, timeout=15)
+            except Exception as exc:
+                logger.error("[LeafLink] auth_format_attempt_failed format=%s error=%s", fmt, exc)
+                continue
+
+            if resp.ok:
+                logger.info("[LeafLink] auth_format_success format=%s", fmt)
+                return True
+
+            reason = _classify_auth_error(resp)
+            logger.warning(
+                "[LeafLink] auth_format_rejected format=%s status=%s reason=%s",
+                fmt,
+                resp.status_code,
+                reason,
+            )
+
+        logger.error("[LeafLink] auth_failed all_formats_exhausted")
+        return False
+
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         url = f"{self.base_url}/{path.lstrip('/')}"
         safe_params = {k: v for k, v in (params or {}).items() if k not in ("api_key", "token", "secret")}
-        logger.info("leaflink: API request method=GET url=%s params=%s", url, safe_params)
+
+        # Log which auth format is active (never the value itself)
+        active_auth_header = self.session.headers.get("Authorization", "")
+        active_auth_format = active_auth_header.split(" ")[0] if active_auth_header else (
+            "X-API-Key" if "X-API-Key" in self.session.headers else "none"
+        )
+        logger.info(
+            "leaflink: API request method=GET url=%s params=%s auth_format=%s",
+            url,
+            safe_params,
+            active_auth_format,
+        )
+
         try:
             resp = self.session.get(url, params=params, timeout=45)
         except Exception as exc:
             logger.error("leaflink: API request failed url=%s error=%s", url, exc)
             raise
+
         content_type = resp.headers.get("Content-Type", "")
         logger.info(
             "leaflink: API response url=%s status=%s content_type=%s size=%s",
@@ -144,7 +270,47 @@ class LeafLinkClient:
             content_type,
             len(resp.content),
         )
-        if "application/json" not in content_type.lower():
+
+        # ── Auth-failure detection and multi-format fallback ─────────────────
+        if resp.status_code in (401, 403):
+            reason = _classify_auth_error(resp)
+            logger.warning(
+                "[LeafLink] auth_failed status=%s reason=%s url=%s auth_format=%s",
+                resp.status_code,
+                reason,
+                url,
+                active_auth_format,
+            )
+            # Only attempt fallback when we haven't already tried all formats.
+            # _try_auth_formats will update self._auth_format and session headers.
+            if self._auth_format == "Token":
+                logger.info("[LeafLink] auth_fallback_start — trying alternative auth formats")
+                fallback_ok = self._try_auth_formats(probe_path=path)
+                if fallback_ok:
+                    logger.info(
+                        "[LeafLink] auth_fallback_success new_format=%s — retrying original request",
+                        self._auth_format,
+                    )
+                    try:
+                        resp = self.session.get(url, params=params, timeout=45)
+                    except Exception as exc:
+                        logger.error("leaflink: API retry failed url=%s error=%s", url, exc)
+                        raise
+                    content_type = resp.headers.get("Content-Type", "")
+                    logger.info(
+                        "leaflink: API response (retry) url=%s status=%s content_type=%s size=%s",
+                        url,
+                        resp.status_code,
+                        content_type,
+                        len(resp.content),
+                    )
+                else:
+                    logger.error(
+                        "[LeafLink] auth_failed all_formats_exhausted url=%s",
+                        url,
+                    )
+
+        if "application/json" not in content_type.lower() and not resp.ok:
             logger.warning(
                 "leaflink: API response is not JSON url=%s status=%s content_type=%s body_preview=%s",
                 url,
@@ -157,7 +323,7 @@ class LeafLinkClient:
                 "leaflink: API HTTP error url=%s status=%s body=%s",
                 url,
                 resp.status_code,
-                resp.text[:500],  # Log more of the response body
+                resp.text[:500],
             )
         return resp
 

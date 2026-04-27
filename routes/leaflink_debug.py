@@ -2,6 +2,7 @@
 LeafLink debug endpoint — returns full connectivity and configuration diagnostics.
 GET /leaflink/debug
 GET /leaflink/auth-debug
+GET /leaflink/auth-test
 """
 import logging
 import os
@@ -503,3 +504,112 @@ async def debug_leaflink_auth(
             "ok": False,
             "error": str(e),
         }
+
+
+@router.get("/auth-test")
+async def auth_test(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """
+    Test LeafLink authentication without exposing credentials.
+
+    Tries DB credentials first, then falls back to environment variables.
+    Returns a structured result indicating whether auth is valid and why it
+    failed if not — never exposes the actual API key.
+
+    Response shape:
+        { "ok": true, "auth_valid": true, "message": "...", "api_key_set": true,
+          "base_url": "...", "company_id": "..." }
+        { "ok": false, "auth_valid": false, "message": "...",
+          "reason": "credentials_not_provided|invalid_token|expired_token|forbidden|other" }
+    """
+    logger.info("[LeafLink] auth_test_start")
+
+    api_key_raw = os.getenv("LEAFLINK_API_KEY", "")
+    base_url_val = DEFAULT_LEAFLINK_BASE_URL
+    company_id_val = DEFAULT_LEAFLINK_COMPANY_ID
+
+    # ── Resolve credentials (DB preferred, env fallback) ─────────────────────
+    cred_source = "environment"
+    try:
+        cred_result = await db.execute(
+            select(BrandAPICredential)
+            .where(
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+            )
+            .order_by(BrandAPICredential.last_sync_at.desc().nullslast())
+            .limit(1)
+        )
+        db_cred = cred_result.scalar_one_or_none()
+        if db_cred and db_cred.api_key:
+            api_key_raw = db_cred.api_key
+            company_id_val = db_cred.company_id or company_id_val
+            cred_source = "database"
+            logger.info(
+                "[LeafLink] auth_test using_db_credentials brand_id=%s",
+                db_cred.brand_id,
+            )
+    except Exception as cred_exc:
+        logger.warning("[LeafLink] auth_test db_cred_lookup_failed error=%s", cred_exc)
+
+    api_key_set = bool(api_key_raw and api_key_raw.strip())
+
+    if not api_key_set:
+        logger.warning("[LeafLink] auth_test_result success=false reason=api_key_not_set")
+        return {
+            "ok": False,
+            "auth_valid": False,
+            "message": "LEAFLINK_API_KEY is not set",
+            "reason": "credentials_not_provided",
+            "api_key_set": False,
+            "base_url": base_url_val or None,
+            "company_id": company_id_val or None,
+            "cred_source": cred_source,
+        }
+
+    # ── Build client and validate ─────────────────────────────────────────────
+    try:
+        client = LeafLinkClient(
+            api_key=api_key_raw,
+            base_url=base_url_val or None,
+            company_id=company_id_val or None,
+        )
+    except ValueError as ve:
+        reason = "credentials_not_provided"
+        logger.warning("[LeafLink] auth_test_result success=false reason=%s error=%s", reason, ve)
+        return {
+            "ok": False,
+            "auth_valid": False,
+            "message": str(ve),
+            "reason": reason,
+            "api_key_set": api_key_set,
+            "base_url": base_url_val or None,
+            "company_id": company_id_val or None,
+            "cred_source": cred_source,
+        }
+
+    auth_valid, reason = client._validate_auth()
+
+    if auth_valid:
+        logger.info("[LeafLink] auth_test_result success=true auth_format=%s", client._auth_format)
+        return {
+            "ok": True,
+            "auth_valid": True,
+            "message": "LeafLink API is reachable",
+            "api_key_set": True,
+            "base_url": client.base_url,
+            "company_id": client.company_id,
+            "auth_format": client._auth_format,
+            "cred_source": cred_source,
+        }
+
+    logger.warning("[LeafLink] auth_test_result success=false reason=%s", reason)
+    return {
+        "ok": False,
+        "auth_valid": False,
+        "message": f"LeafLink authentication failed",
+        "reason": reason,
+        "api_key_set": True,
+        "base_url": client.base_url,
+        "company_id": client.company_id,
+        "cred_source": cred_source,
+    }

@@ -59,10 +59,53 @@ async def _create_assistant_tables() -> None:
         logger.error("startup: failed to create assistant tables: %s", exc)
 
 
+async def _validate_leaflink_startup() -> None:
+    """Validate LeafLink credentials at startup.
+
+    Logs structured results but never crashes the app — LeafLink auth failure
+    is non-fatal so the rest of the service can still serve requests.
+    """
+    logger.info("[LeafLink] startup_validation_start")
+    try:
+        from services.leaflink_client import LeafLinkClient, DEFAULT_LEAFLINK_API_KEY, DEFAULT_LEAFLINK_BASE_URL, DEFAULT_LEAFLINK_COMPANY_ID
+
+        if not DEFAULT_LEAFLINK_API_KEY:
+            logger.warning(
+                "[LeafLink] startup_validation_result success=false reason=LEAFLINK_API_KEY_not_set"
+            )
+            return
+
+        client = LeafLinkClient(
+            api_key=DEFAULT_LEAFLINK_API_KEY,
+            base_url=DEFAULT_LEAFLINK_BASE_URL or None,
+            company_id=DEFAULT_LEAFLINK_COMPANY_ID or None,
+        )
+        auth_valid, reason = client._validate_auth()
+        if auth_valid:
+            logger.info(
+                "[LeafLink] startup_validation_result success=true auth_format=%s",
+                client._auth_format,
+            )
+        else:
+            logger.warning(
+                "[LeafLink] startup_validation_result success=false reason=%s",
+                reason,
+            )
+    except ValueError as ve:
+        # Missing required env var — already logged inside LeafLinkClient.__init__
+        logger.warning("[LeafLink] startup_validation_result success=false reason=%s", ve)
+    except Exception as exc:
+        logger.warning(
+            "[LeafLink] startup_validation_result success=false reason=unexpected_error error=%s",
+            exc,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Starting {APP_NAME} in {APP_ENV}")
     await _create_assistant_tables()
+    await _validate_leaflink_startup()
     yield
     logger.info("Shutting down")
 
