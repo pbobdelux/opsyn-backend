@@ -13,10 +13,16 @@ Endpoints:
 import logging
 import os
 from datetime import datetime, timezone
+from typing import Optional
 
 import requests
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from database import get_db
+from models import BrandAPICredential
+from services.integration_credentials import validate_leaflink_credential
 from services.integration_health import (
     get_all_integrations_health,
     get_overall_status,
@@ -128,36 +134,74 @@ async def integrations_alerts():
 # ---------------------------------------------------------------------------
 
 @router.post("/leaflink/test")
-def leaflink_test():
+async def leaflink_test(
+    brand_id: Optional[str] = Query(None, description="Brand slug to test (e.g. 'noble-nectar')"),
+    db: AsyncSession = Depends(get_db),
+):
     """
-    Test LeafLink authentication and order fetch capability.
+    Test LeafLink authentication and order fetch capability for a specific brand.
 
-    Attempts a minimal order fetch (page_size=1) to confirm credentials work.
+    Loads the credential from the database and attempts a minimal order fetch
+    (page_size=1) to confirm credentials work.
     Never exposes API keys, tokens, or internal error details.
+
+    Query params:
+      brand_id: Brand slug to test
 
     Response:
       {
         "ok": true,
         "auth_valid": true,
         "can_fetch": true,
+        "credential_source": "db",
+        "brand_id": "noble-nectar",
         "message": "LeafLink connection is working."
       }
     """
-    logger.info("[IntegrationHealth] leaflink_test_start")
+    logger.info("[IntegrationHealth] leaflink_test_start brand=%s", brand_id or "unspecified")
 
     try:
-        from services import leaflink_auth
+        if not brand_id:
+            return {
+                "ok": False,
+                "auth_valid": False,
+                "can_fetch": False,
+                "credential_source": "db",
+                "brand_id": None,
+                "message": "brand_id query parameter is required.",
+            }
 
-        health = leaflink_auth.get_auth_health()
-        auth_valid = health.get("auth_present", False)
-        can_fetch = health.get("can_fetch_orders", False)
+        # Load credential from DB
+        cred_result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.brand_id == brand_id,
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+            )
+        )
+        cred = cred_result.scalar_one_or_none()
 
-        if not auth_valid:
-            message = "LeafLink credentials are not configured."
-            ok = False
-        elif not can_fetch:
-            last_error = health.get("last_error", "")
-            if last_error and ("403" in str(last_error) or "401" in str(last_error)):
+        if not cred:
+            logger.info(
+                "[IntegrationCredentials] health_check brand=%s status=missing source=db",
+                brand_id,
+            )
+            return {
+                "ok": False,
+                "auth_valid": False,
+                "can_fetch": False,
+                "credential_source": "db",
+                "brand_id": brand_id,
+                "message": "No LeafLink credentials found for this brand.",
+            }
+
+        valid = validate_leaflink_credential(cred)
+        auth_valid = True  # credential exists in DB
+        can_fetch = valid
+
+        if not valid:
+            last_error = cred.last_error or ""
+            if "403" in str(last_error) or "401" in str(last_error):
                 message = "LeafLink credentials are invalid or expired. Please reconnect."
             else:
                 message = "LeafLink credentials are present but orders cannot be fetched. Check connection."
@@ -167,7 +211,8 @@ def leaflink_test():
             ok = True
 
         logger.info(
-            "[IntegrationHealth] leaflink_test_result ok=%s auth_valid=%s can_fetch=%s",
+            "[IntegrationHealth] leaflink_test_result brand=%s ok=%s auth_valid=%s can_fetch=%s credential_source=db",
+            brand_id,
             ok,
             auth_valid,
             can_fetch,
@@ -177,17 +222,18 @@ def leaflink_test():
             "ok": ok,
             "auth_valid": auth_valid,
             "can_fetch": can_fetch,
+            "credential_source": "db",
+            "brand_id": brand_id,
             "message": message,
         }
 
     except Exception as exc:
-        logger.error("[IntegrationHealth] leaflink_test_error error=%s", exc)
-        logger.info(
-            "[IntegrationHealth] leaflink_test_result ok=False auth_valid=False can_fetch=False",
-        )
+        logger.error("[IntegrationHealth] leaflink_test_error brand=%s error=%s", brand_id, exc)
         return {
             "ok": False,
             "auth_valid": False,
             "can_fetch": False,
+            "credential_source": "db",
+            "brand_id": brand_id,
             "message": "LeafLink test failed. Check service logs.",
         }

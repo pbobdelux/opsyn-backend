@@ -253,7 +253,7 @@ async def sync_leaflink(
                 try:
                     # Step 2: Fetch orders from the LeafLink API (pure HTTP, no DB).
                     logger.info("leaflink: sync_client_init brand_id=%s", brand_id)
-                    client = LeafLinkClient(api_key=api_key, company_id=company_id)
+                    client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=brand_id)
                     logger.info("leaflink: sync_api_call_start brand_id=%s", brand_id)
                     fetch_result = client.fetch_recent_orders(normalize=True, brand=brand_id)
                     orders = fetch_result["orders"]
@@ -270,6 +270,11 @@ async def sync_leaflink(
                     else:
                         cred.last_error = None
 
+                    logger.info(
+                        "[IntegrationCredentials] %s brand_id=%s",
+                        "marked_success" if result.get("ok") else "marked_invalid",
+                        brand_id,
+                    )
                     logger.info(
                         "leaflink: sync_endpoint brand_id=%s result=%s created=%s updated=%s skipped=%s lines=%s pages=%s",
                         brand_id,
@@ -405,7 +410,7 @@ async def sync_leaflink_now(
 
                 # Step 2: Fetch orders from the LeafLink API (pure HTTP, no DB).
                 logger.info("leaflink: sync_client_init brand_id=%s", brand_id)
-                client = LeafLinkClient(api_key=api_key, company_id=company_id)
+                client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=brand_id)
                 logger.info("leaflink: sync_api_call_start brand_id=%s", brand_id)
                 fetch_result = client.fetch_recent_orders(normalize=True, brand=brand_id)
                 orders = fetch_result["orders"]
@@ -421,6 +426,12 @@ async def sync_leaflink_now(
                     cred.last_error = result.get("error", "Unknown error")
                 else:
                     cred.last_error = None
+
+                logger.info(
+                    "[IntegrationCredentials] %s brand_id=%s",
+                    "marked_success" if result.get("ok") else "marked_invalid",
+                    brand_id,
+                )
 
                 if result.get("ok"):
                     total_orders_fetched += result.get("orders_fetched", 0)

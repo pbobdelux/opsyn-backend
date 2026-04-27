@@ -93,6 +93,7 @@ async def orders_sync(
         sync_metadata: dict = {}
 
         if brand_filter:
+            cred = None
             try:
                 from services.leaflink_client import LeafLinkClient
                 from services.leaflink_sync import sync_leaflink_orders
@@ -112,7 +113,7 @@ async def orders_sync(
                     company_id: str = cred.company_id or ""
 
                     logger.info(
-                        "[LeafLink] sync_start brand=%s force_full=%s",
+                        "[LeafLink] sync_start brand=%s credential_source=db force_full=%s",
                         brand_filter,
                         force_full,
                     )
@@ -138,7 +139,7 @@ async def orders_sync(
                         webhook_url=_watchdog_url,
                     )
 
-                    client = LeafLinkClient(api_key=api_key, company_id=company_id)
+                    client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=brand_filter)
 
                     # force_full=True → fetch all pages (unlimited); otherwise fetch recent (5 pages)
                     max_pages_arg = None if force_full else 5
@@ -218,6 +219,9 @@ async def orders_sync(
                             },
                             webhook_url=_watchdog_url,
                         )
+                        # Mark credential as successfully used
+                        from services.integration_credentials import mark_credential_success
+                        await mark_credential_success(cred)
                     else:
                         await emit_watchdog_event(
                             event_type="sync_failed",
@@ -232,11 +236,15 @@ async def orders_sync(
                             },
                             webhook_url=_watchdog_url,
                         )
+                        # Mark credential as failed
+                        from services.integration_credentials import mark_credential_invalid
+                        await mark_credential_invalid(cred, sync_result.get("error") or "sync_failed")
                 else:
-                    logger.info(
-                        "[OrdersSync] no_leaflink_credentials brand=%s — serving from DB only",
+                    logger.warning(
+                        "[LeafLink] credential_missing brand=%s — serving from DB only",
                         brand_filter,
                     )
+                    sync_metadata["credential_missing"] = True
                     sync_metadata["used_force_full"] = force_full
 
             except Exception as sync_exc:
@@ -248,6 +256,11 @@ async def orders_sync(
                 )
                 sync_metadata["sync_error"] = str(sync_exc)
                 sync_metadata["used_force_full"] = force_full
+
+                # Mark credential as failed if we had one
+                if cred is not None:
+                    from services.integration_credentials import mark_credential_invalid
+                    await mark_credential_invalid(cred, str(sync_exc))
 
                 # Watchdog: emit sync_failed on exception
                 _watchdog_url_exc = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")

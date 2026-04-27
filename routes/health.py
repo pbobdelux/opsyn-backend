@@ -7,7 +7,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import BrandAPICredential, Order
-from services import leaflink_auth
 from services.integration_health import (
     get_all_integrations_health,
     get_overall_status,
@@ -72,23 +71,51 @@ async def health_data(db: AsyncSession = Depends(get_db)):
 
         data_source = "live" if (orders_count > 0 or customers_count > 0) else "empty"
 
-        # LeafLink auth health (non-blocking — failures don't break the endpoint)
-        try:
-            ll_health = leaflink_auth.get_auth_health()
-            leaflink_auth_ok = ll_health["auth_present"] and ll_health["can_fetch_orders"]
-            leaflink_last_success_at = ll_health["last_success_at"]
-            leaflink_last_error = ll_health["last_error"]
+        # LeafLink credential health — load from DB per brand (non-blocking)
+        leaflink_auth_ok = False
+        leaflink_last_success_at = None
+        leaflink_last_error = None
+        leaflink_sync_state = "missing"
+        leaflink_credential_source = "missing"
+        leaflink_connected = False
+        leaflink_status = "missing"
 
-            if leaflink_auth_ok:
-                leaflink_sync_state = "healthy"
-            elif ll_health["auth_present"] and not ll_health["can_fetch_orders"]:
-                leaflink_sync_state = "degraded"
+        try:
+            # Find the most recently synced active LeafLink credential across all brands
+            ll_cred_result = await db.execute(
+                select(BrandAPICredential)
+                .where(
+                    BrandAPICredential.integration_name == "leaflink",
+                    BrandAPICredential.is_active == True,
+                )
+                .order_by(BrandAPICredential.last_sync_at.desc().nullslast())
+                .limit(1)
+            )
+            ll_cred = ll_cred_result.scalar_one_or_none()
+
+            if ll_cred:
+                leaflink_credential_source = "db"
+                leaflink_last_success_at = ll_cred.last_sync_at.isoformat() if ll_cred.last_sync_at else None
+                leaflink_last_error = ll_cred.last_error
+
+                if ll_cred.sync_status == "ok":
+                    leaflink_auth_ok = True
+                    leaflink_connected = True
+                    leaflink_status = "active"
+                    leaflink_sync_state = "healthy"
+                elif ll_cred.sync_status == "failed":
+                    leaflink_status = "invalid"
+                    leaflink_sync_state = "failed"
+                else:
+                    leaflink_status = "degraded"
+                    leaflink_sync_state = "degraded"
             else:
-                leaflink_sync_state = "failed"
+                leaflink_credential_source = "missing"
+                leaflink_status = "missing"
+                leaflink_sync_state = "missing"
+
         except Exception as ll_exc:
-            logger.warning("[Health] leaflink_auth_check_failed error=%s", ll_exc)
-            leaflink_auth_ok = False
-            leaflink_last_success_at = None
+            logger.warning("[Health] leaflink_credential_check_failed error=%s", ll_exc)
             leaflink_last_error = str(ll_exc)
             leaflink_sync_state = "failed"
 
@@ -152,6 +179,9 @@ async def health_data(db: AsyncSession = Depends(get_db)):
             "leaflink_last_success_at": leaflink_last_success_at,
             "leaflink_last_error": leaflink_last_error,
             "leaflink_sync_state": leaflink_sync_state,
+            "leaflink_credential_source": leaflink_credential_source,
+            "leaflink_connected": leaflink_connected,
+            "leaflink_status": leaflink_status,
             # Integration health summary
             "overall_integration_status": overall_integration_status,
             "integrations_broken_count": integrations_broken_count,
@@ -177,6 +207,9 @@ async def health_data(db: AsyncSession = Depends(get_db)):
             "leaflink_last_success_at": None,
             "leaflink_last_error": str(e),
             "leaflink_sync_state": "failed",
+            "leaflink_credential_source": "missing",
+            "leaflink_connected": False,
+            "leaflink_status": "missing",
             # Integration health summary (fallback values on error)
             "overall_integration_status": "unknown",
             "integrations_broken_count": 0,

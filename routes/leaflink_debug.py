@@ -22,6 +22,8 @@ from services.leaflink_client import (
     LeafLinkClient,
 )
 
+# DEFAULT_LEAFLINK_API_KEY was removed — credentials are now loaded from DB per brand
+
 logger = logging.getLogger("leaflink_debug")
 router = APIRouter()
 
@@ -95,6 +97,7 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
             client = LeafLinkClient(
                 api_key=db_cred_for_api.api_key,
                 company_id=db_cred_for_api.company_id,
+                brand_id=db_cred_for_api.brand_id,
             )
             credentials_valid = True
             logger.info(
@@ -115,29 +118,10 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
             api_error = str(client_exc)
             logger.error("leaflink: debug client_init_failed error=%s", client_exc)
     else:
-        # No DB credentials — fall back to environment variables (may still fail).
-        credentials_source = "environment"
-        logger.info("leaflink: debug using_env_credentials (no db credentials found)")
-        try:
-            client = LeafLinkClient()
-            credentials_valid = True
-            logger.info(
-                "leaflink: debug client_created_from_env base_url=%s company_id=%s",
-                client.base_url,
-                client.company_id,
-            )
-
-            try:
-                payload = client.list_orders(page=1, page_size=1)
-                api_connected = True
-                logger.info("leaflink: debug api_connected=true payload_type=%s", type(payload).__name__)
-            except Exception as api_exc:
-                api_error = str(api_exc)
-                logger.error("leaflink: debug api_call_failed error=%s", api_exc)
-
-        except Exception as client_exc:
-            api_error = str(client_exc)
-            logger.error("leaflink: debug client_init_failed error=%s", client_exc)
+        # No DB credentials found — cannot connect without per-brand credentials.
+        credentials_source = "missing"
+        logger.warning("leaflink: debug no_db_credentials_found — cannot connect without per-brand credentials")
+        api_error = "No active LeafLink credentials found in database. Use POST /integrations/leaflink/connect to add credentials."
 
     # ── Database: count orders ───────────────────────────────────────────────
     orders_in_db = 0
