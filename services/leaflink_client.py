@@ -4,12 +4,9 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from services import leaflink_auth
-
 logger = logging.getLogger("leaflink_client")
 
 DEFAULT_LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://www.leaflink.com/api/v2").strip().rstrip("/")
-DEFAULT_LEAFLINK_API_KEY = os.getenv("LEAFLINK_API_KEY", "").strip()
 DEFAULT_LEAFLINK_COMPANY_ID = os.getenv("LEAFLINK_COMPANY_ID", "").strip()
 LEAFLINK_API_VERSION = os.getenv("LEAFLINK_API_VERSION", "").strip()
 LEAFLINK_USER_AGENT = os.getenv("LEAFLINK_USER_AGENT", "opsyn-backend").strip()
@@ -77,42 +74,39 @@ def _first_non_empty(*values: Any) -> Any:
 class LeafLinkClient:
     def __init__(
         self,
-        api_key: Optional[str] = None,
+        api_key: str,
         base_url: Optional[str] = None,
         company_id: Optional[str] = None,
+        brand_id: Optional[str] = None,
     ) -> None:
+        self.brand_id = brand_id or "unknown"
         self.base_url = (base_url or DEFAULT_LEAFLINK_BASE_URL).strip().rstrip("/")
 
         # Clean the API key: strip whitespace and remove "Token " prefix if present
-        self.api_key = (api_key or DEFAULT_LEAFLINK_API_KEY).strip()
+        # api_key is required — no env var fallback (multi-tenant: each brand has its own key)
+        self.api_key = (api_key or "").strip()
         if self.api_key.startswith("Token "):
-            logger.warning("leaflink: client_init api_key starts with 'Token ' prefix, removing it")
+            logger.warning(
+                "leaflink: client_init brand=%s api_key starts with 'Token ' prefix, removing it",
+                self.brand_id,
+            )
             self.api_key = self.api_key[6:].strip()
 
         self.company_id = str(company_id or DEFAULT_LEAFLINK_COMPANY_ID).strip()
 
         if not self.base_url:
-            logger.warning("leaflink: client_init missing LEAFLINK_BASE_URL")
+            logger.warning("leaflink: client_init brand=%s missing base_url", self.brand_id)
             raise ValueError("Missing LEAFLINK_BASE_URL")
         if not self.api_key:
-            logger.warning("leaflink: client_init missing LEAFLINK_API_KEY")
-            raise ValueError("Missing LEAFLINK_API_KEY")
+            logger.warning("leaflink: client_init brand=%s missing api_key", self.brand_id)
+            raise ValueError("Missing api_key — LeafLink credentials must be provided per brand (not from env vars)")
         if not self.company_id:
-            logger.warning("leaflink: client_init missing LEAFLINK_COMPANY_ID")
+            logger.warning("leaflink: client_init brand=%s missing company_id", self.brand_id)
             raise ValueError("Missing LEAFLINK_COMPANY_ID")
 
-        # Validate credentials and log result (never logs actual secrets)
-        cred_check = leaflink_auth.validate_leaflink_credentials()
-        logger.info(
-            "[LeafLinkAuth] credentials_check valid=%s auth_mode=%s missing=%s",
-            cred_check["valid"],
-            cred_check["auth_mode"],
-            cred_check["missing_vars"] or "none",
-        )
-
         self.session = requests.Session()
-        # Base session headers — Authorization is injected per-request via
-        # get_auth_headers() so that token refreshes are picked up automatically.
+        # Base session headers — Authorization header is built per-request from
+        # the instance api_key so each brand uses its own credential.
         self.session.headers.update({
             "Content-Type": "application/json",
             "User-Agent": LEAFLINK_USER_AGENT,
@@ -122,47 +116,43 @@ class LeafLinkClient:
             self.session.headers["LeafLink-Version"] = LEAFLINK_API_VERSION
 
         logger.info(
-            "leaflink: client_init base_url=%s company_id=%s api_key_set=%s",
+            "[LeafLinkAuth] tenant=%s brand=%s auth_present=true source=db",
+            self.brand_id,
+            self.brand_id,
+        )
+        logger.info(
+            "leaflink: client_init brand=%s base_url=%s company_id=%s api_key_set=%s",
+            self.brand_id,
             self.base_url,
             self.company_id,
             bool(self.api_key),
-        )
-        logger.info(
-            "leaflink: client_init auth_test key_prefix=%s... base_url=%s company_id=%s",
-            self.api_key[:6] if self.api_key else "NONE",
-            self.base_url,
-            self.company_id,
-        )
-        logger.info(
-            "leaflink: client_init api_key_normalized key_prefix=%s... key_length=%s",
-            self.api_key[:6] if self.api_key else "NONE",
-            len(self.api_key),
         )
 
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         url = f"{self.base_url}/{path.lstrip('/')}"
         safe_params = {k: v for k, v in (params or {}).items() if k not in ("api_key", "token", "secret")}
-        logger.info("leaflink: API request method=GET url=%s params=%s", url, safe_params)
+        logger.info(
+            "[LeafLink] request brand=%s auth_present=true url=%s params=%s",
+            self.brand_id,
+            url,
+            safe_params,
+        )
 
         def _do_request() -> requests.Response:
-            auth_headers = leaflink_auth.get_auth_headers()
+            # Use the per-brand api_key stored on this instance — never reads from env vars
+            auth_headers = {"Authorization": f"Token {self.api_key}"}
             try:
                 return self.session.get(url, params=params, timeout=45, headers=auth_headers)
             except Exception as exc:
-                logger.error("leaflink: API request failed url=%s error=%s", url, exc)
+                logger.error(
+                    "leaflink: API request failed brand=%s url=%s error=%s",
+                    self.brand_id,
+                    url,
+                    exc,
+                )
                 raise
 
         resp = _do_request()
-
-        # Auto-retry once on auth failure after attempting recovery
-        if resp.status_code in (401, 403):
-            recovered = leaflink_auth.handle_auth_failure(resp.status_code, resp.text)
-            if recovered:
-                logger.info(
-                    "[LeafLinkAuth] retrying request after token refresh url=%s",
-                    url,
-                )
-                resp = _do_request()
 
         content_type = resp.headers.get("Content-Type", "")
         logger.info(
@@ -181,21 +171,24 @@ class LeafLinkClient:
                 resp.text[:200],
             )
         if resp.ok:
-            leaflink_auth.record_success()
-            logger.info("[LeafLinkAuth] request_authorized=true url=%s", url)
+            logger.info(
+                "[LeafLinkAuth] request_authorized=true brand=%s url=%s",
+                self.brand_id,
+                url,
+            )
         else:
-            err_msg = f"HTTP {resp.status_code}: {resp.text[:200]}"
-            leaflink_auth.record_error(err_msg)
             if resp.status_code in (401, 403):
                 logger.error(
-                    "[LeafLinkAuth] auth_failed status=%s reason=%s url=%s",
+                    "[LeafLinkAuth] auth_failed brand=%s status=%s reason=%s url=%s",
+                    self.brand_id,
                     resp.status_code,
                     resp.text[:200],
                     url,
                 )
             else:
                 logger.error(
-                    "leaflink: API HTTP error url=%s status=%s body=%s",
+                    "leaflink: API HTTP error brand=%s url=%s status=%s body=%s",
+                    self.brand_id,
                     url,
                     resp.status_code,
                     resp.text[:500],
@@ -226,7 +219,8 @@ class LeafLinkClient:
             resp = self._get_raw("orders-received/", params=params)
         except Exception as exc:
             logger.error(
-                "[LeafLinkAuth] list_orders_request_failed error=%s",
+                "leaflink: list_orders_request_failed brand=%s error=%s",
+                self.brand_id,
                 exc,
             )
             raise
@@ -238,7 +232,8 @@ class LeafLinkClient:
             result_type = type(data).__name__
             result_count = len(data) if isinstance(data, list) else len(data.get("results") or data.get("data") or data.get("orders") or [])
             logger.info(
-                "leaflink: list_orders success page=%s result_type=%s result_count=%s",
+                "leaflink: list_orders success brand=%s page=%s result_type=%s result_count=%s",
+                self.brand_id,
                 page,
                 result_type,
                 result_count,
@@ -247,13 +242,15 @@ class LeafLinkClient:
 
         if resp.status_code in (401, 403):
             logger.error(
-                "[LeafLinkAuth] list_orders_auth_failed status=%s body=%s",
+                "[LeafLinkAuth] list_orders_auth_failed brand=%s status=%s body=%s",
+                self.brand_id,
                 resp.status_code,
                 resp.text[:500],
             )
         else:
             logger.error(
-                "leaflink: list_orders failed status=%s content_type=%s body_preview=%s",
+                "leaflink: list_orders failed brand=%s status=%s content_type=%s body_preview=%s",
+                self.brand_id,
                 resp.status_code,
                 content_type,
                 resp.text[:220],
