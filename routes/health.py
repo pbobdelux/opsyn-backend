@@ -8,6 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models import BrandAPICredential, Order
 from services import leaflink_auth
+from services.integration_health import (
+    get_all_integrations_health,
+    get_overall_status,
+    get_summary,
+    IntegrationStatus,
+)
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("health")
@@ -95,6 +101,45 @@ async def health_data(db: AsyncSession = Depends(get_db)):
             leaflink_last_error or "none",
         )
 
+        # Integration health summary (non-blocking — failures don't break the endpoint)
+        overall_integration_status = "unknown"
+        integrations_broken_count = 0
+        integrations_stale_count = 0
+        integrations_requiring_attention = 0
+        top_issue: str | None = None
+        opsyn_summary = "Integration status unavailable."
+
+        try:
+            integrations = await get_all_integrations_health()
+            overall_integration_status = get_overall_status(integrations)
+            integrations_broken_count = sum(
+                1 for i in integrations if i.status == IntegrationStatus.BROKEN
+            )
+            integrations_stale_count = sum(
+                1 for i in integrations if i.status == IntegrationStatus.STALE
+            )
+            integrations_requiring_attention = sum(
+                1 for i in integrations if i.requires_attention
+            )
+            opsyn_summary = get_summary(integrations)
+
+            # Top issue: first broken, then stale, then degraded
+            for status in (IntegrationStatus.BROKEN, IntegrationStatus.STALE, IntegrationStatus.DEGRADED):
+                match = next((i for i in integrations if i.status == status), None)
+                if match:
+                    top_issue = match.recommended_action or f"{match.integration_name} needs attention"
+                    break
+
+        except Exception as ih_exc:
+            logger.warning("[Health] integration_health_check_failed error=%s", ih_exc)
+
+        logger.info(
+            "[Health] integration_status=%s broken=%s stale=%s",
+            overall_integration_status,
+            integrations_broken_count,
+            integrations_stale_count,
+        )
+
         return make_json_safe({
             "ok": True,
             "orders_count": orders_count,
@@ -107,6 +152,13 @@ async def health_data(db: AsyncSession = Depends(get_db)):
             "leaflink_last_success_at": leaflink_last_success_at,
             "leaflink_last_error": leaflink_last_error,
             "leaflink_sync_state": leaflink_sync_state,
+            # Integration health summary
+            "overall_integration_status": overall_integration_status,
+            "integrations_broken_count": integrations_broken_count,
+            "integrations_stale_count": integrations_stale_count,
+            "integrations_requiring_attention": integrations_requiring_attention,
+            "top_issue": top_issue,
+            "opsyn_summary": opsyn_summary,
         })
 
     except Exception as e:
@@ -125,4 +177,11 @@ async def health_data(db: AsyncSession = Depends(get_db)):
             "leaflink_last_success_at": None,
             "leaflink_last_error": str(e),
             "leaflink_sync_state": "failed",
+            # Integration health summary (fallback values on error)
+            "overall_integration_status": "unknown",
+            "integrations_broken_count": 0,
+            "integrations_stale_count": 0,
+            "integrations_requiring_attention": 0,
+            "top_issue": None,
+            "opsyn_summary": "Health check failed. Check service logs.",
         })
