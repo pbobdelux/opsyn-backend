@@ -101,7 +101,7 @@ class LeafLinkClient:
 
         self.session = requests.Session()
         self.session.headers.update({
-            "Authorization": f"Token {self.api_key}",
+            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "User-Agent": LEAFLINK_USER_AGENT,
         })
@@ -125,6 +125,11 @@ class LeafLinkClient:
             "leaflink: client_init api_key_normalized key_prefix=%s... key_length=%s",
             self.api_key[:6] if self.api_key else "NONE",
             len(self.api_key),
+        )
+        logger.info(
+            "[LeafLinkSync] auth_attempt base_url=%s company_id=%s auth_format=Bearer",
+            self.base_url,
+            self.company_id,
         )
 
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
@@ -151,6 +156,11 @@ class LeafLinkClient:
                 resp.status_code,
                 content_type,
                 resp.text[:200],
+            )
+        if resp.status_code == 403:
+            logger.error(
+                "[LeafLinkSync] auth_failed status=403 body=%s",
+                resp.text[:500],
             )
         if not resp.ok:
             logger.error(
