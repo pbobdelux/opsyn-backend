@@ -1,8 +1,9 @@
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import AsyncSessionLocal
 from models import Order, OrderLine
 from utils.json_utils import make_json_safe
+
+if TYPE_CHECKING:
+    from services.background_sync_manager import BackgroundSyncManager
 
 logger = logging.getLogger("leaflink_sync")
 
@@ -727,3 +731,244 @@ async def sync_leaflink_line_items(
         "errors": errors,
         "duration_seconds": bg_duration,
     }
+
+
+# ---------------------------------------------------------------------------
+# Background continuous sync (Phase 2)
+# ---------------------------------------------------------------------------
+
+# Batch size bounds for adaptive pacing
+_BG_BATCH_MIN = 3
+_BG_BATCH_MAX = 5
+_BG_BATCH_DEFAULT = 4
+
+# Thresholds (seconds) for adaptive batch sizing
+_BG_BATCH_FAST_THRESHOLD = 5.0   # < 5 s → increase batch size
+_BG_BATCH_SLOW_THRESHOLD = 15.0  # > 15 s → decrease batch size
+
+# Hard timeout for the entire background sync run (30 minutes)
+_BG_SYNC_TIMEOUT = 1800
+
+
+async def sync_leaflink_background_continuous(
+    brand_id: str,
+    api_key: str,
+    company_id: str,
+    start_page: int,
+    total_pages: int,
+    manager: Optional["BackgroundSyncManager"] = None,
+) -> None:
+    """
+    Fetch all remaining LeafLink pages in adaptive batches and upsert to DB.
+
+    Designed to run as a fire-and-forget asyncio task after Phase 1 completes.
+    Progress is persisted to BrandAPICredential after every batch so the sync
+    can resume from the last completed page if the service restarts.
+
+    Batch size adapts based on observed fetch latency:
+      - < 5 s per batch  → increase to _BG_BATCH_MAX (5 pages)
+      - > 15 s per batch → decrease to _BG_BATCH_MIN (3 pages)
+      - otherwise        → keep at _BG_BATCH_DEFAULT (4 pages)
+
+    Args:
+        brand_id:    Brand slug / ID.
+        api_key:     LeafLink API key.
+        company_id:  LeafLink company ID.
+        start_page:  First page to fetch (Phase 1 already fetched pages before this).
+        total_pages: Total pages reported by LeafLink API.
+        manager:     Optional BackgroundSyncManager instance for in-memory tracking.
+    """
+    from services.leaflink_client import LeafLinkClient
+
+    bg_start = time.monotonic()
+    current_page = start_page
+    batch_size = _BG_BATCH_DEFAULT
+    total_orders_synced = 0
+    resume_url: Optional[str] = None
+
+    logger.info(
+        "[OrdersSync] bg_sync_start brand=%s start_page=%s total_pages=%s",
+        brand_id,
+        start_page,
+        total_pages,
+    )
+
+    try:
+        client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=brand_id)
+    except Exception as client_exc:
+        logger.error(
+            "[OrdersSync] bg_sync_client_init_error brand=%s error=%s",
+            brand_id,
+            client_exc,
+        )
+        if manager:
+            await manager.persist_progress(
+                brand_id=brand_id,
+                last_synced_page=start_page - 1,
+                total_pages=total_pages,
+                sync_status="error",
+                error=str(client_exc),
+            )
+        return
+
+    loop = asyncio.get_event_loop()
+
+    while current_page <= total_pages:
+        # Hard timeout guard
+        elapsed_total = time.monotonic() - bg_start
+        if elapsed_total > _BG_SYNC_TIMEOUT:
+            logger.warning(
+                "[OrdersSync] bg_sync_timeout brand=%s elapsed=%.1fs pages_done=%s/%s",
+                brand_id,
+                elapsed_total,
+                current_page - start_page,
+                total_pages - start_page + 1,
+            )
+            break
+
+        logger.info(
+            "[OrdersSync] bg_batch_start page=%s batch_size=%s",
+            current_page,
+            batch_size,
+        )
+        batch_start = time.monotonic()
+
+        # ------------------------------------------------------------------ #
+        # Fetch a batch of pages from LeafLink (runs in thread pool)          #
+        # ------------------------------------------------------------------ #
+        _capture_page = current_page
+        _capture_url = resume_url
+        _capture_batch = batch_size
+
+        def _fetch_batch():
+            return client.fetch_orders_page_range(
+                start_page=_capture_page,
+                num_pages=_capture_batch,
+                page_size=HEADER_BATCH_SIZE * 4,  # 100 orders per page
+                normalize=True,
+                brand=brand_id,
+                resume_url=_capture_url,
+            )
+
+        try:
+            fetch_result = await loop.run_in_executor(None, _fetch_batch)
+        except Exception as fetch_exc:
+            err_msg = str(fetch_exc)
+            logger.error(
+                "[OrdersSync] bg_batch_fetch_error brand=%s page=%s error=%s",
+                brand_id,
+                current_page,
+                err_msg,
+                exc_info=True,
+            )
+            if manager:
+                manager.record_page_complete(brand_id, current_page - 1, error=err_msg)
+            # Skip this batch and advance to avoid infinite loop
+            current_page += batch_size
+            await asyncio.sleep(2)
+            continue
+
+        batch_orders = fetch_result.get("orders", [])
+        pages_fetched_this_batch = fetch_result.get("pages_fetched", batch_size)
+        resume_url = fetch_result.get("next_url")
+        next_page = fetch_result.get("next_page")
+
+        batch_fetch_ms = round((time.monotonic() - batch_start) * 1000)
+        logger.info(
+            "[OrdersSync] bg_batch_complete page=%s orders=%s duration_ms=%s",
+            current_page,
+            len(batch_orders),
+            batch_fetch_ms,
+        )
+
+        # ------------------------------------------------------------------ #
+        # Upsert order headers (headers-only, line items deferred)            #
+        # ------------------------------------------------------------------ #
+        if batch_orders:
+            try:
+                await sync_leaflink_orders_headers_only(
+                    brand_id=brand_id,
+                    orders=batch_orders,
+                    pages_fetched=pages_fetched_this_batch,
+                )
+
+                # Defer line items to a separate fire-and-forget task
+                _li_orders = batch_orders
+
+                async def _write_line_items():
+                    await sync_leaflink_line_items(brand_id, _li_orders)
+
+                asyncio.create_task(_write_line_items())
+
+            except Exception as upsert_exc:
+                logger.error(
+                    "[OrdersSync] bg_batch_upsert_error brand=%s page=%s error=%s",
+                    brand_id,
+                    current_page,
+                    upsert_exc,
+                    exc_info=True,
+                )
+
+        total_orders_synced += len(batch_orders)
+        last_completed_page = (next_page - 1) if next_page else total_pages
+
+        # ------------------------------------------------------------------ #
+        # Persist progress to DB                                              #
+        # ------------------------------------------------------------------ #
+        if manager:
+            manager.record_page_complete(brand_id, last_completed_page)
+            await manager.persist_progress(
+                brand_id=brand_id,
+                last_synced_page=last_completed_page,
+                total_pages=total_pages,
+                sync_status="syncing",
+            )
+
+        percent = round((last_completed_page / total_pages) * 100, 1) if total_pages else 0
+        logger.info(
+            "[OrdersSync] bg_batch_complete page=%s total_pages=%s percent=%.1f%%",
+            last_completed_page,
+            total_pages,
+            percent,
+        )
+
+        # ------------------------------------------------------------------ #
+        # Adaptive batch sizing based on fetch latency                        #
+        # ------------------------------------------------------------------ #
+        batch_seconds = (time.monotonic() - batch_start)
+        if batch_seconds < _BG_BATCH_FAST_THRESHOLD:
+            batch_size = min(batch_size + 1, _BG_BATCH_MAX)
+        elif batch_seconds > _BG_BATCH_SLOW_THRESHOLD:
+            batch_size = max(batch_size - 1, _BG_BATCH_MIN)
+
+        # Advance page pointer
+        if next_page:
+            current_page = next_page
+        else:
+            # No more pages
+            break
+
+        if not resume_url:
+            # LeafLink returned no next URL — we've reached the end
+            break
+
+    # ---------------------------------------------------------------------- #
+    # Sync complete                                                           #
+    # ---------------------------------------------------------------------- #
+    total_duration = round(time.monotonic() - bg_start, 1)
+    logger.info(
+        "[OrdersSync] bg_sync_complete brand=%s total_pages=%s total_orders=%s duration_seconds=%s",
+        brand_id,
+        total_pages,
+        total_orders_synced,
+        total_duration,
+    )
+
+    if manager:
+        final_page = min(current_page - 1, total_pages)
+        await manager.persist_progress(
+            brand_id=brand_id,
+            last_synced_page=final_page,
+            total_pages=total_pages,
+            sync_status="idle",
+        )

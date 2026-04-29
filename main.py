@@ -67,10 +67,76 @@ async def _create_assistant_tables() -> None:
         logger.error("startup: failed to create assistant tables: %s", exc)
 
 
+async def _resume_interrupted_syncs() -> None:
+    """
+    On startup, check BrandAPICredential for any syncs that were in-progress
+    when the service last shut down and resume them from last_synced_page + 1.
+
+    A sync is considered interrupted when:
+      - sync_status = "syncing"
+      - last_synced_page is not None
+      - total_pages_available is not None
+      - last_synced_page < total_pages_available
+    """
+    try:
+        from database import AsyncSessionLocal
+        from models import BrandAPICredential
+        from services.background_sync_manager import sync_manager
+
+        if AsyncSessionLocal is None:
+            logger.warning("startup: DATABASE_URL not set — skipping sync resume check")
+            return
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(BrandAPICredential).where(
+                    BrandAPICredential.integration_name == "leaflink",
+                    BrandAPICredential.is_active == True,
+                    BrandAPICredential.sync_status == "syncing",
+                )
+            )
+            interrupted = result.scalars().all()
+
+        resumable = [
+            c for c in interrupted
+            if (
+                c.last_synced_page is not None
+                and c.total_pages_available is not None
+                and c.last_synced_page < c.total_pages_available
+                and c.api_key
+                and c.company_id
+            )
+        ]
+
+        if not resumable:
+            logger.info("startup: no interrupted syncs to resume")
+            return
+
+        for cred in resumable:
+            resume_from = (cred.last_synced_page or 0) + 1
+            logger.info(
+                "startup: resuming_sync brand=%s from_page=%s total_pages=%s",
+                cred.brand_id,
+                resume_from,
+                cred.total_pages_available,
+            )
+            sync_manager.start_sync(
+                brand_id=cred.brand_id,
+                api_key=cred.api_key,
+                company_id=cred.company_id,
+                total_pages=cred.total_pages_available,
+                start_page=resume_from,
+            )
+
+    except Exception as exc:
+        logger.error("startup: resume_interrupted_syncs_failed error=%s", exc, exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Starting {APP_NAME} in {APP_ENV}")
     await _create_assistant_tables()
+    await _resume_interrupted_syncs()
     route_count = len(app.routes)
     logger.info("[Startup] routes_registered count=%s", route_count)
     yield
