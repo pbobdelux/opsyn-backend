@@ -1,8 +1,10 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import asyncio
 import logging
 import os
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Header, Request
@@ -30,6 +32,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s - %(message)s",
 )
+
+# Thread pool for running synchronous LeafLink HTTP calls off the event loop.
+# This prevents requests.get() pagination from blocking async request handling.
+_leaflink_executor = ThreadPoolExecutor(max_workers=4)
 
 APP_NAME = "Opsyn Backend"
 APP_ENV = os.getenv("ENVIRONMENT", "production")
@@ -287,13 +293,25 @@ async def sync_leaflink(
                 )
 
                 try:
+                    logger.info("[SyncEndpoint] sync_start brand=%s", brand_id)
+
                     # Step 2: Fetch orders from the LeafLink API (pure HTTP, no DB).
+                    # Run the synchronous requests.get() calls in a thread pool so
+                    # they do not block the event loop while paginating LeafLink.
                     logger.info("leaflink: sync_client_init brand_id=%s", brand_id)
                     client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=brand_id)
-                    logger.info("leaflink: sync_api_call_start brand_id=%s", brand_id)
-                    fetch_result = client.fetch_recent_orders(normalize=True, brand=brand_id)
+                    logger.info("[SyncEndpoint] leaflink_fetch_start")
+                    loop = asyncio.get_event_loop()
+                    fetch_result = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            _leaflink_executor,
+                            lambda: client.fetch_recent_orders(normalize=True, brand=brand_id),
+                        ),
+                        timeout=300,
+                    )
                     orders = fetch_result["orders"]
                     pages_fetched = fetch_result["pages_fetched"]
+                    logger.info("[SyncEndpoint] leaflink_fetch_done pages=%s", pages_fetched)
 
                     # Step 3: Upsert orders and line items inside the same transaction.
                     result = await sync_leaflink_orders(db, brand_id, orders, pages_fetched=pages_fetched)
@@ -321,6 +339,7 @@ async def sync_leaflink(
                         result.get("line_items_written", 0),
                         result.get("pages_fetched", 0),
                     )
+                    logger.info("[SyncEndpoint] sync_complete brand=%s", brand_id)
 
                     total_created += result.get("created", 0)
                     total_updated += result.get("updated", 0)
@@ -443,14 +462,25 @@ async def sync_leaflink_now(
                 company_id: str | None = cred.company_id
 
                 logger.info("leaflink: sync_now syncing brand_id=%s", brand_id)
+                logger.info("[SyncEndpoint] sync_start brand=%s", brand_id)
 
                 # Step 2: Fetch orders from the LeafLink API (pure HTTP, no DB).
+                # Run the synchronous requests.get() calls in a thread pool so
+                # they do not block the event loop while paginating LeafLink.
                 logger.info("leaflink: sync_client_init brand_id=%s", brand_id)
                 client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=brand_id)
-                logger.info("leaflink: sync_api_call_start brand_id=%s", brand_id)
-                fetch_result = client.fetch_recent_orders(normalize=True, brand=brand_id)
+                logger.info("[SyncEndpoint] leaflink_fetch_start")
+                loop = asyncio.get_event_loop()
+                fetch_result = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        _leaflink_executor,
+                        lambda: client.fetch_recent_orders(normalize=True, brand=brand_id),
+                    ),
+                    timeout=300,
+                )
                 orders = fetch_result["orders"]
                 pages_fetched = fetch_result["pages_fetched"]
+                logger.info("[SyncEndpoint] leaflink_fetch_done pages=%s", pages_fetched)
 
                 # Step 3: Upsert orders and line items inside the same transaction.
                 result = await sync_leaflink_orders(db, brand_id, orders, pages_fetched=pages_fetched)
@@ -468,6 +498,7 @@ async def sync_leaflink_now(
                     "marked_success" if result.get("ok") else "marked_invalid",
                     brand_id,
                 )
+                logger.info("[SyncEndpoint] sync_complete brand=%s", brand_id)
 
                 if result.get("ok"):
                     total_orders_fetched += result.get("orders_fetched", 0)
