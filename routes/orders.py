@@ -427,15 +427,19 @@ async def orders_sync(
 
                 # Upsert Phase 1 orders to DB
                 logger.info("[OrdersSync] phase=1 db_upsert_start count=%s", len(orders_from_leaflink))
+                logger.info("[OrdersSync] upsert_start transaction_active=%s", db.in_transaction())
 
                 async def _do_phase1_upsert():
-                    async with db.begin():
-                        return await sync_leaflink_orders(
-                            db,
-                            _resolved_brand_id,
-                            orders_from_leaflink,
-                            pages_fetched=pages_fetched_phase1,
-                        )
+                    # No db.begin() here — the session already has an active
+                    # transaction from the earlier credential-lookup queries.
+                    # Wrapping with db.begin() again raises:
+                    #   InvalidRequestError: A transaction is already begun on this Session.
+                    return await sync_leaflink_orders(
+                        db,
+                        _resolved_brand_id,
+                        orders_from_leaflink,
+                        pages_fetched=pages_fetched_phase1,
+                    )
 
                 try:
                     sync_result = await asyncio.wait_for(
