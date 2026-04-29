@@ -50,6 +50,10 @@ class BrandAPICredential(Base):
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Incremental / background-sync pagination state
+    last_synced_page: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    total_pages_estimate: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sync_in_progress: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
