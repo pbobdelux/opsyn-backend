@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal, get_db
 from models import BrandAPICredential, Order
+from services.background_sync_manager import sync_manager
 from services.watchdog_client import emit_watchdog_event
 from utils.json_utils import make_json_safe
 
@@ -487,7 +488,6 @@ async def orders_sync(
                         li_task_exc, _resolved_brand_id, exc_info=True,
                     )
 
-
                 phase1_orders_upserted = sync_result.get("orders_fetched", 0)
                 logger.info(
                     "[OrdersSync] phase=1_complete pages_fetched=%s orders_upserted=%s",
@@ -507,120 +507,60 @@ async def orders_sync(
                 sync_metadata["latest_order_date"] = newest.isoformat() if newest else None
 
                 # ---------------------------------------------------------- #
-                # Phase 2: Spawn background task for remaining pages          #
+                # Persist Phase 1 progress to BrandAPICredential             #
+                # ---------------------------------------------------------- #
+                _phase1_page = start_page + pages_fetched_phase1 - 1
+                try:
+                    async with AsyncSessionLocal() as _p1_sess:
+                        async with _p1_sess.begin():
+                            from sqlalchemy import select as _sel
+                            _p1_res = await _p1_sess.execute(
+                                _sel(BrandAPICredential).where(
+                                    BrandAPICredential.id == cred.id,
+                                )
+                            )
+                            _p1_cred = _p1_res.scalar_one_or_none()
+                            if _p1_cred:
+                                _p1_cred.last_synced_page = _phase1_page
+                                _p1_cred.total_pages_available = total_pages_available
+                                _p1_cred.sync_status = "syncing" if (next_leaflink_url and next_page_number) else "idle"
+                                _p1_cred.last_sync_at = datetime.now(timezone.utc)
+                                _p1_cred.last_error = None
+                    logger.info(
+                        "[OrdersSync] phase1_progress_persisted brand=%s page=%s total_pages=%s",
+                        _resolved_brand_id,
+                        _phase1_page,
+                        total_pages_available,
+                    )
+                except Exception as _p1_persist_exc:
+                    logger.error(
+                        "[OrdersSync] phase1_progress_persist_error brand=%s error=%s",
+                        _resolved_brand_id,
+                        _p1_persist_exc,
+                    )
+
+                # ---------------------------------------------------------- #
+                # Phase 2: Spawn persistent background sync for remaining     #
+                # pages via BackgroundSyncManager                             #
                 # ---------------------------------------------------------- #
                 pages_remaining = (total_pages_available - start_page - pages_fetched_phase1 + 1) if total_pages_available else None
 
-                if next_leaflink_url and next_page_number:
+                if next_leaflink_url and next_page_number and total_pages_available:
                     logger.info(
-                        "[OrdersSync] background_sync_started pages_remaining=%s next_page=%s",
-                        pages_remaining,
+                        "[OrdersSync] bg_continuous_sync_started brand=%s start_page=%s total_pages=%s",
+                        _resolved_brand_id,
                         next_page_number,
+                        total_pages_available,
                     )
 
-                    # Capture values for the background closure
-                    _bg_api_key = api_key
-                    _bg_company_id = company_id
-                    _bg_brand_id = _resolved_brand_id
-                    _bg_next_url = next_leaflink_url
-                    _bg_next_page = next_page_number
-
-                    async def _background_sync():
-                        """Fetch all remaining LeafLink pages and upsert to DB."""
-                        bg_start = time.monotonic()
-                        bg_next_url: Optional[str] = _bg_next_url
-                        bg_page = _bg_next_page
-                        bg_total_upserted = 0
-                        bg_pages_fetched = 0
-
-                        logger.info(
-                            "[OrdersSync] bg_sync_start brand=%s next_page=%s",
-                            _bg_brand_id,
-                            bg_page,
-                        )
-
-                        try:
-                            bg_client = LeafLinkClient(
-                                api_key=_bg_api_key,
-                                company_id=_bg_company_id,
-                                brand_id=_bg_brand_id,
-                            )
-
-                            while bg_next_url:
-                                elapsed = time.monotonic() - bg_start
-                                if elapsed > BACKGROUND_SYNC_TIMEOUT:
-                                    logger.warning(
-                                        "[OrdersSync] bg_sync_timeout brand=%s elapsed=%ss pages_fetched=%s",
-                                        _bg_brand_id,
-                                        round(elapsed, 1),
-                                        bg_pages_fetched,
-                                    )
-                                    break
-
-                                def _bg_fetch_one_batch():
-                                    return bg_client.fetch_orders_page_range(
-                                        start_page=bg_page,
-                                        num_pages=5,  # Fetch 5 pages per background iteration
-                                        page_size=LEAFLINK_PAGE_SIZE,
-                                        normalize=True,
-                                        brand=_bg_brand_id,
-                                        resume_url=bg_next_url,
-                                    )
-
-                                bg_loop = asyncio.get_event_loop()
-                                bg_fetch = await bg_loop.run_in_executor(
-                                    _leaflink_executor, _bg_fetch_one_batch
-                                )
-
-                                bg_orders = bg_fetch["orders"]
-                                bg_pages_this_batch = bg_fetch["pages_fetched"]
-                                bg_next_url = bg_fetch["next_url"]
-                                bg_page = bg_fetch["next_page"] or bg_page
-
-                                if bg_orders:
-                                    async with AsyncSessionLocal() as bg_db:
-                                        async with bg_db.begin():
-                                            await sync_leaflink_orders(
-                                                bg_db,
-                                                _bg_brand_id,
-                                                bg_orders,
-                                                pages_fetched=bg_pages_this_batch,
-                                            )
-
-                                bg_total_upserted += len(bg_orders)
-                                bg_pages_fetched += bg_pages_this_batch
-
-                                logger.info(
-                                    "[OrdersSync] bg_sync_progress brand=%s page=%s batch_orders=%s total_upserted=%s",
-                                    _bg_brand_id,
-                                    bg_page,
-                                    len(bg_orders),
-                                    bg_total_upserted,
-                                )
-
-                                if not bg_next_url:
-                                    break
-
-                            bg_duration = round(time.monotonic() - bg_start, 1)
-                            logger.info(
-                                "[OrdersSync] bg_sync_complete brand=%s total_upserted=%s pages_fetched=%s duration=%ss",
-                                _bg_brand_id,
-                                bg_total_upserted,
-                                bg_pages_fetched,
-                                bg_duration,
-                            )
-
-                        except Exception as bg_exc:
-                            logger.error(
-                                "[OrdersSync] bg_sync_error brand=%s error=%s",
-                                _bg_brand_id,
-                                bg_exc,
-                                exc_info=True,
-                            )
-
-                    # Fire and forget — do not await
                     try:
-                        asyncio.create_task(_background_sync())
+                        sync_manager.start_sync(
+                            brand_id=_resolved_brand_id,
+                            api_key=api_key,
+                            company_id=company_id,
+                            total_pages=total_pages_available,
+                            start_page=next_page_number,
+                        )
                         sync_metadata["background_sync_active"] = True
                     except Exception as bg_task_exc:
                         logger.error(
@@ -952,3 +892,134 @@ async def orders_sync(
                 "last_error": _p2_emsg,
                 "traceback": traceback.format_exc(),
             })
+
+
+@router.get("/sync/status")
+async def orders_sync_status(
+    brand: Optional[str] = Query(None, description="Brand slug to check (e.g., 'noble-nectar')"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return the current background sync progress for a brand.
+
+    Combines in-memory state from BackgroundSyncManager with persisted
+    progress from BrandAPICredential and a live order count from the DB.
+
+    Response fields:
+      ok                           — always true unless brand is missing
+      brand_id                     — echoed brand slug
+      background_sync_active       — true if a background task is running
+      pages_synced                 — last page number successfully synced
+      total_pages                  — total pages reported by LeafLink
+      percent_complete             — (pages_synced / total_pages) * 100
+      total_orders_in_db           — COUNT(*) of orders for this brand
+      last_synced_at               — ISO timestamp of last successful sync
+      sync_status                  — "idle" | "syncing" | "paused" | "error"
+      estimated_completion_minutes — rough estimate based on pages/minute
+      errors                       — list of recent error strings
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    if not brand:
+        return {
+            "ok": False,
+            "error": "brand query parameter is required",
+            "timestamp": timestamp,
+        }
+
+    logger.info("[OrdersSync] status_check brand=%s", brand)
+
+    # ------------------------------------------------------------------ #
+    # Load credential from DB                                             #
+    # ------------------------------------------------------------------ #
+    try:
+        cred_result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.brand_id == brand,
+                BrandAPICredential.integration_name == "leaflink",
+            )
+        )
+        cred = cred_result.scalar_one_or_none()
+    except Exception as cred_exc:
+        logger.error("[OrdersSync] status_check db_error brand=%s error=%s", brand, cred_exc)
+        return {
+            "ok": False,
+            "brand_id": brand,
+            "error": "Database error during credential lookup",
+            "timestamp": timestamp,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Count orders in DB for this brand                                   #
+    # ------------------------------------------------------------------ #
+    try:
+        count_result = await db.execute(
+            select(func.count(Order.id)).where(Order.brand_id == brand)
+        )
+        total_orders_in_db = count_result.scalar_one()
+    except Exception as count_exc:
+        logger.error("[OrdersSync] status_check count_error brand=%s error=%s", brand, count_exc)
+        total_orders_in_db = 0
+
+    # ------------------------------------------------------------------ #
+    # Merge in-memory manager state with DB state                         #
+    # ------------------------------------------------------------------ #
+    manager_status = sync_manager.get_status(brand)
+    bg_active = sync_manager.is_syncing(brand)
+
+    if cred is not None:
+        db_pages_synced = cred.last_synced_page or 0
+        db_total_pages = cred.total_pages_available or 0
+        db_sync_status = cred.sync_status or "idle"
+        db_last_synced_at = cred.last_sync_at.isoformat() if cred.last_sync_at else None
+        db_last_error = cred.last_error
+    else:
+        db_pages_synced = 0
+        db_total_pages = 0
+        db_sync_status = "idle"
+        db_last_synced_at = None
+        db_last_error = None
+
+    # In-memory state is more current than DB when a sync is active
+    pages_synced = manager_status["pages_synced"] if bg_active else db_pages_synced
+    total_pages = manager_status["total_pages"] if manager_status["total_pages"] else db_total_pages
+
+    percent_complete = round((pages_synced / total_pages) * 100, 1) if total_pages else 0.0
+
+    # Estimate completion: 4 pages per batch, ~10 seconds per batch → 0.4 pages/s
+    pages_remaining = max(total_pages - pages_synced, 0)
+    estimated_completion_minutes: Optional[float] = None
+    if bg_active and pages_remaining > 0:
+        pages_per_second = 0.4
+        estimated_completion_minutes = round(pages_remaining / pages_per_second / 60, 1)
+
+    errors = list(manager_status.get("errors", []))
+    if db_last_error and db_last_error not in errors:
+        errors = [db_last_error] + errors
+
+    # Reconcile sync_status: if manager says active but DB says idle, trust manager
+    effective_sync_status = "syncing" if bg_active else db_sync_status
+
+    logger.info(
+        "[OrdersSync] status_response brand=%s active=%s pages=%s/%s percent=%.1f%% orders_in_db=%s",
+        brand,
+        bg_active,
+        pages_synced,
+        total_pages,
+        percent_complete,
+        total_orders_in_db,
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "brand_id": brand,
+        "background_sync_active": bg_active,
+        "pages_synced": pages_synced,
+        "total_pages": total_pages,
+        "percent_complete": percent_complete,
+        "total_orders_in_db": total_orders_in_db,
+        "last_synced_at": db_last_synced_at,
+        "sync_status": effective_sync_status,
+        "estimated_completion_minutes": estimated_completion_minutes,
+        "errors": errors,
+    })
