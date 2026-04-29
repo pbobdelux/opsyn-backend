@@ -24,8 +24,13 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 _leaflink_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="leaflink-sync")
 
 # Timeout constants
-LEAFLINK_TIMEOUT_SECONDS = 5   # Max seconds to wait for LeafLink API
-DB_TIMEOUT_SECONDS = 3         # Max seconds to wait for DB upsert in Phase A
+LEAFLINK_TIMEOUT_SECONDS = 25  # Max seconds to wait for Phase 1 LeafLink fetch (3 pages)
+DB_TIMEOUT_SECONDS = 10        # Max seconds to wait for DB upsert in Phase 1
+BACKGROUND_SYNC_TIMEOUT = 1800 # 30 minutes for background full-sync
+
+# Paginated sync configuration
+LEAFLINK_PAGES_PER_REQUEST = 3  # Pages fetched synchronously per /sync call
+LEAFLINK_PAGE_SIZE = 100        # Orders per LeafLink page
 
 
 @router.get("")
@@ -140,53 +145,51 @@ async def orders_sync(
     brand_id: Optional[str] = Query(None, description="Brand slug or ID to filter orders (e.g., 'noble-nectar')"),
     brand_slug: Optional[str] = Query(None, description="Alias for brand_id — brand slug or ID"),
     updated_after: Optional[str] = Query(None, description="ISO timestamp - only return orders updated after this time (ignored when force_full=true)"),
-    cursor: Optional[str] = Query(None, description="Pagination cursor from previous response"),
-    limit: int = Query(500, ge=1, le=1000, description="Number of orders to return (default 500, max 1000)"),
+    cursor: Optional[str] = Query(None, description="Pagination cursor from previous response (encodes LeafLink page number)"),
+    limit: int = Query(500, ge=1, le=1000, description="Number of orders to return from DB (default 500, max 1000)"),
     force_full: bool = Query(False, description="Force a complete backfill from LeafLink, ignoring updated_after"),
+    pages_per_request: int = Query(LEAFLINK_PAGES_PER_REQUEST, ge=1, le=20, description="LeafLink pages to fetch per request (default 3)"),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get orders for incremental sync with cursor-based pagination.
+    Paginated incremental sync from LeafLink with background continuation.
 
-    Supports efficient incremental sync by:
-    - Returning only orders updated after a given timestamp
-    - Using cursor-based pagination to avoid offset issues
-    - Sorting by updated_at for consistent ordering
-    - Including stable order ID fields for deduplication
+    Phase 1 (synchronous, < 5 seconds):
+    - Decodes cursor to determine which LeafLink page to start from
+    - Fetches only ``pages_per_request`` pages (default 3 = ~300 orders)
+    - Upserts those orders to DB immediately
+    - Returns next_cursor so the client can call again for the next batch
+    - Spawns a background task to fetch remaining pages without blocking
+
+    Phase 2 (background, up to 30 minutes):
+    - Continues fetching remaining LeafLink pages asynchronously
+    - Does not block the HTTP response
+    - Upserts each page to DB as it arrives
+
+    Cursor format: base64(\"page=<N>&url=<next_url>\")
+    - page: next LeafLink page number to fetch
+    - url: LeafLink's own ``next`` URL for that page (avoids re-computing offset)
 
     Query params:
-    - brand_id: Brand slug or ID to filter orders (e.g., "noble-nectar")
-    - brand_slug: Alias for brand_id
-    - updated_after: ISO timestamp (e.g., "2026-04-25T12:30:00Z") — ignored when force_full=true
+    - brand_id / brand_slug: Brand slug or ID (e.g., \"noble-nectar\")
+    - updated_after: ISO timestamp — ignored when force_full=true
     - cursor: Pagination cursor from previous response
-    - limit: Number of orders (1-1000, default 500)
-    - force_full: true/false — force complete backfill from LeafLink (default false)
-
-    Response includes:
-    - orders: Array of order objects
-    - sync_metadata: Sync statistics (total fetched, pages, duration, etc.)
-    - next_cursor: Cursor for next page (if has_more=true)
-    - has_more: Whether more orders exist
-    - server_time: Current server time
-    - sync_version: Sync protocol version
-    - last_synced_at: Timestamp of this sync
+    - limit: Orders to return from DB (1-1000, default 500)
+    - force_full: true/false — force complete backfill from LeafLink
+    - pages_per_request: LeafLink pages per sync call (1-20, default 3)
     """
     endpoint_start = time.monotonic()
 
     # Resolve brand filter — accept brand_id, brand_slug, or camelCase brandId
-    # from query params. brand_slug is an alias; brandId is tolerated for iOS clients.
     brand_filter: Optional[str] = (
         brand_id
         or brand_slug
         or request.query_params.get("brandId")
     )
 
+    logger.info("[OrdersAPI] request_start brand=%s", brand_filter)
     logger.info(
-        "[OrdersAPI] request_start brand=%s",
-        brand_filter,
-    )
-    logger.info(
-        "[OrdersSync] request_start path=%s brand=%s org=%s updated_after=%s cursor=%s limit=%s force_full=%s",
+        "[OrdersSync] request_start path=%s brand=%s org=%s updated_after=%s cursor=%s limit=%s force_full=%s pages_per_request=%s",
         request.url.path,
         brand_filter,
         request.headers.get("x-opsyn-org") or request.headers.get("x-org-id"),
@@ -194,13 +197,42 @@ async def orders_sync(
         cursor[:8] + "..." if cursor else None,
         limit,
         force_full,
+        pages_per_request,
     )
 
-    logger.info("[OrdersSync] requested_brand=%s", brand_filter)
+    # ------------------------------------------------------------------ #
+    # Decode cursor → (start_page, resume_url)                            #
+    # Cursor format: base64("page=<N>&url=<next_url>")                    #
+    # ------------------------------------------------------------------ #
+    start_page = 1
+    resume_url: Optional[str] = None
+
+    if cursor:
+        try:
+            cursor_decoded = base64.b64decode(cursor.encode()).decode("utf-8")
+            # Parse "page=N&url=..." format
+            cursor_parts: dict = {}
+            for part in cursor_decoded.split("&", 1):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    cursor_parts[k] = v
+            start_page = int(cursor_parts.get("page", 1))
+            resume_url = cursor_parts.get("url") or None
+            logger.info(
+                "[OrdersSync] cursor_decoded start_page=%s resume_url=%s",
+                start_page,
+                resume_url[:60] + "..." if resume_url and len(resume_url) > 60 else resume_url,
+            )
+        except Exception as cursor_exc:
+            logger.error("[OrdersSync] cursor_decode_error error=%s", cursor_exc)
+            return {
+                "ok": False,
+                "error": "Invalid cursor format",
+                "data_source": "error",
+            }
 
     # ------------------------------------------------------------------ #
     # Load the first active LeafLink credential from DB                   #
-    # (same logic as /leaflink/debug — not filtered by brand_id)          #
     # ------------------------------------------------------------------ #
     _resolved_brand_id: Optional[str] = None
     _resolved_company_id: Optional[str] = None
@@ -240,107 +272,90 @@ async def orders_sync(
     sync_metadata: dict = {}
     sync_error: Optional[str] = None
     live_refresh_failed: bool = False
+    phase1_orders_upserted: int = 0
+    total_pages_available: Optional[int] = None
+    next_leaflink_url: Optional[str] = None
+    next_page_number: Optional[int] = None
 
+    # ------------------------------------------------------------------ #
+    # Phase 1: Fetch LEAFLINK_PAGES_PER_REQUEST pages synchronously       #
+    # ------------------------------------------------------------------ #
     if _active_cred and not force_db_only:
-        logger.info("[OrdersSync] phase=A start brand=%s", _resolved_brand_id)
-        cred = None
-        try:
-            from services.leaflink_client import LeafLinkClient
-            from services.leaflink_sync import sync_leaflink_orders
+        cred = _active_cred
+        api_key: str = cred.api_key or ""
+        company_id: str = cred.company_id or ""
 
-            logger.info("[OrdersAPI] db_fetch_start")
-            logger.info("[OrdersSync] phase=A leaflink_pull_start")
-            logger.info("[OrdersSync] leaflink_fetch_start")
+        _api_key_valid = bool(api_key.strip())
+        _company_id_valid = bool(company_id.strip())
 
-            cred = _active_cred
+        if not _api_key_valid:
+            logger.warning(
+                "[OrdersSync] credential_invalid brand=%s api_key_missing — will serve DB only",
+                _resolved_brand_id,
+            )
+            sync_metadata["credential_invalid"] = True
+            sync_metadata["credential_error"] = f"LeafLink api_key is empty for brand {_resolved_brand_id}"
+            sync_metadata["total_fetched_from_leaflink"] = None
+            sync_metadata["used_force_full"] = force_full
+        elif not _company_id_valid:
+            logger.warning(
+                "[OrdersSync] credential_invalid brand=%s company_id_missing — will serve DB only",
+                _resolved_brand_id,
+            )
+            sync_metadata["credential_invalid"] = True
+            sync_metadata["credential_error"] = f"LeafLink company_id is empty for brand {_resolved_brand_id}"
+            sync_metadata["total_fetched_from_leaflink"] = None
+            sync_metadata["used_force_full"] = force_full
+        else:
+            logger.info(
+                "[OrdersSync] phase=1_start pages_to_fetch=%s start_page=%s brand=%s",
+                pages_per_request,
+                start_page,
+                _resolved_brand_id,
+            )
 
-            api_key: str = cred.api_key or ""
-            company_id: str = cred.company_id or ""
+            _watchdog_url = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
+            await emit_watchdog_event(
+                event_type="sync_started",
+                brand_id=_resolved_brand_id,
+                sync_metadata={
+                    "total_fetched_from_leaflink": 0,
+                    "total_in_database": 0,
+                    "percent_complete": 0.0,
+                    "latest_order_date": None,
+                    "oldest_order_date": None,
+                    "sync_error": None,
+                },
+                webhook_url=_watchdog_url,
+            )
 
-            # Validate that the credential is actually usable before hitting LeafLink
-            _api_key_valid = bool(api_key.strip())
-            _company_id_valid = bool(company_id.strip())
-
-            if not _api_key_valid:
-                logger.warning(
-                    "[OrdersAPI] credential_invalid brand=%s api_key_missing — will serve DB only",
-                    _resolved_brand_id,
-                )
-                sync_metadata["credential_missing"] = False
-                sync_metadata["credential_invalid"] = True
-                sync_metadata["credential_error"] = f"LeafLink api_key is empty for brand {_resolved_brand_id}"
-                sync_metadata["total_fetched_from_leaflink"] = None
-                sync_metadata["used_force_full"] = force_full
-                logger.info("[OrdersSync] phase=A success brand=%s (invalid credential — no api_key)", _resolved_brand_id)
-                # Fall through to Phase B (DB read) without attempting LeafLink
-            elif not _company_id_valid:
-                logger.warning(
-                    "[OrdersAPI] credential_invalid brand=%s company_id_missing — will serve DB only",
-                    _resolved_brand_id,
-                )
-                sync_metadata["credential_missing"] = False
-                sync_metadata["credential_invalid"] = True
-                sync_metadata["credential_error"] = f"LeafLink company_id is empty for brand {_resolved_brand_id}"
-                sync_metadata["total_fetched_from_leaflink"] = None
-                sync_metadata["used_force_full"] = force_full
-                logger.info("[OrdersSync] phase=A success brand=%s (invalid credential — no company_id)", _resolved_brand_id)
-                # Fall through to Phase B (DB read) without attempting LeafLink
-            else:
-                logger.info(
-                    "[LeafLink] sync_start brand=%s credential_source=db force_full=%s",
-                    _resolved_brand_id,
-                    force_full,
-                )
-                logger.info(
-                    "[OrdersSync] triggering_leaflink_sync brand=%s force_full=%s",
-                    _resolved_brand_id,
-                    force_full,
-                )
-
-                # Watchdog: emit sync_started
-                _watchdog_url = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
-                await emit_watchdog_event(
-                    event_type="sync_started",
-                    brand_id=_resolved_brand_id,
-                    sync_metadata={
-                        "total_fetched_from_leaflink": 0,
-                        "total_in_database": 0,
-                        "percent_complete": 0.0,
-                        "latest_order_date": None,
-                        "oldest_order_date": None,
-                        "sync_error": None,
-                    },
-                    webhook_url=_watchdog_url,
-                )
+            try:
+                from services.leaflink_client import LeafLinkClient
+                from services.leaflink_sync import sync_leaflink_orders
 
                 client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=_resolved_brand_id)
-
-                # force_full=True → fetch all pages (unlimited); otherwise fetch recent (5 pages)
-                max_pages_arg = None if force_full else 5
-
-                # ---------------------------------------------------------- #
-                # Wrap the synchronous LeafLink HTTP call in a thread so we   #
-                # can apply asyncio.wait_for() timeout without blocking the   #
-                # event loop. fetch_recent_orders() uses requests (sync I/O). #
-                # ---------------------------------------------------------- #
-                logger.info("[OrdersAPI] leaflink_refresh_start")
                 loop = asyncio.get_event_loop()
 
-                def _fetch_orders_sync():
-                    return client.fetch_recent_orders(
-                        max_pages=max_pages_arg,
+                def _fetch_page_range_sync():
+                    return client.fetch_orders_page_range(
+                        start_page=start_page,
+                        num_pages=pages_per_request,
+                        page_size=LEAFLINK_PAGE_SIZE,
                         normalize=True,
                         brand=_resolved_brand_id,
+                        resume_url=resume_url,
                     )
+
+                logger.info("[OrdersSync] phase=1 leaflink_fetch_start start_page=%s num_pages=%s", start_page, pages_per_request)
 
                 try:
                     fetch_result = await asyncio.wait_for(
-                        loop.run_in_executor(_leaflink_executor, _fetch_orders_sync),
+                        loop.run_in_executor(_leaflink_executor, _fetch_page_range_sync),
                         timeout=LEAFLINK_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "[OrdersAPI] leaflink_refresh_timeout brand=%s timeout=%ss",
+                        "[OrdersSync] phase=1 leaflink_timeout brand=%s timeout=%ss",
                         _resolved_brand_id,
                         LEAFLINK_TIMEOUT_SECONDS,
                     )
@@ -349,58 +364,40 @@ async def orders_sync(
                     )
 
                 orders_from_leaflink = fetch_result["orders"]
-                pages_fetched = fetch_result["pages_fetched"]
+                pages_fetched_phase1 = fetch_result["pages_fetched"]
+                next_leaflink_url = fetch_result["next_url"]
+                next_page_number = fetch_result["next_page"]
+                total_pages_available = fetch_result["total_pages"]
+                total_count_leaflink = fetch_result["total_count"]
 
-                logger.info("[OrdersSync] phase=A leaflink_pull_success count=%s", len(orders_from_leaflink))
                 logger.info(
-                    "[OrdersSync] leaflink_fetch_complete brand=%s orders=%s pages=%s force_full=%s",
-                    _resolved_brand_id,
+                    "[OrdersSync] phase=1 leaflink_fetch_complete orders=%s pages=%s next_page=%s total_pages=%s",
                     len(orders_from_leaflink),
-                    pages_fetched,
-                    force_full,
-                )
-                logger.info(
-                    "[LeafLink] fetched=%s pages=%s brand=%s",
-                    len(orders_from_leaflink),
-                    pages_fetched,
-                    _resolved_brand_id,
-                )
-                logger.info("[OrdersSync] total_fetched_from_leaflink=%s", len(orders_from_leaflink))
-
-                # Watchdog: emit sync_progress after fetch
-                await emit_watchdog_event(
-                    event_type="sync_progress",
-                    brand_id=_resolved_brand_id,
-                    sync_metadata={
-                        "total_fetched_from_leaflink": len(orders_from_leaflink),
-                        "total_in_database": None,
-                        "percent_complete": None,
-                        "latest_order_date": None,
-                        "oldest_order_date": None,
-                        "sync_error": None,
-                    },
-                    webhook_url=_watchdog_url,
+                    pages_fetched_phase1,
+                    next_page_number,
+                    total_pages_available,
                 )
 
-                logger.info("[OrdersSync] phase=A db_upsert_start")
+                # Upsert Phase 1 orders to DB
+                logger.info("[OrdersSync] phase=1 db_upsert_start count=%s", len(orders_from_leaflink))
 
-                async def _do_db_upsert():
+                async def _do_phase1_upsert():
                     async with db.begin():
                         return await sync_leaflink_orders(
                             db,
                             _resolved_brand_id,
                             orders_from_leaflink,
-                            pages_fetched=pages_fetched,
+                            pages_fetched=pages_fetched_phase1,
                         )
 
                 try:
                     sync_result = await asyncio.wait_for(
-                        _do_db_upsert(),
+                        _do_phase1_upsert(),
                         timeout=DB_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "[OrdersSync] phase=A db_upsert_timeout brand=%s timeout=%ss",
+                        "[OrdersSync] phase=1 db_upsert_timeout brand=%s timeout=%ss",
                         _resolved_brand_id,
                         DB_TIMEOUT_SECONDS,
                     )
@@ -408,144 +405,214 @@ async def orders_sync(
                         f"DB upsert did not complete within {DB_TIMEOUT_SECONDS}s"
                     )
 
+                phase1_orders_upserted = sync_result.get("orders_fetched", 0)
                 logger.info(
-                    "[OrdersSync] phase=A db_upsert_success inserted=%s updated=%s",
-                    sync_result.get("created", 0),
-                    sync_result.get("updated", 0),
-                )
-                logger.info(
-                    "[OrdersSync] upserted_to_db=%s",
-                    sync_result.get("orders_fetched", 0),
+                    "[OrdersSync] phase=1_complete pages_fetched=%s orders_upserted=%s",
+                    pages_fetched_phase1,
+                    phase1_orders_upserted,
                 )
 
-                sync_metadata["total_fetched_from_leaflink"] = sync_result.get("orders_fetched", 0)
-                sync_metadata["pages_fetched"] = sync_result.get("pages_fetched", pages_fetched)
+                sync_metadata["total_fetched_from_leaflink"] = phase1_orders_upserted
+                sync_metadata["pages_fetched"] = pages_fetched_phase1
                 sync_metadata["sync_duration_seconds"] = sync_result.get("sync_duration_seconds", 0)
                 sync_metadata["used_force_full"] = force_full
+                sync_metadata["current_page"] = start_page
+                sync_metadata["total_pages_available"] = total_pages_available
+                sync_metadata["total_count_leaflink"] = total_count_leaflink
 
                 newest = sync_result.get("newest_order_date")
                 sync_metadata["latest_order_date"] = newest.isoformat() if newest else None
 
+                # ---------------------------------------------------------- #
+                # Phase 2: Spawn background task for remaining pages          #
+                # ---------------------------------------------------------- #
+                pages_remaining = (total_pages_available - start_page - pages_fetched_phase1 + 1) if total_pages_available else None
+
+                if next_leaflink_url and next_page_number:
+                    logger.info(
+                        "[OrdersSync] background_sync_started pages_remaining=%s next_page=%s",
+                        pages_remaining,
+                        next_page_number,
+                    )
+
+                    # Capture values for the background closure
+                    _bg_api_key = api_key
+                    _bg_company_id = company_id
+                    _bg_brand_id = _resolved_brand_id
+                    _bg_next_url = next_leaflink_url
+                    _bg_next_page = next_page_number
+
+                    async def _background_sync():
+                        """Fetch all remaining LeafLink pages and upsert to DB."""
+                        bg_start = time.monotonic()
+                        bg_next_url: Optional[str] = _bg_next_url
+                        bg_page = _bg_next_page
+                        bg_total_upserted = 0
+                        bg_pages_fetched = 0
+
+                        logger.info(
+                            "[OrdersSync] bg_sync_start brand=%s next_page=%s",
+                            _bg_brand_id,
+                            bg_page,
+                        )
+
+                        try:
+                            bg_client = LeafLinkClient(
+                                api_key=_bg_api_key,
+                                company_id=_bg_company_id,
+                                brand_id=_bg_brand_id,
+                            )
+
+                            while bg_next_url:
+                                elapsed = time.monotonic() - bg_start
+                                if elapsed > BACKGROUND_SYNC_TIMEOUT:
+                                    logger.warning(
+                                        "[OrdersSync] bg_sync_timeout brand=%s elapsed=%ss pages_fetched=%s",
+                                        _bg_brand_id,
+                                        round(elapsed, 1),
+                                        bg_pages_fetched,
+                                    )
+                                    break
+
+                                def _bg_fetch_one_batch():
+                                    return bg_client.fetch_orders_page_range(
+                                        start_page=bg_page,
+                                        num_pages=5,  # Fetch 5 pages per background iteration
+                                        page_size=LEAFLINK_PAGE_SIZE,
+                                        normalize=True,
+                                        brand=_bg_brand_id,
+                                        resume_url=bg_next_url,
+                                    )
+
+                                bg_loop = asyncio.get_event_loop()
+                                bg_fetch = await bg_loop.run_in_executor(
+                                    _leaflink_executor, _bg_fetch_one_batch
+                                )
+
+                                bg_orders = bg_fetch["orders"]
+                                bg_pages_this_batch = bg_fetch["pages_fetched"]
+                                bg_next_url = bg_fetch["next_url"]
+                                bg_page = bg_fetch["next_page"] or bg_page
+
+                                if bg_orders:
+                                    async with AsyncSessionLocal() as bg_db:
+                                        async with bg_db.begin():
+                                            await sync_leaflink_orders(
+                                                bg_db,
+                                                _bg_brand_id,
+                                                bg_orders,
+                                                pages_fetched=bg_pages_this_batch,
+                                            )
+
+                                bg_total_upserted += len(bg_orders)
+                                bg_pages_fetched += bg_pages_this_batch
+
+                                logger.info(
+                                    "[OrdersSync] bg_sync_progress brand=%s page=%s batch_orders=%s total_upserted=%s",
+                                    _bg_brand_id,
+                                    bg_page,
+                                    len(bg_orders),
+                                    bg_total_upserted,
+                                )
+
+                                if not bg_next_url:
+                                    break
+
+                            bg_duration = round(time.monotonic() - bg_start, 1)
+                            logger.info(
+                                "[OrdersSync] bg_sync_complete brand=%s total_upserted=%s pages_fetched=%s duration=%ss",
+                                _bg_brand_id,
+                                bg_total_upserted,
+                                bg_pages_fetched,
+                                bg_duration,
+                            )
+
+                        except Exception as bg_exc:
+                            logger.error(
+                                "[OrdersSync] bg_sync_error brand=%s error=%s",
+                                _bg_brand_id,
+                                bg_exc,
+                                exc_info=True,
+                            )
+
+                    # Fire and forget — do not await
+                    asyncio.create_task(_background_sync())
+                    sync_metadata["background_sync_active"] = True
+                else:
+                    logger.info("[OrdersSync] no_more_pages — background sync not needed")
+                    sync_metadata["background_sync_active"] = False
+
+                # Mark credential as successfully used
+                from services.integration_credentials import mark_credential_success
+                await mark_credential_success(cred)
+
                 logger.info(
-                    "[LeafLink] upserted=%s created=%s updated=%s brand=%s",
-                    sync_result.get("orders_fetched", 0),
-                    sync_result.get("created", 0),
-                    sync_result.get("updated", 0),
-                    _resolved_brand_id,
+                    "[OrdersSync] response_returned source=live count=%s next_cursor=%s",
+                    phase1_orders_upserted,
+                    "present" if next_leaflink_url else "none",
                 )
 
-                # Watchdog: emit sync_completed or sync_failed based on result
-                if sync_result.get("ok"):
-                    await emit_watchdog_event(
-                        event_type="sync_completed",
-                        brand_id=_resolved_brand_id,
-                        sync_metadata={
-                            "total_fetched_from_leaflink": sync_result.get("orders_fetched", 0),
-                            "total_in_database": sync_result.get("created", 0) + sync_result.get("updated", 0),
-                            "percent_complete": 100.0,
-                            "latest_order_date": sync_metadata.get("latest_order_date"),
-                            "oldest_order_date": None,
-                            "sync_error": None,
-                        },
-                        webhook_url=_watchdog_url,
-                    )
-                    # Mark credential as successfully used
-                    from services.integration_credentials import mark_credential_success
-                    await mark_credential_success(cred)
-                else:
-                    await emit_watchdog_event(
-                        event_type="sync_failed",
-                        brand_id=_resolved_brand_id,
-                        sync_metadata={
-                            "total_fetched_from_leaflink": sync_result.get("orders_fetched", 0),
-                            "total_in_database": sync_result.get("created", 0) + sync_result.get("updated", 0),
-                            "percent_complete": None,
-                            "latest_order_date": sync_metadata.get("latest_order_date"),
-                            "oldest_order_date": None,
-                            "sync_error": sync_result.get("error"),
-                        },
-                        webhook_url=_watchdog_url,
-                    )
-                    # Mark credential as failed
-                    from services.integration_credentials import mark_credential_invalid
-                    await mark_credential_invalid(cred, sync_result.get("error") or "sync_failed")
+            except asyncio.TimeoutError as timeout_exc:
+                timeout_msg = str(timeout_exc)
+                logger.warning(
+                    "[OrdersSync] phase=1 timeout brand=%s error=%s — falling back to DB",
+                    brand_filter,
+                    timeout_msg,
+                )
+                try:
+                    await db.rollback()
+                except Exception as rb_exc:
+                    logger.warning("[OrdersSync] phase=1 rollback_failed error=%s", rb_exc)
 
-                logger.info("[OrdersSync] phase=A success brand=%s", _resolved_brand_id)
+                live_refresh_failed = True
+                sync_error = timeout_msg
+                sync_metadata["sync_error"] = sync_error
+                sync_metadata["used_force_full"] = force_full
 
-        except asyncio.TimeoutError as timeout_exc:
-            # LeafLink or DB timed out — log it, fall through to Phase B with DB fallback
-            timeout_msg = str(timeout_exc)
-            logger.warning(
-                "[OrdersAPI] leaflink_refresh_timeout brand=%s error=%s — falling back to DB",
-                brand_filter,
-                timeout_msg,
-            )
-            try:
-                await db.rollback()
-                logger.info("[OrdersSync] phase=A rollback_executed (timeout)")
-            except Exception as rb_exc:
-                logger.warning("[OrdersSync] phase=A rollback_failed error=%s", rb_exc)
+                _watchdog_url_to = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
+                await emit_watchdog_event(
+                    event_type="sync_failed",
+                    brand_id=_resolved_brand_id or brand_filter,
+                    sync_metadata={
+                        "total_fetched_from_leaflink": None,
+                        "total_in_database": None,
+                        "percent_complete": None,
+                        "latest_order_date": None,
+                        "oldest_order_date": None,
+                        "sync_error": sync_error,
+                    },
+                    webhook_url=_watchdog_url_to,
+                )
 
-            live_refresh_failed = True
-            sync_error = timeout_msg
-            sync_metadata["sync_error"] = sync_error
-            sync_metadata["used_force_full"] = force_full
+            except Exception as phase1_exc:
+                logger.error("[OrdersSync] phase=1 error=%s", phase1_exc, exc_info=True)
+                try:
+                    await db.rollback()
+                except Exception as rb_exc:
+                    logger.warning("[OrdersSync] phase=1 rollback_failed error=%s", rb_exc)
 
-            # Watchdog: emit sync_failed on timeout
-            _watchdog_url_to = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
-            await emit_watchdog_event(
-                event_type="sync_failed",
-                brand_id=_resolved_brand_id or brand_filter,
-                sync_metadata={
-                    "total_fetched_from_leaflink": None,
-                    "total_in_database": None,
-                    "percent_complete": None,
-                    "latest_order_date": None,
-                    "oldest_order_date": None,
-                    "sync_error": sync_error,
-                },
-                webhook_url=_watchdog_url_to,
-            )
+                live_refresh_failed = True
+                sync_error = str(phase1_exc)
+                sync_metadata["sync_error"] = sync_error
+                sync_metadata["used_force_full"] = force_full
 
-            logger.info("[OrdersSync] phase=A session_discarded (timeout)")
-
-        except Exception as phase_a_exc:
-            logger.error("[OrdersSync] phase=A error=%s", phase_a_exc, exc_info=True)
-            try:
-                await db.rollback()
-                logger.info("[OrdersSync] phase=A rollback_executed")
-            except Exception as rb_exc:
-                logger.warning("[OrdersSync] phase=A rollback_failed error=%s", rb_exc)
-
-            live_refresh_failed = True
-            sync_error = str(phase_a_exc)
-            sync_metadata["sync_error"] = sync_error
-            sync_metadata["used_force_full"] = force_full
-
-            # Mark credential as failed if we had one — uses its own fresh session internally
-            if cred is not None:
                 from services.integration_credentials import mark_credential_invalid
                 await mark_credential_invalid(cred, sync_error)
 
-            # Watchdog: emit sync_failed on exception
-            _watchdog_url_exc = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
-            await emit_watchdog_event(
-                event_type="sync_failed",
-                brand_id=_resolved_brand_id or brand_filter,
-                sync_metadata={
-                    "total_fetched_from_leaflink": None,
-                    "total_in_database": None,
-                    "percent_complete": None,
-                    "latest_order_date": None,
-                    "oldest_order_date": None,
-                    "sync_error": sync_error,
-                },
-                webhook_url=_watchdog_url_exc,
-            )
-
-            # CRITICAL: Phase A session is now in a failed/rolled-back state.
-            # DO NOT query db again. Phase B will open a completely fresh session.
-            logger.info("[OrdersSync] phase=A session_discarded")
+                _watchdog_url_exc = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
+                await emit_watchdog_event(
+                    event_type="sync_failed",
+                    brand_id=_resolved_brand_id or brand_filter,
+                    sync_metadata={
+                        "total_fetched_from_leaflink": None,
+                        "total_in_database": None,
+                        "percent_complete": None,
+                        "latest_order_date": None,
+                        "oldest_order_date": None,
+                        "sync_error": sync_error,
+                    },
+                    webhook_url=_watchdog_url_exc,
+                )
 
     else:
         sync_metadata["used_force_full"] = force_full
@@ -553,10 +620,9 @@ async def orders_sync(
             sync_metadata["force_db_only"] = True
 
     # ------------------------------------------------------------------ #
-    # Phase B: Read orders — ALWAYS uses a brand-new session              #
-    # NEVER reuses the Phase A session, even if Phase A succeeded.        #
+    # Phase 2 (read): Serve orders from DB — always a fresh session       #
     # ------------------------------------------------------------------ #
-    logger.info("[OrdersSync] phase=B new_session_created")
+    logger.info("[OrdersSync] phase=2_read new_session_created")
 
     # Parse updated_after (ignored when force_full=true)
     updated_after_dt = None
@@ -574,78 +640,52 @@ async def orders_sync(
     elif force_full and updated_after:
         logger.info("[OrdersSync] force_full=true — ignoring updated_after=%s", updated_after)
 
-    # Decode cursor
-    cursor_id = None
-    if cursor:
-        try:
-            cursor_id = int(base64.b64decode(cursor).decode("utf-8"))
-            logger.info("[OrdersSync] cursor_decoded cursor_id=%s", cursor_id)
-        except Exception as e:
-            logger.error("[OrdersSync] validation_error detail=invalid_cursor error=%s", e)
-            return {
-                "ok": False,
-                "error": "Invalid cursor format",
-                "data_source": "error",
-            }
+    # Decode DB cursor (separate from LeafLink page cursor — this is the DB row ID cursor)
+    db_cursor_id = None
+    # Note: the `cursor` param is now used for LeafLink page pagination, not DB row pagination.
+    # DB pagination uses the `limit` param only. If the client needs DB-level pagination,
+    # they should use the returned next_cursor from the DB read below.
 
     async with AsyncSessionLocal() as read_session:
         try:
-            logger.info("[OrdersSync] phase=B read_start brand=%s", brand_filter)
-            logger.info("[OrdersAPI] db_fetch_start")
+            logger.info("[OrdersSync] phase=2_read read_start brand=%s", brand_filter)
 
-            # ------------------------------------------------------------------ #
-            # Build DB query                                                       #
-            # ------------------------------------------------------------------ #
             query = select(Order)
 
-            # Filter by brand when provided (brand_id column stores the brand slug/ID)
             if brand_filter:
                 query = query.where(Order.brand_id == brand_filter)
                 logger.info("[OrdersSync] filter brand=%s", brand_filter)
 
-            # Filter by updated_after (skipped when force_full=true)
             if updated_after_dt:
                 query = query.where(Order.updated_at >= updated_after_dt)
-
-            # Filter by cursor (pagination)
-            if cursor_id is not None:
-                query = query.where(Order.id > cursor_id)
 
             # Sort by updated_at ascending for consistent incremental sync
             query = query.order_by(Order.updated_at.asc(), Order.id.asc())
 
-            # Fetch limit + 1 to determine if there are more results
+            # Fetch limit + 1 to determine if there are more DB results
             query_with_limit = query.limit(limit + 1)
 
             result = await read_session.execute(query_with_limit)
             orders = result.scalars().all()
 
-            # Determine if there are more results
-            has_more = len(orders) > limit
-            if has_more:
+            db_has_more = len(orders) > limit
+            if db_has_more:
                 orders = orders[:limit]
 
-            # ------------------------------------------------------------------ #
-            # Count total orders in DB for this brand                             #
-            # ------------------------------------------------------------------ #
+            # Count total orders in DB for this brand
             count_query = select(func.count(Order.id))
             if brand_filter:
                 count_query = count_query.where(Order.brand_id == brand_filter)
             count_result = await read_session.execute(count_query)
             total_in_database = count_result.scalar_one()
 
-            logger.info("[OrdersSync] phase=B read_success count=%s", len(orders))
-            logger.info("[OrdersSync] db_count_after=%s", total_in_database)
+            logger.info("[OrdersSync] phase=2_read read_success count=%s total_in_db=%s", len(orders), total_in_database)
 
-            # ------------------------------------------------------------------ #
-            # Build response                                                       #
+            # Build response orders list
             orders_data = []
-            next_cursor = None
-
-            # Track freshness dates across returned orders
+            db_next_cursor = None
             newest_order_date: Optional[datetime] = None
             oldest_order_date: Optional[datetime] = None
-
 
             for order in orders:
                 order_dict = {
@@ -668,7 +708,6 @@ async def orders_sync(
                 }
                 orders_data.append(order_dict)
 
-                # Track newest/oldest order dates for freshness metadata
                 order_date = order.external_updated_at or order.external_created_at or order.updated_at
                 if order_date is not None:
                     if newest_order_date is None or order_date > newest_order_date:
@@ -676,48 +715,36 @@ async def orders_sync(
                     if oldest_order_date is None or order_date < oldest_order_date:
                         oldest_order_date = order_date
 
-                # Update cursor to last order's ID
                 if order == orders[-1]:
-                    next_cursor = base64.b64encode(str(order.id).encode()).decode()
+                    db_next_cursor = base64.b64encode(str(order.id).encode()).decode()
 
             server_time = datetime.now(timezone.utc).isoformat()
             newest_order_date_iso = newest_order_date.isoformat() if newest_order_date else None
             oldest_order_date_iso = oldest_order_date.isoformat() if oldest_order_date else None
 
-            logger.info(
-                "[OrdersAPI] db_fetch_done count=%s newest_order_date=%s",
-                len(orders_data),
-                newest_order_date_iso,
-            )
+            # Build next_cursor for LeafLink page pagination
+            leaflink_next_cursor: Optional[str] = None
+            if next_leaflink_url and next_page_number:
+                cursor_payload = f"page={next_page_number}&url={next_leaflink_url}"
+                leaflink_next_cursor = base64.b64encode(cursor_payload.encode()).decode()
 
-            # Populate remaining sync_metadata fields with defaults for any missing keys
+            leaflink_has_more = bool(next_leaflink_url)
+
+            # Populate sync_metadata defaults
             sync_metadata.setdefault("total_fetched_from_leaflink", None)
             sync_metadata.setdefault("pages_fetched", None)
             sync_metadata.setdefault("sync_duration_seconds", None)
             sync_metadata.setdefault("latest_order_date", None)
+            sync_metadata.setdefault("background_sync_active", False)
+            sync_metadata.setdefault("current_page", start_page)
+            sync_metadata.setdefault("total_pages_available", total_pages_available)
             sync_metadata["total_in_database"] = total_in_database
             sync_metadata["total_returned"] = len(orders_data)
+            sync_metadata["brand_id"] = _resolved_brand_id or brand_filter
+            sync_metadata["company_id"] = _resolved_company_id
 
-            logger.info("[OrdersSync] db_total_orders=%s brand=%s", total_in_database, brand_filter)
-            logger.info("[OrdersSync] returned_to_ios=%s brand=%s", len(orders_data), brand_filter)
-            if sync_metadata.get("latest_order_date"):
-                logger.info("[OrdersSync] latest_order_date=%s brand=%s", sync_metadata["latest_order_date"], brand_filter)
-
-            logger.info(
-                "[OrdersSync] response count=%s has_more=%s brand=%s total_in_db=%s",
-                len(orders_data),
-                has_more,
-                brand_filter,
-                total_in_database,
-            )
-
-            # Determine response source:
-            # - "live"              → LeafLink succeeded and data was refreshed
-            # - "database_fallback" → LeafLink timed out or failed; serving cached DB data
-            # - "database"          → No LeafLink call was attempted (no brand or force_db_only)
-            # - "empty"             → No orders in DB at all
+            # Determine response source
             fetched_from_leaflink = sync_metadata.get("total_fetched_from_leaflink")
-            returning_mock = False
             returning_cache = False
 
             if live_refresh_failed:
@@ -731,37 +758,27 @@ async def orders_sync(
                 source = "database"
                 returning_cache = True
 
+            sync_metadata["returning_cache"] = returning_cache
+
             sync_status = "error" if sync_error else "success"
 
             logger.info("[OrdersAPI] source=%s", source)
             logger.info("[OrdersAPI] db_count=%s", len(orders_data))
             logger.info("[OrdersAPI] newest_order_date=%s", newest_order_date_iso)
             logger.info("[OrdersAPI] refreshed_at=%s", server_time)
-            logger.info("[OrdersAPI] returning_mock=%s", str(returning_mock).lower())
-            logger.info("[OrdersAPI] returning_cache=%s", str(returning_cache).lower())
-
             logger.info(
-                "[Orders] query_count=%s source=%s brand=%s",
+                "[OrdersSync] response count=%s has_more=%s brand=%s total_in_db=%s",
                 len(orders_data),
-                source,
+                leaflink_has_more,
                 brand_filter,
+                total_in_database,
             )
             logger.info(
-                "[OrdersSync] response_orders count=%s source=%s",
-                len(orders_data),
-                source,
-            )
-            logger.info(
-                "[OrdersAPI] response_returned source=%s count=%s",
+                "[OrdersSync] response_returned source=%s count=%s next_cursor=%s",
                 source,
                 len(orders_data),
+                leaflink_next_cursor[:8] + "..." if leaflink_next_cursor else "none",
             )
-
-            # Enrich sync_metadata with brand mapping and freshness info
-            sync_metadata["returning_mock"] = returning_mock
-            sync_metadata["returning_cache"] = returning_cache
-            sync_metadata["brand_id"] = _resolved_brand_id or brand_filter
-            sync_metadata["company_id"] = _resolved_company_id
 
             return make_json_safe({
                 "ok": True,
@@ -775,19 +792,31 @@ async def orders_sync(
                 "refreshed_at": server_time,
                 "synced_at": server_time,
                 "orders": orders_data,
-                "sync_metadata": sync_metadata,
-                "next_cursor": next_cursor if has_more else None,
-                "has_more": has_more,
+                "sync_metadata": {
+                    **sync_metadata,
+                    "current_page": start_page,
+                    "pages_fetched": sync_metadata.get("pages_fetched"),
+                    "total_pages_available": total_pages_available,
+                    "total_fetched_from_leaflink": phase1_orders_upserted,
+                    "background_sync_active": sync_metadata.get("background_sync_active", False),
+                },
+                "pagination": {
+                    "has_more": leaflink_has_more,
+                    "next_cursor": leaflink_next_cursor,
+                },
+                # Legacy fields kept for backwards compatibility
+                "next_cursor": leaflink_next_cursor,
+                "has_more": leaflink_has_more,
                 "server_time": server_time,
-                "sync_version": 1,
+                "sync_version": 2,
                 "last_synced_at": server_time,
                 "last_error": sync_error,
                 "live_refresh_failed": live_refresh_failed,
                 "error": sync_error if live_refresh_failed else None,
             })
 
-        except Exception as phase_b_exc:
-            logger.error("[OrdersSync] phase=B read_error=%s", phase_b_exc, exc_info=True)
+        except Exception as phase2_exc:
+            logger.error("[OrdersSync] phase=2_read error=%s", phase2_exc, exc_info=True)
             server_time = datetime.now(timezone.utc).isoformat()
             return make_json_safe({
                 "ok": False,
@@ -804,6 +833,7 @@ async def orders_sync(
                 "server_time": server_time,
                 "has_more": False,
                 "next_cursor": None,
+                "pagination": {"has_more": False, "next_cursor": None},
                 "sync_metadata": sync_metadata,
-                "last_error": str(phase_b_exc),
+                "last_error": str(phase2_exc),
             })
