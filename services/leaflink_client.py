@@ -195,6 +195,44 @@ class LeafLinkClient:
                 )
         return resp
 
+    def _get_raw_url(self, url: str) -> requests.Response:
+        """Fetch from an absolute URL with auth headers (for pagination)."""
+        # Guard: ensure auth is present
+        if not self.api_key:
+            raise ValueError("Pagination requires authentication — api_key is missing")
+
+        logger.info(
+            "[LeafLink] page_request auth_present=true url=%s",
+            url,
+        )
+
+        auth_headers = {"Authorization": f"Token {self.api_key}"}
+        try:
+            resp = self.session.get(url, params=None, timeout=45, headers=auth_headers)
+        except Exception as exc:
+            logger.error(
+                "[LeafLink] page_request_failed url=%s error=%s",
+                url,
+                exc,
+            )
+            raise
+
+        logger.info(
+            "[LeafLink] page_response status=%s url=%s",
+            resp.status_code,
+            url,
+        )
+
+        if resp.status_code in (401, 403):
+            logger.error(
+                "[LeafLinkAuth] pagination_auth_failed status=%s body=%s url=%s",
+                resp.status_code,
+                resp.text[:200],
+                url,
+            )
+
+        return resp
+
     def list_orders(
         self,
         page: int = 1,
@@ -509,20 +547,29 @@ class LeafLinkClient:
 
                 if next_url:
                     # Use the full ``next`` URL returned by LeafLink directly.
+                    # _get_raw_url() re-attaches the Authorization header so that
+                    # pagination requests are authenticated the same way as page 1.
                     logger.info(
-                        "[LeafLinkSync] page=%s fetching next_url=%s",
+                        "[LeafLinkSync] page=%s auth_present=true fetching next_url=%s",
                         page,
                         next_url,
                     )
-                    try:
-                        resp = self.session.get(next_url, timeout=45)
-                    except Exception as exc:
+                    resp = self._get_raw_url(next_url)
+                    logger.info(
+                        "[LeafLinkSync] page=%s status=%s",
+                        page,
+                        resp.status_code,
+                    )
+                    if resp.status_code in (401, 403):
                         logger.error(
-                            "[LeafLinkSync] page=%s request_failed error=%s",
+                            "[LeafLinkAuth] pagination_auth_failed page=%s status=%s body=%s",
                             page,
-                            exc,
+                            resp.status_code,
+                            resp.text[:200],
                         )
-                        raise
+                        raise RuntimeError(
+                            f"LeafLink pagination auth failed: status={resp.status_code} body={resp.text[:220]}"
+                        )
                     if not resp.ok:
                         logger.error(
                             "[LeafLinkSync] page=%s http_error status=%s body=%s",
