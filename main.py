@@ -203,11 +203,26 @@ async def sync_leaflink(
     """
     expected = os.getenv("OPSYN_SYNC_SECRET")
 
+    header_present = x_opsyn_secret is not None
+    header_matches = x_opsyn_secret == expected if expected else False
+
+    logger.info(
+        "[SyncAuth] request_received header_present=%s header_matches=%s",
+        header_present,
+        header_matches,
+    )
+
     # Require auth for external calls; allow internal calls without header
     if expected and x_opsyn_secret != expected:
-        logger.warning("leaflink: sync_endpoint unauthorized attempt")
+        logger.warning(
+            "[SyncAuth] unauthorized attempt expected_set=%s header_present=%s header_matches=%s",
+            bool(expected),
+            header_present,
+            header_matches,
+        )
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    logger.info("[SyncAuth] authorized")
     logger.info("leaflink: sync_endpoint called")
 
     try:
