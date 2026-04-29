@@ -28,6 +28,131 @@ def get_orders():
     }
 
 
+@router.get("/debug/orders-sync")
+async def debug_orders_sync(
+    brand: Optional[str] = Query(None, description="Brand slug to inspect (e.g. 'noble-nectar')"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Diagnostic endpoint — returns sync state for a given brand without triggering a sync.
+
+    Returns:
+    - backend_time: current server UTC time
+    - last_leaflink_pull: last time LeafLink credentials were successfully used (last_sync_at)
+    - last_twin_ingest: not yet tracked — always null
+    - total_orders: total orders in DB for this brand
+    - newest_order_date / oldest_order_date: date range of orders in DB
+    - orders_by_status: count per status value
+    - rejected_count: count of orders with status 'rejected'
+    - last_error: last credential error message (if any)
+    - leaflink_credentials_valid: whether an active credential exists with no last_error
+    - sync_blocked: always false — blockers only affect routing, not order fetching
+    """
+    logger.info("[OrdersSync] debug_orders_sync brand=%s", brand)
+
+    backend_time = datetime.now(timezone.utc).isoformat()
+
+    # ── Credential lookup ────────────────────────────────────────────────────
+    last_leaflink_pull: Optional[str] = None
+    last_error: Optional[str] = None
+    leaflink_credentials_valid = False
+
+    try:
+        cred_query = select(BrandAPICredential).where(
+            BrandAPICredential.integration_name == "leaflink",
+            BrandAPICredential.is_active == True,
+        )
+        if brand:
+            cred_query = cred_query.where(BrandAPICredential.brand_id == brand)
+        cred_query = cred_query.order_by(BrandAPICredential.last_sync_at.desc().nullslast()).limit(1)
+
+        cred_result = await db.execute(cred_query)
+        cred = cred_result.scalar_one_or_none()
+
+        if cred:
+            last_leaflink_pull = cred.last_sync_at.isoformat() if cred.last_sync_at else None
+            last_error = cred.last_error
+            # Credentials are valid when active and have no recorded error
+            leaflink_credentials_valid = cred.is_active and not cred.last_error
+            logger.info(
+                "[OrdersSync] debug cred_found brand=%s last_sync_at=%s sync_status=%s has_error=%s",
+                brand,
+                last_leaflink_pull,
+                cred.sync_status,
+                bool(last_error),
+            )
+        else:
+            logger.warning("[OrdersSync] debug no_active_credential brand=%s", brand)
+
+    except Exception as cred_exc:
+        logger.error("[OrdersSync] debug cred_lookup_failed brand=%s error=%s", brand, cred_exc)
+
+    # ── Order stats from DB ──────────────────────────────────────────────────
+    total_orders = 0
+    newest_order_date: Optional[str] = None
+    oldest_order_date: Optional[str] = None
+    orders_by_status: dict = {}
+    rejected_count = 0
+
+    try:
+        order_query = select(Order)
+        if brand:
+            order_query = order_query.where(Order.brand_id == brand)
+
+        order_result = await db.execute(order_query)
+        all_orders = order_result.scalars().all()
+        total_orders = len(all_orders)
+
+        newest_dt: Optional[datetime] = None
+        oldest_dt: Optional[datetime] = None
+
+        for order in all_orders:
+            # Status counts
+            status_key = (order.status or "unknown").lower()
+            orders_by_status[status_key] = orders_by_status.get(status_key, 0) + 1
+            if status_key == "rejected":
+                rejected_count += 1
+
+            # Date range — prefer external_updated_at, fall back to external_created_at
+            ts = order.external_updated_at or order.external_created_at
+            if ts:
+                if newest_dt is None or ts > newest_dt:
+                    newest_dt = ts
+                if oldest_dt is None or ts < oldest_dt:
+                    oldest_dt = ts
+
+        newest_order_date = newest_dt.isoformat() if newest_dt else None
+        oldest_order_date = oldest_dt.isoformat() if oldest_dt else None
+
+        logger.info(
+            "[OrdersSync] debug db_stats brand=%s total=%s newest=%s oldest=%s statuses=%s",
+            brand,
+            total_orders,
+            newest_order_date,
+            oldest_order_date,
+            orders_by_status,
+        )
+
+    except Exception as stats_exc:
+        logger.error("[OrdersSync] debug db_stats_failed brand=%s error=%s", brand, stats_exc)
+
+    return make_json_safe({
+        "ok": True,
+        "brand": brand,
+        "backend_time": backend_time,
+        "last_leaflink_pull": last_leaflink_pull,
+        "last_twin_ingest": None,
+        "total_orders": total_orders,
+        "newest_order_date": newest_order_date,
+        "oldest_order_date": oldest_order_date,
+        "orders_by_status": orders_by_status,
+        "rejected_count": rejected_count,
+        "last_error": last_error,
+        "leaflink_credentials_valid": leaflink_credentials_valid,
+        "sync_blocked": False,
+    })
+
+
 @router.get("/sync")
 async def orders_sync(
     request: Request,
@@ -112,13 +237,15 @@ async def orders_sync(
                     api_key: str = cred.api_key or ""
                     company_id: str = cred.company_id or ""
 
+                    # Blockers (mapping issues) only affect routing — NEVER skip the LeafLink
+                    # fetch. Always pull fresh orders from LeafLink when credentials exist.
                     logger.info(
-                        "[LeafLink] sync_start brand=%s credential_source=db force_full=%s",
+                        "[OrdersSync] leaflink_pull_start brand=%s force_full=%s credential_source=db",
                         brand_filter,
                         force_full,
                     )
                     logger.info(
-                        "[OrdersSync] triggering_leaflink_sync brand=%s force_full=%s",
+                        "[LeafLink] sync_start brand=%s credential_source=db force_full=%s",
                         brand_filter,
                         force_full,
                     )
@@ -152,7 +279,7 @@ async def orders_sync(
                     pages_fetched = fetch_result["pages_fetched"]
 
                     logger.info(
-                        "[OrdersSync] leaflink_fetch_complete brand=%s orders=%s pages=%s force_full=%s",
+                        "[OrdersSync] leaflink_pull_success brand=%s count=%s pages=%s force_full=%s",
                         brand_filter,
                         len(orders_from_leaflink),
                         pages_fetched,
@@ -180,6 +307,12 @@ async def orders_sync(
                         webhook_url=_watchdog_url,
                     )
 
+                    logger.info(
+                        "[OrdersSync] db_upsert_start brand=%s orders=%s",
+                        brand_filter,
+                        len(orders_from_leaflink),
+                    )
+
                     async with db.begin():
                         sync_result = await sync_leaflink_orders(
                             db,
@@ -196,6 +329,12 @@ async def orders_sync(
                     newest = sync_result.get("newest_order_date")
                     sync_metadata["latest_order_date"] = newest.isoformat() if newest else None
 
+                    logger.info(
+                        "[OrdersSync] db_upsert_success brand=%s inserted=%s updated=%s",
+                        brand_filter,
+                        sync_result.get("created", 0),
+                        sync_result.get("updated", 0),
+                    )
                     logger.info(
                         "[LeafLink] upserted=%s created=%s updated=%s brand=%s",
                         sync_result.get("orders_fetched", 0),
@@ -223,6 +362,11 @@ async def orders_sync(
                         from services.integration_credentials import mark_credential_success
                         await mark_credential_success(cred)
                     else:
+                        logger.error(
+                            "[OrdersSync] sync_failed brand=%s error=%s",
+                            brand_filter,
+                            sync_result.get("error"),
+                        )
                         await emit_watchdog_event(
                             event_type="sync_failed",
                             brand_id=brand_filter,
@@ -241,6 +385,10 @@ async def orders_sync(
                         await mark_credential_invalid(cred, sync_result.get("error") or "sync_failed")
                 else:
                     logger.warning(
+                        "[OrdersSync] leaflink_pull_start brand=%s — no active credential found, serving from DB cache",
+                        brand_filter,
+                    )
+                    logger.warning(
                         "[LeafLink] credential_missing brand=%s — serving from DB only",
                         brand_filter,
                     )
@@ -248,8 +396,8 @@ async def orders_sync(
                     sync_metadata["used_force_full"] = force_full
 
             except Exception as sync_exc:
-                logger.warning(
-                    "[OrdersSync] leaflink_sync_failed brand=%s error=%s — serving from DB",
+                logger.error(
+                    "[OrdersSync] sync_failed brand=%s error=%s — falling back to DB cache",
                     brand_filter,
                     sync_exc,
                     exc_info=True,
@@ -397,22 +545,42 @@ async def orders_sync(
         sync_metadata["total_returned"] = len(orders_data)
 
         logger.info("[OrdersSync] db_total_orders=%s brand=%s", total_in_database, brand_filter)
-        logger.info("[OrdersSync] returned_to_ios=%s brand=%s", len(orders_data), brand_filter)
-        if sync_metadata.get("latest_order_date"):
-            logger.info("[OrdersSync] latest_order_date=%s brand=%s", sync_metadata["latest_order_date"], brand_filter)
+
+        # Determine data source: "live" if we fetched from LeafLink, "db_cache" if served from DB,
+        # "empty" if no orders exist at all.
+        source = "live" if sync_metadata.get("total_fetched_from_leaflink") else "db_cache"
+        if sync_metadata.get("sync_error"):
+            source = "db_cache"
+        if total_in_database == 0:
+            source = "empty"
+
+        # Compute newest/oldest from the returned orders for the response log
+        _newest_resp: Optional[str] = None
+        _oldest_resp: Optional[str] = None
+        for _od in orders_data:
+            _ts = _od.get("external_updated_at") or _od.get("external_created_at")
+            if _ts:
+                if _newest_resp is None or _ts > _newest_resp:
+                    _newest_resp = _ts
+                if _oldest_resp is None or _ts < _oldest_resp:
+                    _oldest_resp = _ts
 
         logger.info(
-            "[OrdersSync] response count=%s has_more=%s brand=%s total_in_db=%s",
+            "[OrdersSync] response_orders brand=%s count=%s newest=%s oldest=%s source=%s",
+            brand_filter,
+            len(orders_data),
+            _newest_resp,
+            _oldest_resp,
+            source,
+        )
+        logger.info(
+            "[OrdersSync] response count=%s has_more=%s brand=%s total_in_db=%s data_source=%s",
             len(orders_data),
             has_more,
             brand_filter,
             total_in_database,
+            source,
         )
-
-        source = "live" if sync_metadata.get("total_fetched_from_leaflink") else "db_cache"
-        if total_in_database == 0:
-            source = "empty"
-
         logger.info(
             "[Orders] query_count=%s source=%s brand=%s",
             len(orders_data),
