@@ -92,89 +92,21 @@ def get_orders():
 @router.get("/health")
 async def orders_health(
     brand: Optional[str] = Query(None, description="Brand slug to check (e.g., 'noble-nectar')"),
-    db: AsyncSession = Depends(get_db),
 ):
     """
-    Lightweight health check for the orders subsystem.
+    Diagnostic health check for the orders subsystem.
 
-    Returns quickly — no LeafLink calls are made. Useful for monitoring
-    and frontend pre-flight checks.
-
-    Response:
-      {
-        "ok": true,
-        "brand": "noble-nectar",
-        "db_count": <int>,
-        "newest_order_date": "<ISO string | null>",
-        "leaflink_configured": true/false,
-        "timestamp": "<ISO datetime>"
-      }
+    Temporarily returns immediately without touching the database.
+    Purpose: isolate whether hangs are caused by route registration /
+    middleware or by DB access.
     """
-    timestamp = datetime.now(timezone.utc).isoformat()
-
-    try:
-        # Count orders for this brand (or all brands if no brand specified)
-        count_query = select(func.count(Order.id))
-        if brand:
-            count_query = count_query.where(Order.brand_id == brand)
-        count_result = await db.execute(count_query)
-        db_count: int = count_result.scalar_one() or 0
-
-        # Find the newest order date
-        newest_query = select(func.max(Order.external_updated_at))
-        if brand:
-            newest_query = newest_query.where(Order.brand_id == brand)
-        newest_result = await db.execute(newest_query)
-        newest_raw = newest_result.scalar_one_or_none()
-        newest_order_date = newest_raw.isoformat() if newest_raw else None
-
-        # Check if LeafLink is configured for this brand
-        leaflink_configured = False
-        if brand:
-            cred_query = select(BrandAPICredential).where(
-                BrandAPICredential.brand_id == brand,
-                BrandAPICredential.integration_name == "leaflink",
-                BrandAPICredential.is_active == True,
-            )
-            cred_result = await db.execute(cred_query)
-            cred = cred_result.scalar_one_or_none()
-            leaflink_configured = cred is not None and bool(cred.api_key)
-        else:
-            # Check if any active LeafLink credential exists
-            any_cred_result = await db.execute(
-                select(BrandAPICredential).where(
-                    BrandAPICredential.integration_name == "leaflink",
-                    BrandAPICredential.is_active == True,
-                ).limit(1)
-            )
-            leaflink_configured = any_cred_result.scalar_one_or_none() is not None
-
-        logger.info(
-            "[OrdersAPI] health_check brand=%s db_count=%s",
-            brand,
-            db_count,
-        )
-
-        return make_json_safe({
-            "ok": True,
-            "brand": brand,
-            "db_count": db_count,
-            "newest_order_date": newest_order_date,
-            "leaflink_configured": leaflink_configured,
-            "timestamp": timestamp,
-        })
-
-    except Exception as exc:
-        logger.error("[OrdersAPI] health_check_error brand=%s error=%s", brand, exc, exc_info=True)
-        return make_json_safe({
-            "ok": False,
-            "brand": brand,
-            "db_count": 0,
-            "newest_order_date": None,
-            "leaflink_configured": False,
-            "timestamp": timestamp,
-            "error": str(exc),
-        })
+    logger.info("[OrdersHealth] reached_before_db brand=%s", brand)
+    return {
+        "ok": True,
+        "brand": brand,
+        "message": "health route reached",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @router.get("/sync")
