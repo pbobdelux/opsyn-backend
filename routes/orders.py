@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import get_db
+from database import AsyncSessionLocal, get_db
 from models import BrandAPICredential, Order
 from services.watchdog_client import emit_watchdog_event
 from utils.json_utils import make_json_safe
@@ -17,6 +17,7 @@ from utils.json_utils import make_json_safe
 logger = logging.getLogger("orders")
 
 router = APIRouter(prefix="/orders", tags=["orders"])
+debug_router = APIRouter(prefix="/debug", tags=["debug"])
 
 
 @router.get("")
@@ -180,13 +181,33 @@ async def orders_sync(
                         webhook_url=_watchdog_url,
                     )
 
-                    async with db.begin():
+                    logger.info(
+                        "[OrdersSync] db_query_start operation=sync_leaflink_orders brand=%s",
+                        brand_filter,
+                    )
+                    try:
                         sync_result = await sync_leaflink_orders(
                             db,
                             brand_filter,
                             orders_from_leaflink,
                             pages_fetched=pages_fetched,
                         )
+                        await db.commit()
+                        logger.info(
+                            "[OrdersSync] db_query_success operation=sync_leaflink_orders brand=%s rows=%s",
+                            brand_filter,
+                            sync_result.get("orders_fetched", 0),
+                        )
+                    except Exception as db_sync_exc:
+                        logger.error(
+                            "[OrdersSync] db_query_error operation=sync_leaflink_orders brand=%s error=%s",
+                            brand_filter,
+                            db_sync_exc,
+                            exc_info=True,
+                        )
+                        await db.rollback()
+                        logger.info("[OrdersSync] rollback_executed=true brand=%s", brand_filter)
+                        raise
 
                     sync_metadata["total_fetched_from_leaflink"] = sync_result.get("orders_fetched", 0)
                     sync_metadata["pages_fetched"] = sync_result.get("pages_fetched", pages_fetched)
@@ -256,6 +277,15 @@ async def orders_sync(
                 )
                 sync_metadata["sync_error"] = str(sync_exc)
                 sync_metadata["used_force_full"] = force_full
+
+                # Rollback any aborted transaction so the session is clean for
+                # subsequent reads.  This is the critical fix for
+                # InFailedSQLTransactionError.
+                try:
+                    await db.rollback()
+                    logger.info("[OrdersSync] rollback_executed=true brand=%s", brand_filter)
+                except Exception as rb_exc:
+                    logger.warning("[OrdersSync] rollback_failed brand=%s error=%s", brand_filter, rb_exc)
 
                 # Mark credential as failed if we had one
                 if cred is not None:
@@ -338,8 +368,14 @@ async def orders_sync(
         # Fetch limit + 1 to determine if there are more results
         query_with_limit = query.limit(limit + 1)
 
+        logger.info("[OrdersSync] db_query_start operation=fetch_orders brand=%s limit=%s", brand_filter, limit)
         result = await db.execute(query_with_limit)
         orders = result.scalars().all()
+        logger.info(
+            "[OrdersSync] db_query_success operation=fetch_orders brand=%s rows=%s",
+            brand_filter,
+            len(orders),
+        )
 
         # Determine if there are more results
         has_more = len(orders) > limit
@@ -352,8 +388,14 @@ async def orders_sync(
         count_query = select(func.count(Order.id))
         if brand_filter:
             count_query = count_query.where(Order.brand_id == brand_filter)
+        logger.info("[OrdersSync] db_query_start operation=count_orders brand=%s", brand_filter)
         count_result = await db.execute(count_query)
         total_in_database = count_result.scalar_one()
+        logger.info(
+            "[OrdersSync] db_query_success operation=count_orders brand=%s rows=%s",
+            brand_filter,
+            total_in_database,
+        )
 
         # ------------------------------------------------------------------ #
         # Build response                                                       #
@@ -438,56 +480,76 @@ async def orders_sync(
     except Exception as e:
         logger.error("[OrdersSync] fatal_error detail=%s", e, exc_info=True)
 
-        # Never return empty on error — attempt to serve last known DB data
+        # Never return empty on error — attempt to serve last known DB data using
+        # a FRESH session so we are not affected by any aborted transaction on
+        # the original session.
         fallback_synced_at = datetime.now(timezone.utc).isoformat()
-        try:
-            fallback_query = select(Order)
-            if brand_id or brand_slug or (hasattr(request, "query_params") and request.query_params.get("brandId")):
-                _brand = (
-                    brand_id
-                    or brand_slug
-                    or request.query_params.get("brandId")
-                )
-                if _brand:
-                    fallback_query = fallback_query.where(Order.brand_id == _brand)
-            fallback_query = fallback_query.order_by(Order.updated_at.desc()).limit(limit)
-            fallback_result = await db.execute(fallback_query)
-            fallback_orders = fallback_result.scalars().all()
+        _brand_fallback = (
+            brand_id
+            or brand_slug
+            or (request.query_params.get("brandId") if hasattr(request, "query_params") else None)
+        )
 
-            fallback_data = []
-            for order in fallback_orders:
-                fallback_data.append({
-                    "id": order.id,
-                    "external_order_id": order.external_order_id,
-                    "order_number": order.order_number,
-                    "customer_name": order.customer_name,
-                    "amount": float(order.amount) if order.amount else 0,
-                    "status": order.status,
-                    "brand_id": order.brand_id,
-                    "source": order.source,
-                    "review_status": order.review_status,
-                    "item_count": order.item_count,
-                    "unit_count": order.unit_count,
-                    "external_created_at": order.external_created_at.isoformat() if order.external_created_at else None,
-                    "external_updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
-                    "created_at": order.created_at.isoformat() if order.created_at else None,
-                    "updated_at": order.updated_at.isoformat() if order.updated_at else None,
-                    "last_synced_at": order.last_synced_at.isoformat() if order.last_synced_at else None,
-                })
+        fallback_data = []
+        fallback_count = 0
+        try:
+            if AsyncSessionLocal is None:
+                raise RuntimeError("AsyncSessionLocal not configured")
+
+            logger.info(
+                "[OrdersSync] db_query_start operation=fallback_fetch brand=%s",
+                _brand_fallback,
+            )
+            async with AsyncSessionLocal() as fresh_session:
+                fallback_query = select(Order)
+                if _brand_fallback:
+                    fallback_query = fallback_query.where(Order.brand_id == _brand_fallback)
+                fallback_query = fallback_query.order_by(Order.updated_at.desc()).limit(limit)
+                fallback_result = await fresh_session.execute(fallback_query)
+                fallback_orders = fallback_result.scalars().all()
+
+                for order in fallback_orders:
+                    fallback_data.append({
+                        "id": order.id,
+                        "external_order_id": order.external_order_id,
+                        "order_number": order.order_number,
+                        "customer_name": order.customer_name,
+                        "amount": float(order.amount) if order.amount else 0,
+                        "status": order.status,
+                        "brand_id": order.brand_id,
+                        "source": order.source,
+                        "review_status": order.review_status,
+                        "item_count": order.item_count,
+                        "unit_count": order.unit_count,
+                        "external_created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+                        "external_updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
+                        "created_at": order.created_at.isoformat() if order.created_at else None,
+                        "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+                        "last_synced_at": order.last_synced_at.isoformat() if order.last_synced_at else None,
+                    })
+
+                fallback_count = len(fallback_data)
+                logger.info(
+                    "[OrdersSync] db_query_success operation=fallback_fetch brand=%s rows=%s",
+                    _brand_fallback,
+                    fallback_count,
+                )
 
             logger.warning(
                 "[OrdersSync] serving_fallback_db_data count=%s error=%s",
-                len(fallback_data),
+                fallback_count,
                 e,
             )
 
             return make_json_safe({
                 "ok": False,
-                "status": "error",
-                "source": "backend",
-                "data_source": "backend",
+                "sync_status": "error",
+                "last_error": str(e),
+                "source": "db_cache",
+                "data_source": "db_cache",
                 "message": str(e),
-                "count": len(fallback_data),
+                "count": fallback_count,
+                "orders_count": fallback_count,
                 "synced_at": fallback_synced_at,
                 "orders": fallback_data,
                 "has_more": False,
@@ -497,19 +559,141 @@ async def orders_sync(
 
         except Exception as fallback_exc:
             logger.error(
-                "[OrdersSync] fallback_query_failed error=%s original_error=%s",
+                "[OrdersSync] db_query_error operation=fallback_fetch brand=%s error=%s original_error=%s",
+                _brand_fallback,
                 fallback_exc,
                 e,
             )
             return {
                 "ok": False,
-                "status": "error",
+                "sync_status": "error",
+                "last_error": str(e),
                 "source": "error",
                 "data_source": "error",
                 "message": str(e),
+                "orders_count": 0,
                 "count": 0,
                 "synced_at": fallback_synced_at,
                 "orders": [],
                 "has_more": False,
                 "next_cursor": None,
             }
+
+
+# ---------------------------------------------------------------------------
+# Debug endpoint — lightweight diagnostic for the orders sync pipeline
+# Registered on both:
+#   GET /orders/debug/orders-sync?brand=<brand_slug>  (via router)
+#   GET /debug/orders-sync?brand=<brand_slug>          (via debug_router, registered in main.py)
+# ---------------------------------------------------------------------------
+
+async def _debug_orders_sync_handler(
+    brand: Optional[str],
+    db: AsyncSession,
+) -> dict:
+    """Shared implementation for the orders-sync debug endpoint."""
+    result: dict = {
+        "ok": True,
+        "brand": brand,
+        "db_connected": False,
+        "orders_total": None,
+        "orders_for_brand": None,
+        "credential_found": False,
+        "credential_active": False,
+        "last_sync_at": None,
+        "last_sync_status": None,
+        "last_error": None,
+        "errors": [],
+    }
+
+    # ── DB connectivity + order counts ──────────────────────────────────────
+    try:
+        logger.info("[OrdersSync] db_query_start operation=debug_count_all brand=%s", brand)
+        total_result = await db.execute(select(func.count(Order.id)))
+        result["orders_total"] = total_result.scalar_one()
+        result["db_connected"] = True
+        logger.info(
+            "[OrdersSync] db_query_success operation=debug_count_all rows=%s",
+            result["orders_total"],
+        )
+    except Exception as exc:
+        err = f"db_count_all failed: {exc}"
+        logger.error("[OrdersSync] db_query_error operation=debug_count_all error=%s", exc)
+        result["errors"].append(err)
+
+    if brand:
+        try:
+            logger.info("[OrdersSync] db_query_start operation=debug_count_brand brand=%s", brand)
+            brand_count_result = await db.execute(
+                select(func.count(Order.id)).where(Order.brand_id == brand)
+            )
+            result["orders_for_brand"] = brand_count_result.scalar_one()
+            logger.info(
+                "[OrdersSync] db_query_success operation=debug_count_brand brand=%s rows=%s",
+                brand,
+                result["orders_for_brand"],
+            )
+        except Exception as exc:
+            err = f"db_count_brand failed: {exc}"
+            logger.error("[OrdersSync] db_query_error operation=debug_count_brand brand=%s error=%s", brand, exc)
+            result["errors"].append(err)
+
+    # ── LeafLink credential status ───────────────────────────────────────────
+    if brand:
+        try:
+            logger.info("[OrdersSync] db_query_start operation=debug_cred_lookup brand=%s", brand)
+            cred_result = await db.execute(
+                select(BrandAPICredential).where(
+                    BrandAPICredential.brand_id == brand,
+                    BrandAPICredential.integration_name == "leaflink",
+                )
+            )
+            cred = cred_result.scalar_one_or_none()
+            if cred:
+                result["credential_found"] = True
+                result["credential_active"] = bool(cred.is_active)
+                result["last_sync_at"] = cred.last_sync_at.isoformat() if cred.last_sync_at else None
+                result["last_sync_status"] = cred.sync_status
+                result["last_error"] = cred.last_error
+                logger.info(
+                    "[OrdersSync] db_query_success operation=debug_cred_lookup brand=%s active=%s",
+                    brand,
+                    cred.is_active,
+                )
+            else:
+                logger.info("[OrdersSync] db_query_success operation=debug_cred_lookup brand=%s found=false", brand)
+        except Exception as exc:
+            err = f"cred_lookup failed: {exc}"
+            logger.error("[OrdersSync] db_query_error operation=debug_cred_lookup brand=%s error=%s", brand, exc)
+            result["errors"].append(err)
+
+    if result["errors"]:
+        result["ok"] = False
+
+    return result
+
+
+@router.get("/debug/orders-sync")
+async def debug_orders_sync(
+    brand: Optional[str] = Query(None, description="Brand slug to inspect (e.g., 'noble-nectar')"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Diagnostic endpoint for the orders sync pipeline (accessible at /orders/debug/orders-sync).
+
+    Returns DB connectivity status, order counts, and LeafLink credential metadata.
+    """
+    return await _debug_orders_sync_handler(brand=brand, db=db)
+
+
+@debug_router.get("/orders-sync")
+async def debug_orders_sync_root(
+    brand: Optional[str] = Query(None, description="Brand slug to inspect (e.g., 'noble-nectar')"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Diagnostic endpoint for the orders sync pipeline (accessible at /debug/orders-sync).
+
+    Returns DB connectivity status, order counts, and LeafLink credential metadata.
+    """
+    return await _debug_orders_sync_handler(brand=brand, db=db)
