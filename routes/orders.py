@@ -31,21 +31,24 @@ DB_TIMEOUT_SECONDS = 3         # Max seconds to wait for DB upsert in Phase A
 async def resolve_brand_id(
     brand_filter: Optional[str],
     db: AsyncSession,
-) -> tuple[Optional[str], Optional[str]]:
+) -> Optional["BrandAPICredential"]:
     """
-    Resolve a brand_filter slug/ID to (brand_id, company_id) by looking up
-    the active LeafLink credential in the database.
+    Resolve a brand_filter slug/ID to the active LeafLink BrandAPICredential
+    from the database.
 
     Logs the resolution result for traceability.
-    Raises HTTPException(400) if brand_filter is provided but not found.
+    Raises HTTPException(500) on database error.
 
-    Returns (brand_id, company_id) — both may be None if brand_filter is None.
+    Returns the BrandAPICredential if found and active, or None if brand_filter
+    is falsy or no matching credential exists.  Callers that only need
+    (brand_id, company_id) can read those attributes directly from the returned
+    object.
     """
     from fastapi import HTTPException
 
     if not brand_filter:
         logger.info("[BrandResolve] input=None — no brand filter provided")
-        return None, None
+        return None
 
     try:
         cred_result = await db.execute(
@@ -69,8 +72,7 @@ async def resolve_brand_id(
             "[BrandResolve] input=%s resolved_brand_id=None company_id=None api_key_present=false credential_found=false",
             brand_filter,
         )
-        # Return the filter as-is so the endpoint can still serve DB data
-        return brand_filter, None
+        return None
 
     api_key_present = bool(cred.api_key and cred.api_key.strip())
     logger.info(
@@ -80,7 +82,7 @@ async def resolve_brand_id(
         cred.company_id,
         str(api_key_present).lower(),
     )
-    return cred.brand_id, cred.company_id
+    return cred
 
 
 @router.get("")
@@ -251,8 +253,21 @@ async def orders_sync(
         force_full,
     )
 
-    # Resolve brand_id → company_id mapping and log it for traceability
-    _resolved_brand_id, _resolved_company_id = await resolve_brand_id(brand_filter, db)
+    # Resolve brand_id → credential in a single DB lookup; all Phase A logic
+    # reuses this object directly — no second credential query is performed.
+    logger.info("[OrdersSync] requested_brand=%s", brand_filter)
+    _resolved_cred = await resolve_brand_id(brand_filter, db)
+    _resolved_brand_id: Optional[str] = _resolved_cred.brand_id if _resolved_cred else (brand_filter or None)
+    _resolved_company_id: Optional[str] = _resolved_cred.company_id if _resolved_cred else None
+
+    credential_source = "database" if _resolved_cred else "missing"
+    logger.info("[OrdersSync] credential_source=%s", credential_source)
+    logger.info("[OrdersSync] resolved_brand_id=%s", _resolved_brand_id)
+    logger.info("[OrdersSync] resolved_company_id=%s", _resolved_company_id)
+    logger.info(
+        "[OrdersSync] api_key_present=%s",
+        "true" if (_resolved_cred and _resolved_cred.api_key and _resolved_cred.api_key.strip()) else "false",
+    )
 
     # ------------------------------------------------------------------ #
     # FORCE_DB_ONLY: emergency debug mode — skip LeafLink entirely        #
@@ -270,23 +285,14 @@ async def orders_sync(
 
     if brand_filter and not force_db_only:
         logger.info("[OrdersSync] phase=A start brand=%s", brand_filter)
-        cred = None
+        # Use the credential already resolved above — no second DB lookup needed.
+        cred = _resolved_cred
         try:
             from services.leaflink_client import LeafLinkClient
             from services.leaflink_sync import sync_leaflink_orders
 
-            logger.info("[OrdersAPI] db_fetch_start")
+            logger.info("[OrdersSync] leaflink_fetch_start")
             logger.info("[OrdersSync] phase=A leaflink_pull_start")
-
-            # Look up credentials for this brand using the Phase A session.
-            cred_result = await db.execute(
-                select(BrandAPICredential).where(
-                    BrandAPICredential.brand_id == brand_filter,
-                    BrandAPICredential.integration_name == "leaflink",
-                    BrandAPICredential.is_active == True,
-                )
-            )
-            cred = cred_result.scalar_one_or_none()
 
             if cred:
                 api_key: str = cred.api_key or ""
@@ -307,7 +313,8 @@ async def orders_sync(
                     sync_metadata["total_fetched_from_leaflink"] = None
                     sync_metadata["used_force_full"] = force_full
                     logger.info("[OrdersSync] phase=A success brand=%s (invalid credential — no api_key)", brand_filter)
-                    # Fall through to Phase B (DB read) without attempting LeafLink
+
+
                 elif not _company_id_valid:
                     logger.warning(
                         "[OrdersAPI] credential_invalid brand=%s company_id_missing — will serve DB only",
@@ -457,14 +464,16 @@ async def orders_sync(
                     sync_metadata["latest_order_date"] = newest.isoformat() if newest else None
 
                     logger.info(
-                        "[LeafLink] upserted=%s created=%s updated=%s brand=%s",
-                        sync_result.get("orders_fetched", 0),
-                        sync_result.get("created", 0),
-                        sync_result.get("updated", 0),
-                        brand_filter,
+                        "[OrdersSync] total_fetched_from_leaflink=%s",
+                        sync_metadata["total_fetched_from_leaflink"],
+                    )
+                    logger.info(
+                        "[OrdersSync] upserted_to_db=%s",
+                        sync_result.get("created", 0) + sync_result.get("updated", 0),
                     )
 
-                    # Watchdog: emit sync_completed or sync_failed based on result
+
+
                     if sync_result.get("ok"):
                         await emit_watchdog_event(
                             event_type="sync_completed",
@@ -797,17 +806,23 @@ async def orders_sync(
                 len(orders_data),
             )
 
+
             # Enrich sync_metadata with brand mapping and freshness info
             sync_metadata["returning_mock"] = returning_mock
             sync_metadata["returning_cache"] = returning_cache
             sync_metadata["brand_id"] = _resolved_brand_id or brand_filter
             sync_metadata["company_id"] = _resolved_company_id
 
+            logger.info("[OrdersSync] db_count_after=%s", total_in_database)
+
             return make_json_safe({
                 "ok": True,
                 "sync_status": sync_status,
                 "source": source,
                 "data_source": source,
+                "brand_id": _resolved_brand_id or brand_filter,
+                "company_id": _resolved_company_id,
+                "total_fetched_from_leaflink": sync_metadata.get("total_fetched_from_leaflink"),
                 "count": len(orders_data),
                 "total_in_database": total_in_database,
                 "newest_order_date": newest_order_date_iso,
