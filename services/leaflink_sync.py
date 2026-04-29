@@ -963,19 +963,21 @@ async def sync_leaflink_background_continuous(
     # Sync complete                                                           #
     # ---------------------------------------------------------------------- #
     total_duration = round(time.monotonic() - bg_start, 1)
-    logger.info(
-        "[OrdersSync] bg_sync_complete brand=%s total_pages=%s total_orders=%s duration_seconds=%s",
-        brand_id,
-        total_pages,
-        total_orders_synced,
-        total_duration,
-    )
+    final_page = min(current_page - 1, total_pages)
 
     if manager:
-        final_page = min(current_page - 1, total_pages)
         await manager.persist_progress(
             brand_id=brand_id,
             last_synced_page=final_page,
             total_pages=total_pages,
-            sync_status="idle",
+            sync_status="complete",
         )
+
+    logger.info(
+        "[OrdersSync] bg_sync_complete brand=%s final_page=%s total_pages=%s total_orders=%s duration_seconds=%s",
+        brand_id,
+        final_page,
+        total_pages,
+        total_orders_synced,
+        total_duration,
+    )

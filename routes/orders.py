@@ -1022,7 +1022,25 @@ async def orders_sync_status(
     pages_synced = manager_status["pages_synced"] if bg_active else db_pages_synced
     total_pages = manager_status["total_pages"] if manager_status["total_pages"] else db_total_pages
 
+    # If pages_synced is still 0 but we have orders in DB, infer from order count
+    if pages_synced == 0 and total_orders_in_db > 0:
+        pages_synced = max(1, total_orders_in_db // 50)
+        logger.info(
+            "[OrdersSync] status_inferred_pages_from_orders brand=%s orders=%s inferred_pages=%s",
+            brand,
+            total_orders_in_db,
+            pages_synced,
+        )
+
     percent_complete = round((pages_synced / total_pages) * 100, 1) if total_pages else 0.0
+
+    # Reconcile sync_status: if DB says syncing but manager says inactive, trust DB
+    if db_sync_status == "syncing" and not bg_active:
+        effective_sync_status = "syncing"
+        bg_active = True  # Infer that sync is still running
+    else:
+        # Reconcile sync_status: if manager says active but DB says idle, trust manager
+        effective_sync_status = "syncing" if bg_active else db_sync_status
 
     # Estimate completion: 4 pages per batch, ~10 seconds per batch → 0.4 pages/s
     pages_remaining = max(total_pages - pages_synced, 0)
@@ -1034,9 +1052,6 @@ async def orders_sync_status(
     errors = list(manager_status.get("errors", []))
     if db_last_error and db_last_error not in errors:
         errors = [db_last_error] + errors
-
-    # Reconcile sync_status: if manager says active but DB says idle, trust manager
-    effective_sync_status = "syncing" if bg_active else db_sync_status
 
     logger.info(
         "[OrdersSync] status_response brand=%s active=%s pages=%s/%s percent=%.1f%% orders_in_db=%s",
