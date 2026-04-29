@@ -941,11 +941,23 @@ async def orders_sync_status(
         )
         cred = cred_result.scalar_one_or_none()
     except Exception as cred_exc:
-        logger.error("[OrdersSync] status_check db_error brand=%s error=%s", brand, cred_exc)
+        error_type = type(cred_exc).__name__
+        error_msg = str(cred_exc)
+        tb = traceback.format_exc()
+        logger.error(
+            "[OrdersSync] status_check_error brand=%s type=%s msg=%s",
+            brand,
+            error_type,
+            error_msg,
+            exc_info=True,
+        )
         return {
             "ok": False,
             "brand_id": brand,
             "error": "Database error during credential lookup",
+            "error_type": error_type,
+            "error_message": error_msg,
+            "traceback": tb,
             "timestamp": timestamp,
         }
 
