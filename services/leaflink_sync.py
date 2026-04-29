@@ -7,10 +7,14 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from database import AsyncSessionLocal
 from models import Order, OrderLine
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("leaflink_sync")
+
+# Number of order headers committed per batch in Phase 1
+HEADER_BATCH_SIZE = 25
 
 
 def utc_now() -> datetime:
@@ -430,3 +434,296 @@ async def sync_leaflink_orders(
             "sync_duration_seconds": sync_duration,
             "errors": [str(e)],
         }
+
+
+async def sync_leaflink_orders_headers_only(
+    brand_id: str,
+    orders: list[dict],
+    pages_fetched: int = 0,
+) -> dict[str, Any]:
+    """Upsert ONLY order headers (Order table) for Phase 1 — no line items.
+
+    Opens its own DB sessions and commits in small batches of HEADER_BATCH_SIZE
+    so that no single transaction holds locks for more than a handful of rows.
+    Line item data is preserved in ``line_items_json`` on the Order row so the
+    background worker can read it back without re-fetching from LeafLink.
+
+    Returns a summary dict compatible with the existing sync_result contract.
+    """
+    sync_start = time.monotonic()
+    logger.info(
+        "[LeafLinkSync] headers_only_start brand=%s orders=%s pages_fetched=%s",
+        brand_id,
+        len(orders),
+        pages_fetched,
+    )
+
+    created = 0
+    updated = 0
+    skipped = 0
+    errors: list[str] = []
+    newest_order_date: datetime | None = None
+
+    # Split orders into batches of HEADER_BATCH_SIZE
+    batches = [
+        orders[i : i + HEADER_BATCH_SIZE]
+        for i in range(0, len(orders), HEADER_BATCH_SIZE)
+    ]
+
+    for batch in batches:
+        batch_start = time.monotonic()
+        batch_size = len(batch)
+        logger.info("[OrdersSync] upsert_batch_start size=%s", batch_size)
+
+        try:
+            async with AsyncSessionLocal() as db:
+                async with db.begin():
+                    for o in batch:
+                        if not isinstance(o, dict):
+                            skipped += 1
+                            continue
+
+                        external_id = safe_str(o.get("external_id"))
+                        if not external_id:
+                            skipped += 1
+                            continue
+
+                        customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
+                        status = (safe_str(o.get("status")) or "submitted").lower()
+                        order_number = safe_str(o.get("order_number"))
+
+                        amount_decimal = safe_decimal(
+                            o.get("total_amount")
+                            or o.get("amount")
+                            or o.get("total")
+                            or o.get("subtotal")
+                            or o.get("price")
+                        )
+                        total_cents = decimal_to_cents(amount_decimal) or 0
+
+                        item_count = safe_int(o.get("item_count"), default=0)
+                        unit_count = safe_int(o.get("unit_count"), default=0)
+
+                        # Normalise line items and store as JSON — do NOT write
+                        # OrderLine rows here; that is deferred to the background worker.
+                        raw_line_items = o.get("line_items", [])
+                        normalized_line_items = normalize_line_items(raw_line_items)
+
+                        if item_count == 0:
+                            item_count = len(normalized_line_items)
+                        if unit_count == 0:
+                            unit_count = sum(
+                                item.get("quantity", 0) or 0
+                                for item in normalized_line_items
+                            )
+
+                        review_status = derive_review_status(normalized_line_items)
+                        now = utc_now()
+                        raw_payload = (
+                            o.get("raw_payload")
+                            if isinstance(o.get("raw_payload"), dict)
+                            else o
+                        )
+
+                        external_created_at = parse_dt(o.get("created_at"))
+                        external_updated_at = parse_dt(o.get("updated_at"))
+
+                        for ts_dt in (external_updated_at, external_created_at):
+                            if ts_dt:
+                                if newest_order_date is None or ts_dt > newest_order_date:
+                                    newest_order_date = ts_dt
+                                break
+
+                        existing_result = await db.execute(
+                            select(Order).where(
+                                Order.brand_id == brand_id,
+                                Order.external_order_id == external_id,
+                            )
+                        )
+                        existing = existing_result.scalar_one_or_none()
+
+                        if existing:
+                            existing.customer_name = customer_name
+                            existing.status = status
+                            existing.order_number = order_number
+                            existing.total_cents = total_cents
+                            existing.amount = amount_decimal
+                            existing.item_count = item_count
+                            existing.unit_count = unit_count
+                            existing.line_items_json = make_json_safe(normalized_line_items)
+                            existing.raw_payload = make_json_safe(raw_payload)
+                            existing.review_status = review_status
+                            existing.sync_status = "ok"
+                            existing.synced_at = now
+                            existing.last_synced_at = now
+                            existing.external_created_at = external_created_at
+                            existing.external_updated_at = external_updated_at
+                            updated += 1
+                        else:
+                            db.add(
+                                Order(
+                                    brand_id=brand_id,
+                                    external_order_id=external_id,
+                                    order_number=order_number,
+                                    customer_name=customer_name,
+                                    status=status,
+                                    total_cents=total_cents,
+                                    amount=amount_decimal,
+                                    item_count=item_count,
+                                    unit_count=unit_count,
+                                    line_items_json=make_json_safe(normalized_line_items),
+                                    raw_payload=make_json_safe(raw_payload),
+                                    source="leaflink",
+                                    review_status=review_status,
+                                    sync_status="ok",
+                                    synced_at=now,
+                                    last_synced_at=now,
+                                    external_created_at=external_created_at,
+                                    external_updated_at=external_updated_at,
+                                )
+                            )
+                            created += 1
+
+        except Exception as batch_exc:
+            err_msg = str(batch_exc)
+            logger.error(
+                "[OrdersSync] upsert_batch_error brand=%s batch_size=%s error=%s",
+                brand_id,
+                batch_size,
+                err_msg,
+                exc_info=True,
+            )
+            errors.append(err_msg)
+            skipped += batch_size
+            continue
+
+        batch_ms = round((time.monotonic() - batch_start) * 1000)
+        logger.info("[OrdersSync] upsert_batch_done size=%s duration_ms=%s", batch_size, batch_ms)
+
+    sync_duration = round(time.monotonic() - sync_start, 2)
+    logger.info(
+        "[LeafLinkSync] headers_only_complete brand=%s created=%s updated=%s skipped=%s duration=%ss",
+        brand_id,
+        created,
+        updated,
+        skipped,
+        sync_duration,
+    )
+
+    return {
+        "ok": len(errors) == 0,
+        "orders_fetched": len(orders),
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "line_items_written": 0,
+        "newest_order_date": newest_order_date,
+        "pages_fetched": pages_fetched,
+        "sync_duration_seconds": sync_duration,
+        "errors": errors,
+        "mock_data": any(isinstance(o, dict) and o.get("mock_data") for o in orders),
+        "message": f"Upserted {created + updated} order headers ({created} new, {updated} updated)",
+    }
+
+
+async def sync_leaflink_line_items(
+    brand_id: str,
+    orders: list[dict],
+) -> dict[str, Any]:
+    """Write OrderLine rows for a list of pre-fetched orders (background Phase 2).
+
+    Reads the order IDs from the DB (by brand_id + external_order_id), then
+    deletes stale OrderLine rows and inserts fresh ones.  Runs in its own
+    session so it never blocks the HTTP response.
+    """
+    bg_start = time.monotonic()
+    total_lines_written = 0
+    errors: list[str] = []
+
+    logger.info(
+        "[OrdersSync] line_items_deferred count=%s",
+        len(orders),
+    )
+
+    for o in orders:
+        if not isinstance(o, dict):
+            continue
+
+        external_id = safe_str(o.get("external_id"))
+        if not external_id:
+            continue
+
+        raw_line_items = o.get("line_items", [])
+        normalized_line_items = normalize_line_items(raw_line_items)
+
+        if not normalized_line_items:
+            continue
+
+        try:
+            async with AsyncSessionLocal() as db:
+                async with db.begin():
+                    result = await db.execute(
+                        select(Order).where(
+                            Order.brand_id == brand_id,
+                            Order.external_order_id == external_id,
+                        )
+                    )
+                    order_row = result.scalar_one_or_none()
+                    if order_row is None:
+                        logger.warning(
+                            "[OrdersSync] line_items_order_not_found brand=%s external_id=%s",
+                            brand_id,
+                            external_id,
+                        )
+                        continue
+
+                    await db.execute(
+                        delete(OrderLine).where(OrderLine.order_id == order_row.id)
+                    )
+
+                    for item in normalized_line_items:
+                        db.add(
+                            OrderLine(
+                                order_id=order_row.id,
+                                sku=item.get("sku"),
+                                product_name=item.get("product_name"),
+                                quantity=item.get("quantity"),
+                                unit_price=item.get("unit_price"),
+                                total_price=item.get("total_price"),
+                                unit_price_cents=item.get("unit_price_cents"),
+                                total_price_cents=item.get("total_price_cents"),
+                                mapped_product_id=item.get("mapped_product_id"),
+                                mapping_status=item.get("mapping_status"),
+                                mapping_issue=item.get("mapping_issue"),
+                                raw_payload=make_json_safe(item.get("raw_payload")),
+                            )
+                        )
+
+                    total_lines_written += len(normalized_line_items)
+
+        except Exception as line_exc:
+            err_msg = str(line_exc)
+            logger.error(
+                "[OrdersSync] line_items_error brand=%s external_id=%s error=%s",
+                brand_id,
+                external_id,
+                err_msg,
+                exc_info=True,
+            )
+            errors.append(err_msg)
+
+    bg_duration = round(time.monotonic() - bg_start, 2)
+    logger.info(
+        "[OrdersSync] line_items_complete brand=%s lines_written=%s duration=%ss errors=%s",
+        brand_id,
+        total_lines_written,
+        bg_duration,
+        len(errors),
+    )
+
+    return {
+        "ok": len(errors) == 0,
+        "lines_written": total_lines_written,
+        "errors": errors,
+        "duration_seconds": bg_duration,
+    }
