@@ -93,6 +93,11 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
             db_cred_for_api.brand_id,
             db_cred_for_api.company_id,
         )
+        logger.info(
+            "[OrdersAPI] brand_id=%s company_id=%s",
+            db_cred_for_api.brand_id,
+            db_cred_for_api.company_id,
+        )
         try:
             client = LeafLinkClient(
                 api_key=db_cred_for_api.api_key,
@@ -222,14 +227,19 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     except Exception as metrics_exc:
         logger.error("leaflink: debug metrics_failed error=%s", metrics_exc)
 
+    # Resolve brand_id from the active credential used for the API check
+    _debug_brand_id = db_cred_for_api.brand_id if db_cred_for_api else None
+    _debug_company_id = db_cred_for_api.company_id if db_cred_for_api else (DEFAULT_LEAFLINK_COMPANY_ID or company_id_raw or None)
+
     result = {
         "ok": True,
         "api_connected": api_connected,
         "credentials_loaded": credentials_loaded,
         "credentials_valid": credentials_valid,
         "credentials_source": credentials_source,
+        "brand_id": _debug_brand_id,
         "base_url": DEFAULT_LEAFLINK_BASE_URL or base_url_raw or None,
-        "company_id": DEFAULT_LEAFLINK_COMPANY_ID or company_id_raw or None,
+        "company_id": _debug_company_id,
         "orders_in_db": orders_in_db,
         "orders_with_line_items": orders_with_line_items,
         "orders_without_line_items": orders_without_line_items,

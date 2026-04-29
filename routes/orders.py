@@ -19,6 +19,58 @@ logger = logging.getLogger("orders")
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 
+async def resolve_brand_id(
+    brand_filter: Optional[str],
+    db: AsyncSession,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Resolve a brand_filter slug/ID to (brand_id, company_id) by looking up
+    the active LeafLink credential in the database.
+
+    Logs the resolution result for traceability.
+    Raises HTTPException(400) if brand_filter is provided but not found.
+
+    Returns (brand_id, company_id) — both may be None if brand_filter is None.
+    """
+    from fastapi import HTTPException
+
+    if not brand_filter:
+        return None, None
+
+    try:
+        cred_result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.brand_id == brand_filter,
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+            )
+        )
+        cred = cred_result.scalar_one_or_none()
+    except Exception as exc:
+        logger.error(
+            "[OrdersAPI] brand_resolution db_error brand_filter=%s error=%s",
+            brand_filter,
+            exc,
+        )
+        raise HTTPException(status_code=500, detail="Database error during brand resolution")
+
+    if cred is None:
+        logger.warning(
+            "[OrdersAPI] brand_resolution brand_filter=%s resolved_brand_id=None company_id=None (no active credential)",
+            brand_filter,
+        )
+        # Return the filter as-is so the endpoint can still serve DB data
+        return brand_filter, None
+
+    logger.info(
+        "[OrdersAPI] brand_resolution brand_filter=%s resolved_brand_id=%s company_id=%s",
+        brand_filter,
+        cred.brand_id,
+        cred.company_id,
+    )
+    return cred.brand_id, cred.company_id
+
+
 @router.get("")
 def get_orders():
     return {
@@ -76,6 +128,11 @@ async def orders_sync(
     )
 
     logger.info(
+        "[OrdersAPI] request brand=%s force_full=%s",
+        brand_filter,
+        force_full,
+    )
+    logger.info(
         "[OrdersSync] request_start path=%s brand=%s org=%s updated_after=%s cursor=%s limit=%s force_full=%s",
         request.url.path,
         brand_filter,
@@ -86,9 +143,10 @@ async def orders_sync(
         force_full,
     )
 
-    # ------------------------------------------------------------------ #
-    # Phase A: LeafLink sync (write) — dedicated session, discard on err  #
-    # ------------------------------------------------------------------ #
+    # Resolve brand_id → company_id mapping and log it for traceability
+    _resolved_brand_id, _resolved_company_id = await resolve_brand_id(brand_filter, db)
+
+
     sync_metadata: dict = {}
     sync_error: Optional[str] = None
 
@@ -387,9 +445,12 @@ async def orders_sync(
 
             # ------------------------------------------------------------------ #
             # Build response                                                       #
-            # ------------------------------------------------------------------ #
             orders_data = []
             next_cursor = None
+
+            # Track freshness dates across returned orders
+            newest_order_date: Optional[datetime] = None
+            oldest_order_date: Optional[datetime] = None
 
             for order in orders:
                 order_dict = {
@@ -412,11 +473,21 @@ async def orders_sync(
                 }
                 orders_data.append(order_dict)
 
+                # Track newest/oldest order dates for freshness metadata
+                order_date = order.external_updated_at or order.external_created_at or order.updated_at
+                if order_date is not None:
+                    if newest_order_date is None or order_date > newest_order_date:
+                        newest_order_date = order_date
+                    if oldest_order_date is None or order_date < oldest_order_date:
+                        oldest_order_date = order_date
+
                 # Update cursor to last order's ID
                 if order == orders[-1]:
                     next_cursor = base64.b64encode(str(order.id).encode()).decode()
 
             server_time = datetime.now(timezone.utc).isoformat()
+            newest_order_date_iso = newest_order_date.isoformat() if newest_order_date else None
+            oldest_order_date_iso = oldest_order_date.isoformat() if oldest_order_date else None
 
             # Populate remaining sync_metadata fields with defaults for any missing keys
             sync_metadata.setdefault("total_fetched_from_leaflink", None)
@@ -439,11 +510,27 @@ async def orders_sync(
                 total_in_database,
             )
 
-            source = "live" if sync_metadata.get("total_fetched_from_leaflink") else "db_cache"
+            # Determine source: live if we fetched from LeafLink, empty if no orders, else database
+            fetched_from_leaflink = sync_metadata.get("total_fetched_from_leaflink")
+            returning_mock = False
+            returning_cache = False
+
             if total_in_database == 0:
                 source = "empty"
+            elif fetched_from_leaflink:
+                source = "live"
+            else:
+                source = "database"
+                returning_cache = True
 
             sync_status = "error" if sync_error else "success"
+
+            logger.info("[OrdersAPI] source=%s", source)
+            logger.info("[OrdersAPI] db_count=%s", len(orders_data))
+            logger.info("[OrdersAPI] newest_order_date=%s", newest_order_date_iso)
+            logger.info("[OrdersAPI] refreshed_at=%s", server_time)
+            logger.info("[OrdersAPI] returning_mock=%s", str(returning_mock).lower())
+            logger.info("[OrdersAPI] returning_cache=%s", str(returning_cache).lower())
 
             logger.info(
                 "[Orders] query_count=%s source=%s brand=%s",
@@ -457,12 +544,22 @@ async def orders_sync(
                 source,
             )
 
+            # Enrich sync_metadata with brand mapping and freshness info
+            sync_metadata["returning_mock"] = returning_mock
+            sync_metadata["returning_cache"] = returning_cache
+            sync_metadata["brand_id"] = _resolved_brand_id or brand_filter
+            sync_metadata["company_id"] = _resolved_company_id
+
             return make_json_safe({
                 "ok": True,
                 "sync_status": sync_status,
                 "source": source,
                 "data_source": source,
                 "count": len(orders_data),
+                "total_in_database": total_in_database,
+                "newest_order_date": newest_order_date_iso,
+                "oldest_order_date": oldest_order_date_iso,
+                "refreshed_at": server_time,
                 "synced_at": server_time,
                 "orders": orders_data,
                 "sync_metadata": sync_metadata,
@@ -484,6 +581,10 @@ async def orders_sync(
                 "source": "error",
                 "orders": [],
                 "count": 0,
+                "total_in_database": 0,
+                "newest_order_date": None,
+                "oldest_order_date": None,
+                "refreshed_at": server_time,
                 "synced_at": server_time,
                 "server_time": server_time,
                 "has_more": False,

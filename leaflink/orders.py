@@ -1,9 +1,10 @@
 import logging
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -151,6 +152,7 @@ def derive_review_status(line_items: list[dict[str, Any]], blockers: list[dict[s
 
 @router.get("/orders")
 async def get_orders(db: AsyncSession = Depends(get_db)):
+    logger.info("[OrdersAPI] request endpoint=/leaflink/orders")
     logger.info("leaflink: get_orders request start")
     try:
         logger.info("leaflink: get_orders db_query_start")
@@ -164,8 +166,19 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
         logger.error("leaflink: get_orders db_query_failed error=%s", exc, exc_info=True)
         raise
 
+    # Count total orders in DB (all brands)
+    try:
+        total_count_result = await db.execute(select(func.count(Order.id)))
+        total_in_database = total_count_result.scalar_one() or 0
+    except Exception:
+        total_in_database = len(orders)
+
     results: list[dict[str, Any]] = []
     review_status_counts: dict[str, int] = {}
+
+    # Track freshness dates across all orders
+    newest_order_date: datetime | None = None
+    oldest_order_date: datetime | None = None
 
     for order in orders:
         line_items = build_line_items(order)
@@ -185,6 +198,14 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
         blockers = derive_blockers(line_items)
         review_status = derive_review_status(line_items, blockers, order)
         review_status_counts[review_status] = review_status_counts.get(review_status, 0) + 1
+
+        # Track newest/oldest order dates
+        order_date = order.external_updated_at or order.external_created_at or order.updated_at
+        if order_date is not None:
+            if newest_order_date is None or order_date > newest_order_date:
+                newest_order_date = order_date
+            if oldest_order_date is None or order_date < oldest_order_date:
+                oldest_order_date = order_date
 
         results.append({
             "id": order.id,
@@ -207,6 +228,16 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
             "updated_at": order.updated_at,
         })
 
+    refreshed_at = datetime.now(timezone.utc).isoformat()
+    newest_order_date_iso = newest_order_date.isoformat() if newest_order_date else None
+    oldest_order_date_iso = oldest_order_date.isoformat() if oldest_order_date else None
+
+    logger.info("[OrdersAPI] db_count=%s", len(results))
+    logger.info("[OrdersAPI] newest_order_date=%s", newest_order_date_iso)
+    logger.info("[OrdersAPI] refreshed_at=%s", refreshed_at)
+    logger.info("[OrdersAPI] returning_mock=false")
+    logger.info("[OrdersAPI] returning_cache=false")
+
     if not results:
         logger.info("leaflink: get_orders no_orders_found (not an error)")
     else:
@@ -217,14 +248,26 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
         )
 
     return {
+        "ok": True,
         "success": True,
         "count": len(results),
+        "total_in_database": total_in_database,
+        "newest_order_date": newest_order_date_iso,
+        "oldest_order_date": oldest_order_date_iso,
+        "refreshed_at": refreshed_at,
+        "source": "database",
         "orders": results,
+        "sync_metadata": {
+            "returning_mock": False,
+            "returning_cache": False,
+        },
     }
+
 
 
 @router.get("/orders/id/{order_id}")
 async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
+    logger.info("[OrdersAPI] request endpoint=/leaflink/orders/id/%s", order_id)
     logger.info("leaflink: get_order_detail request order_id=%s", order_id)
     result = await db.execute(
         select(Order)
@@ -236,6 +279,7 @@ async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
     if not order:
         logger.info("leaflink: get_order_detail not_found order_id=%s", order_id)
         return {
+            "ok": False,
             "success": False,
             "error": "Order not found",
         }
@@ -266,8 +310,29 @@ async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
         review_status,
     )
 
+    refreshed_at = datetime.now(timezone.utc).isoformat()
+    order_date = order.external_updated_at or order.external_created_at or order.updated_at
+    newest_order_date_iso = order_date.isoformat() if order_date else None
+
+    logger.info("[OrdersAPI] db_count=1")
+    logger.info("[OrdersAPI] newest_order_date=%s", newest_order_date_iso)
+    logger.info("[OrdersAPI] refreshed_at=%s", refreshed_at)
+    logger.info("[OrdersAPI] returning_mock=false")
+    logger.info("[OrdersAPI] returning_cache=false")
+
     return {
+        "ok": True,
         "success": True,
+        "count": 1,
+        "total_in_database": 1,
+        "newest_order_date": newest_order_date_iso,
+        "oldest_order_date": newest_order_date_iso,
+        "refreshed_at": refreshed_at,
+        "source": "database",
+        "sync_metadata": {
+            "returning_mock": False,
+            "returning_cache": False,
+        },
         "order": {
             "id": order.id,
             "external_id": order.external_order_id,
