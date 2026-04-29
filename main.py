@@ -123,11 +123,18 @@ async def log_requests(request: Request, call_next):
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(str(exc))
-    logger.error(traceback.format_exc())
+    tb = traceback.format_exc()
+    logger.error("[GlobalException] error_type=%s error=%s", type(exc).__name__, exc)
+    logger.error("[GlobalException] traceback:\n%s", tb)
     return JSONResponse(
         status_code=500,
-        content={"ok": False, "error": "internal_error"},
+        content={
+            "ok": False,
+            "error": "internal_error",
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "path": str(request.url.path),
+        },
     )
 
 

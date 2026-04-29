@@ -3,6 +3,7 @@ import base64
 import logging
 import os
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Optional
@@ -330,10 +331,38 @@ async def orders_sync(
             )
 
             try:
-                from services.leaflink_client import LeafLinkClient
+                from services.leaflink_client import LeafLinkClient, DEFAULT_LEAFLINK_BASE_URL
                 from services.leaflink_sync import sync_leaflink_orders
 
-                client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=_resolved_brand_id)
+                _api_url = f"{DEFAULT_LEAFLINK_BASE_URL}/orders-received/"
+                logger.info(
+                    "[OrdersSync] phase=1_fetch_init brand=%s company_id=%s api_url=%s",
+                    _resolved_brand_id,
+                    _resolved_company_id,
+                    _api_url,
+                )
+
+                try:
+                    client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=_resolved_brand_id)
+                except Exception as client_init_exc:
+                    _etype = type(client_init_exc).__name__
+                    _emsg = str(client_init_exc)
+                    logger.error(
+                        "[OrdersSync] phase=1_fetch failing_step=client_init error_type=%s error=%s brand=%s",
+                        _etype, _emsg, _resolved_brand_id, exc_info=True,
+                    )
+                    return make_json_safe({
+                        "ok": False,
+                        "error": "internal_error",
+                        "error_type": _etype,
+                        "error_message": _emsg,
+                        "failing_step": "phase_1_client_init",
+                        "brand_id": _resolved_brand_id,
+                        "company_id": _resolved_company_id,
+                        "api_url": _api_url,
+                        "traceback": traceback.format_exc(),
+                    })
+
                 loop = asyncio.get_event_loop()
 
                 def _fetch_page_range_sync():
@@ -362,6 +391,24 @@ async def orders_sync(
                     raise asyncio.TimeoutError(
                         f"LeafLink API did not respond within {LEAFLINK_TIMEOUT_SECONDS}s"
                     )
+                except Exception as fetch_exc:
+                    _etype = type(fetch_exc).__name__
+                    _emsg = str(fetch_exc)
+                    logger.error(
+                        "[OrdersSync] phase=1_fetch failing_step=phase_1_fetch error_type=%s error=%s brand=%s api_url=%s",
+                        _etype, _emsg, _resolved_brand_id, _api_url, exc_info=True,
+                    )
+                    return make_json_safe({
+                        "ok": False,
+                        "error": "internal_error",
+                        "error_type": _etype,
+                        "error_message": _emsg,
+                        "failing_step": "phase_1_fetch",
+                        "brand_id": _resolved_brand_id,
+                        "company_id": _resolved_company_id,
+                        "api_url": _api_url,
+                        "traceback": traceback.format_exc(),
+                    })
 
                 orders_from_leaflink = fetch_result["orders"]
                 pages_fetched_phase1 = fetch_result["pages_fetched"]
@@ -404,6 +451,23 @@ async def orders_sync(
                     raise asyncio.TimeoutError(
                         f"DB upsert did not complete within {DB_TIMEOUT_SECONDS}s"
                     )
+                except Exception as upsert_exc:
+                    _etype = type(upsert_exc).__name__
+                    _emsg = str(upsert_exc)
+                    logger.error(
+                        "[OrdersSync] phase=1_upsert failing_step=phase_1_upsert error_type=%s error=%s brand=%s",
+                        _etype, _emsg, _resolved_brand_id, exc_info=True,
+                    )
+                    return make_json_safe({
+                        "ok": False,
+                        "error": "internal_error",
+                        "error_type": _etype,
+                        "error_message": _emsg,
+                        "failing_step": "phase_1_upsert",
+                        "brand_id": _resolved_brand_id,
+                        "company_id": _resolved_company_id,
+                        "traceback": traceback.format_exc(),
+                    })
 
                 phase1_orders_upserted = sync_result.get("orders_fetched", 0)
                 logger.info(
@@ -536,8 +600,17 @@ async def orders_sync(
                             )
 
                     # Fire and forget — do not await
-                    asyncio.create_task(_background_sync())
-                    sync_metadata["background_sync_active"] = True
+                    try:
+                        asyncio.create_task(_background_sync())
+                        sync_metadata["background_sync_active"] = True
+                    except Exception as bg_task_exc:
+                        logger.error(
+                            "[OrdersSync] background_task_create_error error_type=%s error=%s brand=%s",
+                            type(bg_task_exc).__name__, bg_task_exc, _resolved_brand_id, exc_info=True,
+                        )
+                        sync_metadata["background_sync_active"] = False
+                        sync_metadata["background_task_error"] = str(bg_task_exc)
+                        sync_metadata["background_task_error_type"] = type(bg_task_exc).__name__
                 else:
                     logger.info("[OrdersSync] no_more_pages — background sync not needed")
                     sync_metadata["background_sync_active"] = False
@@ -583,17 +656,26 @@ async def orders_sync(
                     },
                     webhook_url=_watchdog_url_to,
                 )
-
             except Exception as phase1_exc:
-                logger.error("[OrdersSync] phase=1 error=%s", phase1_exc, exc_info=True)
+                _p1_etype = type(phase1_exc).__name__
+                _p1_emsg = str(phase1_exc)
+                logger.error(
+                    "[OrdersSync] phase=1 error_type=%s error=%s brand=%s",
+                    _p1_etype, _p1_emsg, _resolved_brand_id, exc_info=True,
+                )
                 try:
                     await db.rollback()
                 except Exception as rb_exc:
                     logger.warning("[OrdersSync] phase=1 rollback_failed error=%s", rb_exc)
 
                 live_refresh_failed = True
-                sync_error = str(phase1_exc)
+                sync_error = _p1_emsg
                 sync_metadata["sync_error"] = sync_error
+                sync_metadata["error_type"] = _p1_etype
+                sync_metadata["error_message"] = _p1_emsg
+                sync_metadata["failing_step"] = "phase_1"
+                sync_metadata["brand_id"] = _resolved_brand_id
+                sync_metadata["company_id"] = _resolved_company_id
                 sync_metadata["used_force_full"] = force_full
 
                 from services.integration_credentials import mark_credential_invalid
@@ -613,6 +695,7 @@ async def orders_sync(
                     },
                     webhook_url=_watchdog_url_exc,
                 )
+
 
     else:
         sync_metadata["used_force_full"] = force_full
@@ -815,11 +898,23 @@ async def orders_sync(
                 "error": sync_error if live_refresh_failed else None,
             })
 
+
         except Exception as phase2_exc:
-            logger.error("[OrdersSync] phase=2_read error=%s", phase2_exc, exc_info=True)
+            _p2_etype = type(phase2_exc).__name__
+            _p2_emsg = str(phase2_exc)
+            logger.error(
+                "[OrdersSync] phase=2_read error_type=%s error=%s brand=%s",
+                _p2_etype, _p2_emsg, brand_filter, exc_info=True,
+            )
             server_time = datetime.now(timezone.utc).isoformat()
             return make_json_safe({
                 "ok": False,
+                "error": "internal_error",
+                "error_type": _p2_etype,
+                "error_message": _p2_emsg,
+                "failing_step": "phase_2_read",
+                "brand_id": _resolved_brand_id or brand_filter,
+                "company_id": _resolved_company_id,
                 "sync_status": "error",
                 "data_source": "error",
                 "source": "error",
@@ -835,5 +930,6 @@ async def orders_sync(
                 "next_cursor": None,
                 "pagination": {"has_more": False, "next_cursor": None},
                 "sync_metadata": sync_metadata,
-                "last_error": str(phase2_exc),
+                "last_error": _p2_emsg,
+                "traceback": traceback.format_exc(),
             })
