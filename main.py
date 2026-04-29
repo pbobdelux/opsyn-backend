@@ -19,6 +19,7 @@ from routes.crm import router as crm_router
 from routes.health import router as health_router
 from routes.integrations import router as integrations_router
 from routes.integrations_health import router as integrations_health_router
+from routes.debug_orders_sync import router as debug_orders_sync_router
 from routes.leaflink_debug import router as leaflink_debug_router
 from routes.orders import router as orders_router
 from routes.voice import router as voice_router
@@ -95,6 +96,7 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 app.include_router(ai_router, prefix="/ai")
 app.include_router(crm_router)
+app.include_router(debug_orders_sync_router, prefix="/debug")
 app.include_router(health_router)
 app.include_router(integrations_router)
 app.include_router(integrations_health_router)
