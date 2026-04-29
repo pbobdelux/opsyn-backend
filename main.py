@@ -20,7 +20,7 @@ from routes.health import router as health_router
 from routes.integrations import router as integrations_router
 from routes.integrations_health import router as integrations_health_router
 from routes.leaflink_debug import router as leaflink_debug_router
-from routes.orders import router as orders_router
+from routes.orders import router as orders_router, debug_router as orders_debug_router
 from routes.voice import router as voice_router
 from routes.voice_brain import router as voice_brain_router
 from utils.json_utils import make_json_safe
@@ -101,6 +101,7 @@ app.include_router(integrations_health_router)
 app.include_router(leaflink_orders_router)
 app.include_router(leaflink_debug_router, prefix="/leaflink")
 app.include_router(orders_router)
+app.include_router(orders_debug_router)
 app.include_router(voice_router)
 app.include_router(voice_brain_router)
 
@@ -131,6 +132,20 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True, "status": "healthy", "time": utc_now_iso()}
+
+
+@app.get("/routes")
+def list_routes():
+    """List all mounted routes (for debugging)."""
+    routes = []
+    for route in app.routes:
+        if hasattr(route, "path") and hasattr(route, "methods"):
+            routes.append({
+                "path": route.path,
+                "methods": list(route.methods) if route.methods else ["GET"],
+                "name": route.name if hasattr(route, "name") else None,
+            })
+    return {"ok": True, "count": len(routes), "routes": routes}
 
 
 @app.post("/orders")
