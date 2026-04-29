@@ -780,6 +780,13 @@ async def sync_leaflink_background_continuous(
     """
     from services.leaflink_client import LeafLinkClient
 
+    logger.info(
+        "[OrdersSync] bg_continuous_sync_started brand=%s start_page=%s total_pages=%s",
+        brand_id,
+        start_page,
+        total_pages,
+    )
+
     bg_start = time.monotonic()
     current_page = start_page
     batch_size = _BG_BATCH_DEFAULT
