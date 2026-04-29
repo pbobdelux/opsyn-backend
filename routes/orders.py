@@ -19,12 +19,12 @@ logger = logging.getLogger("orders")
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 
-@router.get("")
-def get_orders():
+@router.get("/status")
+def get_orders_status():
+    """Lightweight status check for the orders router (no DB call)."""
     return {
-        "items": [],
-        "count": 0,
-        "message": "Orders endpoint is live",
+        "ok": True,
+        "message": "Orders router is live. Use GET /orders?brand=<slug> for order data.",
     }
 
 
