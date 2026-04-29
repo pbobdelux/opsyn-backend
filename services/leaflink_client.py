@@ -507,26 +507,34 @@ class LeafLinkClient:
         max_pages: Optional[int] = None,
         normalize: bool = False,
         brand: str = "unknown",
+        start_url: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Fetch all orders from LeafLink, paginating until no ``next`` URL is returned.
+        """Fetch orders from LeafLink, paginating until no ``next`` URL is returned.
 
         Args:
             max_pages: Maximum number of pages to fetch. ``None`` (default) means
                 unlimited — fetch every page until LeafLink returns no ``next`` URL.
-                Pass an integer to cap the number of pages (e.g. for testing).
+                Pass an integer to cap the number of pages (e.g. for testing or
+                Phase 1 quick-sync).
             normalize: When ``True``, run each raw order through ``_normalize_order``.
             brand: Brand slug used only for structured log messages.
+            start_url: If provided, begin pagination from this absolute URL instead
+                of page 1. Used by background sync to resume from where Phase 1 left
+                off.
 
         Returns:
             A dict with keys:
-                ``orders``       – list of order dicts
+                ``orders``        – list of order dicts
                 ``pages_fetched`` – number of pages retrieved
+                ``next_url``      – next pagination URL if more pages exist, else None
+                ``total_count``   – total order count reported by LeafLink API, or None
         """
         effective_max = max_pages if max_pages is not None else 10_000
         logger.info(
-            "[LeafLink] fetch_start brand=%s max_pages=%s",
+            "[LeafLink] fetch_start brand=%s max_pages=%s start_url=%s",
             brand,
             max_pages if max_pages is not None else "unlimited",
+            start_url or "page_1",
         )
         logger.info(
             "[LeafLinkSync] mock_mode_enabled=%s brand=%s",
@@ -543,10 +551,13 @@ class LeafLinkClient:
 
         all_orders: List[Dict[str, Any]] = []
         pages_fetched = 0
+        total_count: Optional[int] = None
 
         try:
             page = 1
-            next_url: Optional[str] = None
+            # If a resume URL was provided (background sync), start there;
+            # otherwise begin at page 1 via list_orders().
+            next_url: Optional[str] = start_url
 
             while page <= effective_max:
                 pages_fetched += 1
@@ -601,6 +612,9 @@ class LeafLinkClient:
                         or []
                     )
                     next_url = payload.get("next")
+                    # Capture total count from the first page response
+                    if total_count is None and isinstance(payload.get("count"), int):
+                        total_count = payload["count"]
                 else:
                     raise RuntimeError(f"Unexpected LeafLink response type: {type(payload).__name__}")
 
@@ -662,10 +676,11 @@ class LeafLinkClient:
 
         total = len(all_orders)
         logger.info(
-            "[LeafLink] fetch_complete total=%s pages=%s brand=%s",
+            "[LeafLink] fetch_complete total=%s pages=%s brand=%s total_count=%s",
             total,
             pages_fetched,
             brand,
+            total_count,
         )
         logger.info(
             "[LeafLinkSync] finished brand=%s total_fetched=%s pages_fetched=%s normalize=%s",
@@ -675,4 +690,9 @@ class LeafLinkClient:
             normalize,
         )
 
-        return {"orders": all_orders, "pages_fetched": pages_fetched}
+        return {
+            "orders": all_orders,
+            "pages_fetched": pages_fetched,
+            "next_url": next_url,
+            "total_count": total_count,
+        }

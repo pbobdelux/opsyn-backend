@@ -24,8 +24,172 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 _leaflink_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="leaflink-sync")
 
 # Timeout constants
-LEAFLINK_TIMEOUT_SECONDS = 5   # Max seconds to wait for LeafLink API
-DB_TIMEOUT_SECONDS = 3         # Max seconds to wait for DB upsert in Phase A
+LEAFLINK_TIMEOUT_SECONDS = 30  # Max seconds to wait for Phase 1 LeafLink fetch (per page batch)
+DB_TIMEOUT_SECONDS = 10        # Max seconds to wait for DB upsert in Phase 1
+
+# Background sync: no hard timeout — runs until complete or error
+BACKGROUND_SYNC_PAGE_TIMEOUT = 45  # Seconds per page fetch in background (generous)
+
+
+async def _background_sync_remaining_pages(
+    api_key: str,
+    company_id: str,
+    brand_id: str,
+    cred_id: int,
+    resume_url: str,
+    pages_already_fetched: int,
+    total_pages_estimate: Optional[int],
+) -> None:
+    """
+    Background task: fetch all remaining LeafLink pages after Phase 1 and upsert
+    them to the database one page at a time.
+
+    This runs fire-and-forget after the /orders/sync response is returned to the
+    client.  It uses its own DB sessions so it is completely decoupled from the
+    request lifecycle.
+
+    Args:
+        api_key: LeafLink API key for the brand.
+        company_id: LeafLink company ID for the brand.
+        brand_id: Brand slug / ID used for DB scoping and logging.
+        cred_id: Primary key of the BrandAPICredential row to update progress on.
+        resume_url: The ``next`` URL returned by Phase 1 — where background sync
+            starts.
+        pages_already_fetched: Number of pages Phase 1 already fetched (for
+            accurate page numbering in logs).
+        total_pages_estimate: Total pages estimate from Phase 1 (for logging).
+    """
+    from services.leaflink_client import LeafLinkClient
+    from services.leaflink_sync import sync_leaflink_orders
+    from sqlalchemy import select as sa_select
+
+    logger.info(
+        "[OrdersSync] background_sync_start brand=%s resume_url=%s pages_already=%s total_estimate=%s",
+        brand_id,
+        resume_url,
+        pages_already_fetched,
+        total_pages_estimate,
+    )
+
+    loop = asyncio.get_event_loop()
+    client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=brand_id)
+
+    current_url: Optional[str] = resume_url
+    page_number = pages_already_fetched + 1
+    total_bg_pages = 0
+    total_bg_orders = 0
+
+    while current_url:
+        # Capture for closure
+        _url = current_url
+        _page = page_number
+
+        def _fetch_one_page() -> dict:
+            return client.fetch_recent_orders(
+                max_pages=1,
+                normalize=True,
+                brand=brand_id,
+                start_url=_url,
+            )
+
+        try:
+            fetch_result = await asyncio.wait_for(
+                loop.run_in_executor(_leaflink_executor, _fetch_one_page),
+                timeout=BACKGROUND_SYNC_PAGE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "[OrdersSync] background_page=%s timeout brand=%s — stopping background sync",
+                _page,
+                brand_id,
+            )
+            break
+        except Exception as fetch_exc:
+            logger.error(
+                "[OrdersSync] background_page=%s fetch_error brand=%s error=%s — stopping background sync",
+                _page,
+                brand_id,
+                fetch_exc,
+            )
+            break
+
+        page_orders = fetch_result.get("orders", [])
+        next_url = fetch_result.get("next_url")
+
+        logger.info(
+            "[OrdersSync] background_page=%s fetched=%s brand=%s",
+            _page,
+            len(page_orders),
+            brand_id,
+        )
+
+        if page_orders:
+            try:
+                async with AsyncSessionLocal() as bg_session:
+                    async with bg_session.begin():
+                        await sync_leaflink_orders(
+                            bg_session,
+                            brand_id,
+                            page_orders,
+                            pages_fetched=_page,
+                        )
+                total_bg_orders += len(page_orders)
+            except Exception as upsert_exc:
+                logger.error(
+                    "[OrdersSync] background_page=%s upsert_error brand=%s error=%s",
+                    _page,
+                    brand_id,
+                    upsert_exc,
+                )
+                # Continue to next page even if one upsert fails
+
+        total_bg_pages += 1
+
+        # Update progress on the credential row
+        try:
+            async with AsyncSessionLocal() as prog_session:
+                async with prog_session.begin():
+                    cred_result = await prog_session.execute(
+                        sa_select(BrandAPICredential).where(BrandAPICredential.id == cred_id)
+                    )
+                    db_cred = cred_result.scalar_one_or_none()
+                    if db_cred:
+                        db_cred.last_synced_page = _page
+        except Exception as prog_exc:
+            logger.warning(
+                "[OrdersSync] background_page=%s progress_update_failed brand=%s error=%s",
+                _page,
+                brand_id,
+                prog_exc,
+            )
+
+        current_url = next_url
+        page_number += 1
+
+    # Mark sync_in_progress = False when done
+    try:
+        async with AsyncSessionLocal() as done_session:
+            async with done_session.begin():
+                cred_result = await done_session.execute(
+                    sa_select(BrandAPICredential).where(BrandAPICredential.id == cred_id)
+                )
+                db_cred = cred_result.scalar_one_or_none()
+                if db_cred:
+                    db_cred.sync_in_progress = False
+                    db_cred.last_synced_page = page_number - 1
+    except Exception as done_exc:
+        logger.warning(
+            "[OrdersSync] background_sync_complete_update_failed brand=%s error=%s",
+            brand_id,
+            done_exc,
+        )
+
+    logger.info(
+        "[OrdersSync] background_sync_complete brand=%s total_pages_synced=%s total_orders_synced=%s",
+        brand_id,
+        total_bg_pages,
+        total_bg_orders,
+    )
 
 
 @router.get("")
@@ -143,30 +307,42 @@ async def orders_sync(
     cursor: Optional[str] = Query(None, description="Pagination cursor from previous response"),
     limit: int = Query(500, ge=1, le=1000, description="Number of orders to return (default 500, max 1000)"),
     force_full: bool = Query(False, description="Force a complete backfill from LeafLink, ignoring updated_after"),
+    max_pages_per_request: int = Query(3, ge=1, le=10, description="Pages to fetch synchronously in Phase 1 (default 3, max 10). Remaining pages sync in background."),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Get orders for incremental sync with cursor-based pagination.
 
-    Supports efficient incremental sync by:
-    - Returning only orders updated after a given timestamp
-    - Using cursor-based pagination to avoid offset issues
-    - Sorting by updated_at for consistent ordering
-    - Including stable order ID fields for deduplication
+    Uses a two-phase architecture to return quickly while syncing all data:
+
+    Phase 1 (synchronous, returns to client):
+      - Fetches only max_pages_per_request pages from LeafLink (default: 3 = ~300 orders)
+      - Upserts those orders to the database immediately
+      - Returns within 1-2 seconds with partial data + pagination metadata
+
+    Phase 2 (background, fire-and-forget):
+      - Continues fetching remaining pages after the response is sent
+      - Upserts each page to the database as it arrives
+      - No timeout — runs until all pages are fetched or an error occurs
+      - Progress tracked in BrandAPICredential.last_synced_page
 
     Query params:
     - brand_id: Brand slug or ID to filter orders (e.g., "noble-nectar")
     - brand_slug: Alias for brand_id
     - updated_after: ISO timestamp (e.g., "2026-04-25T12:30:00Z") — ignored when force_full=true
     - cursor: Pagination cursor from previous response
-    - limit: Number of orders (1-1000, default 500)
+    - limit: Number of orders to return from DB (1-1000, default 500)
     - force_full: true/false — force complete backfill from LeafLink (default false)
+    - max_pages_per_request: Pages to fetch synchronously (1-10, default 3)
 
     Response includes:
-    - orders: Array of order objects
-    - sync_metadata: Sync statistics (total fetched, pages, duration, etc.)
-    - next_cursor: Cursor for next page (if has_more=true)
-    - has_more: Whether more orders exist
+    - orders: Array of order objects (from DB after Phase 1 upsert)
+    - sync_metadata: Sync statistics including background_sync_in_progress, total_pages_estimate
+    - next_cursor: Cursor for next page of DB results (if has_more=true)
+    - has_more: Whether more orders exist in DB
+    - background_sync_in_progress: true if background sync was triggered
+    - total_pages_estimate: Estimated total pages from LeafLink API
+    - pages_fetched_so_far: Pages fetched in Phase 1
     - server_time: Current server time
     - sync_version: Sync protocol version
     - last_synced_at: Timestamp of this sync
@@ -186,7 +362,7 @@ async def orders_sync(
         brand_filter,
     )
     logger.info(
-        "[OrdersSync] request_start path=%s brand=%s org=%s updated_after=%s cursor=%s limit=%s force_full=%s",
+        "[OrdersSync] request_start path=%s brand=%s org=%s updated_after=%s cursor=%s limit=%s force_full=%s max_pages_per_request=%s",
         request.url.path,
         brand_filter,
         request.headers.get("x-opsyn-org") or request.headers.get("x-org-id"),
@@ -194,6 +370,7 @@ async def orders_sync(
         cursor[:8] + "..." if cursor else None,
         limit,
         force_full,
+        max_pages_per_request,
     )
 
     logger.info("[OrdersSync] requested_brand=%s", brand_filter)
@@ -240,9 +417,20 @@ async def orders_sync(
     sync_metadata: dict = {}
     sync_error: Optional[str] = None
     live_refresh_failed: bool = False
+    background_sync_in_progress: bool = False
+    total_pages_estimate: Optional[int] = None
+    pages_fetched_so_far: int = 0
+    _phase1_next_url: Optional[str] = None
 
     if _active_cred and not force_db_only:
-        logger.info("[OrdersSync] phase=A start brand=%s", _resolved_brand_id)
+        # ------------------------------------------------------------------ #
+        # Phase 1: Quick synchronous fetch — only max_pages_per_request pages #
+        # ------------------------------------------------------------------ #
+        logger.info(
+            "[OrdersSync] phase=1_start max_pages=%s brand=%s",
+            max_pages_per_request,
+            _resolved_brand_id,
+        )
         cred = None
         try:
             from services.leaflink_client import LeafLinkClient
@@ -315,8 +503,10 @@ async def orders_sync(
 
                 client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=_resolved_brand_id)
 
-                # force_full=True → fetch all pages (unlimited); otherwise fetch recent (5 pages)
-                max_pages_arg = None if force_full else 5
+                # Phase 1: fetch only max_pages_per_request pages synchronously.
+                # When force_full=True we still use the same limit — background sync
+                # will handle the rest regardless.
+                phase1_max_pages = max_pages_per_request
 
                 # ---------------------------------------------------------- #
                 # Wrap the synchronous LeafLink HTTP call in a thread so we   #
@@ -328,7 +518,7 @@ async def orders_sync(
 
                 def _fetch_orders_sync():
                     return client.fetch_recent_orders(
-                        max_pages=max_pages_arg,
+                        max_pages=phase1_max_pages,
                         normalize=True,
                         brand=_resolved_brand_id,
                     )
@@ -350,7 +540,21 @@ async def orders_sync(
 
                 orders_from_leaflink = fetch_result["orders"]
                 pages_fetched = fetch_result["pages_fetched"]
+                _phase1_next_url = fetch_result.get("next_url")
+                _total_count = fetch_result.get("total_count")
 
+                # Derive total pages estimate from total_count (100 orders/page)
+                if _total_count and _total_count > 0:
+                    total_pages_estimate = (_total_count + 99) // 100
+                pages_fetched_so_far = pages_fetched
+
+                logger.info(
+                    "[OrdersSync] phase=1_complete pages_fetched=%s orders_fetched=%s total_count=%s total_pages_estimate=%s",
+                    pages_fetched,
+                    len(orders_from_leaflink),
+                    _total_count,
+                    total_pages_estimate,
+                )
                 logger.info("[OrdersSync] phase=A leaflink_pull_success count=%s", len(orders_from_leaflink))
                 logger.info(
                     "[OrdersSync] leaflink_fetch_complete brand=%s orders=%s pages=%s force_full=%s",
@@ -366,6 +570,10 @@ async def orders_sync(
                     _resolved_brand_id,
                 )
                 logger.info("[OrdersSync] total_fetched_from_leaflink=%s", len(orders_from_leaflink))
+
+                # Log per-page counts (Phase 1 fetched them all at once, so approximate)
+                for _pg in range(1, pages_fetched + 1):
+                    logger.info("[OrdersSync] page=%s fetched=~100 brand=%s", _pg, _resolved_brand_id)
 
                 # Watchdog: emit sync_progress after fetch
                 await emit_watchdog_event(
@@ -422,6 +630,8 @@ async def orders_sync(
                 sync_metadata["pages_fetched"] = sync_result.get("pages_fetched", pages_fetched)
                 sync_metadata["sync_duration_seconds"] = sync_result.get("sync_duration_seconds", 0)
                 sync_metadata["used_force_full"] = force_full
+                sync_metadata["pages_fetched_so_far"] = pages_fetched_so_far
+                sync_metadata["total_pages_estimate"] = total_pages_estimate
 
                 newest = sync_result.get("newest_order_date")
                 sync_metadata["latest_order_date"] = newest.isoformat() if newest else None
@@ -434,7 +644,61 @@ async def orders_sync(
                     _resolved_brand_id,
                 )
 
-                # Watchdog: emit sync_completed or sync_failed based on result
+                # ---------------------------------------------------------- #
+                # Phase 2: Trigger background sync for remaining pages        #
+                # ---------------------------------------------------------- #
+                if _phase1_next_url:
+                    logger.info(
+                        "[OrdersSync] background_sync_triggered total_pages_estimate=%s brand=%s resume_url=%s",
+                        total_pages_estimate,
+                        _resolved_brand_id,
+                        _phase1_next_url,
+                    )
+                    background_sync_in_progress = True
+                    sync_metadata["background_sync_in_progress"] = True
+
+                    # Mark credential as sync_in_progress
+                    try:
+                        async with AsyncSessionLocal() as _prog_session:
+                            async with _prog_session.begin():
+                                from sqlalchemy import select as _sa_select
+                                _cred_row = (await _prog_session.execute(
+                                    _sa_select(BrandAPICredential).where(BrandAPICredential.id == cred.id)
+                                )).scalar_one_or_none()
+                                if _cred_row:
+                                    _cred_row.sync_in_progress = True
+                                    _cred_row.last_synced_page = pages_fetched
+                                    if total_pages_estimate:
+                                        _cred_row.total_pages_estimate = total_pages_estimate
+                    except Exception as _prog_exc:
+                        logger.warning(
+                            "[OrdersSync] background_sync_flag_failed brand=%s error=%s",
+                            _resolved_brand_id,
+                            _prog_exc,
+                        )
+
+                    # Fire-and-forget: schedule background task on the event loop
+                    asyncio.ensure_future(
+                        _background_sync_remaining_pages(
+                            api_key=api_key,
+                            company_id=company_id,
+                            brand_id=_resolved_brand_id,
+                            cred_id=cred.id,
+                            resume_url=_phase1_next_url,
+                            pages_already_fetched=pages_fetched,
+                            total_pages_estimate=total_pages_estimate,
+                        )
+                    )
+                else:
+                    # All pages fetched in Phase 1 — no background sync needed
+                    sync_metadata["background_sync_in_progress"] = False
+                    logger.info(
+                        "[OrdersSync] all_pages_fetched_in_phase1 brand=%s pages=%s",
+                        _resolved_brand_id,
+                        pages_fetched,
+                    )
+
+                # Watchdog: emit sync_completed (Phase 1 done; background may continue)
                 if sync_result.get("ok"):
                     await emit_watchdog_event(
                         event_type="sync_completed",
@@ -442,7 +706,7 @@ async def orders_sync(
                         sync_metadata={
                             "total_fetched_from_leaflink": sync_result.get("orders_fetched", 0),
                             "total_in_database": sync_result.get("created", 0) + sync_result.get("updated", 0),
-                            "percent_complete": 100.0,
+                            "percent_complete": 100.0 if not _phase1_next_url else round(pages_fetched / (total_pages_estimate or pages_fetched) * 100, 1),
                             "latest_order_date": sync_metadata.get("latest_order_date"),
                             "oldest_order_date": None,
                             "sync_error": None,
@@ -695,6 +959,9 @@ async def orders_sync(
             sync_metadata.setdefault("pages_fetched", None)
             sync_metadata.setdefault("sync_duration_seconds", None)
             sync_metadata.setdefault("latest_order_date", None)
+            sync_metadata.setdefault("background_sync_in_progress", background_sync_in_progress)
+            sync_metadata.setdefault("total_pages_estimate", total_pages_estimate)
+            sync_metadata.setdefault("pages_fetched_so_far", pages_fetched_so_far)
             sync_metadata["total_in_database"] = total_in_database
             sync_metadata["total_returned"] = len(orders_data)
 
@@ -704,11 +971,12 @@ async def orders_sync(
                 logger.info("[OrdersSync] latest_order_date=%s brand=%s", sync_metadata["latest_order_date"], brand_filter)
 
             logger.info(
-                "[OrdersSync] response count=%s has_more=%s brand=%s total_in_db=%s",
+                "[OrdersSync] response count=%s has_more=%s brand=%s total_in_db=%s background_sync=%s",
                 len(orders_data),
                 has_more,
                 brand_filter,
                 total_in_database,
+                background_sync_in_progress,
             )
 
             # Determine response source:
@@ -778,6 +1046,9 @@ async def orders_sync(
                 "sync_metadata": sync_metadata,
                 "next_cursor": next_cursor if has_more else None,
                 "has_more": has_more,
+                "background_sync_in_progress": background_sync_in_progress,
+                "total_pages_estimate": total_pages_estimate,
+                "pages_fetched_so_far": pages_fetched_so_far,
                 "server_time": server_time,
                 "sync_version": 1,
                 "last_synced_at": server_time,
@@ -804,6 +1075,9 @@ async def orders_sync(
                 "server_time": server_time,
                 "has_more": False,
                 "next_cursor": None,
+                "background_sync_in_progress": False,
+                "total_pages_estimate": None,
+                "pages_fetched_so_far": 0,
                 "sync_metadata": sync_metadata,
                 "last_error": str(phase_b_exc),
             })
