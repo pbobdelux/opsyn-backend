@@ -515,7 +515,8 @@ class LeafLinkClient:
                         next_url,
                     )
                     try:
-                        resp = self.session.get(next_url, timeout=45)
+                        auth_headers = {"Authorization": f"Token {self.api_key}"}
+                        resp = self.session.get(next_url, timeout=45, headers=auth_headers)
                     except Exception as exc:
                         logger.error(
                             "[LeafLinkSync] page=%s request_failed error=%s",
