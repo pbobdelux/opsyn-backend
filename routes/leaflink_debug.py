@@ -497,3 +497,117 @@ async def debug_leaflink_auth(
             "ok": False,
             "error": str(e),
         }
+
+
+@router.get("/raw-orders")
+async def raw_orders_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """
+    Debug endpoint: calls LeafLink orders-received/ directly and returns the
+    raw API response with no normalization.  Use this to determine whether
+    LeafLink is returning 0 orders or whether the issue is in parsing/filtering.
+
+    GET /leaflink/raw-orders
+    """
+    # ── Load first active LeafLink credential (same query as /orders/sync) ──
+    try:
+        cred_result = await db.execute(
+            select(BrandAPICredential)
+            .where(
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+            )
+            .order_by(BrandAPICredential.last_sync_at.desc().nullslast())
+            .limit(1)
+        )
+        cred = cred_result.scalar_one_or_none()
+    except Exception as cred_exc:
+        logger.error("[LeafLinkRaw] cred_lookup_failed error=%s", cred_exc)
+        return {"ok": False, "error": f"DB credential lookup failed: {cred_exc}"}
+
+    if cred is None:
+        logger.warning("[LeafLinkRaw] no active credentials found")
+        return {
+            "ok": False,
+            "error": "No active LeafLink credentials found in database. Use POST /integrations/leaflink/connect to add credentials.",
+        }
+
+    company_id = cred.company_id
+    logger.info("[LeafLinkRaw] request company_id=%s", company_id)
+
+    # ── Build client and call orders-received/ ───────────────────────────────
+    try:
+        client = LeafLinkClient(
+            api_key=cred.api_key,
+            company_id=company_id,
+            brand_id=cred.brand_id,
+        )
+    except Exception as client_exc:
+        logger.error("[LeafLinkRaw] client_init_failed error=%s", client_exc)
+        return {"ok": False, "error": f"LeafLink client init failed: {client_exc}"}
+
+    api_url = f"{client.base_url}/orders-received/"
+
+    try:
+        raw = client.list_orders(page=1, page_size=100)
+    except Exception as api_exc:
+        logger.error("[LeafLinkRaw] api_call_failed error=%s", api_exc)
+        return {
+            "ok": False,
+            "company_id": company_id,
+            "api_url": api_url,
+            "base_url": client.base_url,
+            "error": str(api_exc),
+        }
+
+    # ── Inspect the raw response ─────────────────────────────────────────────
+    response_type = type(raw).__name__
+    logger.info("[LeafLinkRaw] response_type=%s", response_type)
+
+    # Determine result list, count, and pagination info regardless of shape
+    if isinstance(raw, list):
+        results_list = raw
+        count = len(raw)
+        next_url = None
+        total_pages = 1
+    elif isinstance(raw, dict):
+        results_list = (
+            raw.get("results")
+            or raw.get("data")
+            or raw.get("orders")
+            or []
+        )
+        count = raw.get("count", len(results_list))
+        next_url = raw.get("next")
+        # Estimate total pages from count + page_size (100)
+        if isinstance(count, int) and count > 0:
+            total_pages = (count + 99) // 100
+        else:
+            total_pages = 1
+    else:
+        results_list = []
+        count = 0
+        next_url = None
+        total_pages = 0
+
+    logger.info("[LeafLinkRaw] response_count=%s", count)
+
+    first_2 = results_list[:2] if isinstance(results_list, list) else []
+
+    if first_2:
+        first_order_id = first_2[0].get("id") if isinstance(first_2[0], dict) else None
+        logger.info("[LeafLinkRaw] first_order_id=%s", first_order_id)
+    else:
+        logger.info("[LeafLinkRaw] first_order_id=none (empty results)")
+
+    return {
+        "ok": True,
+        "company_id": company_id,
+        "api_url": api_url,
+        "base_url": client.base_url,
+        "response_type": response_type,
+        "count": count,
+        "total_pages": total_pages,
+        "has_next": bool(next_url),
+        "next_url": next_url,
+        "first_2_orders": first_2,
+    }
