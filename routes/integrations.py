@@ -266,8 +266,6 @@ async def leaflink_connect(
             exc,
         )
 
-    now = _utc_now()
-
     try:
         async with db.begin():
             # Upsert the credential inside the transaction
@@ -289,7 +287,6 @@ async def leaflink_connect(
                     is_active=True,
                     sync_status="ok" if valid else "failed",
                     last_error=None if valid else (validation_error or "Invalid credentials"),
-                    last_checked_at=now,
                 )
                 db.add(cred)
             else:
@@ -299,7 +296,6 @@ async def leaflink_connect(
                 cred.is_active = True
                 cred.sync_status = "ok" if valid else "failed"
                 cred.last_error = None if valid else (validation_error or "Invalid credentials")
-                cred.last_checked_at = now
 
     except Exception as exc:
         logger.error(

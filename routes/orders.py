@@ -17,6 +17,7 @@ from utils.json_utils import make_json_safe
 logger = logging.getLogger("orders")
 
 router = APIRouter(prefix="/orders", tags=["orders"])
+debug_router = APIRouter(prefix="/debug", tags=["debug"])
 
 
 @router.get("")
@@ -491,3 +492,91 @@ async def orders_sync(
                 "sync_metadata": sync_metadata,
                 "last_error": str(phase_b_exc),
             })
+
+
+# ---------------------------------------------------------------------------
+# Debug router — GET /debug/orders-sync
+# ---------------------------------------------------------------------------
+
+@debug_router.get("/orders-sync")
+async def debug_orders_sync(
+    brand: Optional[str] = Query(None, description="Brand slug to inspect (e.g. 'noble-nectar')"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Debug endpoint: inspect LeafLink credential status and order counts for a brand.
+
+    Query params:
+      brand (required): Brand slug to inspect
+
+    Returns credential metadata, sync status, and order counts from the database.
+    Never exposes secret values.
+    """
+    if not brand:
+        return {
+            "ok": False,
+            "error": "brand query parameter is required",
+            "example": "/debug/orders-sync?brand=noble-nectar",
+        }
+
+    logger.info("[DebugOrdersSync] request brand=%s", brand)
+
+    result: dict = {"ok": True, "brand": brand}
+
+    # Credential status
+    try:
+        cred_result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.brand_id == brand,
+                BrandAPICredential.integration_name == "leaflink",
+            )
+        )
+        cred = cred_result.scalar_one_or_none()
+
+        if cred:
+            result["credential"] = {
+                "found": True,
+                "is_active": cred.is_active,
+                "sync_status": cred.sync_status,
+                "last_sync_at": cred.last_sync_at.isoformat() if cred.last_sync_at else None,
+                "last_error": cred.last_error,
+                "company_id": cred.company_id,
+                "has_api_key": bool(cred.api_key),
+            }
+        else:
+            result["credential"] = {"found": False}
+    except Exception as exc:
+        logger.error("[DebugOrdersSync] credential_lookup_error brand=%s error=%s", brand, exc)
+        result["credential"] = {"found": False, "error": str(exc)}
+
+    # Order counts
+    try:
+        count_result = await db.execute(
+            select(func.count(Order.id)).where(Order.brand_id == brand)
+        )
+        total_orders = count_result.scalar_one()
+
+        newest_result = await db.execute(
+            select(Order.external_updated_at)
+            .where(Order.brand_id == brand)
+            .order_by(Order.external_updated_at.desc())
+            .limit(1)
+        )
+        newest_row = newest_result.scalar_one_or_none()
+
+        result["orders"] = {
+            "total_in_database": total_orders,
+            "newest_order_date": newest_row.isoformat() if newest_row else None,
+        }
+    except Exception as exc:
+        logger.error("[DebugOrdersSync] order_count_error brand=%s error=%s", brand, exc)
+        result["orders"] = {"error": str(exc)}
+
+    logger.info(
+        "[DebugOrdersSync] complete brand=%s credential_found=%s total_orders=%s",
+        brand,
+        result.get("credential", {}).get("found"),
+        result.get("orders", {}).get("total_in_database"),
+    )
+
+    return make_json_safe(result)
