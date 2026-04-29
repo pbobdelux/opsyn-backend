@@ -543,17 +543,32 @@ async def orders_sync(
                 # Phase 2: Spawn persistent background sync for remaining     #
                 # pages via BackgroundSyncManager                             #
                 # ---------------------------------------------------------- #
+                logger.info(
+                    "[OrdersSync] phase2_check_conditions next_url=%s next_page=%s total_pages=%s",
+                    bool(next_leaflink_url),
+                    next_page_number,
+                    total_pages_available,
+                )
+
                 pages_remaining = (total_pages_available - start_page - pages_fetched_phase1 + 1) if total_pages_available else None
 
                 if next_leaflink_url and next_page_number and total_pages_available:
                     logger.info(
-                        "[OrdersSync] bg_continuous_sync_started brand=%s start_page=%s total_pages=%s",
+                        "[OrdersSync] phase2_before_manager_start brand=%s start_page=%s total_pages=%s pages_remaining=%s",
                         _resolved_brand_id,
                         next_page_number,
                         total_pages_available,
+                        pages_remaining,
                     )
 
                     try:
+                        logger.info(
+                            "[OrdersSync] phase2_calling_manager_start_sync brand=%s api_key_len=%s company_id=%s",
+                            _resolved_brand_id,
+                            len(api_key) if api_key else 0,
+                            company_id,
+                        )
+
                         sync_manager.start_sync(
                             brand_id=_resolved_brand_id,
                             api_key=api_key,
@@ -561,17 +576,28 @@ async def orders_sync(
                             total_pages=total_pages_available,
                             start_page=next_page_number,
                         )
+
+                        logger.info(
+                            "[OrdersSync] phase2_manager_started brand=%s task_created=true",
+                            _resolved_brand_id,
+                        )
                         sync_metadata["background_sync_active"] = True
                     except Exception as bg_task_exc:
                         logger.error(
-                            "[OrdersSync] background_task_create_error error_type=%s error=%s brand=%s",
-                            type(bg_task_exc).__name__, bg_task_exc, _resolved_brand_id, exc_info=True,
+                            "[OrdersSync] phase2_manager_error brand=%s error=%s",
+                            _resolved_brand_id,
+                            bg_task_exc,
+                            exc_info=True,
                         )
                         sync_metadata["background_sync_active"] = False
-                        sync_metadata["background_task_error"] = str(bg_task_exc)
-                        sync_metadata["background_task_error_type"] = type(bg_task_exc).__name__
+                        sync_metadata["background_sync_error"] = str(bg_task_exc)
                 else:
-                    logger.info("[OrdersSync] no_more_pages — background sync not needed")
+                    logger.info(
+                        "[OrdersSync] phase2_skipped brand=%s reason=no_more_pages next_url=%s next_page=%s",
+                        _resolved_brand_id,
+                        bool(next_leaflink_url),
+                        next_page_number,
+                    )
                     sync_metadata["background_sync_active"] = False
 
                 # Mark credential as successfully used

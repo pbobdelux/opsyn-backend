@@ -101,6 +101,13 @@ class BackgroundSyncManager:
 
         Returns the created Task so callers can optionally await it.
         """
+        logger.info(
+            "[BackgroundSyncManager] start_sync_called brand=%s start_page=%s total_pages=%s",
+            brand_id,
+            start_page,
+            total_pages,
+        )
+
         # Cancel any existing task for this brand before starting a new one
         existing = self._tasks.get(brand_id)
         if existing and not existing.done():
@@ -149,6 +156,12 @@ class BackgroundSyncManager:
 
         task = asyncio.create_task(_run(), name=f"bg_sync_{brand_id}")
         self._tasks[brand_id] = task
+        logger.info(
+            "[BackgroundSyncManager] task_created brand=%s task_name=%s task_id=%s",
+            brand_id,
+            task.get_name(),
+            id(task),
+        )
         logger.info(
             "[BackgroundSyncManager] task_started brand=%s start_page=%s total_pages=%s",
             brand_id,
