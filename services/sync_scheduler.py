@@ -43,7 +43,10 @@ def run_single_sync():
 
     headers = {}
     if SYNC_SECRET:
-        headers["x-opsyn-secret"] = SYNC_SECRET
+        headers["X-OPSYN-SECRET"] = SYNC_SECRET
+        logger.info("sync_auth: header_present=true")
+    else:
+        logger.warning("sync_auth: OPSYN_SYNC_SECRET not set — requests will be unauthorized")
 
     payload = {
         "org_id": SYNC_ORG_ID,
