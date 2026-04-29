@@ -71,8 +71,8 @@ async def resolve_brand_id(
     return cred.brand_id, cred.company_id
 
 
-@router.get("")
-def get_orders():
+@router.get("/status")
+def get_orders_status():
     return {
         "items": [],
         "count": 0,
