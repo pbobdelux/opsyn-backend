@@ -65,6 +65,8 @@ async def _create_assistant_tables() -> None:
 async def lifespan(app: FastAPI):
     logger.info(f"Starting {APP_NAME} in {APP_ENV}")
     await _create_assistant_tables()
+    route_count = len(app.routes)
+    logger.info("[Startup] routes_registered count=%s", route_count)
     yield
     logger.info("Shutting down")
 
@@ -131,6 +133,25 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True, "status": "healthy", "time": utc_now_iso()}
+
+
+@app.get("/ping")
+def ping():
+    logger.info("[Ping] reached")
+    return {"ok": True, "timestamp": utc_now_iso()}
+
+
+@app.get("/debug/routes")
+def debug_routes():
+    routes = []
+    for route in app.routes:
+        methods = list(getattr(route, "methods", None) or [])
+        path = getattr(route, "path", None)
+        if path is not None:
+            routes.append({"path": path, "methods": methods})
+    count = len(routes)
+    logger.info("[RoutesDebug] reached count=%s", count)
+    return {"ok": True, "routes": routes, "count": count}
 
 
 @app.post("/orders")
