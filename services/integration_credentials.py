@@ -82,7 +82,7 @@ def validate_leaflink_credential(credential: BrandAPICredential) -> bool:
     """
     Test a LeafLink credential by making a minimal API request (page_size=1).
 
-    Updates credential.last_checked_at and credential.sync_status in-memory.
+    Updates credential.sync_status in-memory.
     The caller is responsible for persisting the credential to the database.
 
     Returns True if the credential is valid, False otherwise.
@@ -104,7 +104,6 @@ def validate_leaflink_credential(credential: BrandAPICredential) -> bool:
             "[IntegrationCredentials] validation brand_id=%s valid=false reason=empty_api_key",
             brand_id,
         )
-        credential.last_checked_at = _utc_now()
         credential.sync_status = "failed"
         return False
 
@@ -121,7 +120,6 @@ def validate_leaflink_credential(credential: BrandAPICredential) -> bool:
         )
 
         valid = resp.ok
-        credential.last_checked_at = _utc_now()
         credential.sync_status = "ok" if valid else "failed"
 
         logger.info(
@@ -138,7 +136,6 @@ def validate_leaflink_credential(credential: BrandAPICredential) -> bool:
             brand_id,
             exc,
         )
-        credential.last_checked_at = _utc_now()
         credential.sync_status = "failed"
         return False
 
@@ -154,7 +151,7 @@ async def mark_credential_invalid(
     """
     Mark a credential as failed in the database.
 
-    Sets sync_status = "failed", last_error = error, last_checked_at = now.
+    Sets sync_status = "failed", last_error = error.
     Logs the reason without exposing the api_key.
     """
     brand_id = credential.brand_id or "unknown"
@@ -173,7 +170,6 @@ async def mark_credential_invalid(
                 if db_cred:
                     db_cred.sync_status = "failed"
                     db_cred.last_error = error
-                    db_cred.last_checked_at = _utc_now()
 
         logger.info(
             "[IntegrationCredentials] marked_invalid brand_id=%s reason=%s",
