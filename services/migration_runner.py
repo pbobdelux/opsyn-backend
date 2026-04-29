@@ -4,13 +4,17 @@ Migration runner — applies pending SQL migrations on startup.
 Tracks applied migrations in a `schema_migrations` table so each migration
 is only ever executed once (idempotent). Migrations are discovered by scanning
 the `migrations/` directory for `.sql` files, sorted by filename (timestamp-based).
+
+asyncpg does not support multiple SQL statements in a single prepared-statement
+call, so each migration file is split on `;` and each statement is executed
+individually via ``conn.exec_driver_sql()`` (raw SQL, bypasses prepared-statement
+overhead). Each migration runs in its own transaction so a failure in one file
+does not abort subsequent migrations.
 """
 
 import logging
 import os
 import time
-
-from sqlalchemy import text
 
 logger = logging.getLogger("migration_runner")
 
@@ -24,6 +28,26 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     duration_ms INTEGER
 );
 """
+
+
+def _split_statements(sql: str) -> list[str]:
+    """
+    Split a SQL file into individual statements.
+
+    Strips comment-only lines and blank lines, then splits on `;`.
+    Returns only non-empty statement strings.
+    """
+    statements = []
+    for raw in sql.split(";"):
+        # Strip whitespace and filter out lines that are purely comments or blank
+        lines = [
+            line for line in raw.splitlines()
+            if line.strip() and not line.strip().startswith("--")
+        ]
+        stmt = "\n".join(lines).strip()
+        if stmt:
+            statements.append(stmt)
+    return statements
 
 
 async def run_migrations() -> list[str]:
@@ -55,18 +79,21 @@ async def run_migrations() -> list[str]:
             logger.info("[Migration] no migration files found")
             return []
 
-        async with engine.begin() as conn:
-            # Ensure the tracking table exists before anything else
-            await conn.execute(text(CREATE_SCHEMA_MIGRATIONS_TABLE))
+        # Bootstrap: ensure the tracking table exists in its own transaction
+        async with engine.connect() as bootstrap_conn:
+            for stmt in _split_statements(CREATE_SCHEMA_MIGRATIONS_TABLE):
+                await bootstrap_conn.exec_driver_sql(stmt)
+            await bootstrap_conn.commit()
 
-            for filename in sql_files:
-                try:
+        # Apply each migration in an independent transaction so that a failure
+        # in one file does not abort the remaining migrations.
+        for filename in sql_files:
+            try:
+                async with engine.connect() as conn:
                     # Check whether this migration has already been applied
-                    row = await conn.execute(
-                        text(
-                            "SELECT 1 FROM schema_migrations WHERE migration_name = :name"
-                        ),
-                        {"name": filename},
+                    row = await conn.exec_driver_sql(
+                        "SELECT 1 FROM schema_migrations WHERE migration_name = $1",
+                        (filename,),
                     )
                     if row.fetchone() is not None:
                         logger.debug("[Migration] already applied migration=%s — skipping", filename)
@@ -80,18 +107,26 @@ async def run_migrations() -> list[str]:
                     logger.info("[Migration] applying migration=%s", filename)
                     start_ms = time.monotonic()
 
-                    await conn.execute(text(sql))
+                    # Execute each statement individually — asyncpg does not
+                    # support multiple statements in a single prepared call.
+                    statements = _split_statements(sql)
+                    logger.debug(
+                        "[Migration] migration=%s statement_count=%s",
+                        filename,
+                        len(statements),
+                    )
+                    for stmt in statements:
+                        await conn.exec_driver_sql(stmt)
 
                     duration_ms = int((time.monotonic() - start_ms) * 1000)
 
                     # Record the migration as applied
-                    await conn.execute(
-                        text(
-                            "INSERT INTO schema_migrations (migration_name, duration_ms) "
-                            "VALUES (:name, :duration_ms)"
-                        ),
-                        {"name": filename, "duration_ms": duration_ms},
+                    await conn.exec_driver_sql(
+                        "INSERT INTO schema_migrations (migration_name, duration_ms) "
+                        "VALUES ($1, $2)",
+                        (filename, duration_ms),
                     )
+                    await conn.commit()
 
                     logger.info(
                         "[Migration] applied migration=%s duration_ms=%s",
@@ -100,14 +135,14 @@ async def run_migrations() -> list[str]:
                     )
                     applied.append(filename)
 
-                except Exception as migration_exc:
-                    logger.error(
-                        "[Migration] failed migration=%s error=%s",
-                        filename,
-                        migration_exc,
-                        exc_info=True,
-                    )
-                    # Continue with remaining migrations rather than aborting startup
+            except Exception as migration_exc:
+                logger.error(
+                    "[Migration] failed migration=%s error=%s",
+                    filename,
+                    migration_exc,
+                    exc_info=True,
+                )
+                # Continue with remaining migrations rather than aborting startup
 
     except Exception as exc:
         logger.error("[Migration] runner error=%s", exc, exc_info=True)
