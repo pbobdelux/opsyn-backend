@@ -159,6 +159,7 @@ async def sync_leaflink_orders(
         pages_fetched: Number of API pages retrieved (for metadata).
     """
     sync_start = time.monotonic()
+    logger.info("[LeafLinkSync] upsert_start transaction_active=%s", db.in_transaction())
     logger.info(
         "[LeafLink] sync_start brand=%s orders=%s pages_fetched=%s",
         brand_id,
