@@ -122,6 +122,7 @@ async def orders_sync(
                         brand_filter,
                         force_full,
                     )
+                    logger.info("[OrdersSync] leaflink_pull_start brand=%s", brand_filter)
 
                     # Watchdog: emit sync_started
                     _watchdog_url = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
@@ -157,6 +158,11 @@ async def orders_sync(
                         len(orders_from_leaflink),
                         pages_fetched,
                         force_full,
+                    )
+                    logger.info(
+                        "[OrdersSync] leaflink_pull_success count=%s brand=%s",
+                        len(orders_from_leaflink),
+                        brand_filter,
                     )
                     logger.info(
                         "[LeafLink] fetched=%s pages=%s brand=%s",
@@ -203,6 +209,21 @@ async def orders_sync(
                         sync_result.get("updated", 0),
                         brand_filter,
                     )
+                    logger.info(
+                        "[OrdersSync] db_upsert_success inserted=%s updated=%s brand=%s",
+                        sync_result.get("created", 0),
+                        sync_result.get("updated", 0),
+                        brand_filter,
+                    )
+
+                    # Log any orders with review blockers (blockers affect routing, not fetching)
+                    _blocked_count = sync_result.get("skipped", 0)
+                    if _blocked_count:
+                        logger.info(
+                            "[OrdersSync] blockers_ignored count=%s brand=%s",
+                            _blocked_count,
+                            brand_filter,
+                        )
 
                     # Watchdog: emit sync_completed or sync_failed based on result
                     if sync_result.get("ok"):
@@ -248,6 +269,11 @@ async def orders_sync(
                     sync_metadata["used_force_full"] = force_full
 
             except Exception as sync_exc:
+                logger.error(
+                    "[OrdersSync] sync_failed error=%s brand=%s",
+                    sync_exc,
+                    brand_filter,
+                )
                 logger.warning(
                     "[OrdersSync] leaflink_sync_failed brand=%s error=%s — serving from DB",
                     brand_filter,
@@ -417,6 +443,12 @@ async def orders_sync(
             "[Orders] query_count=%s source=%s brand=%s",
             len(orders_data),
             source,
+            brand_filter,
+        )
+        logger.info(
+            "[OrdersSync] response_orders count=%s newest=%s brand=%s",
+            len(orders_data),
+            sync_metadata.get("latest_order_date"),
             brand_filter,
         )
 

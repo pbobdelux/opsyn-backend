@@ -374,6 +374,12 @@ async def sync_leaflink_orders(
             brand_id,
         )
         logger.info(
+            "[OrdersSync] db_upsert_success inserted=%s updated=%s brand=%s",
+            created,
+            updated,
+            brand_id,
+        )
+        logger.info(
             "[LeafLink] sync_complete duration=%ss brand=%s pages=%s",
             sync_duration,
             brand_id,
@@ -409,6 +415,12 @@ async def sync_leaflink_orders(
 
     except Exception as e:
         sync_duration = round(time.monotonic() - sync_start, 2)
+        logger.error(
+            "[OrdersSync] sync_failed error=%s brand=%s duration_seconds=%s",
+            e,
+            brand_id,
+            sync_duration,
+        )
         logger.error(
             "leaflink: sync_failed brand_id=%s error=%s duration_seconds=%s",
             brand_id,
