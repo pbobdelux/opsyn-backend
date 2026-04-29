@@ -136,6 +136,9 @@ async def _resume_interrupted_syncs() -> None:
 async def lifespan(app: FastAPI):
     logger.info(f"Starting {APP_NAME} in {APP_ENV}")
     await _create_assistant_tables()
+    from services.migration_runner import run_migrations
+    applied = await run_migrations()
+    logger.info("[Startup] migrations_complete count=%s", len(applied))
     await _resume_interrupted_syncs()
     route_count = len(app.routes)
     logger.info("[Startup] routes_registered count=%s", route_count)
