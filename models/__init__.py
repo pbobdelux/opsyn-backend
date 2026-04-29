@@ -16,6 +16,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -58,6 +59,8 @@ class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (
         UniqueConstraint("brand_id", "external_order_id", name="uq_brand_external_order"),
+        Index("ix_orders_brand_id", "brand_id"),
+        Index("ix_orders_order_number", "order_number"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)

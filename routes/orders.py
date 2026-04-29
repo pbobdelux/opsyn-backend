@@ -30,7 +30,7 @@ DB_TIMEOUT_SECONDS = 10        # Max seconds to wait for DB upsert in Phase 1
 BACKGROUND_SYNC_TIMEOUT = 1800 # 30 minutes for background full-sync
 
 # Paginated sync configuration
-LEAFLINK_PAGES_PER_REQUEST = 3  # Pages fetched synchronously per /sync call
+LEAFLINK_PAGES_PER_REQUEST = 1  # Pages fetched synchronously per /sync call
 LEAFLINK_PAGE_SIZE = 100        # Orders per LeafLink page
 
 
@@ -332,7 +332,11 @@ async def orders_sync(
 
             try:
                 from services.leaflink_client import LeafLinkClient, DEFAULT_LEAFLINK_BASE_URL
-                from services.leaflink_sync import sync_leaflink_orders
+                from services.leaflink_sync import (
+                    sync_leaflink_orders,
+                    sync_leaflink_orders_headers_only,
+                    sync_leaflink_line_items,
+                )
 
                 _api_url = f"{DEFAULT_LEAFLINK_BASE_URL}/orders-received/"
                 logger.info(
@@ -425,25 +429,16 @@ async def orders_sync(
                     total_pages_available,
                 )
 
-                # Upsert Phase 1 orders to DB
+                # Phase 1 upsert: headers only, batched commits of 25 orders
                 logger.info("[OrdersSync] phase=1 db_upsert_start count=%s", len(orders_from_leaflink))
-                logger.info("[OrdersSync] upsert_start transaction_active=%s", db.in_transaction())
-
-                async def _do_phase1_upsert():
-                    # No db.begin() here — the session already has an active
-                    # transaction from the earlier credential-lookup queries.
-                    # Wrapping with db.begin() again raises:
-                    #   InvalidRequestError: A transaction is already begun on this Session.
-                    return await sync_leaflink_orders(
-                        db,
-                        _resolved_brand_id,
-                        orders_from_leaflink,
-                        pages_fetched=pages_fetched_phase1,
-                    )
 
                 try:
                     sync_result = await asyncio.wait_for(
-                        _do_phase1_upsert(),
+                        sync_leaflink_orders_headers_only(
+                            _resolved_brand_id,
+                            orders_from_leaflink,
+                            pages_fetched=pages_fetched_phase1,
+                        ),
                         timeout=DB_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
@@ -472,6 +467,26 @@ async def orders_sync(
                         "company_id": _resolved_company_id,
                         "traceback": traceback.format_exc(),
                     })
+
+                # Spawn background task to write line items without blocking response
+                _li_brand_id = _resolved_brand_id
+                _li_orders = orders_from_leaflink
+
+                async def _background_line_items():
+                    await sync_leaflink_line_items(_li_brand_id, _li_orders)
+
+                try:
+                    asyncio.create_task(_background_line_items())
+                    logger.info(
+                        "[OrdersSync] line_items_deferred count=%s",
+                        len(orders_from_leaflink),
+                    )
+                except Exception as li_task_exc:
+                    logger.error(
+                        "[OrdersSync] line_items_task_create_error error=%s brand=%s",
+                        li_task_exc, _resolved_brand_id, exc_info=True,
+                    )
+
 
                 phase1_orders_upserted = sync_result.get("orders_fetched", 0)
                 logger.info(
