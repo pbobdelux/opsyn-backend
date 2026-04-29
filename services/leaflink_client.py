@@ -502,6 +502,160 @@ class LeafLinkClient:
             "raw_payload": raw,
         }
 
+    def fetch_orders_page_range(
+        self,
+        start_page: int = 1,
+        num_pages: int = 3,
+        page_size: int = 100,
+        normalize: bool = True,
+        brand: str = "unknown",
+        resume_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Fetch a bounded range of pages from LeafLink, starting at ``start_page``.
+
+        Designed for paginated incremental sync: fetch a small batch of pages
+        quickly, return the ``next_url`` so the caller can resume later.
+
+        Args:
+            start_page: Logical page number to start from (used for logging).
+            num_pages: Maximum number of pages to fetch in this call.
+            page_size: Orders per page (passed to LeafLink as ``page_size``).
+            normalize: When ``True``, run each raw order through ``_normalize_order``.
+            brand: Brand slug used only for structured log messages.
+            resume_url: If provided, resume pagination from this absolute URL
+                        instead of fetching page 1 from scratch.
+
+        Returns:
+            A dict with keys:
+                ``orders``            – list of order dicts for this batch
+                ``pages_fetched``     – number of pages retrieved in this call
+                ``next_url``          – absolute URL for the next page, or ``None``
+                ``next_page``         – logical page number for the next batch
+                ``total_count``       – total order count reported by LeafLink (first page only)
+                ``total_pages``       – estimated total pages (total_count / page_size, rounded up)
+        """
+        logger.info(
+            "[LeafLink] fetch_page_range_start brand=%s start_page=%s num_pages=%s resume_url=%s",
+            brand,
+            start_page,
+            num_pages,
+            resume_url or "none",
+        )
+
+        all_orders: List[Dict[str, Any]] = []
+        pages_fetched = 0
+        next_url: Optional[str] = resume_url
+        total_count: Optional[int] = None
+        current_page = start_page
+
+        try:
+            while pages_fetched < num_pages:
+                if next_url:
+                    logger.info(
+                        "[LeafLink] page_range page=%s fetching next_url=%s",
+                        current_page,
+                        next_url,
+                    )
+                    resp = self._get_raw_url(next_url)
+                    if resp.status_code in (401, 403):
+                        raise RuntimeError(
+                            f"LeafLink pagination auth failed: status={resp.status_code} body={resp.text[:220]}"
+                        )
+                    if not resp.ok:
+                        raise RuntimeError(
+                            f"LeafLink API error: status={resp.status_code} body={resp.text[:220]}"
+                        )
+                    payload = resp.json()
+                else:
+                    payload = self.list_orders(page=current_page, page_size=page_size)
+
+                if isinstance(payload, list):
+                    results = payload
+                    next_url = None
+                elif isinstance(payload, dict):
+                    results = (
+                        payload.get("results")
+                        or payload.get("data")
+                        or payload.get("orders")
+                        or []
+                    )
+                    next_url = payload.get("next")
+                    # Capture total count from first page
+                    if total_count is None and "count" in payload:
+                        total_count = payload.get("count")
+                else:
+                    raise RuntimeError(f"Unexpected LeafLink response type: {type(payload).__name__}")
+
+                if not isinstance(results, list):
+                    raise RuntimeError(f"Unexpected LeafLink results type: {type(results).__name__}")
+
+                if not results:
+                    logger.info(
+                        "[LeafLink] page_range page=%s empty_results — stopping",
+                        current_page,
+                    )
+                    next_url = None
+                    break
+
+                if normalize:
+                    for raw in results:
+                        if isinstance(raw, dict):
+                            all_orders.append(self._normalize_order(raw))
+                else:
+                    for raw in results:
+                        if isinstance(raw, dict):
+                            all_orders.append(raw)
+
+                pages_fetched += 1
+                total_so_far = len(all_orders)
+                logger.info(
+                    "[LeafLink] page_range page=%s fetched=%s total_so_far=%s next=%s",
+                    current_page,
+                    len(results),
+                    total_so_far,
+                    next_url or "None",
+                )
+
+                if not next_url:
+                    break
+
+                current_page += 1
+
+        except Exception as exc:
+            logger.error(
+                "[LeafLink] fetch_page_range_error brand=%s start_page=%s error=%s",
+                brand,
+                start_page,
+                exc,
+            )
+            raise
+
+        import math
+        total_pages: Optional[int] = None
+        if total_count is not None and page_size > 0:
+            total_pages = math.ceil(total_count / page_size)
+
+        next_page = start_page + pages_fetched if next_url else None
+
+        logger.info(
+            "[LeafLink] fetch_page_range_complete brand=%s pages_fetched=%s orders=%s next_page=%s total_count=%s total_pages=%s",
+            brand,
+            pages_fetched,
+            len(all_orders),
+            next_page,
+            total_count,
+            total_pages,
+        )
+
+        return {
+            "orders": all_orders,
+            "pages_fetched": pages_fetched,
+            "next_url": next_url,
+            "next_page": next_page,
+            "total_count": total_count,
+            "total_pages": total_pages,
+        }
+
     def fetch_recent_orders(
         self,
         max_pages: Optional[int] = None,
