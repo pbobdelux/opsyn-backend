@@ -529,12 +529,18 @@ class LeafLinkClient:
             max_pages if max_pages is not None else "unlimited",
         )
         logger.info(
+            "[LeafLinkSync] mock_mode_enabled=%s brand=%s",
+            str(MOCK_MODE).lower(),
+            brand,
+        )
+        logger.info(
             "[LeafLinkSync] start brand=%s max_pages=%s normalize=%s mock_mode=%s",
             brand,
             max_pages if max_pages is not None else "unlimited",
             normalize,
             MOCK_MODE,
         )
+
         all_orders: List[Dict[str, Any]] = []
         pages_fetched = 0
 
@@ -645,11 +651,13 @@ class LeafLinkClient:
                 MOCK_MODE,
             )
             if MOCK_MODE:
-                logger.warning(
-                    "[LeafLinkSync] API failed, falling back to mock data (MOCK_MODE=true)"
+                logger.error(
+                    "[LeafLinkSync] API failed and MOCK_MODE=true — refusing to return mock data when live data is expected"
                 )
-                mock_orders: List[Dict[str, Any]] = [{"mock_data": True}]
-                return {"orders": mock_orders, "pages_fetched": 1}
+                logger.error("[LeafLinkSync] error=%s", exc)
+                logger.error("[LeafLinkSync] returning_mock=true (blocked — raising instead)")
+                raise  # Re-raise the original exception instead of returning mock
+            logger.info("[LeafLinkSync] returning_mock=false")
             raise
 
         total = len(all_orders)
