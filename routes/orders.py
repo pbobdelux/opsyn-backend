@@ -28,61 +28,6 @@ LEAFLINK_TIMEOUT_SECONDS = 5   # Max seconds to wait for LeafLink API
 DB_TIMEOUT_SECONDS = 3         # Max seconds to wait for DB upsert in Phase A
 
 
-async def resolve_brand_id(
-    brand_filter: Optional[str],
-    db: AsyncSession,
-) -> tuple[Optional[str], Optional[str]]:
-    """
-    Resolve a brand_filter slug/ID to (brand_id, company_id) by looking up
-    the active LeafLink credential in the database.
-
-    Logs the resolution result for traceability.
-    Raises HTTPException(400) if brand_filter is provided but not found.
-
-    Returns (brand_id, company_id) — both may be None if brand_filter is None.
-    """
-    from fastapi import HTTPException
-
-    if not brand_filter:
-        logger.info("[BrandResolve] input=None — no brand filter provided")
-        return None, None
-
-    try:
-        cred_result = await db.execute(
-            select(BrandAPICredential).where(
-                BrandAPICredential.brand_id == brand_filter,
-                BrandAPICredential.integration_name == "leaflink",
-                BrandAPICredential.is_active == True,
-            )
-        )
-        cred = cred_result.scalar_one_or_none()
-    except Exception as exc:
-        logger.error(
-            "[BrandResolve] input=%s db_error=%s",
-            brand_filter,
-            exc,
-        )
-        raise HTTPException(status_code=500, detail="Database error during brand resolution")
-
-    if cred is None:
-        logger.warning(
-            "[BrandResolve] input=%s resolved_brand_id=None company_id=None api_key_present=false credential_found=false",
-            brand_filter,
-        )
-        # Return the filter as-is so the endpoint can still serve DB data
-        return brand_filter, None
-
-    api_key_present = bool(cred.api_key and cred.api_key.strip())
-    logger.info(
-        "[BrandResolve] input=%s resolved_brand_id=%s company_id=%s api_key_present=%s credential_found=true",
-        brand_filter,
-        cred.brand_id,
-        cred.company_id,
-        str(api_key_present).lower(),
-    )
-    return cred.brand_id, cred.company_id
-
-
 @router.get("")
 def get_orders():
     return {
@@ -251,8 +196,36 @@ async def orders_sync(
         force_full,
     )
 
-    # Resolve brand_id → company_id mapping and log it for traceability
-    _resolved_brand_id, _resolved_company_id = await resolve_brand_id(brand_filter, db)
+    logger.info("[OrdersSync] requested_brand=%s", brand_filter)
+
+    # ------------------------------------------------------------------ #
+    # Load the first active LeafLink credential from DB                   #
+    # (same logic as /leaflink/debug — not filtered by brand_id)          #
+    # ------------------------------------------------------------------ #
+    _resolved_brand_id: Optional[str] = None
+    _resolved_company_id: Optional[str] = None
+    _active_cred = None
+    try:
+        cred_result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+            ).order_by(BrandAPICredential.last_sync_at.desc().nullslast()).limit(1)
+        )
+        _active_cred = cred_result.scalar_one_or_none()
+    except Exception as _cred_exc:
+        logger.error("[OrdersSync] credential_load_error error=%s", _cred_exc)
+
+    if _active_cred is not None:
+        _resolved_brand_id = _active_cred.brand_id
+        _resolved_company_id = _active_cred.company_id
+        _api_key_present = bool(_active_cred.api_key and _active_cred.api_key.strip())
+        logger.info("[OrdersSync] credential_source=database")
+        logger.info("[OrdersSync] resolved_brand_id=%s", _resolved_brand_id)
+        logger.info("[OrdersSync] resolved_company_id=%s", _resolved_company_id)
+        logger.info("[OrdersSync] api_key_present=%s", str(_api_key_present).lower())
+    else:
+        logger.warning("[OrdersSync] credential_source=missing — no active LeafLink credential found")
 
     # ------------------------------------------------------------------ #
     # FORCE_DB_ONLY: emergency debug mode — skip LeafLink entirely        #
@@ -268,8 +241,8 @@ async def orders_sync(
     sync_error: Optional[str] = None
     live_refresh_failed: bool = False
 
-    if brand_filter and not force_db_only:
-        logger.info("[OrdersSync] phase=A start brand=%s", brand_filter)
+    if _active_cred and not force_db_only:
+        logger.info("[OrdersSync] phase=A start brand=%s", _resolved_brand_id)
         cred = None
         try:
             from services.leaflink_client import LeafLinkClient
@@ -277,241 +250,227 @@ async def orders_sync(
 
             logger.info("[OrdersAPI] db_fetch_start")
             logger.info("[OrdersSync] phase=A leaflink_pull_start")
+            logger.info("[OrdersSync] leaflink_fetch_start")
 
-            # Look up credentials for this brand using the Phase A session.
-            cred_result = await db.execute(
-                select(BrandAPICredential).where(
-                    BrandAPICredential.brand_id == brand_filter,
-                    BrandAPICredential.integration_name == "leaflink",
-                    BrandAPICredential.is_active == True,
-                )
-            )
-            cred = cred_result.scalar_one_or_none()
+            cred = _active_cred
 
-            if cred:
-                api_key: str = cred.api_key or ""
-                company_id: str = cred.company_id or ""
+            api_key: str = cred.api_key or ""
+            company_id: str = cred.company_id or ""
 
-                # Validate that the credential is actually usable before hitting LeafLink
-                _api_key_valid = bool(api_key.strip())
-                _company_id_valid = bool(company_id.strip())
+            # Validate that the credential is actually usable before hitting LeafLink
+            _api_key_valid = bool(api_key.strip())
+            _company_id_valid = bool(company_id.strip())
 
-                if not _api_key_valid:
-                    logger.warning(
-                        "[OrdersAPI] credential_invalid brand=%s api_key_missing — will serve DB only",
-                        brand_filter,
-                    )
-                    sync_metadata["credential_missing"] = False
-                    sync_metadata["credential_invalid"] = True
-                    sync_metadata["credential_error"] = f"LeafLink api_key is empty for brand {brand_filter}"
-                    sync_metadata["total_fetched_from_leaflink"] = None
-                    sync_metadata["used_force_full"] = force_full
-                    logger.info("[OrdersSync] phase=A success brand=%s (invalid credential — no api_key)", brand_filter)
-                    # Fall through to Phase B (DB read) without attempting LeafLink
-                elif not _company_id_valid:
-                    logger.warning(
-                        "[OrdersAPI] credential_invalid brand=%s company_id_missing — will serve DB only",
-                        brand_filter,
-                    )
-                    sync_metadata["credential_missing"] = False
-                    sync_metadata["credential_invalid"] = True
-                    sync_metadata["credential_error"] = f"LeafLink company_id is empty for brand {brand_filter}"
-                    sync_metadata["total_fetched_from_leaflink"] = None
-                    sync_metadata["used_force_full"] = force_full
-                    logger.info("[OrdersSync] phase=A success brand=%s (invalid credential — no company_id)", brand_filter)
-                    # Fall through to Phase B (DB read) without attempting LeafLink
-                else:
-                    logger.info(
-                        "[LeafLink] sync_start brand=%s credential_source=db force_full=%s",
-                        brand_filter,
-                        force_full,
-                    )
-                    logger.info(
-                        "[OrdersSync] triggering_leaflink_sync brand=%s force_full=%s",
-                        brand_filter,
-                        force_full,
-                    )
-
-                    # Watchdog: emit sync_started
-                    _watchdog_url = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
-                    await emit_watchdog_event(
-                        event_type="sync_started",
-                        brand_id=brand_filter,
-                        sync_metadata={
-                            "total_fetched_from_leaflink": 0,
-                            "total_in_database": 0,
-                            "percent_complete": 0.0,
-                            "latest_order_date": None,
-                            "oldest_order_date": None,
-                            "sync_error": None,
-                        },
-                        webhook_url=_watchdog_url,
-                    )
-
-                    client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=brand_filter)
-
-                    # force_full=True → fetch all pages (unlimited); otherwise fetch recent (5 pages)
-                    max_pages_arg = None if force_full else 5
-
-                    # ---------------------------------------------------------- #
-                    # Wrap the synchronous LeafLink HTTP call in a thread so we   #
-                    # can apply asyncio.wait_for() timeout without blocking the   #
-                    # event loop. fetch_recent_orders() uses requests (sync I/O). #
-                    # ---------------------------------------------------------- #
-                    logger.info("[OrdersAPI] leaflink_refresh_start")
-                    loop = asyncio.get_event_loop()
-
-                    def _fetch_orders_sync():
-                        return client.fetch_recent_orders(
-                            max_pages=max_pages_arg,
-                            normalize=True,
-                            brand=brand_filter,
-                        )
-
-                    try:
-                        fetch_result = await asyncio.wait_for(
-                            loop.run_in_executor(_leaflink_executor, _fetch_orders_sync),
-                            timeout=LEAFLINK_TIMEOUT_SECONDS,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "[OrdersAPI] leaflink_refresh_timeout brand=%s timeout=%ss",
-                            brand_filter,
-                            LEAFLINK_TIMEOUT_SECONDS,
-                        )
-                        raise asyncio.TimeoutError(
-                            f"LeafLink API did not respond within {LEAFLINK_TIMEOUT_SECONDS}s"
-                        )
-
-                    orders_from_leaflink = fetch_result["orders"]
-                    pages_fetched = fetch_result["pages_fetched"]
-
-                    logger.info("[OrdersSync] phase=A leaflink_pull_success count=%s", len(orders_from_leaflink))
-                    logger.info(
-                        "[OrdersSync] leaflink_fetch_complete brand=%s orders=%s pages=%s force_full=%s",
-                        brand_filter,
-                        len(orders_from_leaflink),
-                        pages_fetched,
-                        force_full,
-                    )
-                    logger.info(
-                        "[LeafLink] fetched=%s pages=%s brand=%s",
-                        len(orders_from_leaflink),
-                        pages_fetched,
-                        brand_filter,
-                    )
-
-                    # Watchdog: emit sync_progress after fetch
-                    await emit_watchdog_event(
-                        event_type="sync_progress",
-                        brand_id=brand_filter,
-                        sync_metadata={
-                            "total_fetched_from_leaflink": len(orders_from_leaflink),
-                            "total_in_database": None,
-                            "percent_complete": None,
-                            "latest_order_date": None,
-                            "oldest_order_date": None,
-                            "sync_error": None,
-                        },
-                        webhook_url=_watchdog_url,
-                    )
-
-                    logger.info("[OrdersSync] phase=A db_upsert_start")
-
-                    async def _do_db_upsert():
-                        async with db.begin():
-                            return await sync_leaflink_orders(
-                                db,
-                                brand_filter,
-                                orders_from_leaflink,
-                                pages_fetched=pages_fetched,
-                            )
-
-                    try:
-                        sync_result = await asyncio.wait_for(
-                            _do_db_upsert(),
-                            timeout=DB_TIMEOUT_SECONDS,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "[OrdersSync] phase=A db_upsert_timeout brand=%s timeout=%ss",
-                            brand_filter,
-                            DB_TIMEOUT_SECONDS,
-                        )
-                        raise asyncio.TimeoutError(
-                            f"DB upsert did not complete within {DB_TIMEOUT_SECONDS}s"
-                        )
-
-                    logger.info(
-                        "[OrdersSync] phase=A db_upsert_success inserted=%s updated=%s",
-                        sync_result.get("created", 0),
-                        sync_result.get("updated", 0),
-                    )
-
-                    sync_metadata["total_fetched_from_leaflink"] = sync_result.get("orders_fetched", 0)
-                    sync_metadata["pages_fetched"] = sync_result.get("pages_fetched", pages_fetched)
-                    sync_metadata["sync_duration_seconds"] = sync_result.get("sync_duration_seconds", 0)
-                    sync_metadata["used_force_full"] = force_full
-
-                    newest = sync_result.get("newest_order_date")
-                    sync_metadata["latest_order_date"] = newest.isoformat() if newest else None
-
-                    logger.info(
-                        "[LeafLink] upserted=%s created=%s updated=%s brand=%s",
-                        sync_result.get("orders_fetched", 0),
-                        sync_result.get("created", 0),
-                        sync_result.get("updated", 0),
-                        brand_filter,
-                    )
-
-                    # Watchdog: emit sync_completed or sync_failed based on result
-                    if sync_result.get("ok"):
-                        await emit_watchdog_event(
-                            event_type="sync_completed",
-                            brand_id=brand_filter,
-                            sync_metadata={
-                                "total_fetched_from_leaflink": sync_result.get("orders_fetched", 0),
-                                "total_in_database": sync_result.get("created", 0) + sync_result.get("updated", 0),
-                                "percent_complete": 100.0,
-                                "latest_order_date": sync_metadata.get("latest_order_date"),
-                                "oldest_order_date": None,
-                                "sync_error": None,
-                            },
-                            webhook_url=_watchdog_url,
-                        )
-                        # Mark credential as successfully used
-                        from services.integration_credentials import mark_credential_success
-                        await mark_credential_success(cred)
-                    else:
-                        await emit_watchdog_event(
-                            event_type="sync_failed",
-                            brand_id=brand_filter,
-                            sync_metadata={
-                                "total_fetched_from_leaflink": sync_result.get("orders_fetched", 0),
-                                "total_in_database": sync_result.get("created", 0) + sync_result.get("updated", 0),
-                                "percent_complete": None,
-                                "latest_order_date": sync_metadata.get("latest_order_date"),
-                                "oldest_order_date": None,
-                                "sync_error": sync_result.get("error"),
-                            },
-                            webhook_url=_watchdog_url,
-                        )
-                        # Mark credential as failed
-                        from services.integration_credentials import mark_credential_invalid
-                        await mark_credential_invalid(cred, sync_result.get("error") or "sync_failed")
-
-                    logger.info("[OrdersSync] phase=A success brand=%s", brand_filter)
-
-            else:
+            if not _api_key_valid:
                 logger.warning(
-                    "[OrdersAPI] credential_missing brand=%s — will serve DB only",
-                    brand_filter,
+                    "[OrdersAPI] credential_invalid brand=%s api_key_missing — will serve DB only",
+                    _resolved_brand_id,
                 )
-                sync_metadata["credential_missing"] = True
-                sync_metadata["credential_error"] = f"LeafLink not configured for brand {brand_filter}"
+                sync_metadata["credential_missing"] = False
+                sync_metadata["credential_invalid"] = True
+                sync_metadata["credential_error"] = f"LeafLink api_key is empty for brand {_resolved_brand_id}"
                 sync_metadata["total_fetched_from_leaflink"] = None
                 sync_metadata["used_force_full"] = force_full
-                logger.info("[OrdersSync] phase=A success brand=%s (no credential)", brand_filter)
+                logger.info("[OrdersSync] phase=A success brand=%s (invalid credential — no api_key)", _resolved_brand_id)
+                # Fall through to Phase B (DB read) without attempting LeafLink
+            elif not _company_id_valid:
+                logger.warning(
+                    "[OrdersAPI] credential_invalid brand=%s company_id_missing — will serve DB only",
+                    _resolved_brand_id,
+                )
+                sync_metadata["credential_missing"] = False
+                sync_metadata["credential_invalid"] = True
+                sync_metadata["credential_error"] = f"LeafLink company_id is empty for brand {_resolved_brand_id}"
+                sync_metadata["total_fetched_from_leaflink"] = None
+                sync_metadata["used_force_full"] = force_full
+                logger.info("[OrdersSync] phase=A success brand=%s (invalid credential — no company_id)", _resolved_brand_id)
+                # Fall through to Phase B (DB read) without attempting LeafLink
+            else:
+                logger.info(
+                    "[LeafLink] sync_start brand=%s credential_source=db force_full=%s",
+                    _resolved_brand_id,
+                    force_full,
+                )
+                logger.info(
+                    "[OrdersSync] triggering_leaflink_sync brand=%s force_full=%s",
+                    _resolved_brand_id,
+                    force_full,
+                )
+
+                # Watchdog: emit sync_started
+                _watchdog_url = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
+                await emit_watchdog_event(
+                    event_type="sync_started",
+                    brand_id=_resolved_brand_id,
+                    sync_metadata={
+                        "total_fetched_from_leaflink": 0,
+                        "total_in_database": 0,
+                        "percent_complete": 0.0,
+                        "latest_order_date": None,
+                        "oldest_order_date": None,
+                        "sync_error": None,
+                    },
+                    webhook_url=_watchdog_url,
+                )
+
+                client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=_resolved_brand_id)
+
+                # force_full=True → fetch all pages (unlimited); otherwise fetch recent (5 pages)
+                max_pages_arg = None if force_full else 5
+
+                # ---------------------------------------------------------- #
+                # Wrap the synchronous LeafLink HTTP call in a thread so we   #
+                # can apply asyncio.wait_for() timeout without blocking the   #
+                # event loop. fetch_recent_orders() uses requests (sync I/O). #
+                # ---------------------------------------------------------- #
+                logger.info("[OrdersAPI] leaflink_refresh_start")
+                loop = asyncio.get_event_loop()
+
+                def _fetch_orders_sync():
+                    return client.fetch_recent_orders(
+                        max_pages=max_pages_arg,
+                        normalize=True,
+                        brand=_resolved_brand_id,
+                    )
+
+                try:
+                    fetch_result = await asyncio.wait_for(
+                        loop.run_in_executor(_leaflink_executor, _fetch_orders_sync),
+                        timeout=LEAFLINK_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[OrdersAPI] leaflink_refresh_timeout brand=%s timeout=%ss",
+                        _resolved_brand_id,
+                        LEAFLINK_TIMEOUT_SECONDS,
+                    )
+                    raise asyncio.TimeoutError(
+                        f"LeafLink API did not respond within {LEAFLINK_TIMEOUT_SECONDS}s"
+                    )
+
+                orders_from_leaflink = fetch_result["orders"]
+                pages_fetched = fetch_result["pages_fetched"]
+
+                logger.info("[OrdersSync] phase=A leaflink_pull_success count=%s", len(orders_from_leaflink))
+                logger.info(
+                    "[OrdersSync] leaflink_fetch_complete brand=%s orders=%s pages=%s force_full=%s",
+                    _resolved_brand_id,
+                    len(orders_from_leaflink),
+                    pages_fetched,
+                    force_full,
+                )
+                logger.info(
+                    "[LeafLink] fetched=%s pages=%s brand=%s",
+                    len(orders_from_leaflink),
+                    pages_fetched,
+                    _resolved_brand_id,
+                )
+                logger.info("[OrdersSync] total_fetched_from_leaflink=%s", len(orders_from_leaflink))
+
+                # Watchdog: emit sync_progress after fetch
+                await emit_watchdog_event(
+                    event_type="sync_progress",
+                    brand_id=_resolved_brand_id,
+                    sync_metadata={
+                        "total_fetched_from_leaflink": len(orders_from_leaflink),
+                        "total_in_database": None,
+                        "percent_complete": None,
+                        "latest_order_date": None,
+                        "oldest_order_date": None,
+                        "sync_error": None,
+                    },
+                    webhook_url=_watchdog_url,
+                )
+
+                logger.info("[OrdersSync] phase=A db_upsert_start")
+
+                async def _do_db_upsert():
+                    async with db.begin():
+                        return await sync_leaflink_orders(
+                            db,
+                            _resolved_brand_id,
+                            orders_from_leaflink,
+                            pages_fetched=pages_fetched,
+                        )
+
+                try:
+                    sync_result = await asyncio.wait_for(
+                        _do_db_upsert(),
+                        timeout=DB_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[OrdersSync] phase=A db_upsert_timeout brand=%s timeout=%ss",
+                        _resolved_brand_id,
+                        DB_TIMEOUT_SECONDS,
+                    )
+                    raise asyncio.TimeoutError(
+                        f"DB upsert did not complete within {DB_TIMEOUT_SECONDS}s"
+                    )
+
+                logger.info(
+                    "[OrdersSync] phase=A db_upsert_success inserted=%s updated=%s",
+                    sync_result.get("created", 0),
+                    sync_result.get("updated", 0),
+                )
+                logger.info(
+                    "[OrdersSync] upserted_to_db=%s",
+                    sync_result.get("orders_fetched", 0),
+                )
+
+                sync_metadata["total_fetched_from_leaflink"] = sync_result.get("orders_fetched", 0)
+                sync_metadata["pages_fetched"] = sync_result.get("pages_fetched", pages_fetched)
+                sync_metadata["sync_duration_seconds"] = sync_result.get("sync_duration_seconds", 0)
+                sync_metadata["used_force_full"] = force_full
+
+                newest = sync_result.get("newest_order_date")
+                sync_metadata["latest_order_date"] = newest.isoformat() if newest else None
+
+                logger.info(
+                    "[LeafLink] upserted=%s created=%s updated=%s brand=%s",
+                    sync_result.get("orders_fetched", 0),
+                    sync_result.get("created", 0),
+                    sync_result.get("updated", 0),
+                    _resolved_brand_id,
+                )
+
+                # Watchdog: emit sync_completed or sync_failed based on result
+                if sync_result.get("ok"):
+                    await emit_watchdog_event(
+                        event_type="sync_completed",
+                        brand_id=_resolved_brand_id,
+                        sync_metadata={
+                            "total_fetched_from_leaflink": sync_result.get("orders_fetched", 0),
+                            "total_in_database": sync_result.get("created", 0) + sync_result.get("updated", 0),
+                            "percent_complete": 100.0,
+                            "latest_order_date": sync_metadata.get("latest_order_date"),
+                            "oldest_order_date": None,
+                            "sync_error": None,
+                        },
+                        webhook_url=_watchdog_url,
+                    )
+                    # Mark credential as successfully used
+                    from services.integration_credentials import mark_credential_success
+                    await mark_credential_success(cred)
+                else:
+                    await emit_watchdog_event(
+                        event_type="sync_failed",
+                        brand_id=_resolved_brand_id,
+                        sync_metadata={
+                            "total_fetched_from_leaflink": sync_result.get("orders_fetched", 0),
+                            "total_in_database": sync_result.get("created", 0) + sync_result.get("updated", 0),
+                            "percent_complete": None,
+                            "latest_order_date": sync_metadata.get("latest_order_date"),
+                            "oldest_order_date": None,
+                            "sync_error": sync_result.get("error"),
+                        },
+                        webhook_url=_watchdog_url,
+                    )
+                    # Mark credential as failed
+                    from services.integration_credentials import mark_credential_invalid
+                    await mark_credential_invalid(cred, sync_result.get("error") or "sync_failed")
+
+                logger.info("[OrdersSync] phase=A success brand=%s", _resolved_brand_id)
 
         except asyncio.TimeoutError as timeout_exc:
             # LeafLink or DB timed out — log it, fall through to Phase B with DB fallback
@@ -536,7 +495,7 @@ async def orders_sync(
             _watchdog_url_to = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
             await emit_watchdog_event(
                 event_type="sync_failed",
-                brand_id=brand_filter,
+                brand_id=_resolved_brand_id or brand_filter,
                 sync_metadata={
                     "total_fetched_from_leaflink": None,
                     "total_in_database": None,
@@ -572,7 +531,7 @@ async def orders_sync(
             _watchdog_url_exc = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
             await emit_watchdog_event(
                 event_type="sync_failed",
-                brand_id=brand_filter,
+                brand_id=_resolved_brand_id or brand_filter,
                 sync_metadata={
                     "total_fetched_from_leaflink": None,
                     "total_in_database": None,
@@ -676,6 +635,7 @@ async def orders_sync(
             total_in_database = count_result.scalar_one()
 
             logger.info("[OrdersSync] phase=B read_success count=%s", len(orders))
+            logger.info("[OrdersSync] db_count_after=%s", total_in_database)
 
             # ------------------------------------------------------------------ #
             # Build response                                                       #
