@@ -1507,15 +1507,23 @@ async def orders_sync_status(
             "estimated_completion_minutes": None,
             "last_error": None,
             "stalled_reason": None,
+            "active_sync_run_id": None,
+            "started_at": None,
+            "source": "sync_run",
             "sync_run": None,
             "timestamp": timestamp,
         })
 
-    # Compute percent_complete correctly: pages_synced / total_pages * 100
+    # Compute percent_complete correctly: pages_synced / total_pages * 100.
+    # For a freshly queued run (pages_synced=0, total_pages=None) return 0
+    # rather than None so callers always get a numeric value when a run exists.
     percent_complete: Optional[float] = None
     if run.total_pages and run.total_pages > 0:
         raw_pct = (run.pages_synced / run.total_pages) * 100
         percent_complete = round(min(100.0, max(0.0, raw_pct)), 2)
+    elif run.status in ("queued", "syncing"):
+        # Run exists but total_pages not yet known — report 0 progress
+        percent_complete = 0
 
     # ETA: only when actively syncing, not stalled, and enough data
     estimated_completion_minutes: Optional[float] = None
@@ -1537,9 +1545,12 @@ async def orders_sync_status(
     else:
         effective_status = run.status
 
+    # active_sync_run_id is only set when reporting on an active (non-completed) run
+    active_sync_run_id = run.id if active_run is not None and run is active_run else None
+
     logger.info(
         "[OrdersSyncStatus] response brand=%s status=%s pages=%s/%s pct=%s "
-        "orders_in_db=%s stalled=%s data_mode=%s",
+        "orders_in_db=%s stalled=%s data_mode=%s source=sync_run run_id=%s",
         brand,
         effective_status,
         run.pages_synced,
@@ -1548,6 +1559,7 @@ async def orders_sync_status(
         total_orders_in_db,
         is_stalled,
         data_mode,
+        run.id,
     )
 
     return make_json_safe({
@@ -1567,6 +1579,9 @@ async def orders_sync_status(
         "last_error": run.last_error,
         "stalled_reason": run.stalled_reason if is_stalled else None,
         "is_stalled": is_stalled,
+        "active_sync_run_id": active_sync_run_id,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "source": "sync_run",
         "sync_run": serialize_sync_run(run, is_stalled=is_stalled),
         "timestamp": timestamp,
     })
