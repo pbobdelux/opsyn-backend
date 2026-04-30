@@ -866,6 +866,13 @@ async def sync_leaflink_background_continuous(
                     attempt + 1,
                     max_retries + 1,
                 )
+                logger.info(
+                    "[OrdersSyncResume] fetch_attempt brand=%s page=%s attempt=%s/%s",
+                    brand_id,
+                    start_page,
+                    attempt + 1,
+                    max_retries + 1,
+                )
 
                 _capture_page = start_page
                 _capture_url = resume_url
@@ -886,6 +893,11 @@ async def sync_leaflink_background_continuous(
                 logger.info(
                     "[OrdersSync] fetch_success brand=%s page=%s orders=%s",
                     brand_id,
+                    start_page,
+                    len(result.get("orders", [])),
+                )
+                logger.info(
+                    "[OrdersSyncResume] page_fetched page=%s count=%s",
                     start_page,
                     len(result.get("orders", [])),
                 )
@@ -911,6 +923,15 @@ async def sync_leaflink_background_continuous(
                         max_retries + 1,
                         fetch_exc,
                     )
+                    logger.error(
+                        "[OrdersSyncResume] fetch_failed brand=%s page=%s error_code=%s transient=%s attempt=%s/%s",
+                        brand_id,
+                        start_page,
+                        error_code,
+                        is_transient,
+                        attempt + 1,
+                        max_retries + 1,
+                    )
                     raise
 
                 # Transient error — retry with backoff
@@ -921,6 +942,13 @@ async def sync_leaflink_background_continuous(
                     error_code,
                     attempt + 1,
                     max_retries + 1,
+                    backoff_seconds,
+                )
+                logger.warning(
+                    "[OrdersSyncResume] retrying brand=%s page=%s error=%s backoff=%s",
+                    brand_id,
+                    start_page,
+                    fetch_exc,
                     backoff_seconds,
                 )
 
@@ -1040,6 +1068,28 @@ async def sync_leaflink_background_continuous(
 
         total_orders_synced += len(batch_orders)
         last_completed_page = (next_page - 1) if next_page else total_pages
+
+        # Log progress in the [OrdersSyncResume] format for observability
+        try:
+            async with AsyncSessionLocal() as _count_sess:
+                from sqlalchemy import func as _func
+                _count_res = await _count_sess.execute(
+                    select(_func.count(Order.id)).where(Order.brand_id == brand_id)
+                )
+                _db_count_after = _count_res.scalar_one() or 0
+            logger.info(
+                "[OrdersSyncResume] upserted count=%s db_count_after=%s page=%s/%s",
+                len(batch_orders),
+                _db_count_after,
+                last_completed_page,
+                total_pages,
+            )
+        except Exception as _count_exc:
+            logger.debug(
+                "[OrdersSyncResume] db_count_error brand=%s error=%s",
+                brand_id,
+                _count_exc,
+            )
 
         # ------------------------------------------------------------------ #
         # Persist progress to DB                                              #
