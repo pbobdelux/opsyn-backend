@@ -140,6 +140,14 @@ async def process_sync_requests() -> None:
                             await err_db.commit()
                     continue
 
+                # auth_scheme is not a database column — set it at runtime
+                if not getattr(cred, "auth_scheme", None):
+                    cred.auth_scheme = "Token"
+                    logger.info(
+                        "[SyncWorker] auth_scheme_defaulted_to_token brand=%s",
+                        brand_id,
+                    )
+
                 api_key: str = cred.api_key or ""
                 company_id: str = cred.company_id or ""
 
