@@ -20,6 +20,9 @@ import os
 import sys
 from datetime import datetime, timezone
 
+# Force unbuffered output so logs are never lost on crash
+os.environ["PYTHONUNBUFFERED"] = "1"
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -59,6 +62,9 @@ async def poll_and_execute() -> None:
       4. Execute sync_leaflink_background_continuous().
       5. Handle errors: mark job as failed with last_error.
     """
+    logger.info("[SyncWorker] entered poll_and_execute")
+    sys.stdout.flush()
+
     from sqlalchemy import select
 
     from database import AsyncSessionLocal
@@ -66,145 +72,174 @@ async def poll_and_execute() -> None:
     from services.leaflink_sync import sync_leaflink_background_continuous
     from services.sync_run_manager import detect_stalled, mark_stalled
 
-    logger.info("[SyncWorker] polling for jobs")
+    logger.info("[SyncWorker] imports successful")
+    sys.stdout.flush()
+
+    logger.info("[SyncWorker] querying for jobs")
+    sys.stdout.flush()
 
     # ---------------------------------------------------------------------- #
     # Step 1: Query for queued or syncing jobs                                #
     # ---------------------------------------------------------------------- #
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(SyncRun)
-            .where(SyncRun.status.in_(["queued", "syncing"]))
-            .order_by(SyncRun.started_at.asc())
-            .limit(1)
-        )
-        sync_run = result.scalar_one_or_none()
+    try:
+        async with AsyncSessionLocal() as db:
+            logger.info("[SyncWorker] db session created")
+            sys.stdout.flush()
 
-        if not sync_run:
-            logger.info("[SyncWorker] polling for jobs - none found")
-            return
-
-        sync_run_id = sync_run.id
-        brand_id = sync_run.brand_id
-        start_page = sync_run.current_page or 1
-        total_pages = sync_run.total_pages or 1
-        total_orders_available = sync_run.total_orders_available
-
-        logger.info(
-            "[SyncWorker] job_found id=%s brand=%s status=%s start_page=%s total_pages=%s",
-            sync_run_id,
-            brand_id,
-            sync_run.status,
-            start_page,
-            total_pages,
-        )
-        logger.info("[SyncWorker] job_started id=%s brand=%s", sync_run_id, brand_id)
-
-        # ------------------------------------------------------------------ #
-        # Stall detection: if the job is already syncing but has made no      #
-        # progress for STALL_THRESHOLD_SECONDS, mark it stalled and skip it.  #
-        # ------------------------------------------------------------------ #
-        if detect_stalled(sync_run, stall_threshold_seconds=STALL_THRESHOLD_SECONDS):
-            stall_reason = (
-                f"no_progress_for_{STALL_THRESHOLD_SECONDS}s "
-                f"last_progress_at={sync_run.last_progress_at}"
+            result = await db.execute(
+                select(SyncRun)
+                .where(SyncRun.status.in_(["queued", "syncing"]))
+                .order_by(SyncRun.started_at.asc())
+                .limit(1)
             )
-            logger.warning(
-                "[SyncWorker] job_stalled id=%s brand=%s reason=%s",
+            sync_run = result.scalar_one_or_none()
+
+            logger.info("[SyncWorker] job query result: %s", repr(sync_run))
+            sys.stdout.flush()
+
+            if not sync_run:
+                logger.info("[SyncWorker] no jobs found")
+                sys.stdout.flush()
+                return
+
+            sync_run_id = sync_run.id
+            brand_id = sync_run.brand_id
+            start_page = sync_run.current_page or 1
+            total_pages = sync_run.total_pages or 1
+            total_orders_available = sync_run.total_orders_available
+
+            logger.info(
+                "[SyncWorker] job_found id=%s brand=%s status=%s start_page=%s total_pages=%s",
                 sync_run_id,
                 brand_id,
-                stall_reason,
+                sync_run.status,
+                start_page,
+                total_pages,
             )
-            await mark_stalled(db, sync_run_id, stall_reason)
+            logger.info("[SyncWorker] job_started id=%s brand=%s", sync_run_id, brand_id)
+
+            # ------------------------------------------------------------------ #
+            # Stall detection: if the job is already syncing but has made no      #
+            # progress for STALL_THRESHOLD_SECONDS, mark it stalled and skip it.  #
+            # ------------------------------------------------------------------ #
+            if detect_stalled(sync_run, stall_threshold_seconds=STALL_THRESHOLD_SECONDS):
+                stall_reason = (
+                    f"no_progress_for_{STALL_THRESHOLD_SECONDS}s "
+                    f"last_progress_at={sync_run.last_progress_at}"
+                )
+                logger.warning(
+                    "[SyncWorker] job_stalled id=%s brand=%s reason=%s",
+                    sync_run_id,
+                    brand_id,
+                    stall_reason,
+                )
+                await mark_stalled(db, sync_run_id, stall_reason)
+                await db.commit()
+                return
+
+            # ------------------------------------------------------------------ #
+            # Step 2: Claim the job                                               #
+            # ------------------------------------------------------------------ #
+            sync_run.worker_id = WORKER_ID
+            sync_run.status = "syncing"
+            sync_run.last_progress_at = datetime.now(timezone.utc)
             await db.commit()
-            return
 
-        # ------------------------------------------------------------------ #
-        # Step 2: Claim the job                                               #
-        # ------------------------------------------------------------------ #
-        sync_run.worker_id = WORKER_ID
-        sync_run.status = "syncing"
-        sync_run.last_progress_at = datetime.now(timezone.utc)
-        await db.commit()
-
-        logger.info(
-            "[SyncWorker] job_claimed id=%s worker_id=%s brand=%s",
-            sync_run_id,
-            WORKER_ID,
-            brand_id,
+            logger.info(
+                "[SyncWorker] job_claimed id=%s worker_id=%s brand=%s",
+                sync_run_id,
+                WORKER_ID,
+                brand_id,
+            )
+    except Exception as db_exc:
+        logger.error(
+            "[SyncWorker] database error in job query/claim: %s",
+            str(db_exc)[:500],
+            exc_info=True,
         )
+        sys.stdout.flush()
+        raise
 
     # ---------------------------------------------------------------------- #
     # Step 3: Fetch credential                                                #
     # ---------------------------------------------------------------------- #
     logger.info("[SyncWorker] fetching credentials brand=%s", brand_id)
-    async with AsyncSessionLocal() as db:
-        cred_result = await db.execute(
-            select(BrandAPICredential).where(
-                BrandAPICredential.brand_id == brand_id,
-                BrandAPICredential.integration_name == "leaflink",
-                BrandAPICredential.is_active == True,
+    try:
+        async with AsyncSessionLocal() as db:
+            cred_result = await db.execute(
+                select(BrandAPICredential).where(
+                    BrandAPICredential.brand_id == brand_id,
+                    BrandAPICredential.integration_name == "leaflink",
+                    BrandAPICredential.is_active == True,
+                )
             )
-        )
-        cred = cred_result.scalar_one_or_none()
+            cred = cred_result.scalar_one_or_none()
 
-        if not cred:
-            logger.error(
-                "[SyncWorker] credential_not_found id=%s brand=%s",
-                sync_run_id,
+            if not cred:
+                logger.error(
+                    "[SyncWorker] credential_not_found id=%s brand=%s",
+                    sync_run_id,
+                    brand_id,
+                )
+                # Mark job as failed
+                fail_result = await db.execute(
+                    select(SyncRun).where(SyncRun.id == sync_run_id)
+                )
+                fail_run = fail_result.scalar_one_or_none()
+                if fail_run:
+                    fail_run.status = "failed"
+                    fail_run.last_error = "LeafLink credential not found"
+                    fail_run.completed_at = datetime.now(timezone.utc)
+                    await db.commit()
+                return
+
+            api_key: str = cred.api_key or ""
+            company_id: str = cred.company_id or ""
+
+            logger.info(
+                "[SyncWorker] credentials_loaded brand=%s api_key_len=%s company_id=%s",
                 brand_id,
+                len(api_key),
+                company_id,
             )
-            # Mark job as failed
-            fail_result = await db.execute(
-                select(SyncRun).where(SyncRun.id == sync_run_id)
-            )
-            fail_run = fail_result.scalar_one_or_none()
-            if fail_run:
-                fail_run.status = "failed"
-                fail_run.last_error = "LeafLink credential not found"
-                fail_run.completed_at = datetime.now(timezone.utc)
-                await db.commit()
-            return
 
-        api_key: str = cred.api_key or ""
-        company_id: str = cred.company_id or ""
+            # Validate api_key
+            if not api_key or not api_key.strip():
+                logger.error("[SyncWorker] credential_invalid id=%s api_key_missing", sync_run_id)
+                fail_result = await db.execute(
+                    select(SyncRun).where(SyncRun.id == sync_run_id)
+                )
+                fail_run = fail_result.scalar_one_or_none()
+                if fail_run:
+                    fail_run.status = "failed"
+                    fail_run.last_error = "LeafLink api_key is empty"
+                    fail_run.completed_at = datetime.now(timezone.utc)
+                    await db.commit()
+                return
 
-        logger.info(
-            "[SyncWorker] credentials_loaded brand=%s api_key_len=%s company_id=%s",
-            brand_id,
-            len(api_key),
-            company_id,
+            # Validate company_id
+            if not company_id or not company_id.strip():
+                logger.error("[SyncWorker] credential_invalid id=%s company_id_missing", sync_run_id)
+                fail_result = await db.execute(
+                    select(SyncRun).where(SyncRun.id == sync_run_id)
+                )
+                fail_run = fail_result.scalar_one_or_none()
+                if fail_run:
+                    fail_run.status = "failed"
+                    fail_run.last_error = "LeafLink company_id is empty"
+                    fail_run.completed_at = datetime.now(timezone.utc)
+                    await db.commit()
+                return
+
+            logger.info("[SyncWorker] credentials_validated id=%s", sync_run_id)
+    except Exception as db_exc:
+        logger.error(
+            "[SyncWorker] database error fetching credentials: %s",
+            str(db_exc)[:500],
+            exc_info=True,
         )
-
-        # Validate api_key
-        if not api_key or not api_key.strip():
-            logger.error("[SyncWorker] credential_invalid id=%s api_key_missing", sync_run_id)
-            fail_result = await db.execute(
-                select(SyncRun).where(SyncRun.id == sync_run_id)
-            )
-            fail_run = fail_result.scalar_one_or_none()
-            if fail_run:
-                fail_run.status = "failed"
-                fail_run.last_error = "LeafLink api_key is empty"
-                fail_run.completed_at = datetime.now(timezone.utc)
-                await db.commit()
-            return
-
-        # Validate company_id
-        if not company_id or not company_id.strip():
-            logger.error("[SyncWorker] credential_invalid id=%s company_id_missing", sync_run_id)
-            fail_result = await db.execute(
-                select(SyncRun).where(SyncRun.id == sync_run_id)
-            )
-            fail_run = fail_result.scalar_one_or_none()
-            if fail_run:
-                fail_run.status = "failed"
-                fail_run.last_error = "LeafLink company_id is empty"
-                fail_run.completed_at = datetime.now(timezone.utc)
-                await db.commit()
-            return
-
-        logger.info("[SyncWorker] credentials_validated id=%s", sync_run_id)
+        sys.stdout.flush()
+        raise
 
     # ---------------------------------------------------------------------- #
     # Step 4: Execute sync                                                    #
@@ -213,14 +248,23 @@ async def poll_and_execute() -> None:
 
     # Stamp last_progress_at immediately before the first API call so the
     # stall detector does not fire while we are waiting for the first page.
-    async with AsyncSessionLocal() as db:
-        pre_run_result = await db.execute(
-            select(SyncRun).where(SyncRun.id == sync_run_id)
+    try:
+        async with AsyncSessionLocal() as db:
+            pre_run_result = await db.execute(
+                select(SyncRun).where(SyncRun.id == sync_run_id)
+            )
+            pre_run = pre_run_result.scalar_one_or_none()
+            if pre_run:
+                pre_run.last_progress_at = datetime.now(timezone.utc)
+                await db.commit()
+    except Exception as db_exc:
+        logger.error(
+            "[SyncWorker] database error stamping progress: %s",
+            str(db_exc)[:500],
+            exc_info=True,
         )
-        pre_run = pre_run_result.scalar_one_or_none()
-        if pre_run:
-            pre_run.last_progress_at = datetime.now(timezone.utc)
-            await db.commit()
+        sys.stdout.flush()
+        raise
     logger.info("[SyncWorker] first_progress_update id=%s", sync_run_id)
 
     try:
@@ -288,22 +332,72 @@ async def run_scheduler() -> None:
     logger.info("Poll interval: %s seconds", POLL_INTERVAL_SECONDS)
     logger.info("Stall threshold: %s seconds", STALL_THRESHOLD_SECONDS)
     logger.info("===================================")
+    sys.stdout.flush()
 
+    # Validate database connection at startup
+    try:
+        logger.info("[SyncWorker] validating database connection")
+        sys.stdout.flush()
+
+        from sqlalchemy import select
+        from database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as test_db:
+            await test_db.execute(select(1))
+
+        logger.info("[SyncWorker] database connection OK")
+        sys.stdout.flush()
+
+    except Exception as db_test_exc:
+        logger.error(
+            "[SyncWorker] FATAL: database connection failed: %s",
+            str(db_test_exc)[:500],
+            exc_info=True,
+        )
+        sys.stdout.flush()
+        raise
+
+    # Main polling loop
     while True:
         try:
+            logger.info("[SyncWorker] polling loop start")
+            sys.stdout.flush()
+
             await poll_and_execute()
+
         except Exception as loop_exc:
             logger.error(
-                "[SyncWorker] loop_error error=%s",
-                loop_exc,
+                "[SyncWorker] FATAL ERROR in polling loop: %s",
+                str(loop_exc)[:500],
                 exc_info=True,
             )
+            sys.stdout.flush()
 
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
 def main() -> None:
-    asyncio.run(run_scheduler())
+    logger.info("[SyncWorker] main() called")
+    sys.stdout.flush()
+
+    try:
+        logger.info("[SyncWorker] importing asyncio")
+        import asyncio as _asyncio
+        sys.stdout.flush()
+
+        logger.info("[SyncWorker] calling asyncio.run()")
+        sys.stdout.flush()
+
+        _asyncio.run(run_scheduler())
+
+    except Exception as main_exc:
+        logger.error(
+            "[SyncWorker] FATAL ERROR in main: %s",
+            str(main_exc)[:500],
+            exc_info=True,
+        )
+        sys.stdout.flush()
+        raise
 
 
 if __name__ == "__main__":
