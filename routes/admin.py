@@ -57,10 +57,10 @@ async def seed_noble_nectar_credential(
                     created_at,
                     updated_at
                 ) VALUES (
-                    'noble-nectar',
-                    'leaflink',
-                    '9008',
-                    'daa1586d10978bb5bc104b0fc63685ae47a6308e',
+                    LOWER(TRIM(:brand_id)),
+                    LOWER(TRIM(:integration_name)),
+                    :company_id,
+                    :api_key,
                     true,
                     'idle',
                     0,
@@ -71,13 +71,21 @@ async def seed_noble_nectar_credential(
                 )
                 ON CONFLICT (brand_id, integration_name)
                 DO UPDATE SET
+                    brand_id = LOWER(TRIM(EXCLUDED.brand_id)),
+                    integration_name = LOWER(TRIM(EXCLUDED.integration_name)),
                     company_id = EXCLUDED.company_id,
                     api_key = EXCLUDED.api_key,
                     is_active = true,
-                    sync_status = COALESCE(brand_api_credentials.sync_status, 'idle'),
-                    last_synced_page = COALESCE(brand_api_credentials.last_synced_page, 0),
+                    sync_status = 'idle',
+                    last_synced_page = 0,
                     updated_at = NOW()
-            """)
+            """),
+            {
+                "brand_id": "noble-nectar",
+                "integration_name": "leaflink",
+                "company_id": "9008",
+                "api_key": "daa1586d10978bb5bc104b0fc63685ae47a6308e",
+            }
         )
 
         await db.commit()
@@ -90,8 +98,8 @@ async def seed_noble_nectar_credential(
             text("""
                 SELECT brand_id, integration_name, company_id, is_active, sync_status, last_synced_page, LENGTH(api_key) AS key_len
                 FROM brand_api_credentials
-                WHERE brand_id='noble-nectar'
-                AND integration_name='leaflink'
+                WHERE TRIM(LOWER(brand_id)) = 'noble-nectar'
+                AND TRIM(LOWER(integration_name)) = 'leaflink'
             """)
         )
 

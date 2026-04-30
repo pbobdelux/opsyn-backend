@@ -620,28 +620,14 @@ async def leaflink_auth_test(
 ):
     """Test LeafLink authentication (tenant-safe, DB-first)."""
     from database import AsyncSessionLocal
-    from routes.orders import resolve_leaflink_credential
+    from services.credential_resolver import resolve_brand_credential
 
     logger.info("[CredentialResolver] auth_test_request brand=%s", brand)
 
-    # Load credential using tenant-safe resolver
-    try:
-        cred = await resolve_leaflink_credential(db, brand_id=brand, allow_env_fallback=False)
-    except ValueError as val_exc:
-        logger.error("[CredentialResolver] auth_test_credential_error error=%s", val_exc)
-        return {
-            "ok": False,
-            "status_code": None,
-            "credential_found": False,
-            "credential_source": "db",
-            "brand_id": brand,
-            "env_checked": False,
-            "env_ignored": True,
-            "tenant_isolated": True,
-            "error": str(val_exc),
-        }
+    # Load credential using shared resolver with normalization
+    cred_row = await resolve_brand_credential(db, brand, "leaflink")
 
-    if not cred:
+    if not cred_row:
         logger.error("[CredentialResolver] auth_test_no_credential brand=%s", brand)
         return {
             "ok": False,
@@ -655,14 +641,15 @@ async def leaflink_auth_test(
             "error": "tenant_leaflink_credential_not_found",
         }
 
-    api_key = (cred.api_key or "").strip()
-    company_id = (cred.company_id or "").strip()
-    brand_id = cred.brand_id
+    credential_id = cred_row[0]
+    brand_id = cred_row[1]
+    api_key = (cred_row[4] or "").strip()
+    company_id = (cred_row[3] or "").strip()
 
     logger.info(
         "[CredentialResolver] auth_test_credential brand=%s credential_id=%s key_len=%s company_id=%s",
         brand_id,
-        cred.id,
+        credential_id,
         len(api_key),
         company_id,
     )
@@ -728,7 +715,7 @@ async def leaflink_auth_test(
                     async with save_sess.begin():
                         save_result = await save_sess.execute(
                             select(BrandAPICredential).where(
-                                BrandAPICredential.id == cred.id,
+                                BrandAPICredential.id == credential_id,
                             )
                         )
                         save_cred = save_result.scalar_one_or_none()
@@ -737,7 +724,7 @@ async def leaflink_auth_test(
                             logger.info(
                                 "[CredentialResolver] saved_scheme scheme=%s credential_id=%s",
                                 successful_scheme,
-                                cred.id,
+                                credential_id,
                             )
         except Exception as save_exc:
             logger.error(
@@ -755,7 +742,7 @@ async def leaflink_auth_test(
             "status_code": 200,
             "credential_found": True,
             "credential_source": "db",
-            "credential_id": cred.id,
+            "credential_id": credential_id,
             "brand_id": brand_id,
             "company_id": company_id,
             "api_key_prefix": api_key[:6] if api_key else "MISSING",
@@ -777,7 +764,7 @@ async def leaflink_auth_test(
             "status_code": attempts[-1].get("status_code") if attempts else None,
             "credential_found": True,
             "credential_source": "db",
-            "credential_id": cred.id,
+            "credential_id": credential_id,
             "brand_id": brand_id,
             "company_id": company_id,
             "api_key_prefix": api_key[:6] if api_key else "MISSING",

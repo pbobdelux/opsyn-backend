@@ -3,8 +3,8 @@ import os
 from typing import Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -49,40 +49,35 @@ async def debug_db_check(
 
     # Check for specific brand if provided
     if brand:
-        credential_exists = False
-        credential_id = None
-        company_id = None
-        api_key_len = None
-        is_active = None
+        logger.info("[DB] debug_db_check_request brand=%s", brand)
 
-        try:
-            result = await db.execute(
-                select(BrandAPICredential).where(
-                    BrandAPICredential.brand_id == brand,
-                    BrandAPICredential.integration_name == "leaflink",
-                )
-            )
-            cred = result.scalar_one_or_none()
+        # Use shared resolver
+        from services.credential_resolver import resolve_brand_credential
 
-            if cred:
-                credential_exists = True
-                credential_id = cred.id
-                company_id = cred.company_id
-                api_key_len = len((cred.api_key or "").strip())
-                is_active = cred.is_active
+        cred_row = await resolve_brand_credential(db, brand, "leaflink")
 
-                logger.info(
-                    "[DB] brand_credential_found brand=%s credential_id=%s key_len=%s is_active=%s",
-                    brand,
-                    credential_id,
-                    api_key_len,
-                    is_active,
-                )
-            else:
-                logger.warning("[DB] brand_credential_not_found brand=%s", brand)
+        if cred_row:
+            credential_id = cred_row[0]
+            credential_brand = cred_row[1]
+            credential_integration = cred_row[2]
+            company_id = cred_row[3]
+            api_key = cred_row[4]
+            is_active = cred_row[5]
+            sync_status = cred_row[6]
+            last_synced_page = cred_row[7]
 
-        except Exception as exc:
-            logger.error("[DB] brand_credential_query_error brand=%s error=%s", brand, exc)
+            credential_exists = True
+            api_key_len = len(api_key) if api_key else None
+            resolver_match_found = True
+        else:
+            credential_exists = False
+            credential_id = None
+            company_id = None
+            api_key_len = None
+            is_active = None
+            sync_status = None
+            last_synced_page = None
+            resolver_match_found = False
 
         return {
             "ok": True,
@@ -93,7 +88,10 @@ async def debug_db_check(
             "company_id": company_id,
             "api_key_len": api_key_len,
             "is_active": is_active,
+            "sync_status": sync_status,
+            "last_synced_page": last_synced_page,
             "brand_api_credentials_count": total_count,
+            "resolver_match_found": resolver_match_found,
             "credential_source": "db_only",
             "env_checked": False,
         }
@@ -108,3 +106,68 @@ async def debug_db_check(
             "credential_source": "db_only",
             "env_checked": False,
         }
+
+
+@router.get("/brand-api-credentials")
+async def debug_brand_api_credentials(
+    db: AsyncSession = Depends(get_db),
+):
+    """Debug endpoint to inspect all brand_api_credentials rows with exact values."""
+
+    logger.info("[DEBUG] brand_api_credentials_dump_request")
+
+    try:
+        result = await db.execute(
+            text("""
+                SELECT
+                    id,
+                    brand_id,
+                    LENGTH(brand_id) AS brand_id_length,
+                    quote_literal(brand_id) AS quoted_brand_id,
+                    integration_name,
+                    LENGTH(integration_name) AS integration_name_length,
+                    quote_literal(integration_name) AS quoted_integration_name,
+                    company_id,
+                    is_active,
+                    sync_status,
+                    last_synced_page,
+                    LENGTH(api_key) AS api_key_len,
+                    created_at,
+                    updated_at
+                FROM brand_api_credentials
+                ORDER BY created_at DESC
+            """)
+        )
+
+        rows = result.fetchall()
+
+        credentials = []
+        for row in rows:
+            credentials.append({
+                "id": row[0],
+                "brand_id": row[1],
+                "brand_id_length": row[2],
+                "quoted_brand_id": row[3],
+                "integration_name": row[4],
+                "integration_name_length": row[5],
+                "quoted_integration_name": row[6],
+                "company_id": row[7],
+                "is_active": row[8],
+                "sync_status": row[9],
+                "last_synced_page": row[10],
+                "api_key_len": row[11],
+                "created_at": row[12],
+                "updated_at": row[13],
+            })
+
+        logger.info("[DEBUG] brand_api_credentials_dump total_rows=%s", len(credentials))
+
+        return {
+            "ok": True,
+            "total_credentials": len(credentials),
+            "credentials": credentials,
+        }
+
+    except Exception as exc:
+        logger.error("[DEBUG] brand_api_credentials_dump_error error=%s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
