@@ -36,12 +36,161 @@ LEAFLINK_PAGE_SIZE = 100        # Orders per LeafLink page
 
 
 @router.get("")
-def get_orders():
-    return {
-        "items": [],
-        "count": 0,
-        "message": "Orders endpoint is live",
-    }
+async def get_orders(
+    brand: str = Query(..., description="Brand slug/ID"),
+    limit: int = Query(100, ge=1, le=1000, description="Orders per page (default 100, max 1000)"),
+    offset: int = Query(0, ge=0, description="Offset for pagination (default 0)"),
+    cursor: Optional[str] = Query(None, description="Opaque cursor for cursor-based pagination"),
+    sort_by: str = Query("updated_at", description="Sort field: updated_at, created_at, external_updated_at"),
+    sort_order: str = Query("desc", description="asc or desc"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Fetch paginated orders for a brand.
+
+    Supports two pagination modes:
+    1. Limit/Offset: Use limit and offset parameters
+    2. Cursor-based: Use cursor parameter (more efficient for large datasets)
+
+    Response includes next_cursor / prev_cursor for navigating pages.
+    """
+    from leaflink.orders import serialize_order
+
+    # ------------------------------------------------------------------ #
+    # Decode cursor → (cursor_id, cursor_updated_at)                      #
+    # Cursor format: base64("id=<N>&updated_at=<ISO>")                    #
+    # ------------------------------------------------------------------ #
+    cursor_id: Optional[int] = None
+    cursor_updated_at: Optional[str] = None
+
+    if cursor:
+        try:
+            decoded = base64.b64decode(cursor).decode()
+            parts = dict(p.split("=", 1) for p in decoded.split("&") if "=" in p)
+            cursor_id = int(parts["id"]) if parts.get("id") else None
+            cursor_updated_at = parts.get("updated_at") or None
+        except Exception as cursor_exc:
+            logger.error("[OrdersAPI] cursor_decode_error error=%s", cursor_exc)
+            return {"ok": False, "error": "Invalid cursor format"}
+
+    # ------------------------------------------------------------------ #
+    # Resolve sort column                                                  #
+    # ------------------------------------------------------------------ #
+    if sort_by == "created_at":
+        sort_col = Order.created_at
+    elif sort_by == "external_updated_at":
+        sort_col = Order.external_updated_at
+    else:
+        sort_by = "updated_at"
+        sort_col = Order.updated_at
+
+    # ------------------------------------------------------------------ #
+    # Build base query                                                     #
+    # ------------------------------------------------------------------ #
+    from sqlalchemy.orm import selectinload as _selectinload
+
+    query = (
+        select(Order)
+        .options(_selectinload(Order.lines))
+        .where(Order.brand_id == brand)
+    )
+
+    if sort_order == "asc":
+        query = query.order_by(sort_col.asc(), Order.id.asc())
+    else:
+        sort_order = "desc"
+        query = query.order_by(sort_col.desc(), Order.id.desc())
+
+    # ------------------------------------------------------------------ #
+    # Apply cursor filter OR offset                                        #
+    # ------------------------------------------------------------------ #
+    if cursor_id and cursor_updated_at:
+        if sort_order == "asc":
+            query = query.where(
+                (sort_col > cursor_updated_at)
+                | ((sort_col == cursor_updated_at) & (Order.id > cursor_id))
+            )
+        else:
+            query = query.where(
+                (sort_col < cursor_updated_at)
+                | ((sort_col == cursor_updated_at) & (Order.id < cursor_id))
+            )
+    else:
+        query = query.offset(offset)
+
+    # ------------------------------------------------------------------ #
+    # Fetch limit + 1 to detect has_more                                  #
+    # ------------------------------------------------------------------ #
+    try:
+        result = await db.execute(query.limit(limit + 1))
+        orders = list(result.scalars().all())
+    except Exception as exc:
+        logger.error("[OrdersAPI] db_query_failed brand=%s error=%s", brand, exc, exc_info=True)
+        return {"ok": False, "error": "Database query failed"}
+
+    has_more = len(orders) > limit
+    if has_more:
+        orders = orders[:limit]
+
+    # ------------------------------------------------------------------ #
+    # Total count for the brand (separate query)                           #
+    # ------------------------------------------------------------------ #
+    try:
+        total_count_result = await db.execute(
+            select(func.count(Order.id)).where(Order.brand_id == brand)
+        )
+        total_in_database = total_count_result.scalar_one() or 0
+    except Exception:
+        total_in_database = len(orders)
+
+    # ------------------------------------------------------------------ #
+    # Build next / prev cursors                                            #
+    # ------------------------------------------------------------------ #
+    next_cursor: Optional[str] = None
+    prev_cursor: Optional[str] = None
+
+    if has_more and orders:
+        last_order = orders[-1]
+        sort_val = getattr(last_order, sort_by, None)
+        sort_val_iso = sort_val.isoformat() if sort_val is not None else ""
+        next_cursor = base64.b64encode(
+            f"id={last_order.id}&updated_at={sort_val_iso}".encode()
+        ).decode()
+
+    if not cursor and offset > 0 and orders:
+        prev_offset = max(0, offset - limit)
+        prev_cursor = base64.b64encode(
+            f"offset={prev_offset}".encode()
+        ).decode()
+
+    # ------------------------------------------------------------------ #
+    # Serialize                                                            #
+    # ------------------------------------------------------------------ #
+    serialized_orders = [serialize_order(o) for o in orders]
+
+    logger.info(
+        "[OrdersAPI] get_orders brand=%s count=%s total=%s offset=%s limit=%s has_more=%s cursor=%s",
+        brand,
+        len(serialized_orders),
+        total_in_database,
+        offset,
+        limit,
+        has_more,
+        bool(cursor),
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "brand_id": brand,
+        "orders": serialized_orders,
+        "count": len(serialized_orders),
+        "total_in_database": total_in_database,
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "prev_cursor": prev_cursor,
+    })
 
 
 @router.get("/health")
