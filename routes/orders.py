@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal, get_db
-from models import BrandAPICredential, Order, SyncRequest
+from models import BrandAPICredential, Order, SyncRequest, SyncRun
 from services.watchdog_client import emit_watchdog_event
 from utils.json_utils import make_json_safe
 
@@ -1426,25 +1426,30 @@ async def orders_sync_status(
     db: AsyncSession = Depends(get_db),
 ):
     """
+    Return the current sync progress for a brand.
 
-    Return the current background sync progress for a brand.
+    Uses the SyncRun model as the authoritative source of truth.
+    Falls back to the last completed run if no active run exists.
 
-    Combines sync_requests queue state (pending/processing rows) with
-    persisted progress from BrandAPICredential and a live order count from DB.
+    percent_complete = pages_synced / total_pages * 100 (clamped 0-100).
+    Returns null if total_pages is unknown.
 
-    Response fields:
-      ok                           — always true unless brand is missing
-      brand_id                     — echoed brand slug
-      background_sync_active       — true if a worker request is pending/processing
-      pages_synced                 — last page number successfully synced
-      total_pages                  — total pages reported by LeafLink
-      percent_complete             — (pages_synced / total_pages) * 100
-      total_orders_in_db           — COUNT(*) of orders for this brand
-      last_synced_at               — ISO timestamp of last successful sync
-      sync_status                  — "idle" | "syncing" | "paused" | "error"
-      estimated_completion_minutes — rough estimate based on pages/minute
-      errors                       — list of recent error strings
+    Stall detection: if last_progress_at is >90 seconds old, status=stalled,
+    background_sync_active=false, and ETA is suppressed.
+
+    ETA is only returned when: status=syncing AND not stalled AND pages_synced>=3
+    AND last_progress_at is recent.
+
+    data_mode reflects the truthfulness of the data:
+      live_db       — sync completed, data is current
+      partial_sync  — sync in progress
+      stalled       — sync was running but has not progressed for >90s
+      cached        — no active run, showing last completed run info
+      failed        — last run failed
+      no_data       — no runs found at all
     """
+    from services.sync_run_manager import detect_stalled, serialize_sync_run
+
     timestamp = datetime.now(timezone.utc).isoformat()
 
     if not brand:
@@ -1454,321 +1459,751 @@ async def orders_sync_status(
             "timestamp": timestamp,
         }
 
-    logger.info("[OrdersSync] status_check brand=%s", brand)
+    logger.info("[OrdersSyncStatus] status_check brand=%s", brand)
 
     # ------------------------------------------------------------------ #
-    # Load credential from DB                                             #
+    # Fetch active SyncRun (queued or syncing)                           #
     # ------------------------------------------------------------------ #
     try:
-        cred_result = await db.execute(
-            select(BrandAPICredential).where(
-                BrandAPICredential.brand_id == brand,
-                BrandAPICredential.integration_name == "leaflink",
-            )
-        )
-        cred = cred_result.scalar_one_or_none()
-    except Exception as cred_exc:
-        # CRITICAL: Rollback the failed transaction so the session is not poisoned
+        active_run = await SyncRun.get_active_run(db, brand)
+    except Exception as exc:
+        logger.error("[OrdersSyncStatus] active_run_fetch_error brand=%s error=%s", brand, exc)
         await db.rollback()
-
-        logger.warning(
-            "[OrdersSync] credential_load_error brand=%s error=%s — trying fallback",
-            brand,
-            cred_exc,
-        )
-
-        # Fallback: use a FRESH session to avoid the poisoned transaction state.
-        # Query without total_orders_available using raw SQL to avoid ORM selecting
-        # a column that may not yet exist in the schema.
-        try:
-            async with AsyncSessionLocal() as fallback_db:
-                from sqlalchemy import text
-                _fb_result = await fallback_db.execute(
-                    text("""
-                        SELECT id, brand_id, integration_name, api_key, company_id,
-                               is_active, sync_status, last_sync_at, last_error,
-                               last_synced_page, total_pages_available
-                        FROM brand_api_credentials
-                        WHERE brand_id = :brand AND integration_name = 'leaflink'
-                        LIMIT 1
-                    """),
-                    {"brand": brand},
-                )
-                _fb_row = _fb_result.fetchone()
-                if _fb_row:
-                    cred = BrandAPICredential(
-                        id=_fb_row[0],
-                        brand_id=_fb_row[1],
-                        integration_name=_fb_row[2],
-                        api_key=_fb_row[3],
-                        company_id=_fb_row[4],
-                        is_active=_fb_row[5],
-                        sync_status=_fb_row[6],
-                        last_sync_at=_fb_row[7],
-                        last_error=_fb_row[8],
-                        last_synced_page=_fb_row[9],
-                        total_pages_available=_fb_row[10],
-                        total_orders_available=None,  # Column doesn't exist yet
-                    )
-                else:
-                    cred = None
-        except Exception as fallback_exc:
-            error_type = type(fallback_exc).__name__
-            error_msg = str(fallback_exc)
-            tb = traceback.format_exc()
-            logger.error(
-                "[OrdersSync] credential_fallback_error brand=%s error=%s",
-                brand,
-                fallback_exc,
-            )
-            return {
-                "ok": False,
-                "brand_id": brand,
-                "error": "Database error during credential lookup",
-                "error_type": error_type,
-                "error_message": error_msg,
-                "traceback": tb,
-                "timestamp": timestamp,
-            }
+        active_run = None
 
     # ------------------------------------------------------------------ #
-    # Count orders in DB for this brand (shared helper)                  #
-    # ------------------------------------------------------------------ #
-    total_orders_in_db = await _get_brand_order_count(db, brand)
-
-    logger.info(
-        "[OrdersSyncStatus] db_count brand=%s count=%s",
-        brand,
-        total_orders_in_db,
-    )
-
-    # ------------------------------------------------------------------ #
-    # Check sync_requests queue for active worker activity                #
+    # Fetch last completed run                                            #
     # ------------------------------------------------------------------ #
     try:
-        queue_result = await db.execute(
-            select(SyncRequest)
-            .where(
-                SyncRequest.brand_id == brand,
-                SyncRequest.status.in_(["pending", "processing"]),
+        last_completed = await SyncRun.get_last_completed_run(db, brand)
+    except Exception as exc:
+        logger.error("[OrdersSyncStatus] last_completed_fetch_error brand=%s error=%s", brand, exc)
+        await db.rollback()
+        last_completed = None
+
+    # ------------------------------------------------------------------ #
+    # Count distinct orders in DB for this brand                         #
+    # ------------------------------------------------------------------ #
+    try:
+        count_result = await db.execute(
+            select(func.count(func.distinct(Order.external_order_id))).where(
+                Order.brand_id == brand
             )
-            .order_by(SyncRequest.created_at.desc())
-            .limit(1)
         )
-        active_queue_request = queue_result.scalar_one_or_none()
-    except Exception as queue_exc:
-        logger.error("[OrdersSync] status_queue_check_error brand=%s error=%s", brand, queue_exc)
-        active_queue_request = None
+        total_orders_in_db = count_result.scalar_one() or 0
+    except Exception as exc:
+        logger.error("[OrdersSyncStatus] order_count_error brand=%s error=%s", brand, exc)
+        await db.rollback()
+        total_orders_in_db = 0
 
-    bg_active = active_queue_request is not None
+    # ------------------------------------------------------------------ #
+    # Determine which run to report on                                   #
+    # ------------------------------------------------------------------ #
+    run = active_run
+    is_stalled = False
+    data_mode = "no_data"
+    background_sync_active = False
+    last_successful_sync_at = None
 
-    if cred is not None:
-        db_pages_synced = cred.last_synced_page or 0
-        db_total_pages = cred.total_pages_available or 0
-        db_sync_status = cred.sync_status or "idle"
-        db_last_synced_at = cred.last_sync_at.isoformat() if cred.last_sync_at else None
-        db_last_error = cred.last_error
-        # Load total_orders_available safely — column may not exist yet in schema
+    if last_completed:
+        last_successful_sync_at = (
+            last_completed.completed_at.isoformat()
+            if last_completed.completed_at
+            else None
+        )
+
+    if run is not None:
+        is_stalled = detect_stalled(run)
+        background_sync_active = not is_stalled and run.status in ("queued", "syncing")
+
+        if is_stalled:
+            data_mode = "stalled"
+        elif run.status == "syncing":
+            data_mode = "partial_sync"
+        else:
+            data_mode = "partial_sync"
+    elif last_completed is not None:
+        run = last_completed
+        data_mode = "live_db"
+        background_sync_active = False
+    else:
+        # Check for failed runs
         try:
-            total_orders_available = cred.total_orders_available
-        except AttributeError:
-            total_orders_available = None
-    else:
-        db_pages_synced = 0
-        db_total_pages = 0
-        db_sync_status = "idle"
-        db_last_synced_at = None
-        db_last_error = None
-        total_orders_available = None
-
-    # In-memory state is more current than DB when a sync is active
-    db_pages_synced_raw = db_pages_synced  # preserve original stored value for logging
-    pages_synced = db_pages_synced
-    total_pages = db_total_pages
-
-    # ------------------------------------------------------------------ #
-    # Calculate inferred progress from actual order count                 #
-    # ------------------------------------------------------------------ #
-    # LeafLink returns 50 orders per page, so infer pages from order count
-    inferred_pages_from_orders = total_orders_in_db // 50
-
-    # Use the higher of stored/in-memory or inferred progress
-    # (stored might lag behind actual if DB writes are faster than progress updates)
-    displayed_pages_synced = max(pages_synced, inferred_pages_from_orders)
-
-    # If inferred is higher, log and persist the correction
-    if inferred_pages_from_orders > pages_synced:
-        logger.info(
-            "[OrdersSyncStatus] corrected_progress brand=%s old_page=%s inferred_page=%s displayed_page=%s total_orders=%s",
-            brand,
-            db_pages_synced_raw,
-            inferred_pages_from_orders,
-            displayed_pages_synced,
-            total_orders_in_db,
-        )
-
-        # Persist the corrected progress back to DB
-        try:
-            async with AsyncSessionLocal() as _corr_sess:
-                async with _corr_sess.begin():
-                    _corr_res = await _corr_sess.execute(
-                        select(BrandAPICredential).where(
-                            BrandAPICredential.brand_id == brand,
-                            BrandAPICredential.integration_name == "leaflink",
-                        )
-                    )
-                    _corr_cred = _corr_res.scalar_one_or_none()
-                    if _corr_cred:
-                        _corr_cred.last_synced_page = inferred_pages_from_orders
-                        _corr_cred.last_sync_at = datetime.now(timezone.utc)
-            logger.info(
-                "[OrdersSyncStatus] persisted_corrected_progress brand=%s page=%s",
-                brand,
-                inferred_pages_from_orders,
+            failed_result = await db.execute(
+                select(SyncRun)
+                .where(SyncRun.brand_id == brand, SyncRun.status == "failed")
+                .order_by(SyncRun.completed_at.desc())
+                .limit(1)
             )
-        except Exception as _corr_exc:
-            logger.error(
-                "[OrdersSyncStatus] persist_correction_error brand=%s error=%s",
-                brand,
-                _corr_exc,
-                exc_info=True,
-            )
+            failed_run = failed_result.scalar_one_or_none()
+        except Exception:
+            await db.rollback()
+            failed_run = None
+
+        if failed_run:
+            run = failed_run
+            data_mode = "failed"
+        else:
+            data_mode = "no_data"
 
     # ------------------------------------------------------------------ #
-    # Calculate percent complete based on actual order counts (preferred) #
-    # Distinguish between actual (from LeafLink API) and estimated        #
-    # (inferred from page count) totals.                                  #
+    # Build response from run (if any)                                   #
     # ------------------------------------------------------------------ #
-    effective_sync_status = None
+    if run is None:
+        return make_json_safe({
+            "ok": True,
+            "brand_id": brand,
+            "sync_status": "idle",
+            "data_mode": "no_data",
+            "background_sync_active": False,
+            "pages_synced": 0,
+            "total_pages": None,
+            "percent_complete": None,
+            "total_orders_in_db": total_orders_in_db,
+            "orders_loaded_this_run": 0,
+            "total_orders_available": None,
+            "last_successful_sync_at": None,
+            "estimated_completion_minutes": None,
+            "last_error": None,
+            "stalled_reason": None,
+            "sync_run": None,
+            "timestamp": timestamp,
+        })
 
-    # Distinguish between actual and estimated
-    total_orders_estimated: Optional[int] = None  # Fallback estimate from page count
+    # Compute percent_complete correctly: pages_synced / total_pages * 100
+    percent_complete: Optional[float] = None
+    if run.total_pages and run.total_pages > 0:
+        raw_pct = (run.pages_synced / run.total_pages) * 100
+        percent_complete = round(min(100.0, max(0.0, raw_pct)), 2)
 
-    if cred and total_orders_available:
-        # total_orders_available is the actual count from LeafLink API
-        pass
-    elif total_pages and total_pages > 0:
-        # Estimate: assume 100 orders per page
-        total_orders_estimated = total_pages * 100
-
-    # Use actual if available, else estimated
-    _total_for_percent = total_orders_available or total_orders_estimated
-
-    if _total_for_percent and _total_for_percent > 0:
-        percent_complete = round((total_orders_in_db / _total_for_percent) * 100, 1)
-        percent_complete = min(100.0, percent_complete)
-    else:
-        percent_complete = 0.0
-
-    logger.info(
-        "[OrdersSyncStatus] progress brand=%s orders=%s/%s estimated=%s percent=%.1f%%",
-        brand,
-        total_orders_in_db,
-        total_orders_available or total_orders_estimated,
-        total_orders_estimated is not None,
-        percent_complete,
-    )
-
-    # Detect completion: if we've loaded all available orders
-    if total_orders_available and total_orders_in_db >= total_orders_available:
-        effective_sync_status = "complete"
-        bg_active = False
-        percent_complete = 100.0
-        logger.info(
-            "[OrdersSyncStatus] detected_completion_from_orders brand=%s orders=%s/%s",
-            brand,
-            total_orders_in_db,
-            total_orders_available,
-        )
-    # Fallback: detect completion from page count if order count not available
-    elif total_pages and displayed_pages_synced >= total_pages:
-        effective_sync_status = "complete"
-        bg_active = False
-        percent_complete = 100.0
-        logger.info(
-            "[OrdersSyncStatus] detected_completion brand=%s pages=%s/%s orders=%s",
-            brand,
-            displayed_pages_synced,
-            total_pages,
-            total_orders_in_db,
-        )
-
-    # Reconcile sync_status: handle partial syncs gracefully
-    if total_orders_in_db > 0 and not bg_active:
-        # We have orders but sync is not active
-        if effective_sync_status == "complete":
-            # Already detected as complete above — keep it
-            pass
-        elif db_sync_status == "paused":
-            # Sync was paused (transient error)
-            effective_sync_status = "paused"
-        elif db_sync_status == "error":
-            # Sync had permanent error
-            effective_sync_status = "error"
-        elif effective_sync_status is None:
-            # Partial sync, not active, no error — infer paused
-            effective_sync_status = "paused"
-            logger.info(
-                "[OrdersSyncStatus] inferred_paused brand=%s orders=%s/%s",
-                brand,
-                total_orders_in_db,
-                total_orders_available,
-            )
-    elif db_sync_status == "syncing" and not bg_active:
-        # DB says syncing but queue says inactive — trust DB
-        effective_sync_status = "syncing"
-        bg_active = True
-    else:
-        # Use effective_sync_status from above (may be "complete" if all orders/pages synced)
-        if effective_sync_status is None:
-            effective_sync_status = "syncing" if bg_active else db_sync_status
-
-    # Estimate completion: 4 pages per batch, ~10 seconds per batch → 0.4 pages/s
-    pages_remaining = max(total_pages - displayed_pages_synced, 0)
+    # ETA: only when actively syncing, not stalled, and enough data
     estimated_completion_minutes: Optional[float] = None
-    if effective_sync_status == "paused":
-        # Paused due to transient error — retry time is unknown
-        logger.info(
-            "[OrdersSync] status_paused brand=%s error=%s",
-            brand,
-            db_last_error,
-        )
-        estimated_completion_minutes = None
-    elif bg_active and pages_remaining > 0:
-        pages_per_second = 0.4
-        estimated_completion_minutes = round(pages_remaining / pages_per_second / 60, 1)
+    if (
+        not is_stalled
+        and run.status == "syncing"
+        and run.pages_synced >= 3
+        and run.last_progress_at is not None
+    ):
+        eta = run.estimated_completion_minutes()
+        if eta is not None:
+            estimated_completion_minutes = round(eta, 1)
 
-    errors: list[str] = []
-    if db_last_error and db_last_error not in errors:
-        errors = [db_last_error] + errors
+    # Effective status for the response
+    if is_stalled:
+        effective_status = "stalled"
+    elif run is last_completed:
+        effective_status = "completed"
+    else:
+        effective_status = run.status
 
     logger.info(
-        "[OrdersSyncStatus] response brand=%s stored_page=%s inferred_page=%s displayed_page=%s/%s percent=%.1f%% orders=%s/%s active=%s status=%s",
+        "[OrdersSyncStatus] response brand=%s status=%s pages=%s/%s pct=%s "
+        "orders_in_db=%s stalled=%s data_mode=%s",
         brand,
-        db_pages_synced_raw,
-        inferred_pages_from_orders,
-        displayed_pages_synced,
-        total_pages,
+        effective_status,
+        run.pages_synced,
+        run.total_pages,
         percent_complete,
         total_orders_in_db,
-        total_orders_available,
-        bg_active,
-        effective_sync_status,
+        is_stalled,
+        data_mode,
     )
 
     return make_json_safe({
         "ok": True,
         "brand_id": brand,
-        "background_sync_active": bg_active,
-        "pages_synced": displayed_pages_synced,
-        "total_pages": total_pages,
-        "total_orders_in_db": total_orders_in_db,
-        "total_orders_available": total_orders_available,
-        "total_orders_estimated": total_orders_estimated,
+        "sync_status": effective_status,
+        "data_mode": data_mode,
+        "background_sync_active": background_sync_active,
+        "pages_synced": run.pages_synced,
+        "total_pages": run.total_pages,
         "percent_complete": percent_complete,
-        "last_synced_at": db_last_synced_at,
-        "sync_status": effective_sync_status,
-        "last_error": db_last_error,
+        "total_orders_in_db": total_orders_in_db,
+        "orders_loaded_this_run": run.orders_loaded_this_run,
+        "total_orders_available": run.total_orders_available,
+        "last_successful_sync_at": last_successful_sync_at,
         "estimated_completion_minutes": estimated_completion_minutes,
-        "errors": errors,
+        "last_error": run.last_error,
+        "stalled_reason": run.stalled_reason if is_stalled else None,
+        "is_stalled": is_stalled,
+        "sync_run": serialize_sync_run(run, is_stalled=is_stalled),
+        "timestamp": timestamp,
     })
+
+
+@router.post("/sync/reset")
+async def orders_sync_reset(
+    brand: str = Query(..., description="Brand slug (e.g., 'noble-nectar')"),
+    hard: bool = Query(False, description="If true, delete all orders for this brand"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Reset sync state for a brand.
+
+    Stops any active sync worker, marks the active SyncRun as stalled
+    (reason=manual_reset), and clears cursor/progress state.
+
+    If hard=true, all Order rows for the brand are also deleted.
+    Existing orders are preserved by default (soft reset).
+
+    Returns a reset confirmation with order count.
+    """
+    from services.sync_run_manager import reset_run
+    from services.background_sync_manager import sync_manager
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    logger.info("[OrdersSyncReset] reset_requested brand=%s hard=%s", brand, hard)
+
+    # Stop any in-memory background worker
+    sync_manager.stop_sync(brand)
+
+    try:
+        async with AsyncSessionLocal() as reset_db:
+            async with reset_db.begin():
+                result = await reset_run(reset_db, brand, hard=hard)
+
+        logger.info(
+            "[OrdersSyncReset] reset_complete brand=%s action=%s hard=%s",
+            brand,
+            result.get("action"),
+            hard,
+        )
+
+        return make_json_safe({
+            "ok": True,
+            "brand_id": brand,
+            "hard": hard,
+            "timestamp": timestamp,
+            **result,
+        })
+
+    except Exception as exc:
+        logger.error("[OrdersSyncReset] reset_error brand=%s error=%s", brand, exc, exc_info=True)
+        return {
+            "ok": False,
+            "brand_id": brand,
+            "error": str(exc),
+            "timestamp": timestamp,
+        }
+
+
+@router.post("/sync/start")
+async def orders_sync_start(
+    brand: str = Query(..., description="Brand slug (e.g., 'noble-nectar')"),
+    mode: str = Query("full", description="Sync mode: full | incremental"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Start a new sync run for a brand.
+
+    Creates a SyncRun record and enqueues a background sync.
+    Rejects duplicate starts if a run is already active (queued or syncing).
+
+    Always starts from page 1 / cursor null.
+    Returns sync_run_id and initial status.
+    """
+    from services.sync_run_manager import create_sync_run
+    from services.background_sync_manager import sync_manager
+    from services.credential_resolver import resolve_brand_credential
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    logger.info("[OrdersSyncStart] start_requested brand=%s mode=%s", brand, mode)
+
+    if mode not in ("full", "incremental"):
+        return {
+            "ok": False,
+            "error": f"Invalid mode '{mode}'. Must be 'full' or 'incremental'.",
+            "timestamp": timestamp,
+        }
+
+    # Resolve credential
+    cred_row = await resolve_brand_credential(db, brand, "leaflink")
+    if not cred_row:
+        return {
+            "ok": False,
+            "brand_id": brand,
+            "error": "leaflink_credential_not_found",
+            "timestamp": timestamp,
+        }
+
+    api_key = cred_row[4]
+    company_id = cred_row[3]
+
+    # Create SyncRun — rejects if one is already active
+    try:
+        async with AsyncSessionLocal() as start_db:
+            async with start_db.begin():
+                run = await create_sync_run(start_db, brand, mode=mode)
+                sync_run_id = run.id
+    except ValueError as dup_exc:
+        logger.warning("[OrdersSyncStart] duplicate_start brand=%s error=%s", brand, dup_exc)
+        return {
+            "ok": False,
+            "brand_id": brand,
+            "error": "sync_already_active",
+            "detail": str(dup_exc),
+            "timestamp": timestamp,
+        }
+    except Exception as exc:
+        logger.error("[OrdersSyncStart] create_run_error brand=%s error=%s", brand, exc, exc_info=True)
+        return {
+            "ok": False,
+            "brand_id": brand,
+            "error": str(exc),
+            "timestamp": timestamp,
+        }
+
+    logger.info(
+        "[OrdersSyncStart] sync_run_created brand=%s run_id=%s mode=%s",
+        brand,
+        sync_run_id,
+        mode,
+    )
+
+    # Enqueue background sync via SyncRequest (picked up by worker)
+    try:
+        async with AsyncSessionLocal() as enq_db:
+            async with enq_db.begin():
+                enq_db.add(SyncRequest(
+                    brand_id=brand,
+                    status="pending",
+                    start_page=1,
+                    total_pages=None,
+                    total_orders_available=None,
+                ))
+        logger.info("[OrdersSyncStart] sync_request_enqueued brand=%s run_id=%s", brand, sync_run_id)
+    except Exception as enq_exc:
+        logger.error("[OrdersSyncStart] enqueue_error brand=%s error=%s", brand, enq_exc)
+
+    return make_json_safe({
+        "ok": True,
+        "brand_id": brand,
+        "sync_run_id": sync_run_id,
+        "mode": mode,
+        "status": "queued",
+        "message": f"Sync run {sync_run_id} created and queued for brand {brand}",
+        "timestamp": timestamp,
+    })
+
+
+@router.post("/sync/resume")
+async def orders_sync_resume(
+    brand: str = Query(..., description="Brand slug (e.g., 'noble-nectar')"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Resume sync from the last successfully persisted cursor/page.
+
+    Never restarts at page 1 unless no prior progress exists.
+    Never creates duplicate workers — rejects if a run is already active.
+
+    Returns sync_run_id and current status.
+    """
+    from services.sync_run_manager import create_sync_run, get_last_completed_run
+    from services.credential_resolver import resolve_brand_credential
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    logger.info("[OrdersSyncResume] resume_requested brand=%s", brand)
+
+    # Reject if already active
+    try:
+        active = await SyncRun.get_active_run(db, brand)
+    except Exception as exc:
+        await db.rollback()
+        active = None
+
+    if active:
+        return {
+            "ok": False,
+            "brand_id": brand,
+            "error": "sync_already_active",
+            "sync_run_id": active.id,
+            "status": active.status,
+            "detail": f"Run {active.id} is already {active.status}",
+            "timestamp": timestamp,
+        }
+
+    # Find last run with progress to resume from
+    try:
+        last_run_result = await db.execute(
+            select(SyncRun)
+            .where(SyncRun.brand_id == brand)
+            .order_by(SyncRun.started_at.desc())
+            .limit(1)
+        )
+        last_run = last_run_result.scalar_one_or_none()
+    except Exception as exc:
+        await db.rollback()
+        last_run = None
+
+    resume_page = 1
+    resume_cursor = None
+    if last_run and last_run.last_successful_page:
+        resume_page = last_run.last_successful_page + 1
+        resume_cursor = last_run.last_successful_cursor
+        logger.info(
+            "[OrdersSyncResume] resuming_from brand=%s page=%s cursor_hash=%s",
+            brand,
+            resume_page,
+            _cursor_hash_safe(resume_cursor),
+        )
+    else:
+        logger.info("[OrdersSyncResume] no_prior_progress brand=%s starting_from_page_1", brand)
+
+    # Resolve credential
+    cred_row = await resolve_brand_credential(db, brand, "leaflink")
+    if not cred_row:
+        return {
+            "ok": False,
+            "brand_id": brand,
+            "error": "leaflink_credential_not_found",
+            "timestamp": timestamp,
+        }
+
+    # Create new SyncRun for the resume
+    try:
+        async with AsyncSessionLocal() as res_db:
+            async with res_db.begin():
+                run = await create_sync_run(res_db, brand, mode="incremental")
+                # Pre-populate resume cursor/page
+                run.current_page = resume_page
+                run.current_cursor = resume_cursor
+                sync_run_id = run.id
+    except ValueError as dup_exc:
+        return {
+            "ok": False,
+            "brand_id": brand,
+            "error": "sync_already_active",
+            "detail": str(dup_exc),
+            "timestamp": timestamp,
+        }
+    except Exception as exc:
+        logger.error("[OrdersSyncResume] create_run_error brand=%s error=%s", brand, exc, exc_info=True)
+        return {
+            "ok": False,
+            "brand_id": brand,
+            "error": str(exc),
+            "timestamp": timestamp,
+        }
+
+    # Enqueue background sync request
+    try:
+        async with AsyncSessionLocal() as enq_db:
+            async with enq_db.begin():
+                enq_db.add(SyncRequest(
+                    brand_id=brand,
+                    status="pending",
+                    start_page=resume_page,
+                    total_pages=None,
+                    total_orders_available=None,
+                ))
+    except Exception as enq_exc:
+        logger.error("[OrdersSyncResume] enqueue_error brand=%s error=%s", brand, enq_exc)
+
+    return make_json_safe({
+        "ok": True,
+        "brand_id": brand,
+        "sync_run_id": sync_run_id,
+        "mode": "incremental",
+        "status": "queued",
+        "resume_from_page": resume_page,
+        "message": f"Resuming sync from page {resume_page} for brand {brand}",
+        "timestamp": timestamp,
+    })
+
+
+@router.get("/sync/debug")
+async def orders_sync_debug(
+    brand: str = Query(..., description="Brand slug (e.g., 'noble-nectar')"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Full diagnostic dump for a brand's sync state.
+
+    Returns:
+    - Active SyncRun (full object)
+    - Last completed SyncRun
+    - Current worker state (BackgroundSyncManager)
+    - Last 20 SyncRun records (page log)
+    - DB order counts (distinct external_order_id)
+    - Duplicate LeafLink ID count
+    - Newest/oldest order dates
+    - Current cursor hash
+    - Last error
+    """
+    from services.sync_run_manager import detect_stalled, serialize_sync_run
+    from services.background_sync_manager import sync_manager
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    logger.info("[OrdersSyncDebug] debug_request brand=%s", brand)
+
+    # Active run
+    try:
+        active_run = await SyncRun.get_active_run(db, brand)
+    except Exception as exc:
+        await db.rollback()
+        active_run = None
+
+    # Last completed run
+    try:
+        last_completed = await SyncRun.get_last_completed_run(db, brand)
+    except Exception as exc:
+        await db.rollback()
+        last_completed = None
+
+    # Last 20 runs (page log)
+    try:
+        runs_result = await db.execute(
+            select(SyncRun)
+            .where(SyncRun.brand_id == brand)
+            .order_by(SyncRun.started_at.desc())
+            .limit(20)
+        )
+        recent_runs = runs_result.scalars().all()
+    except Exception as exc:
+        await db.rollback()
+        recent_runs = []
+
+    # Order counts
+    try:
+        total_count_result = await db.execute(
+            select(func.count(func.distinct(Order.external_order_id))).where(
+                Order.brand_id == brand
+            )
+        )
+        total_orders_in_db = total_count_result.scalar_one() or 0
+    except Exception as exc:
+        await db.rollback()
+        total_orders_in_db = 0
+
+    # Duplicate external_order_id count
+    try:
+        from sqlalchemy import text as _text
+        dup_result = await db.execute(
+            _text("""
+                SELECT COUNT(*) FROM (
+                    SELECT external_order_id
+                    FROM orders
+                    WHERE brand_id = :brand
+                    GROUP BY external_order_id
+                    HAVING COUNT(*) > 1
+                ) AS dups
+            """),
+            {"brand": brand},
+        )
+        duplicate_count = dup_result.scalar_one() or 0
+    except Exception as exc:
+        await db.rollback()
+        duplicate_count = 0
+
+    # Newest/oldest order dates
+    try:
+        from sqlalchemy import text as _text2
+        dates_result = await db.execute(
+            _text2("""
+                SELECT
+                    MAX(external_updated_at) AS newest,
+                    MIN(external_updated_at) AS oldest
+                FROM orders
+                WHERE brand_id = :brand
+            """),
+            {"brand": brand},
+        )
+        dates_row = dates_result.fetchone()
+        newest_order_date = dates_row[0].isoformat() if dates_row and dates_row[0] else None
+        oldest_order_date = dates_row[1].isoformat() if dates_row and dates_row[1] else None
+    except Exception as exc:
+        await db.rollback()
+        newest_order_date = None
+        oldest_order_date = None
+
+    # Worker state
+    worker_state = sync_manager.get_status(brand)
+
+    # Serialize runs
+    is_active_stalled = detect_stalled(active_run) if active_run else False
+
+    return make_json_safe({
+        "ok": True,
+        "brand_id": brand,
+        "timestamp": timestamp,
+        "active_sync_run": serialize_sync_run(active_run, is_stalled=is_active_stalled) if active_run else None,
+        "last_completed_run": serialize_sync_run(last_completed) if last_completed else None,
+        "worker_state": worker_state,
+        "recent_runs": [serialize_sync_run(r, is_stalled=detect_stalled(r)) for r in recent_runs],
+        "db_stats": {
+            "total_orders_in_db": total_orders_in_db,
+            "duplicate_external_ids": duplicate_count,
+            "newest_order_date": newest_order_date,
+            "oldest_order_date": oldest_order_date,
+        },
+        "current_cursor_hash": (
+            _cursor_hash_safe(active_run.current_cursor) if active_run else None
+        ),
+        "last_error": active_run.last_error if active_run else (
+            last_completed.last_error if last_completed else None
+        ),
+    })
+
+
+@router.post("/sync/recover")
+async def orders_sync_recover(
+    brand: str = Query(..., description="Brand slug (e.g., 'noble-nectar')"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Attempt automatic recovery from a stalled or failed sync.
+
+    - If stalled: resume from last good cursor
+    - If failed due to cursor loop: reset cursor to last known good page
+    - If state is corrupted or no prior progress: recommend reset
+    - Returns exact action taken
+    """
+    from services.sync_run_manager import detect_stalled, create_sync_run
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    logger.info("[OrdersSyncRecover] recover_requested brand=%s", brand)
+
+    # Get active run
+    try:
+        active_run = await SyncRun.get_active_run(db, brand)
+    except Exception as exc:
+        await db.rollback()
+        active_run = None
+
+    # Get last run of any status
+    try:
+        last_run_result = await db.execute(
+            select(SyncRun)
+            .where(SyncRun.brand_id == brand)
+            .order_by(SyncRun.started_at.desc())
+            .limit(1)
+        )
+        last_run = last_run_result.scalar_one_or_none()
+    except Exception as exc:
+        await db.rollback()
+        last_run = None
+
+    run_to_check = active_run or last_run
+
+    if run_to_check is None:
+        return {
+            "ok": False,
+            "brand_id": brand,
+            "action": "none",
+            "recommendation": "No sync runs found. Use POST /orders/sync/start to begin.",
+            "timestamp": timestamp,
+        }
+
+    is_stalled = detect_stalled(run_to_check)
+    is_cursor_loop = (
+        run_to_check.stalled_reason == "cursor_loop_detected"
+        or (run_to_check.last_error or "").startswith("cursor_loop")
+    )
+    has_good_cursor = bool(run_to_check.last_successful_cursor or run_to_check.last_successful_page)
+
+    # Determine recovery action
+    if run_to_check.status == "completed":
+        return make_json_safe({
+            "ok": True,
+            "brand_id": brand,
+            "action": "none_needed",
+            "detail": f"Last run {run_to_check.id} completed successfully.",
+            "timestamp": timestamp,
+        })
+
+    if is_stalled or run_to_check.status in ("stalled", "failed"):
+        if is_cursor_loop and has_good_cursor:
+            # Reset cursor to last known good page and resume
+            action = "reset_cursor_and_resume"
+            resume_page = (run_to_check.last_successful_page or 1)
+            resume_cursor = run_to_check.last_successful_cursor
+        elif has_good_cursor:
+            # Resume from last good cursor
+            action = "resume_from_last_good_cursor"
+            resume_page = (run_to_check.last_successful_page or 1) + 1
+            resume_cursor = run_to_check.last_successful_cursor
+        else:
+            # No good cursor — recommend full reset
+            return make_json_safe({
+                "ok": True,
+                "brand_id": brand,
+                "action": "recommend_reset",
+                "detail": (
+                    "No last-good cursor found. "
+                    "Use POST /orders/sync/reset then POST /orders/sync/start?mode=full"
+                ),
+                "run_id": run_to_check.id,
+                "run_status": run_to_check.status,
+                "timestamp": timestamp,
+            })
+
+        # Create a new run resuming from the good cursor
+        from services.credential_resolver import resolve_brand_credential
+        cred_row = await resolve_brand_credential(db, brand, "leaflink")
+        if not cred_row:
+            return {
+                "ok": False,
+                "brand_id": brand,
+                "error": "leaflink_credential_not_found",
+                "timestamp": timestamp,
+            }
+
+        try:
+            async with AsyncSessionLocal() as rec_db:
+                async with rec_db.begin():
+                    new_run = await create_sync_run(rec_db, brand, mode="incremental")
+                    new_run.current_page = resume_page
+                    new_run.current_cursor = resume_cursor
+                    new_run_id = new_run.id
+        except ValueError as dup_exc:
+            return {
+                "ok": False,
+                "brand_id": brand,
+                "error": "sync_already_active",
+                "detail": str(dup_exc),
+                "timestamp": timestamp,
+            }
+
+        # Enqueue
+        try:
+            async with AsyncSessionLocal() as enq_db:
+                async with enq_db.begin():
+                    enq_db.add(SyncRequest(
+                        brand_id=brand,
+                        status="pending",
+                        start_page=resume_page,
+                        total_pages=run_to_check.total_pages,
+                        total_orders_available=run_to_check.total_orders_available,
+                    ))
+        except Exception as enq_exc:
+            logger.error("[OrdersSyncRecover] enqueue_error brand=%s error=%s", brand, enq_exc)
+
+        return make_json_safe({
+            "ok": True,
+            "brand_id": brand,
+            "action": action,
+            "new_sync_run_id": new_run_id,
+            "resume_from_page": resume_page,
+            "prior_run_id": run_to_check.id,
+            "prior_run_status": run_to_check.status,
+            "timestamp": timestamp,
+        })
+
+    # Run is queued or syncing — nothing to recover
+    return make_json_safe({
+        "ok": True,
+        "brand_id": brand,
+        "action": "none_needed",
+        "detail": f"Run {run_to_check.id} is currently {run_to_check.status}. No recovery needed.",
+        "sync_run_id": run_to_check.id,
+        "timestamp": timestamp,
+    })
+
+
+def _cursor_hash_safe(cursor: Optional[str]) -> Optional[str]:
+    """Safe cursor hash for use in routes/orders.py without importing sync_run_manager."""
+    import hashlib
+    if not cursor:
+        return None
+    return hashlib.sha256(cursor.encode()).hexdigest()[:12]
