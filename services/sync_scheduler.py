@@ -87,6 +87,8 @@ async def poll_and_execute() -> None:
 
             sync_run_id = sync_run.id
             brand_id = sync_run.brand_id
+            sync_mode = sync_run.mode or "full"
+            last_successful_sync_at = sync_run.last_successful_sync_at
             start_page = sync_run.current_page or 1
             # total_pages may be None for cursor-based pagination (LeafLink).
             # Pass None through so sync_leaflink_background_continuous uses
@@ -235,6 +237,127 @@ async def poll_and_execute() -> None:
         sys.stdout.flush()
         raise
 
+    # ---------------------------------------------------------------------- #
+    # Step 4a: Incremental sync — fetch only orders changed since last sync  #
+    # ---------------------------------------------------------------------- #
+
+    # Determine effective sync mode: fall back to full if no prior timestamp
+    effective_sync_mode = sync_mode
+    if effective_sync_mode == "incremental" and not last_successful_sync_at:
+        logger.info(
+            "[SyncWorker] incremental_mode_but_no_last_sync id=%s brand=%s — falling back to full",
+            sync_run_id,
+            brand_id,
+        )
+        effective_sync_mode = "full"
+
+    if effective_sync_mode == "incremental":
+        try:
+            import asyncio as _asyncio
+            from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+
+            from services.leaflink_client import LeafLinkClient
+            from services.leaflink_sync import sync_leaflink_orders_headers_only
+            from services.sync_run_manager import mark_completed as _mark_completed
+
+            logger.info(
+                "[SyncWorker] incremental_sync id=%s brand=%s since=%s",
+                sync_run_id,
+                brand_id,
+                last_successful_sync_at.isoformat(),
+            )
+
+            _inc_executor = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="leaflink-inc")
+
+            client = LeafLinkClient(
+                api_key=api_key,
+                company_id=company_id,
+                brand_id=brand_id,
+                auth_scheme=auth_scheme,
+            )
+
+            loop = _asyncio.get_event_loop()
+            fetch_result = await loop.run_in_executor(
+                _inc_executor,
+                lambda: client.fetch_orders_since(
+                    since=last_successful_sync_at,
+                    normalize=True,
+                    brand=brand_id,
+                ),
+            )
+
+            orders = fetch_result.get("orders", [])
+            pages_fetched = fetch_result.get("pages_fetched", 0)
+
+            logger.info(
+                "[SyncWorker] incremental_fetch_complete id=%s brand=%s orders=%s pages=%s",
+                sync_run_id,
+                brand_id,
+                len(orders),
+                pages_fetched,
+            )
+
+            # Upsert changed orders using the same path as full sync
+            await sync_leaflink_orders_headers_only(
+                brand_id=brand_id,
+                orders=orders,
+                pages_fetched=pages_fetched,
+            )
+
+            # Mark sync run as completed and record last_successful_sync_at
+            async with AsyncSessionLocal() as done_db:
+                async with done_db.begin():
+                    done_result = await done_db.execute(
+                        select(SyncRun).where(SyncRun.id == sync_run_id)
+                    )
+                    done_run = done_result.scalar_one_or_none()
+                    if done_run:
+                        now = datetime.now(timezone.utc)
+                        done_run.status = "completed"
+                        done_run.completed_at = now
+                        done_run.last_successful_sync_at = now
+                        done_run.pages_synced = pages_fetched
+                        done_run.orders_loaded_this_run = len(orders)
+
+            logger.info(
+                "[SyncWorker] incremental_sync_complete id=%s brand=%s orders=%s",
+                sync_run_id,
+                brand_id,
+                len(orders),
+            )
+
+        except Exception as inc_exc:
+            logger.error(
+                "[SyncWorker] incremental_sync_error id=%s brand=%s error=%s",
+                sync_run_id,
+                brand_id,
+                str(inc_exc)[:500],
+                exc_info=True,
+            )
+            try:
+                async with AsyncSessionLocal() as err_db:
+                    err_result = await err_db.execute(
+                        select(SyncRun).where(SyncRun.id == sync_run_id)
+                    )
+                    err_run = err_result.scalar_one_or_none()
+                    if err_run:
+                        err_run.status = "failed"
+                        err_run.last_error = str(inc_exc)[:500]
+                        err_run.completed_at = datetime.now(timezone.utc)
+                        await err_db.commit()
+                        logger.info("[SyncWorker] marked_failed id=%s error_set=true", sync_run_id)
+            except Exception as mark_exc:
+                logger.error(
+                    "[SyncWorker] failed_to_mark_error id=%s error=%s",
+                    sync_run_id,
+                    str(mark_exc)[:200],
+                )
+
+        return  # Incremental path handled — skip full sync below
+
+    # ---------------------------------------------------------------------- #
+    # Step 4b: Full sync (existing page-by-page path)                        #
+    # ---------------------------------------------------------------------- #
     try:
         logger.info(
             "[SyncWorker] sync_start id=%s start_page=%s total_pages=%s",
