@@ -1,3 +1,17 @@
+# ============================================================================
+# DATABASE CONFIGURATION
+# ============================================================================
+# Production uses AWS RDS Postgres (opsyn_prod database)
+# Development can use Railway Postgres or local Postgres
+#
+# DATABASE_URL format:
+#   AWS RDS: postgresql+asyncpg://user:pass@opsyn-prod.xxxxx.rds.amazonaws.com:5432/opsyn_prod
+#   Railway: postgresql+asyncpg://user:pass@postgres.railway.internal:5432/railway
+#   Local:   postgresql+asyncpg://user:pass@localhost:5432/opsyn_dev
+#
+# Production startup will FAIL if DATABASE_URL does not contain 'rds.amazonaws.com'
+# ============================================================================
+
 import logging
 import os
 from typing import AsyncGenerator
@@ -45,6 +59,7 @@ class Base(DeclarativeBase):
 
 
 if DATABASE_URL:
+    logger.info("[DB] DATABASE_URL is set")
     logger.info(
         "[DB] initializing_engine database_url=%s",
         DATABASE_URL[:50] + "..." if DATABASE_URL else "NOT_SET",
@@ -56,7 +71,7 @@ if DATABASE_URL:
         pool_pre_ping=True,
     )
 
-    logger.info("[DB] engine_created")
+    logger.info("[DB] engine_created successfully")
 
     AsyncSessionLocal = async_sessionmaker(
         bind=engine,
@@ -65,7 +80,33 @@ if DATABASE_URL:
     )
 
     logger.info("[DB] session_factory_created")
+
+    # Parse and log connection details with provider detection
+    try:
+        _parsed_db = urlparse(DATABASE_URL)
+        _db_host = _parsed_db.hostname or "unknown"
+        _db_port = _parsed_db.port or 5432
+        _db_name = _parsed_db.path.lstrip("/") or "unknown"
+
+        # Detect provider
+        if "rds.amazonaws.com" in _db_host:
+            _provider = "aws-rds"
+        elif "railway" in _db_host:
+            _provider = "railway"
+        else:
+            _provider = "unknown"
+
+        logger.info(
+            "[DB] connection_details host=%s port=%s database=%s provider=%s",
+            _db_host,
+            _db_port,
+            _db_name,
+            _provider,
+        )
+    except Exception as _exc:
+        logger.error("[DB] failed_to_parse_url error=%s", _exc)
 else:
+    logger.error("[DB] DATABASE_URL is NOT set - database connection will fail")
     engine = None
     AsyncSessionLocal = None
 
