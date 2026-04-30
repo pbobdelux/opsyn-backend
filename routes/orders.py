@@ -713,23 +713,25 @@ async def orders_sync(
                             if _p1_cred:
                                 _p1_cred.last_synced_page = _phase1_page
                                 _p1_cred.total_pages_available = total_pages_available
-                                # Only set if column exists — may be missing before schema migration
-                                try:
-                                    _p1_cred.total_orders_available = total_count_leaflink
-                                except Exception:
-                                    logger.debug("[OrdersSync] total_orders_available column not yet in schema")
+                                # Only set if column exists and value is not None — never overwrite with NULL
+                                if total_count_leaflink is not None:
+                                    try:
+                                        _p1_cred.total_orders_available = total_count_leaflink
+                                        logger.info(
+                                            "[OrdersSync] persisted_total_orders_available brand=%s count=%s",
+                                            _resolved_brand_id,
+                                            total_count_leaflink,
+                                        )
+                                    except Exception:
+                                        logger.debug("[OrdersSync] total_orders_available column not yet in schema")
                                 _p1_cred.sync_status = "syncing" if (next_leaflink_url and next_page_number) else "idle"
                                 _p1_cred.last_sync_at = datetime.now(timezone.utc)
                                 _p1_cred.last_error = None
                     logger.info(
-                        "[OrdersSync] phase1_progress_persisted brand=%s page=%s total_pages=%s",
+                        "[OrdersSync] phase1_progress_persisted brand=%s page=%s total_pages=%s total_orders=%s",
                         _resolved_brand_id,
                         _phase1_page,
                         total_pages_available,
-                    )
-                    logger.info(
-                        "[OrdersSync] persisted_total_orders_available brand=%s count=%s",
-                        _resolved_brand_id,
                         total_count_leaflink,
                     )
                 except Exception as _p1_persist_exc:
@@ -738,6 +740,7 @@ async def orders_sync(
                         _resolved_brand_id,
                         _p1_persist_exc,
                     )
+
 
                 # ---------------------------------------------------------- #
                 # Phase 2: Spawn persistent background sync for remaining     #
@@ -1258,10 +1261,31 @@ async def orders_sync_status(
             total_orders_in_db,
         )
 
-    # Reconcile sync_status: if DB says syncing but manager says inactive, trust DB
-    if db_sync_status == "syncing" and not bg_active:
+    # Reconcile sync_status: handle partial syncs gracefully
+    if total_orders_in_db > 0 and not bg_active:
+        # We have orders but sync is not active
+        if effective_sync_status == "complete":
+            # Already detected as complete above — keep it
+            pass
+        elif db_sync_status == "paused":
+            # Sync was paused (transient error)
+            effective_sync_status = "paused"
+        elif db_sync_status == "error":
+            # Sync had permanent error
+            effective_sync_status = "error"
+        elif effective_sync_status is None:
+            # Partial sync, not active, no error — infer paused
+            effective_sync_status = "paused"
+            logger.info(
+                "[OrdersSyncStatus] inferred_paused brand=%s orders=%s/%s",
+                brand,
+                total_orders_in_db,
+                total_orders_available,
+            )
+    elif db_sync_status == "syncing" and not bg_active:
+        # DB says syncing but queue says inactive — trust DB
         effective_sync_status = "syncing"
-        bg_active = True  # Infer that sync is still running
+        bg_active = True
     else:
         # Use effective_sync_status from above (may be "complete" if all orders/pages synced)
         if effective_sync_status is None:
