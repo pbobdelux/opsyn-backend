@@ -45,6 +45,7 @@ class Base(DeclarativeBase):
 
 
 if DATABASE_URL:
+    logger.info("[DB] DATABASE_URL is set")
     logger.info(
         "[DB] initializing_engine database_url=%s",
         DATABASE_URL[:50] + "..." if DATABASE_URL else "NOT_SET",
@@ -56,7 +57,23 @@ if DATABASE_URL:
         pool_pre_ping=True,
     )
 
-    logger.info("[DB] engine_created")
+    logger.info("[DB] engine_created successfully")
+
+    # Parse and log connection details
+    try:
+        _conn_parsed = urlparse(DATABASE_URL)
+        _conn_host = _conn_parsed.hostname or "unknown"
+        _conn_port = _conn_parsed.port or 5432
+        _conn_name = _conn_parsed.path.lstrip("/") or "unknown"
+
+        logger.info(
+            "[DB] connection_details host=%s port=%s database=%s",
+            _conn_host,
+            _conn_port,
+            _conn_name,
+        )
+    except Exception as exc:
+        logger.error("[DB] failed_to_parse_url error=%s", exc)
 
     AsyncSessionLocal = async_sessionmaker(
         bind=engine,
@@ -68,6 +85,7 @@ if DATABASE_URL:
 else:
     engine = None
     AsyncSessionLocal = None
+    logger.error("[DB] DATABASE_URL is NOT set - database connection will fail")
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

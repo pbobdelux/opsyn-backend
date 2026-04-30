@@ -199,27 +199,28 @@ async def _resume_interrupted_syncs() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"Starting {APP_NAME} in {APP_ENV}")
-
-    # Log database connection info (masked for security)
-    database_url = os.getenv("DATABASE_URL", "")
-    if database_url:
+    # Log active database connection at startup
+    database_url = os.getenv("DATABASE_URL", "NOT_SET")
+    if database_url and database_url != "NOT_SET":
         try:
-            from urllib.parse import urlparse as _urlparse
-            _parsed = _urlparse(database_url)
-            db_host = _parsed.hostname or "unknown"
-            db_port = _parsed.port or 5432
-            db_name = _parsed.path.lstrip("/") or "unknown"
+            from urllib.parse import urlparse
+            parsed = urlparse(database_url)
+            db_host = parsed.hostname or "unknown"
+            db_port = parsed.port or 5432
+            db_name = parsed.path.lstrip("/") or "unknown"
+
             logger.info(
-                "[DB] connected_to=postgres://<user>@%s:%s/%s",
+                "[DB] ACTIVE_DATABASE_URL=postgresql://<user>@%s:%s/%s",
                 db_host,
                 db_port,
                 db_name,
             )
         except Exception as exc:
-            logger.error("[DB] parse_error error=%s", exc)
+            logger.error("[DB] failed_to_parse_database_url error=%s", exc)
     else:
-        logger.error("[DB] DATABASE_URL not set")
+        logger.error("[DB] DATABASE_URL not set or empty")
+
+    logger.info(f"Starting {APP_NAME} in {APP_ENV}")
 
     await _create_assistant_tables()
     from services.migration_runner import run_migrations
