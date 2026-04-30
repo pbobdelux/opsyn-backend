@@ -133,24 +133,13 @@ class LeafLinkClient:
         # Determine auth scheme
         if auth_scheme:
             self.auth_scheme: str = auth_scheme
-            logger.info(
-                "[LeafLinkAuth] using_explicit_scheme scheme=%s",
-                auth_scheme,
-            )
         else:
             env_scheme = os.getenv("LEAFLINK_AUTH_SCHEME", "auto").lower()
             if env_scheme in ("bearer", "token", "raw"):
                 self.auth_scheme = env_scheme.capitalize() if env_scheme != "raw" else "Raw"
-                logger.info(
-                    "[LeafLinkAuth] using_env_scheme scheme=%s",
-                    self.auth_scheme,
-                )
             else:
                 # Default to Bearer (most common for modern APIs)
                 self.auth_scheme = "Bearer"
-                logger.info(
-                    "[LeafLinkAuth] using_default_scheme scheme=Bearer",
-                )
 
         self.session = requests.Session()
         # Base session headers — Authorization header is built per-request from
@@ -225,13 +214,6 @@ class LeafLinkClient:
                 logger.error("[LeafLinkAuth] invalid_headers aborting_request path=%s", path)
                 raise ValueError("Invalid Authorization header")
 
-            logger.info(
-                "[LeafLinkAuth] request_start path=%s scheme=%s api_key_len=%s",
-                path,
-                self.auth_scheme,
-                len(self.api_key),
-            )
-
             try:
                 return self.session.get(
                     url,
@@ -248,12 +230,6 @@ class LeafLinkClient:
                 raise
 
         resp = _do_request()
-
-        logger.info(
-            "[LeafLinkSync] page_response status=%s path=%s",
-            resp.status_code,
-            path,
-        )
 
         content_type = resp.headers.get("Content-Type", "")
         if "application/json" not in content_type.lower():

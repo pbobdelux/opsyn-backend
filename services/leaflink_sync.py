@@ -384,36 +384,21 @@ async def sync_leaflink_orders_headers_only(
     pages_fetched: int = 0,
     batch_size: int = HEADER_BATCH_SIZE,
 ) -> dict[str, Any]:
-    """Upsert ONLY order headers (Order table) for Phase 1 — no line items.
-
-    Opens its own DB sessions and commits in small batches of ``batch_size``
-    so that no single transaction holds locks for more than a handful of rows.
-    Line item data is preserved in ``line_items_json`` on the Order row so the
-    background worker can read it back without re-fetching from LeafLink.
-
-    After all header batches are committed a fire-and-forget asyncio task is
-    spawned to write the corresponding OrderLine rows in the background.
-
-    Returns a summary dict compatible with the existing sync_result contract.
-    """
+    """Upsert order headers in batches with idempotency."""
     sync_start = time.monotonic()
 
     created = 0
     updated = 0
     skipped = 0
     errors: list[str] = []
-    newest_order_date: datetime | None = None
 
-    # Split orders into batches of batch_size
+    # Split orders into batches
     batches = [
         orders[i : i + batch_size]
         for i in range(0, len(orders), batch_size)
     ]
 
     for batch in batches:
-        batch_start = time.monotonic()
-        current_batch_size = len(batch)
-
         try:
             async with AsyncSessionLocal() as db:
                 async with db.begin():
@@ -427,52 +412,7 @@ async def sync_leaflink_orders_headers_only(
                             skipped += 1
                             continue
 
-                        customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
-                        status = (safe_str(o.get("status")) or "submitted").lower()
-                        order_number = safe_str(o.get("order_number"))
-
-                        amount_decimal = safe_decimal(
-                            o.get("total_amount")
-                            or o.get("amount")
-                            or o.get("total")
-                            or o.get("subtotal")
-                            or o.get("price")
-                        )
-                        total_cents = decimal_to_cents(amount_decimal) or 0
-
-                        item_count = safe_int(o.get("item_count"), default=0)
-                        unit_count = safe_int(o.get("unit_count"), default=0)
-
-                        # Normalise line items and store as JSON — do NOT write
-                        # OrderLine rows here; that is deferred to the background worker.
-                        raw_line_items = o.get("line_items", [])
-                        normalized_line_items = normalize_line_items(raw_line_items)
-
-                        if item_count == 0:
-                            item_count = len(normalized_line_items)
-                        if unit_count == 0:
-                            unit_count = sum(
-                                item.get("quantity", 0) or 0
-                                for item in normalized_line_items
-                            )
-
-                        review_status = derive_review_status(normalized_line_items)
-                        now = utc_now()
-                        raw_payload = (
-                            o.get("raw_payload")
-                            if isinstance(o.get("raw_payload"), dict)
-                            else o
-                        )
-
-                        external_created_at = parse_dt(o.get("created_at"))
-                        external_updated_at = parse_dt(o.get("updated_at"))
-
-                        for ts_dt in (external_updated_at, external_created_at):
-                            if ts_dt:
-                                if newest_order_date is None or ts_dt > newest_order_date:
-                                    newest_order_date = ts_dt
-                                break
-
+                        # Upsert by external_id (idempotent)
                         existing_result = await db.execute(
                             select(Order).where(
                                 Order.brand_id == brand_id,
@@ -481,7 +421,33 @@ async def sync_leaflink_orders_headers_only(
                         )
                         existing = existing_result.scalar_one_or_none()
 
+                        # Extract fields
+                        customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
+                        status = (safe_str(o.get("status")) or "submitted").lower()
+                        order_number = safe_str(o.get("order_number"))
+                        amount_decimal = safe_decimal(
+                            o.get("total_amount") or o.get("amount") or o.get("total")
+                        )
+                        total_cents = decimal_to_cents(amount_decimal) or 0
+
+                        # Normalize line items
+                        raw_line_items = o.get("line_items", [])
+                        normalized_line_items = normalize_line_items(raw_line_items)
+
+                        item_count = safe_int(o.get("item_count"), default=len(normalized_line_items))
+                        unit_count = safe_int(o.get("unit_count"), default=sum(
+                            item.get("quantity", 0) or 0 for item in normalized_line_items
+                        ))
+
+                        review_status = derive_review_status(normalized_line_items)
+                        now = utc_now()
+                        raw_payload = o if isinstance(o, dict) else {}
+
+                        external_created_at = parse_dt(o.get("created_at"))
+                        external_updated_at = parse_dt(o.get("updated_at"))
+
                         if existing:
+                            # Update existing order
                             existing.customer_name = customer_name
                             existing.status = status
                             existing.order_number = order_number
@@ -499,45 +465,42 @@ async def sync_leaflink_orders_headers_only(
                             existing.external_updated_at = external_updated_at
                             updated += 1
                         else:
-                            db.add(
-                                Order(
-                                    brand_id=brand_id,
-                                    external_order_id=external_id,
-                                    order_number=order_number,
-                                    customer_name=customer_name,
-                                    status=status,
-                                    total_cents=total_cents,
-                                    amount=amount_decimal,
-                                    item_count=item_count,
-                                    unit_count=unit_count,
-                                    line_items_json=make_json_safe(normalized_line_items),
-                                    raw_payload=make_json_safe(raw_payload),
-                                    source="leaflink",
-                                    review_status=review_status,
-                                    sync_status="ok",
-                                    synced_at=now,
-                                    last_synced_at=now,
-                                    external_created_at=external_created_at,
-                                    external_updated_at=external_updated_at,
-                                )
-                            )
+                            # Create new order
+                            db.add(Order(
+                                brand_id=brand_id,
+                                external_order_id=external_id,
+                                order_number=order_number,
+                                customer_name=customer_name,
+                                status=status,
+                                total_cents=total_cents,
+                                amount=amount_decimal,
+                                item_count=item_count,
+                                unit_count=unit_count,
+                                line_items_json=make_json_safe(normalized_line_items),
+                                raw_payload=make_json_safe(raw_payload),
+                                source="leaflink",
+                                review_status=review_status,
+                                sync_status="ok",
+                                synced_at=now,
+                                last_synced_at=now,
+                                external_created_at=external_created_at,
+                                external_updated_at=external_updated_at,
+                            ))
                             created += 1
 
+                    # Batch commit happens here
         except Exception as batch_exc:
-            err_msg = str(batch_exc)
             logger.error(
-                "[OrdersSync] upsert_batch_error brand=%s batch_size=%s error=%s",
+                "[OrdersSync] batch_error brand=%s error=%s",
                 brand_id,
-                current_batch_size,
-                err_msg,
+                str(batch_exc)[:500],
                 exc_info=True,
             )
-            errors.append(err_msg)
-            skipped += current_batch_size
+            errors.append(str(batch_exc))
+            skipped += len(batch)
             continue
 
-    # Spawn a fire-and-forget background task to write OrderLine rows so the
-    # caller is not blocked waiting for line-item DB writes.
+    # Spawn background task for line items
     async def _background_line_items() -> None:
         await sync_leaflink_line_items(brand_id, orders)
 
@@ -547,17 +510,12 @@ async def sync_leaflink_orders_headers_only(
 
     return {
         "ok": len(errors) == 0,
-        "orders_fetched": len(orders),
         "created": created,
         "updated": updated,
         "skipped": skipped,
-        "line_items_written": 0,
-        "newest_order_date": newest_order_date,
         "pages_fetched": pages_fetched,
         "sync_duration_seconds": sync_duration,
         "errors": errors,
-        "mock_data": any(isinstance(o, dict) and o.get("mock_data") for o in orders),
-        "message": f"Upserted {created + updated} order headers ({created} new, {updated} updated)",
     }
 
 
@@ -1068,20 +1026,19 @@ async def sync_leaflink_background_continuous(
                         await _srm_mark_completed(_done_db, sync_run_id)
             except Exception as _done_exc:
                 logger.error(
-                    "[OrdersSync] sync_run_mark_completed_error run_id=%s error=%s",
+                    "[OrdersSync] mark_completed_error run_id=%s error=%s",
                     sync_run_id,
                     _done_exc,
                 )
 
         logger.info(
-            "[OrdersSync] bg_sync_complete brand=%s final_page=%s total_pages=%s "
-            "total_orders=%s duration_seconds=%s sync_run_id=%s",
+            "[OrdersSync] sync_complete id=%s brand=%s pages=%s/%s orders=%s duration=%ss",
+            sync_run_id,
             brand_id,
             final_page,
             total_pages,
             total_orders_synced,
             total_duration,
-            sync_run_id,
         )
 
     except Exception as e:
