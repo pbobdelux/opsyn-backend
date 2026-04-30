@@ -150,6 +150,51 @@ def derive_review_status(line_items: list[dict[str, Any]], blockers: list[dict[s
     return "ready"
 
 
+def serialize_order(order: Order) -> dict[str, Any]:
+    """Serialize a single Order ORM object to a JSON-safe dict.
+
+    Reusable across endpoints — call this on each order in a paginated
+    result set rather than loading all orders into memory at once.
+    """
+    line_items = build_line_items(order)
+
+    amount = money_to_float(order.amount)
+    if amount is None and order.total_cents is not None:
+        amount = cents_to_amount(order.total_cents)
+
+    item_count = order.item_count
+    if item_count is None:
+        item_count = len(line_items)
+
+    unit_count = order.unit_count
+    if unit_count is None:
+        unit_count = sum((item.get("quantity") or 0) for item in line_items)
+
+    blockers = derive_blockers(line_items)
+    review_status = derive_review_status(line_items, blockers, order)
+
+    return {
+        "id": order.id,
+        "external_id": order.external_order_id,
+        "order_number": order.order_number,
+        "customer_name": order.customer_name,
+        "status": order.status,
+        "amount": amount,
+        "item_count": item_count,
+        "unit_count": unit_count,
+        "line_items": line_items,
+        "review_status": review_status,
+        "blockers": blockers,
+        "sync_status": order.sync_status or "ok",
+        "last_synced_at": order.last_synced_at or order.synced_at,
+        "source": order.source,
+        "external_created_at": order.external_created_at,
+        "external_updated_at": order.external_updated_at,
+        "created_at": order.created_at,
+        "updated_at": order.updated_at,
+    }
+
+
 @router.get("/orders")
 async def get_orders(db: AsyncSession = Depends(get_db)):
     logger.info("[OrdersAPI] request endpoint=/leaflink/orders")
@@ -181,22 +226,8 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
     oldest_order_date: datetime | None = None
 
     for order in orders:
-        line_items = build_line_items(order)
-
-        amount = money_to_float(order.amount)
-        if amount is None and order.total_cents is not None:
-            amount = cents_to_amount(order.total_cents)
-
-        item_count = order.item_count
-        if item_count is None:
-            item_count = len(line_items)
-
-        unit_count = order.unit_count
-        if unit_count is None:
-            unit_count = sum((item.get("quantity") or 0) for item in line_items)
-
-        blockers = derive_blockers(line_items)
-        review_status = derive_review_status(line_items, blockers, order)
+        serialized = serialize_order(order)
+        review_status = serialized["review_status"]
         review_status_counts[review_status] = review_status_counts.get(review_status, 0) + 1
 
         # Track newest/oldest order dates
@@ -207,26 +238,7 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
             if oldest_order_date is None or order_date < oldest_order_date:
                 oldest_order_date = order_date
 
-        results.append({
-            "id": order.id,
-            "external_id": order.external_order_id,
-            "order_number": order.order_number,
-            "customer_name": order.customer_name,
-            "status": order.status,
-            "amount": amount,
-            "item_count": item_count,
-            "unit_count": unit_count,
-            "line_items": line_items,
-            "review_status": review_status,
-            "blockers": blockers,
-            "sync_status": order.sync_status or "ok",
-            "last_synced_at": order.last_synced_at or order.synced_at,
-            "source": order.source,
-            "external_created_at": order.external_created_at,
-            "external_updated_at": order.external_updated_at,
-            "created_at": order.created_at,
-            "updated_at": order.updated_at,
-        })
+        results.append(serialized)
 
     refreshed_at = datetime.now(timezone.utc).isoformat()
     newest_order_date_iso = newest_order_date.isoformat() if newest_order_date else None
