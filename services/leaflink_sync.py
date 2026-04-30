@@ -1028,7 +1028,29 @@ async def sync_leaflink_background_continuous(
                 # Return gracefully — worker will retry on next poll
                 return
             else:
-                # Permanent error — mark as error and propagate
+                # Permanent error — detect auth failures specifically before propagating
+                _err_lower = _err_str.lower()
+                if "status=401" in _err_lower or "auth failed" in _err_lower or "authentication failed" in _err_lower:
+                    logger.error(
+                        "[LeafLinkSync] auth_failed id=%s status=401 error=%s",
+                        sync_run_id,
+                        _err_str[:300],
+                    )
+                    _err_str = f"LeafLink authentication failed (401): {_err_str[:300]}"
+                elif "status=403" in _err_lower or "forbidden" in _err_lower or "invalid_token" in _err_lower:
+                    logger.error(
+                        "[LeafLinkSync] forbidden id=%s status=403 error=%s",
+                        sync_run_id,
+                        _err_str[:300],
+                    )
+                    _err_str = f"LeafLink access forbidden (403): {_err_str[:300]}"
+                else:
+                    logger.error(
+                        "[LeafLinkSync] api_error id=%s error=%s",
+                        sync_run_id,
+                        _err_str[:500],
+                    )
+
                 logger.error(
                     "[OrdersSync] sync_failed_permanent_error brand=%s error=%s",
                     brand_id,
@@ -1040,7 +1062,7 @@ async def sync_leaflink_background_continuous(
                     try:
                         async with AsyncSessionLocal() as _fail_db2:
                             async with _fail_db2.begin():
-                                await _srm_mark_failed(_fail_db2, sync_run_id, _err_str)
+                                await _srm_mark_failed(_fail_db2, sync_run_id, _err_str[:500])
                     except Exception:
                         pass
 
@@ -1058,6 +1080,12 @@ async def sync_leaflink_background_continuous(
         # ------------------------------------------------------------------ #
         next_cursor_hash = _cursor_hash(next_cursor)
         prev_cursor_hash = _cursor_hash(_prev_cursor)
+        logger.info(
+            "[LeafLinkSync] page_fetched id=%s page=%s orders=%s",
+            sync_run_id,
+            current_page,
+            len(batch_orders),
+        )
         logger.info(
             "[OrdersSync] page_fetched brand=%s page=%s orders=%s next_cursor_hash=%s "
             "prev_cursor_hash=%s duration_ms=%s",

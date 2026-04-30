@@ -98,6 +98,7 @@ async def poll_and_execute() -> None:
             start_page,
             total_pages,
         )
+        logger.info("[SyncWorker] job_started id=%s brand=%s", sync_run_id, brand_id)
 
         # ------------------------------------------------------------------ #
         # Stall detection: if the job is already syncing but has made no      #
@@ -136,6 +137,7 @@ async def poll_and_execute() -> None:
     # ---------------------------------------------------------------------- #
     # Step 3: Fetch credential                                                #
     # ---------------------------------------------------------------------- #
+    logger.info("[SyncWorker] fetching credentials brand=%s", brand_id)
     async with AsyncSessionLocal() as db:
         cred_result = await db.execute(
             select(BrandAPICredential).where(
@@ -167,37 +169,68 @@ async def poll_and_execute() -> None:
         api_key: str = cred.api_key or ""
         company_id: str = cred.company_id or ""
 
-        if not api_key.strip() or not company_id.strip():
-            logger.error(
-                "[SyncWorker] credential_incomplete id=%s brand=%s "
-                "api_key_present=%s company_id_present=%s",
-                sync_run_id,
-                brand_id,
-                bool(api_key.strip()),
-                bool(company_id.strip()),
-            )
+        logger.info(
+            "[SyncWorker] credentials_loaded brand=%s api_key_len=%s company_id=%s",
+            brand_id,
+            len(api_key),
+            company_id,
+        )
+
+        # Validate api_key
+        if not api_key or not api_key.strip():
+            logger.error("[SyncWorker] credential_invalid id=%s api_key_missing", sync_run_id)
             fail_result = await db.execute(
                 select(SyncRun).where(SyncRun.id == sync_run_id)
             )
             fail_run = fail_result.scalar_one_or_none()
             if fail_run:
                 fail_run.status = "failed"
-                fail_run.last_error = "LeafLink api_key or company_id is empty"
+                fail_run.last_error = "LeafLink api_key is empty"
                 fail_run.completed_at = datetime.now(timezone.utc)
                 await db.commit()
             return
 
+        # Validate company_id
+        if not company_id or not company_id.strip():
+            logger.error("[SyncWorker] credential_invalid id=%s company_id_missing", sync_run_id)
+            fail_result = await db.execute(
+                select(SyncRun).where(SyncRun.id == sync_run_id)
+            )
+            fail_run = fail_result.scalar_one_or_none()
+            if fail_run:
+                fail_run.status = "failed"
+                fail_run.last_error = "LeafLink company_id is empty"
+                fail_run.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+            return
+
+        logger.info("[SyncWorker] credentials_validated id=%s", sync_run_id)
+
     # ---------------------------------------------------------------------- #
     # Step 4: Execute sync                                                    #
     # ---------------------------------------------------------------------- #
-    logger.info(
-        "[SyncWorker] starting page fetch id=%s start_page=%s total_pages=%s",
-        sync_run_id,
-        start_page,
-        total_pages,
-    )
+    logger.info("[SyncWorker] requesting page=1 id=%s brand=%s", sync_run_id, brand_id)
+
+    # Stamp last_progress_at immediately before the first API call so the
+    # stall detector does not fire while we are waiting for the first page.
+    async with AsyncSessionLocal() as db:
+        pre_run_result = await db.execute(
+            select(SyncRun).where(SyncRun.id == sync_run_id)
+        )
+        pre_run = pre_run_result.scalar_one_or_none()
+        if pre_run:
+            pre_run.last_progress_at = datetime.now(timezone.utc)
+            await db.commit()
+    logger.info("[SyncWorker] first_progress_update id=%s", sync_run_id)
 
     try:
+        logger.info(
+            "[SyncWorker] sync_start id=%s start_page=%s total_pages=%s",
+            sync_run_id,
+            start_page,
+            total_pages,
+        )
+
         await sync_leaflink_background_continuous(
             brand_id=brand_id,
             api_key=api_key,
@@ -216,10 +249,10 @@ async def poll_and_execute() -> None:
             "[SyncWorker] sync_error id=%s brand=%s error=%s",
             sync_run_id,
             brand_id,
-            sync_exc,
+            str(sync_exc)[:500],
             exc_info=True,
         )
-        # Mark job as failed
+        # IMMEDIATELY mark as failed with error
         try:
             async with AsyncSessionLocal() as err_db:
                 err_result = await err_db.execute(
@@ -228,14 +261,15 @@ async def poll_and_execute() -> None:
                 err_run = err_result.scalar_one_or_none()
                 if err_run:
                     err_run.status = "failed"
-                    err_run.last_error = str(sync_exc)
+                    err_run.last_error = str(sync_exc)[:500]  # Truncate to 500 chars
                     err_run.completed_at = datetime.now(timezone.utc)
                     await err_db.commit()
+                    logger.info("[SyncWorker] marked_failed id=%s error_set=true", sync_run_id)
         except Exception as mark_exc:
             logger.error(
                 "[SyncWorker] failed_to_mark_error id=%s error=%s",
                 sync_run_id,
-                mark_exc,
+                str(mark_exc)[:200],
             )
 
 
