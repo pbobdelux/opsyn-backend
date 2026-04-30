@@ -760,8 +760,28 @@ async def orders_sync(
                     _api_url,
                 )
 
+                # Use stored auth scheme if available, otherwise default to Bearer
+                if _active_cred and _active_cred.auth_scheme:
+                    _auth_scheme = _active_cred.auth_scheme
+                    logger.info(
+                        "[LeafLinkAuth] using_stored_scheme scheme=%s brand=%s",
+                        _auth_scheme,
+                        _resolved_brand_id,
+                    )
+                else:
+                    _auth_scheme = "Bearer"
+                    logger.info(
+                        "[LeafLinkAuth] using_default_scheme scheme=Bearer brand=%s",
+                        _resolved_brand_id,
+                    )
+
                 try:
-                    client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=_resolved_brand_id)
+                    client = LeafLinkClient(
+                        api_key=api_key,
+                        company_id=company_id,
+                        brand_id=_resolved_brand_id,
+                        auth_scheme=_auth_scheme,
+                    )
                 except Exception as client_init_exc:
                     _etype = type(client_init_exc).__name__
                     _emsg = str(client_init_exc)

@@ -1,8 +1,10 @@
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import requests
+
+AuthScheme = Literal["Bearer", "Token", "Raw"]
 
 logger = logging.getLogger("leaflink_client")
 
@@ -78,6 +80,7 @@ class LeafLinkClient:
         base_url: Optional[str] = None,
         company_id: Optional[str] = None,
         brand_id: Optional[str] = None,
+        auth_scheme: Optional[AuthScheme] = None,
     ) -> None:
         self.brand_id = brand_id or "unknown"
         self.base_url = (base_url or DEFAULT_LEAFLINK_BASE_URL).strip().rstrip("/")
@@ -106,6 +109,28 @@ class LeafLinkClient:
             logger.warning("leaflink: client_init brand=%s missing company_id", self.brand_id)
             raise ValueError("Missing LEAFLINK_COMPANY_ID")
 
+        # Determine auth scheme
+        if auth_scheme:
+            self.auth_scheme: str = auth_scheme
+            logger.info(
+                "[LeafLinkAuth] using_explicit_scheme scheme=%s",
+                auth_scheme,
+            )
+        else:
+            env_scheme = os.getenv("LEAFLINK_AUTH_SCHEME", "auto").lower()
+            if env_scheme in ("bearer", "token", "raw"):
+                self.auth_scheme = env_scheme.capitalize() if env_scheme != "raw" else "Raw"
+                logger.info(
+                    "[LeafLinkAuth] using_env_scheme scheme=%s",
+                    self.auth_scheme,
+                )
+            else:
+                # Default to Bearer (most common for modern APIs)
+                self.auth_scheme = "Bearer"
+                logger.info(
+                    "[LeafLinkAuth] using_default_scheme scheme=Bearer",
+                )
+
         self.session = requests.Session()
         # Base session headers — Authorization header is built per-request from
         # the instance api_key so each brand uses its own credential.
@@ -123,10 +148,12 @@ class LeafLinkClient:
             self.brand_id,
         )
         logger.info(
-            "[LeafLinkAuth] api_key_prefix=%s api_key_len=%s company_id=%s auth_scheme=Token has_whitespace=%s",
+            "[LeafLinkAuth] credential brand=%s company_id=%s prefix=%s len=%s scheme=%s has_whitespace=%s",
+            self.brand_id,
+            self.company_id,
             self.api_key[:6] if self.api_key else "MISSING",
             len(self.api_key),
-            self.company_id,
+            self.auth_scheme,
             _had_whitespace,
         )
         logger.info(
@@ -142,6 +169,18 @@ class LeafLinkClient:
         if not self.company_id:
             logger.error("[LeafLinkAuth] MISSING company_id brand=%s", self.brand_id)
 
+    def _get_auth_header(self) -> dict:
+        """Build Authorization header based on configured scheme."""
+        if self.auth_scheme == "Bearer":
+            return {"Authorization": f"Bearer {self.api_key}"}
+        elif self.auth_scheme == "Token":
+            return {"Authorization": f"Token {self.api_key}"}
+        elif self.auth_scheme == "Raw":
+            return {"Authorization": self.api_key}
+        else:
+            # Fallback to Bearer
+            return {"Authorization": f"Bearer {self.api_key}"}
+
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         url = f"{self.base_url}/{path.lstrip('/')}"
         safe_params = {k: v for k, v in (params or {}).items() if k not in ("api_key", "token", "secret")}
@@ -153,13 +192,12 @@ class LeafLinkClient:
         )
 
         def _do_request() -> requests.Response:
-            # Use the per-brand api_key stored on this instance — never reads from env vars
-            # CORRECT format: Authorization: Token <api_key>
-            auth_headers = {"Authorization": f"Token {self.api_key}"}
+            auth_headers = self._get_auth_header()
             logger.debug(
-                "[LeafLinkAuth] request_headers auth_scheme=Token api_key_prefix=%s url=%s",
+                "[LeafLinkAuth] request method=GET path=%s scheme=%s prefix=%s",
+                path,
+                self.auth_scheme,
                 self.api_key[:6] if self.api_key else "MISSING",
-                url,
             )
             try:
                 return self.session.get(url, params=params, timeout=45, headers=auth_headers)
@@ -199,8 +237,9 @@ class LeafLinkClient:
         else:
             if resp.status_code == 403:
                 logger.error(
-                    "[LeafLinkAuth] 403_invalid_token endpoint=%s api_key_prefix=%s api_key_len=%s brand=%s",
+                    "[LeafLinkAuth] 403_invalid_token endpoint=%s scheme=%s api_key_prefix=%s api_key_len=%s brand=%s",
                     url,
+                    self.auth_scheme,
                     self.api_key[:6] if self.api_key else "MISSING",
                     len(self.api_key),
                     self.brand_id,
@@ -234,13 +273,13 @@ class LeafLinkClient:
             url,
         )
 
-        # CORRECT format: Authorization: Token <api_key>
-        auth_headers = {"Authorization": f"Token {self.api_key}"}
         logger.debug(
-            "[LeafLinkAuth] request_headers auth_scheme=Token api_key_prefix=%s url=%s",
-            self.api_key[:6] if self.api_key else "MISSING",
+            "[LeafLinkAuth] request method=GET url=%s scheme=%s prefix=%s",
             url,
+            self.auth_scheme,
+            self.api_key[:6] if self.api_key else "MISSING",
         )
+        auth_headers = self._get_auth_header()
         try:
             resp = self.session.get(url, params=None, timeout=45, headers=auth_headers)
         except Exception as exc:
@@ -256,6 +295,15 @@ class LeafLinkClient:
             resp.status_code,
             url,
         )
+
+        if resp.status_code == 403:
+            logger.error(
+                "[LeafLinkAuth] 403_invalid_token url=%s scheme=%s prefix=%s len=%s",
+                url,
+                self.auth_scheme,
+                self.api_key[:6] if self.api_key else "MISSING",
+                len(self.api_key),
+            )
 
         if resp.status_code in (401, 403):
             logger.error(
