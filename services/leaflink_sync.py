@@ -947,6 +947,11 @@ async def sync_leaflink_background_continuous(
             current_page,
             batch_size,
         )
+        logger.info(
+            "[OrdersSyncWorker] page_start brand=%s page=%s",
+            brand_id,
+            current_page,
+        )
         batch_start = time.monotonic()
 
         # ------------------------------------------------------------------ #
@@ -990,6 +995,12 @@ async def sync_leaflink_background_continuous(
                     fetch_exc,
                     exc_info=True,
                 )
+                logger.error(
+                    "[OrdersSyncWorker] page_error brand=%s page=%s error=%s",
+                    brand_id,
+                    current_page,
+                    fetch_exc,
+                )
 
                 if manager:
                     await manager.persist_progress(
@@ -1021,13 +1032,20 @@ async def sync_leaflink_background_continuous(
         # ------------------------------------------------------------------ #
         if batch_orders:
             try:
-                await sync_leaflink_orders_headers_only(
+                upsert_result = await sync_leaflink_orders_headers_only(
                     brand_id=brand_id,
                     orders=batch_orders,
                     pages_fetched=pages_fetched_this_batch,
                 )
                 # Line items are deferred inside sync_leaflink_orders_headers_only
                 # via asyncio.create_task — no need to spawn a second task here.
+                logger.info(
+                    "[OrdersSyncWorker] page_success brand=%s page=%s inserted=%s updated=%s",
+                    brand_id,
+                    current_page,
+                    upsert_result.get("created", 0),
+                    upsert_result.get("updated", 0),
+                )
 
             except Exception as upsert_exc:
                 logger.error(
@@ -1036,6 +1054,12 @@ async def sync_leaflink_background_continuous(
                     current_page,
                     upsert_exc,
                     exc_info=True,
+                )
+                logger.error(
+                    "[OrdersSyncWorker] page_error brand=%s page=%s error=%s",
+                    brand_id,
+                    current_page,
+                    upsert_exc,
                 )
 
         total_orders_synced += len(batch_orders)

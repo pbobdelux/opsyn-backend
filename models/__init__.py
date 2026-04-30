@@ -55,13 +55,6 @@ class BrandAPICredential(Base):
     last_synced_page: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
     total_pages_available: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_orders_available: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Auto-detected auth scheme for this credential
-    auth_scheme: Mapped[Optional[str]] = mapped_column(
-        String(20),
-        nullable=True,
-        default=None,
-        comment="Auto-detected auth scheme: Bearer, Token, or Raw",
-    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
