@@ -85,6 +85,11 @@ async def _load_leaflink_credential(
     # PRIORITY 1: Exact brand match from DB
     if brand_filter:
         try:
+            logger.info(
+                "[DB] querying brand_api_credentials brand=%s integration=leaflink is_active=true",
+                brand_filter,
+            )
+
             result = await db.execute(
                 select(BrandAPICredential).where(
                     BrandAPICredential.brand_id == brand_filter,
@@ -97,6 +102,13 @@ async def _load_leaflink_credential(
             if cred:
                 # Found exact match — STOP, do NOT fallback
                 api_key = (cred.api_key or "").strip()
+
+                logger.info(
+                    "[DB] query_result found brand=%s company_id=%s key_len=%s",
+                    cred.brand_id,
+                    cred.company_id,
+                    len(api_key),
+                )
 
                 # Safety check: validate key length
                 if len(api_key) > 50:
@@ -120,6 +132,10 @@ async def _load_leaflink_credential(
 
                 return cred
             else:
+                logger.warning(
+                    "[DB] query_result not_found brand=%s",
+                    brand_filter,
+                )
                 logger.info(
                     "[LeafLinkAuth] exact_brand_not_found brand=%s",
                     brand_filter,
@@ -135,6 +151,12 @@ async def _load_leaflink_credential(
             raise
 
         except Exception as exc:
+            logger.error(
+                "[DB] query_error brand=%s error=%s",
+                brand_filter,
+                exc,
+                exc_info=True,
+            )
             logger.error(
                 "[LeafLinkAuth] exact_brand_lookup_error brand=%s error=%s",
                 brand_filter,
