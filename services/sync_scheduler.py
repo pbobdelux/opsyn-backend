@@ -119,23 +119,28 @@ async def poll_and_execute() -> None:
             logger.info("[SyncWorker] job_started id=%s brand=%s", sync_run_id, brand_id)
 
             # ------------------------------------------------------------------ #
-            # Stall detection: if the job is already syncing but has made no      #
-            # progress for STALL_THRESHOLD_SECONDS, mark it stalled and skip it.  #
+            # Stall detection: only check jobs that have been claimed            #
+            # (worker_id is not null). Skip newly queued jobs.                   #
             # ------------------------------------------------------------------ #
-            if detect_stalled(sync_run, stall_threshold_seconds=STALL_THRESHOLD_SECONDS):
-                stall_reason = (
-                    f"no_progress_for_{STALL_THRESHOLD_SECONDS}s "
-                    f"last_progress_at={sync_run.last_progress_at}"
-                )
-                logger.warning(
-                    "[SyncWorker] job_stalled id=%s brand=%s reason=%s",
-                    sync_run_id,
-                    brand_id,
-                    stall_reason,
-                )
-                await mark_stalled(db, sync_run_id, stall_reason)
-                await db.commit()
-                return
+            if sync_run.worker_id is not None:
+                # Job was claimed by a worker but made no progress
+                if detect_stalled(sync_run, stall_threshold_seconds=STALL_THRESHOLD_SECONDS):
+                    stall_reason = (
+                        f"no_progress_for_{STALL_THRESHOLD_SECONDS}s "
+                        f"last_progress_at={sync_run.last_progress_at}"
+                    )
+                    logger.warning(
+                        "[SyncWorker] job_stalled id=%s brand=%s reason=%s",
+                        sync_run_id,
+                        brand_id,
+                        stall_reason,
+                    )
+                    await mark_stalled(db, sync_run_id, stall_reason)
+                    await db.commit()
+                    return
+            else:
+                # Job is queued and not yet claimed — proceed to claim it
+                logger.info("[SyncWorker] job_unclaimed id=%s - proceeding to claim", sync_run_id)
 
             # ------------------------------------------------------------------ #
             # Step 2: Claim the job                                               #
