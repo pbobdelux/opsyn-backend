@@ -45,17 +45,26 @@ class Base(DeclarativeBase):
 
 
 if DATABASE_URL:
+    logger.info(
+        "[DB] initializing_engine database_url=%s",
+        DATABASE_URL[:50] + "..." if DATABASE_URL else "NOT_SET",
+    )
+
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
         pool_pre_ping=True,
     )
 
+    logger.info("[DB] engine_created")
+
     AsyncSessionLocal = async_sessionmaker(
         bind=engine,
         class_=AsyncSession,
         expire_on_commit=False,
     )
+
+    logger.info("[DB] session_factory_created")
 else:
     engine = None
     AsyncSessionLocal = None

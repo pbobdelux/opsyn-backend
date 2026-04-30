@@ -25,6 +25,7 @@ from routes.leaflink_debug import router as leaflink_debug_router
 from routes.orders import router as orders_router
 from routes.voice import router as voice_router
 from routes.voice_brain import router as voice_brain_router
+from routes.debug import router as debug_router
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("opsyn-backend")
@@ -199,6 +200,27 @@ async def _resume_interrupted_syncs() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Starting {APP_NAME} in {APP_ENV}")
+
+    # Log database connection info (masked for security)
+    database_url = os.getenv("DATABASE_URL", "")
+    if database_url:
+        try:
+            from urllib.parse import urlparse as _urlparse
+            _parsed = _urlparse(database_url)
+            db_host = _parsed.hostname or "unknown"
+            db_port = _parsed.port or 5432
+            db_name = _parsed.path.lstrip("/") or "unknown"
+            logger.info(
+                "[DB] connected_to=postgres://<user>@%s:%s/%s",
+                db_host,
+                db_port,
+                db_name,
+            )
+        except Exception as exc:
+            logger.error("[DB] parse_error error=%s", exc)
+    else:
+        logger.error("[DB] DATABASE_URL not set")
+
     await _create_assistant_tables()
     from services.migration_runner import run_migrations
     applied = await run_migrations()
@@ -266,6 +288,8 @@ app.include_router(leaflink_debug_router, prefix="/leaflink")
 app.include_router(orders_router)
 app.include_router(voice_router)
 app.include_router(voice_brain_router)
+app.include_router(debug_router)
+logger.info("[Routes] registered debug routes")
 
 
 @app.middleware("http")
