@@ -317,6 +317,7 @@ async def orders_credentials(
 @router.get("/sync")
 async def orders_sync(
     request: Request,
+    brand: Optional[str] = Query(None, description="Brand slug or ID (e.g., 'noble-nectar') — primary alias"),
     brand_id: Optional[str] = Query(None, description="Brand slug or ID to filter orders (e.g., 'noble-nectar')"),
     brand_slug: Optional[str] = Query(None, description="Alias for brand_id — brand slug or ID"),
     updated_after: Optional[str] = Query(None, description="ISO timestamp - only return orders updated after this time (ignored when force_full=true)"),
@@ -326,6 +327,7 @@ async def orders_sync(
     pages_per_request: int = Query(LEAFLINK_PAGES_PER_REQUEST, ge=1, le=20, description="LeafLink pages to fetch per request (default 3)"),
     db: AsyncSession = Depends(get_db),
 ):
+
     """
     Paginated incremental sync from LeafLink with background continuation.
 
@@ -370,14 +372,21 @@ async def orders_sync(
     """
 
 
-    # Resolve brand filter — accept brand_id, brand_slug, or camelCase brandId
+
+    # Resolve brand filter — accept brand, brand_id, brand_slug, or camelCase brandId
     brand_filter: Optional[str] = (
-        brand_id
+        brand
+        or brand_id
         or brand_slug
         or request.query_params.get("brandId")
     )
 
-    logger.info("[OrdersAPI] request_start brand=%s", brand_filter)
+    logger.info(
+        "[OrdersSync] request_received brand=%s force_full=%s pages_per_request=%s",
+        brand_filter,
+        force_full,
+        pages_per_request,
+    )
     logger.info(
         "[OrdersSync] request_start path=%s brand=%s org=%s updated_after=%s cursor=%s limit=%s force_full=%s pages_per_request=%s",
         request.url.path,
@@ -389,6 +398,7 @@ async def orders_sync(
         force_full,
         pages_per_request,
     )
+
 
     # ------------------------------------------------------------------ #
     # Decode cursor → (start_page, resume_url)                            #
@@ -422,18 +432,23 @@ async def orders_sync(
             }
 
     # ------------------------------------------------------------------ #
-    # Load the first active LeafLink credential from DB                   #
+    # Load the active LeafLink credential from DB                         #
+    # Filter by brand_filter when provided; fall back to most-recent      #
+    # active credential so single-tenant deployments still work.          #
     # ------------------------------------------------------------------ #
     _resolved_brand_id: Optional[str] = None
     _resolved_company_id: Optional[str] = None
     _active_cred = None
+    _credential_found: bool = False
     try:
-        cred_result = await db.execute(
-            select(BrandAPICredential).where(
-                BrandAPICredential.integration_name == "leaflink",
-                BrandAPICredential.is_active == True,
-            ).order_by(BrandAPICredential.last_sync_at.desc().nullslast()).limit(1)
+        _cred_query = select(BrandAPICredential).where(
+            BrandAPICredential.integration_name == "leaflink",
+            BrandAPICredential.is_active == True,
         )
+        if brand_filter:
+            _cred_query = _cred_query.where(BrandAPICredential.brand_id == brand_filter)
+        _cred_query = _cred_query.order_by(BrandAPICredential.last_sync_at.desc().nullslast()).limit(1)
+        cred_result = await db.execute(_cred_query)
         _active_cred = cred_result.scalar_one_or_none()
     except Exception as _cred_exc:
         # Rollback the failed transaction so the session is not left in a broken state
@@ -441,6 +456,7 @@ async def orders_sync(
         logger.error("[OrdersSync] credential_load_error error=%s", _cred_exc)
 
     if _active_cred is not None:
+        _credential_found = True
         _resolved_brand_id = _active_cred.brand_id
         _resolved_company_id = _active_cred.company_id
         _api_key_present = bool(_active_cred.api_key and _active_cred.api_key.strip())
@@ -448,8 +464,19 @@ async def orders_sync(
         logger.info("[OrdersSync] resolved_brand_id=%s", _resolved_brand_id)
         logger.info("[OrdersSync] resolved_company_id=%s", _resolved_company_id)
         logger.info("[OrdersSync] api_key_present=%s", str(_api_key_present).lower())
+        logger.info(
+            "[OrdersSync] credential_found brand=%s company_id=%s",
+            _resolved_brand_id,
+            _resolved_company_id,
+        )
     else:
-        logger.warning("[OrdersSync] credential_source=missing — no active LeafLink credential found")
+        logger.warning("[OrdersSync] credential_source=missing — no active LeafLink credential found for brand=%s", brand_filter)
+
+    # Use brand_filter as the effective brand ID when no credential was found
+    # so that DB counts still reflect the correct brand
+    _effective_brand_id: Optional[str] = _resolved_brand_id or brand_filter
+
+
 
     # ------------------------------------------------------------------ #
     # FORCE_DB_ONLY: emergency debug mode — skip LeafLink entirely        #
@@ -468,6 +495,26 @@ async def orders_sync(
     total_pages_available: Optional[int] = None
     next_leaflink_url: Optional[str] = None
     next_page_number: Optional[int] = None
+    _sync_triggered: bool = False
+    _worker_enqueued: bool = False
+    _leaflink_call_attempted: bool = False
+
+    # ------------------------------------------------------------------ #
+    # Count existing orders in DB before sync (diagnostic)               #
+    # ------------------------------------------------------------------ #
+    try:
+        _pre_count_result = await db.execute(
+            select(func.count(Order.id)).where(Order.brand_id == _effective_brand_id)
+        )
+        _db_count_before = _pre_count_result.scalar_one() or 0
+    except Exception:
+        _db_count_before = 0
+
+    logger.info(
+        "[OrdersSync] db_count_before brand=%s count=%s",
+        _effective_brand_id,
+        _db_count_before,
+    )
 
     # ------------------------------------------------------------------ #
     # Phase 1: Fetch LEAFLINK_PAGES_PER_REQUEST pages synchronously       #
@@ -476,6 +523,7 @@ async def orders_sync(
         cred = _active_cred
         api_key: str = cred.api_key or ""
         company_id: str = cred.company_id or ""
+
 
         _api_key_valid = bool(api_key.strip())
         _company_id_valid = bool(company_id.strip())
@@ -570,7 +618,14 @@ async def orders_sync(
                         resume_url=resume_url,
                     )
 
-                logger.info("[OrdersSync] phase=1 leaflink_fetch_start start_page=%s num_pages=%s", start_page, pages_per_request)
+                logger.info(
+                    "[OrdersSync] leaflink_call_start brand=%s start_page=%s force_full=%s",
+                    _resolved_brand_id,
+                    start_page,
+                    force_full,
+                )
+                _leaflink_call_attempted = True
+
 
                 try:
                     fetch_result = await asyncio.wait_for(
@@ -613,12 +668,21 @@ async def orders_sync(
                 total_count_leaflink = fetch_result["total_count"]
 
                 logger.info(
+                    "[OrdersSync] leaflink_call_complete brand=%s orders=%s pages=%s total_pages=%s total_count=%s",
+                    _resolved_brand_id,
+                    len(orders_from_leaflink),
+                    pages_fetched_phase1,
+                    total_pages_available,
+                    total_count_leaflink,
+                )
+                logger.info(
                     "[OrdersSync] phase=1 leaflink_fetch_complete orders=%s pages=%s next_page=%s total_pages=%s",
                     len(orders_from_leaflink),
                     pages_fetched_phase1,
                     next_page_number,
                     total_pages_available,
                 )
+
 
                 # Phase 1 upsert: headers only, batched commits of 25 orders
                 logger.info("[OrdersSync] phase=1 db_upsert_start count=%s", len(orders_from_leaflink))
@@ -659,7 +723,14 @@ async def orders_sync(
                         "traceback": traceback.format_exc(),
                     })
 
-                # Spawn background task to write line items without blocking response
+                _sync_triggered = True
+                logger.info(
+                    "[OrdersSync] phase1_upsert_complete brand=%s upserted=%s",
+                    _resolved_brand_id,
+                    len(orders_from_leaflink),
+                )
+
+
                 _li_brand_id = _resolved_brand_id
                 _li_orders = orders_from_leaflink
 
@@ -781,6 +852,14 @@ async def orders_sync(
                             total_pages_available,
                         )
                         sync_metadata["background_sync_active"] = True
+                        _worker_enqueued = True
+                        logger.info(
+                            "[OrdersSync] worker_enqueued brand=%s start_page=%s total_pages=%s",
+                            _resolved_brand_id,
+                            next_page_number,
+                            total_pages_available,
+                        )
+
                     except Exception as enqueue_exc:
                         logger.error(
                             "[OrdersSync] enqueue_error brand=%s error=%s",
@@ -803,10 +882,18 @@ async def orders_sync(
                 await mark_credential_success(cred)
 
                 logger.info(
+                    "[OrdersSync] sync_trigger_mode brand=%s mode=worker sync_triggered=%s worker_enqueued=%s leaflink_attempted=%s",
+                    _resolved_brand_id,
+                    str(_sync_triggered).lower(),
+                    str(_worker_enqueued).lower(),
+                    str(_leaflink_call_attempted).lower(),
+                )
+                logger.info(
                     "[OrdersSync] response_returned source=live count=%s next_cursor=%s",
                     phase1_orders_upserted,
                     "present" if next_leaflink_url else "none",
                 )
+
 
             except asyncio.TimeoutError as timeout_exc:
                 timeout_msg = str(timeout_exc)
@@ -824,6 +911,7 @@ async def orders_sync(
                 sync_error = timeout_msg
                 sync_metadata["sync_error"] = sync_error
                 sync_metadata["used_force_full"] = force_full
+
 
                 _watchdog_url_to = os.getenv("OPSYN_WATCHDOG_WEBHOOK_URL")
                 await emit_watchdog_event(
@@ -930,6 +1018,7 @@ async def orders_sync(
         if force_db_only:
             sync_metadata["force_db_only"] = True
 
+
     # ------------------------------------------------------------------ #
     # Build next_cursor for LeafLink page pagination                      #
     # ------------------------------------------------------------------ #
@@ -943,11 +1032,11 @@ async def orders_sync(
     # ------------------------------------------------------------------ #
     try:
         count_result = await db.execute(
-            select(func.count(Order.id)).where(Order.brand_id == _resolved_brand_id)
+            select(func.count(Order.id)).where(Order.brand_id == _effective_brand_id)
         )
         total_in_database = count_result.scalar_one() or 0
     except Exception:
-        total_in_database = 0
+        total_in_database = _db_count_before
 
     # Determine sync_status from available state
     if sync_error:
@@ -971,18 +1060,25 @@ async def orders_sync(
         _percent_complete = min(100.0, _percent_complete)
 
     logger.info(
-        "[OrdersSync] response_metadata_only brand=%s pages=%s/%s orders=%s percent=%.1f%%",
-        _resolved_brand_id,
-        sync_metadata.get("pages_fetched", 0),
-        total_pages_available,
+        "[OrdersSync] response brand=%s sync_status=%s total_orders_in_db=%s total_orders_available=%s sync_triggered=%s worker_enqueued=%s",
+        _effective_brand_id,
+        _sync_status,
         total_in_database,
-        _percent_complete,
+        _total_orders_available,
+        str(_sync_triggered).lower(),
+        str(_worker_enqueued).lower(),
     )
 
     return make_json_safe({
         "ok": True,
         "sync_status": _sync_status,
         "background_sync_active": sync_metadata.get("background_sync_active", False),
+        "sync_triggered": _sync_triggered,
+        "worker_enqueued": _worker_enqueued,
+        "leaflink_call_attempted": _leaflink_call_attempted,
+        "credential_found": _credential_found,
+        "brand_id": _effective_brand_id,
+        "company_id": _resolved_company_id,
         "pages_synced": sync_metadata.get("pages_fetched", 0),
         "total_pages": total_pages_available,
         "total_orders_in_db": total_in_database,
@@ -993,13 +1089,13 @@ async def orders_sync(
     })
 
 
-
 @router.get("/sync/status")
 async def orders_sync_status(
     brand: Optional[str] = Query(None, description="Brand slug to check (e.g., 'noble-nectar')"),
     db: AsyncSession = Depends(get_db),
 ):
     """
+
     Return the current background sync progress for a brand.
 
     Combines sync_requests queue state (pending/processing rows) with
