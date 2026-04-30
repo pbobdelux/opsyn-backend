@@ -1183,7 +1183,15 @@ async def orders_sync_status(
     # Estimate completion: 4 pages per batch, ~10 seconds per batch → 0.4 pages/s
     pages_remaining = max(total_pages - displayed_pages_synced, 0)
     estimated_completion_minutes: Optional[float] = None
-    if bg_active and pages_remaining > 0:
+    if effective_sync_status == "paused":
+        # Paused due to transient error — retry time is unknown
+        logger.info(
+            "[OrdersSync] status_paused brand=%s error=%s",
+            brand,
+            db_last_error,
+        )
+        estimated_completion_minutes = None
+    elif bg_active and pages_remaining > 0:
         pages_per_second = 0.4
         estimated_completion_minutes = round(pages_remaining / pages_per_second / 60, 1)
 
@@ -1216,6 +1224,7 @@ async def orders_sync_status(
         "percent_complete": percent_complete,
         "last_synced_at": db_last_synced_at,
         "sync_status": effective_sync_status,
+        "last_error": db_last_error,
         "estimated_completion_minutes": estimated_completion_minutes,
         "errors": errors,
     })
