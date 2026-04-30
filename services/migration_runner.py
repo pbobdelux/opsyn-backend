@@ -91,6 +91,7 @@ async def run_migrations() -> list[str]:
             try:
                 async with engine.connect() as conn:
                     # Check whether this migration has already been applied
+                    # (outside the migration transaction so we can safely skip)
                     row = await conn.exec_driver_sql(
                         "SELECT 1 FROM schema_migrations WHERE migration_name = $1",
                         (filename,),
@@ -107,26 +108,31 @@ async def run_migrations() -> list[str]:
                     logger.info("[Migration] applying migration=%s", filename)
                     start_ms = time.monotonic()
 
-                    # Execute each statement individually — asyncpg does not
-                    # support multiple statements in a single prepared call.
-                    statements = _split_statements(sql)
-                    logger.debug(
-                        "[Migration] migration=%s statement_count=%s",
-                        filename,
-                        len(statements),
-                    )
-                    for stmt in statements:
-                        await conn.exec_driver_sql(stmt)
+                    # Each migration runs in its own explicit transaction so that
+                    # a failure rolls back cleanly and does not leave the connection
+                    # in a broken state for subsequent migrations.
+                    async with conn.begin():
+                        # Execute each statement individually — asyncpg does not
+                        # support multiple statements in a single prepared call.
+                        statements = _split_statements(sql)
+                        logger.debug(
+                            "[Migration] migration=%s statement_count=%s",
+                            filename,
+                            len(statements),
+                        )
+                        for stmt in statements:
+                            await conn.exec_driver_sql(stmt)
 
-                    duration_ms = int((time.monotonic() - start_ms) * 1000)
+                        duration_ms = int((time.monotonic() - start_ms) * 1000)
 
-                    # Record the migration as applied
-                    await conn.exec_driver_sql(
-                        "INSERT INTO schema_migrations (migration_name, duration_ms) "
-                        "VALUES ($1, $2)",
-                        (filename, duration_ms),
-                    )
-                    await conn.commit()
+                        # Record the migration as applied (inside the same transaction
+                        # so it is atomically committed or rolled back with the migration)
+                        await conn.exec_driver_sql(
+                            "INSERT INTO schema_migrations (migration_name, duration_ms) "
+                            "VALUES ($1, $2)",
+                            (filename, duration_ms),
+                        )
+                    # Commit happens automatically when the `async with conn.begin()` block exits
 
                     logger.info(
                         "[Migration] applied migration=%s duration_ms=%s",
@@ -136,6 +142,7 @@ async def run_migrations() -> list[str]:
                     applied.append(filename)
 
             except Exception as migration_exc:
+                # Transaction is automatically rolled back by the context manager on exception
                 logger.error(
                     "[Migration] failed migration=%s error=%s",
                     filename,

@@ -21,6 +21,31 @@ logger = logging.getLogger("orders")
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
+
+async def _safe_db_query(
+    db: AsyncSession,
+    query,
+    fallback_value=None,
+    error_context: str = "",
+):
+    """
+    Execute a query safely with automatic rollback on failure.
+
+    Returns (success, result) tuple.
+    """
+    try:
+        result = await db.execute(query)
+        return True, result
+    except Exception as exc:
+        # Rollback the failed transaction so the session is usable again
+        await db.rollback()
+        logger.error(
+            "[OrdersSync] safe_query_error context=%s error=%s",
+            error_context,
+            exc,
+        )
+        return False, fallback_value
+
 # Thread pool for running synchronous LeafLink HTTP calls without blocking the event loop
 _leaflink_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="leaflink-sync")
 
@@ -411,6 +436,8 @@ async def orders_sync(
         )
         _active_cred = cred_result.scalar_one_or_none()
     except Exception as _cred_exc:
+        # Rollback the failed transaction so the session is not left in a broken state
+        await db.rollback()
         logger.error("[OrdersSync] credential_load_error error=%s", _cred_exc)
 
     if _active_cred is not None:
@@ -1011,44 +1038,50 @@ async def orders_sync_status(
         )
         cred = cred_result.scalar_one_or_none()
     except Exception as cred_exc:
+        # CRITICAL: Rollback the failed transaction so the session is not poisoned
+        await db.rollback()
+
         logger.warning(
             "[OrdersSync] credential_load_error brand=%s error=%s — trying fallback",
             brand,
             cred_exc,
         )
-        # Fallback: query without total_orders_available using raw SQL to avoid
-        # ORM selecting a column that may not yet exist in the schema.
+
+        # Fallback: use a FRESH session to avoid the poisoned transaction state.
+        # Query without total_orders_available using raw SQL to avoid ORM selecting
+        # a column that may not yet exist in the schema.
         try:
-            from sqlalchemy import text
-            _fb_result = await db.execute(
-                text("""
-                    SELECT id, brand_id, integration_name, api_key, company_id,
-                           is_active, sync_status, last_sync_at, last_error,
-                           last_synced_page, total_pages_available
-                    FROM brand_api_credentials
-                    WHERE brand_id = :brand AND integration_name = 'leaflink'
-                    LIMIT 1
-                """),
-                {"brand": brand},
-            )
-            _fb_row = _fb_result.fetchone()
-            if _fb_row:
-                cred = BrandAPICredential(
-                    id=_fb_row[0],
-                    brand_id=_fb_row[1],
-                    integration_name=_fb_row[2],
-                    api_key=_fb_row[3],
-                    company_id=_fb_row[4],
-                    is_active=_fb_row[5],
-                    sync_status=_fb_row[6],
-                    last_sync_at=_fb_row[7],
-                    last_error=_fb_row[8],
-                    last_synced_page=_fb_row[9],
-                    total_pages_available=_fb_row[10],
-                    total_orders_available=None,  # Column doesn't exist yet
+            async with AsyncSessionLocal() as fallback_db:
+                from sqlalchemy import text
+                _fb_result = await fallback_db.execute(
+                    text("""
+                        SELECT id, brand_id, integration_name, api_key, company_id,
+                               is_active, sync_status, last_sync_at, last_error,
+                               last_synced_page, total_pages_available
+                        FROM brand_api_credentials
+                        WHERE brand_id = :brand AND integration_name = 'leaflink'
+                        LIMIT 1
+                    """),
+                    {"brand": brand},
                 )
-            else:
-                cred = None
+                _fb_row = _fb_result.fetchone()
+                if _fb_row:
+                    cred = BrandAPICredential(
+                        id=_fb_row[0],
+                        brand_id=_fb_row[1],
+                        integration_name=_fb_row[2],
+                        api_key=_fb_row[3],
+                        company_id=_fb_row[4],
+                        is_active=_fb_row[5],
+                        sync_status=_fb_row[6],
+                        last_sync_at=_fb_row[7],
+                        last_error=_fb_row[8],
+                        last_synced_page=_fb_row[9],
+                        total_pages_available=_fb_row[10],
+                        total_orders_available=None,  # Column doesn't exist yet
+                    )
+                else:
+                    cred = None
         except Exception as fallback_exc:
             error_type = type(fallback_exc).__name__
             error_msg = str(fallback_exc)
@@ -1075,8 +1108,10 @@ async def orders_sync_status(
         count_result = await db.execute(
             select(func.count(Order.id)).where(Order.brand_id == brand)
         )
-        total_orders_in_db = count_result.scalar_one()
+        total_orders_in_db = count_result.scalar_one() or 0
     except Exception as count_exc:
+        # Rollback the failed transaction before any further queries on this session
+        await db.rollback()
         logger.error("[OrdersSync] status_check count_error brand=%s error=%s", brand, count_exc)
         total_orders_in_db = 0
 
