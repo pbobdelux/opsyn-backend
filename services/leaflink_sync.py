@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,13 @@ if TYPE_CHECKING:
     from services.background_sync_manager import BackgroundSyncManager
 
 logger = logging.getLogger("leaflink_sync")
+
+
+def _cursor_hash(cursor: Optional[str]) -> Optional[str]:
+    """Return a short hash of a cursor for safe logging."""
+    if not cursor:
+        return None
+    return hashlib.sha256(cursor.encode()).hexdigest()[:12]
 
 # Thread pool for running synchronous LeafLink HTTP calls without blocking the event loop
 _leaflink_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="leaflink-bg-sync")
@@ -783,34 +791,40 @@ async def sync_leaflink_background_continuous(
     total_pages: int,
     manager: Optional["BackgroundSyncManager"] = None,
     total_orders_available: Optional[int] = None,
+    sync_run_id: Optional[int] = None,
 ) -> None:
     """
     Fetch all remaining LeafLink pages in adaptive batches and upsert to DB.
 
     Designed to run as a fire-and-forget asyncio task after Phase 1 completes.
-    Progress is persisted to BrandAPICredential after every batch so the sync
-    can resume from the last completed page if the service restarts.
+    Progress is persisted to SyncRun (and BrandAPICredential for legacy compat)
+    after every page so the sync can resume from the last completed page if the
+    service restarts.
 
     Batch size adapts based on observed fetch latency:
       - < 5 s per batch  → increase to _BG_BATCH_MAX (5 pages)
       - > 15 s per batch → decrease to _BG_BATCH_MIN (3 pages)
       - otherwise        → keep at _BG_BATCH_DEFAULT (4 pages)
 
+    Cursor-loop detection: if the same cursor is returned twice in a row the
+    run is marked stalled with reason=cursor_loop_detected.
+
     Args:
-        brand_id:    Brand slug / ID.
-        api_key:     LeafLink API key.
-        company_id:  LeafLink company ID.
-        start_page:  First page to fetch (Phase 1 already fetched pages before this).
-        total_pages: Total pages reported by LeafLink API.
-        manager:     Optional BackgroundSyncManager instance for in-memory tracking.
+        brand_id:               Brand slug / ID.
+        api_key:                LeafLink API key.
+        company_id:             LeafLink company ID.
+        start_page:             First page to fetch (Phase 1 already fetched pages before this).
+        total_pages:            Total pages reported by LeafLink API.
+        manager:                Optional BackgroundSyncManager instance for in-memory tracking.
+        total_orders_available: Total orders reported by LeafLink (for progress display).
+        sync_run_id:            Optional SyncRun.id to persist progress against.
     """
     from services.leaflink_client import LeafLinkClient
-
-    logger.info(
-        "[OrdersSync] bg_continuous_sync_started brand=%s start_page=%s total_pages=%s",
-        brand_id,
-        start_page,
-        total_pages,
+    from services.sync_run_manager import (
+        update_progress as _srm_update_progress,
+        mark_completed as _srm_mark_completed,
+        mark_stalled as _srm_mark_stalled,
+        mark_failed as _srm_mark_failed,
     )
 
     bg_start = time.monotonic()
@@ -818,13 +832,44 @@ async def sync_leaflink_background_continuous(
     batch_size = _BG_BATCH_DEFAULT
     total_orders_synced = 0
     resume_url: Optional[str] = None
+    _prev_cursor: Optional[str] = None  # for cursor-loop detection
 
     logger.info(
-        "[OrdersSync] bg_sync_start brand=%s start_page=%s total_pages=%s",
+        "[OrdersSync] bg_sync_start brand=%s start_page=%s total_pages=%s sync_run_id=%s",
         brand_id,
         start_page,
         total_pages,
+        sync_run_id,
     )
+
+    async def _persist_run_progress(
+        pages_synced: int,
+        orders_loaded: int,
+        cursor: Optional[str],
+        page: int,
+        total_pages_val: Optional[int] = None,
+    ) -> None:
+        """Persist progress to SyncRun (if sync_run_id set) and BackgroundSyncManager."""
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _prog_db:
+                    async with _prog_db.begin():
+                        await _srm_update_progress(
+                            _prog_db,
+                            sync_run_id=sync_run_id,
+                            pages_synced=pages_synced,
+                            orders_loaded=orders_loaded,
+                            cursor=cursor,
+                            page=page,
+                            total_pages=total_pages_val,
+                            total_orders_available=total_orders_available,
+                        )
+            except Exception as _prog_exc:
+                logger.error(
+                    "[OrdersSync] sync_run_progress_persist_error run_id=%s error=%s",
+                    sync_run_id,
+                    _prog_exc,
+                )
 
     try:
         client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=brand_id)
@@ -843,6 +888,13 @@ async def sync_leaflink_background_continuous(
                 error=str(client_exc),
                 total_orders_available=total_orders_available,
             )
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _fail_db:
+                    async with _fail_db.begin():
+                        await _srm_mark_failed(_fail_db, sync_run_id, str(client_exc))
+            except Exception:
+                pass
         return
 
     loop = asyncio.get_event_loop()
@@ -960,6 +1012,7 @@ async def sync_leaflink_background_continuous(
         except Exception as fetch_exc:
             error_code = getattr(fetch_exc, "status_code", None)
             is_transient = error_code in TRANSIENT_ERROR_CODES
+            _err_str = str(fetch_exc)
 
             if is_transient:
                 # Transient error exhausted all retries — mark as paused, not failed
@@ -979,6 +1032,17 @@ async def sync_leaflink_background_continuous(
                         error=f"LeafLink temporarily unavailable (HTTP {error_code})",
                         total_orders_available=total_orders_available,
                     )
+                if sync_run_id:
+                    try:
+                        async with AsyncSessionLocal() as _stall_db:
+                            async with _stall_db.begin():
+                                await _srm_mark_stalled(
+                                    _stall_db,
+                                    sync_run_id,
+                                    f"transient_error_http_{error_code}",
+                                )
+                    except Exception:
+                        pass
 
                 # Return gracefully — worker will retry on next poll
                 return
@@ -997,24 +1061,79 @@ async def sync_leaflink_background_continuous(
                         last_synced_page=current_page - 1,
                         total_pages=total_pages,
                         sync_status="error",
-                        error=str(fetch_exc),
+                        error=_err_str,
                         total_orders_available=total_orders_available,
                     )
+                if sync_run_id:
+                    try:
+                        async with AsyncSessionLocal() as _fail_db2:
+                            async with _fail_db2.begin():
+                                await _srm_mark_failed(_fail_db2, sync_run_id, _err_str)
+                    except Exception:
+                        pass
 
                 raise
 
         batch_orders = fetch_result.get("orders", [])
         pages_fetched_this_batch = fetch_result.get("pages_fetched", batch_size)
-        resume_url = fetch_result.get("next_url")
+        next_cursor = fetch_result.get("next_url")
         next_page = fetch_result.get("next_page")
 
         batch_fetch_ms = round((time.monotonic() - batch_start) * 1000)
+
+        # ------------------------------------------------------------------ #
+        # Cursor-loop detection: same cursor returned twice → stalled         #
+        # ------------------------------------------------------------------ #
+        next_cursor_hash = _cursor_hash(next_cursor)
+        prev_cursor_hash = _cursor_hash(_prev_cursor)
         logger.info(
-            "[OrdersSync] bg_batch_complete page=%s orders=%s duration_ms=%s",
+            "[OrdersSync] page_fetched brand=%s page=%s orders=%s next_cursor_hash=%s "
+            "prev_cursor_hash=%s duration_ms=%s",
+            brand_id,
             current_page,
             len(batch_orders),
+            next_cursor_hash,
+            prev_cursor_hash,
             batch_fetch_ms,
         )
+
+        if next_cursor and next_cursor == _prev_cursor:
+            _loop_reason = "cursor_loop_detected"
+            logger.error(
+                "[OrdersSync] cursor_loop_detected brand=%s page=%s cursor_hash=%s — marking stalled",
+                brand_id,
+                current_page,
+                next_cursor_hash,
+            )
+            if manager:
+                await manager.persist_progress(
+                    brand_id=brand_id,
+                    last_synced_page=current_page - 1,
+                    total_pages=total_pages,
+                    sync_status="error",
+                    error=_loop_reason,
+                    total_orders_available=total_orders_available,
+                )
+            if sync_run_id:
+                try:
+                    async with AsyncSessionLocal() as _loop_db:
+                        async with _loop_db.begin():
+                            await _srm_mark_stalled(_loop_db, sync_run_id, _loop_reason)
+                except Exception:
+                    pass
+            return
+
+        _prev_cursor = next_cursor
+        resume_url = next_cursor
+
+        # Log anomaly: 0 orders but next_cursor present
+        if len(batch_orders) == 0 and next_cursor:
+            logger.warning(
+                "[OrdersSync] zero_orders_but_next_cursor brand=%s page=%s cursor_hash=%s",
+                brand_id,
+                current_page,
+                next_cursor_hash,
+            )
 
         # ------------------------------------------------------------------ #
         # Upsert order headers (headers-only, line items deferred)            #
@@ -1042,7 +1161,7 @@ async def sync_leaflink_background_continuous(
         last_completed_page = (next_page - 1) if next_page else total_pages
 
         # ------------------------------------------------------------------ #
-        # Persist progress to DB                                              #
+        # Persist progress to DB (SyncRun + BackgroundSyncManager)           #
         # ------------------------------------------------------------------ #
         if manager:
             manager.record_page_complete(brand_id, last_completed_page)
@@ -1054,12 +1173,21 @@ async def sync_leaflink_background_continuous(
                 total_orders_available=total_orders_available,
             )
 
+        await _persist_run_progress(
+            pages_synced=last_completed_page,
+            orders_loaded=total_orders_synced,
+            cursor=next_cursor,
+            page=last_completed_page,
+            total_pages_val=total_pages,
+        )
+
         percent = round((last_completed_page / total_pages) * 100, 1) if total_pages else 0
         logger.info(
-            "[OrdersSync] bg_batch_complete page=%s total_pages=%s percent=%.1f%%",
+            "[OrdersSync] bg_batch_progress page=%s/%s percent=%.1f%% orders=%s",
             last_completed_page,
             total_pages,
             percent,
+            total_orders_synced,
         )
 
         # ------------------------------------------------------------------ #
@@ -1097,11 +1225,25 @@ async def sync_leaflink_background_continuous(
             total_orders_available=total_orders_available,
         )
 
+    if sync_run_id:
+        try:
+            async with AsyncSessionLocal() as _done_db:
+                async with _done_db.begin():
+                    await _srm_mark_completed(_done_db, sync_run_id)
+        except Exception as _done_exc:
+            logger.error(
+                "[OrdersSync] sync_run_mark_completed_error run_id=%s error=%s",
+                sync_run_id,
+                _done_exc,
+            )
+
     logger.info(
-        "[OrdersSync] bg_sync_complete brand=%s final_page=%s total_pages=%s total_orders=%s duration_seconds=%s",
+        "[OrdersSync] bg_sync_complete brand=%s final_page=%s total_pages=%s "
+        "total_orders=%s duration_seconds=%s sync_run_id=%s",
         brand_id,
         final_page,
         total_pages,
         total_orders_synced,
         total_duration,
+        sync_run_id,
     )
