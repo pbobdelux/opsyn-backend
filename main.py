@@ -199,27 +199,82 @@ async def _resume_interrupted_syncs() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"Starting {APP_NAME} in {APP_ENV}")
-
-    # Log database connection info (masked for security)
+    # Validate DATABASE_URL at startup
     database_url = os.getenv("DATABASE_URL", "")
-    if database_url:
-        try:
-            from urllib.parse import urlparse as _urlparse
-            _parsed = _urlparse(database_url)
-            db_host = _parsed.hostname or "unknown"
-            db_port = _parsed.port or 5432
-            db_name = _parsed.path.lstrip("/") or "unknown"
-            logger.info(
-                "[DB] connected_to=postgres://<user>@%s:%s/%s",
-                db_host,
-                db_port,
-                db_name,
+
+    if not database_url:
+        logger.error("[BOOT_DB] DATABASE_URL is empty or not set")
+        raise RuntimeError("DATABASE_URL environment variable is not set")
+
+    # Check for common malformations
+    if database_url.startswith("DATABASE_URL"):
+        logger.error(
+            "[BOOT_DB] invalid_database_url malformed=true reason=starts_with_DATABASE_URL"
+        )
+        raise RuntimeError(
+            "DATABASE_URL is malformed: value starts with 'DATABASE_URL'. "
+            "Remove the 'DATABASE_URL=' prefix from the value."
+        )
+
+    if "\n" in database_url or "\r" in database_url:
+        logger.error(
+            "[BOOT_DB] invalid_database_url malformed=true reason=contains_newlines"
+        )
+        raise RuntimeError(
+            "DATABASE_URL is malformed: contains newlines. "
+            "Ensure the value is a single line with no line breaks."
+        )
+
+    if database_url.startswith('"') or database_url.startswith("'"):
+        logger.error(
+            "[BOOT_DB] invalid_database_url malformed=true reason=starts_with_quote"
+        )
+        raise RuntimeError(
+            "DATABASE_URL is malformed: value starts with a quote. "
+            "Remove quotes from the variable value."
+        )
+
+    # PRODUCTION FAIL-FAST: Ensure AWS RDS is used
+    environment = os.getenv("ENVIRONMENT", "development").lower()
+
+    if environment == "production":
+        if "rds.amazonaws.com" not in database_url:
+            logger.error(
+                "[BOOT_DB] PRODUCTION mode but DATABASE_URL is not AWS RDS canonical database"
             )
-        except Exception as exc:
-            logger.error("[DB] parse_error error=%s", exc)
-    else:
-        logger.error("[DB] DATABASE_URL not set")
+            raise RuntimeError(
+                "Production DATABASE_URL is not AWS RDS canonical database. "
+                "Expected host to contain 'rds.amazonaws.com'"
+            )
+
+        logger.info("[BOOT_DB] PRODUCTION mode using AWS RDS canonical database")
+
+    # Log active database connection at startup
+    try:
+        from urllib.parse import urlparse as _urlparse
+        _parsed = _urlparse(database_url)
+        db_host = _parsed.hostname or "unknown"
+        db_port = _parsed.port or 5432
+        db_name = _parsed.path.lstrip("/") or "unknown"
+
+        # Detect provider
+        if "rds.amazonaws.com" in db_host:
+            provider = "aws-rds"
+        elif "railway" in db_host:
+            provider = "railway"
+        else:
+            provider = "unknown"
+
+        logger.info(
+            "[BOOT_DB] host=%s db=%s provider=%s",
+            db_host,
+            db_name,
+            provider,
+        )
+    except Exception as exc:
+        logger.error("[BOOT_DB] failed_to_parse_database_url error=%s", exc)
+
+    logger.info(f"Starting {APP_NAME} in {APP_ENV}")
 
     await _create_assistant_tables()
     from services.migration_runner import run_migrations
