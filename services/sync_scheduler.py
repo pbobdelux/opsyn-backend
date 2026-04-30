@@ -200,12 +200,18 @@ async def poll_and_execute() -> None:
 
             api_key: str = cred.api_key or ""
             company_id: str = cred.company_id or ""
+            auth_scheme: str = cred.auth_scheme or "Token"
 
             logger.info(
                 "[SyncWorker] credentials_loaded brand=%s api_key_len=%s company_id=%s",
                 brand_id,
                 len(api_key),
                 company_id,
+            )
+            logger.info(
+                "[LeafLinkAuth] auth_header_present=true scheme=%s api_key_len=%s",
+                auth_scheme,
+                len(api_key),
             )
 
             # Validate api_key
@@ -284,6 +290,7 @@ async def poll_and_execute() -> None:
             brand_id=brand_id,
             api_key=api_key,
             company_id=company_id,
+            auth_scheme=auth_scheme,
             start_page=start_page,
             total_pages=total_pages,
             manager=None,  # No in-memory manager needed — DB-only progress tracking
