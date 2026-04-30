@@ -1019,31 +1019,87 @@ async def orders_sync_status(
         db_last_error = None
 
     # In-memory state is more current than DB when a sync is active
+    db_pages_synced_raw = db_pages_synced  # preserve original stored value for logging
     pages_synced = manager_status["pages_synced"] if bg_active else db_pages_synced
     total_pages = manager_status["total_pages"] if manager_status["total_pages"] else db_total_pages
 
-    # If pages_synced is still 0 but we have orders in DB, infer from order count
-    if pages_synced == 0 and total_orders_in_db > 0:
-        pages_synced = max(1, total_orders_in_db // 50)
+    # ------------------------------------------------------------------ #
+    # Calculate inferred progress from actual order count                 #
+    # ------------------------------------------------------------------ #
+    # LeafLink returns 50 orders per page, so infer pages from order count
+    inferred_pages_from_orders = total_orders_in_db // 50
+
+    # Use the higher of stored/in-memory or inferred progress
+    # (stored might lag behind actual if DB writes are faster than progress updates)
+    displayed_pages_synced = max(pages_synced, inferred_pages_from_orders)
+
+    # If inferred is higher, log and persist the correction
+    if inferred_pages_from_orders > pages_synced:
         logger.info(
-            "[OrdersSync] status_inferred_pages_from_orders brand=%s orders=%s inferred_pages=%s",
+            "[OrdersSyncStatus] corrected_progress brand=%s old_page=%s inferred_page=%s displayed_page=%s total_orders=%s",
             brand,
+            db_pages_synced_raw,
+            inferred_pages_from_orders,
+            displayed_pages_synced,
             total_orders_in_db,
-            pages_synced,
         )
 
-    percent_complete = round((pages_synced / total_pages) * 100, 1) if total_pages else 0.0
+        # Persist the corrected progress back to DB
+        try:
+            async with AsyncSessionLocal() as _corr_sess:
+                async with _corr_sess.begin():
+                    _corr_res = await _corr_sess.execute(
+                        select(BrandAPICredential).where(
+                            BrandAPICredential.brand_id == brand,
+                            BrandAPICredential.integration_name == "leaflink",
+                        )
+                    )
+                    _corr_cred = _corr_res.scalar_one_or_none()
+                    if _corr_cred:
+                        _corr_cred.last_synced_page = inferred_pages_from_orders
+                        _corr_cred.last_sync_at = datetime.now(timezone.utc)
+            logger.info(
+                "[OrdersSyncStatus] persisted_corrected_progress brand=%s page=%s",
+                brand,
+                inferred_pages_from_orders,
+            )
+        except Exception as _corr_exc:
+            logger.error(
+                "[OrdersSyncStatus] persist_correction_error brand=%s error=%s",
+                brand,
+                _corr_exc,
+                exc_info=True,
+            )
+
+    # Calculate percent complete (capped at 100%)
+    percent_complete = round((displayed_pages_synced / total_pages) * 100, 1) if total_pages else 0.0
+    percent_complete = min(100.0, percent_complete)
+
+    # Detect sync completion: if we've synced all pages, mark as complete
+    effective_sync_status = None
+    if total_pages and displayed_pages_synced >= total_pages:
+        effective_sync_status = "complete"
+        bg_active = False
+        percent_complete = 100.0
+        logger.info(
+            "[OrdersSyncStatus] detected_completion brand=%s pages=%s/%s orders=%s",
+            brand,
+            displayed_pages_synced,
+            total_pages,
+            total_orders_in_db,
+        )
 
     # Reconcile sync_status: if DB says syncing but manager says inactive, trust DB
     if db_sync_status == "syncing" and not bg_active:
         effective_sync_status = "syncing"
         bg_active = True  # Infer that sync is still running
     else:
-        # Reconcile sync_status: if manager says active but DB says idle, trust manager
-        effective_sync_status = "syncing" if bg_active else db_sync_status
+        # Use effective_sync_status from above (may be "complete" if all pages synced)
+        if effective_sync_status is None:
+            effective_sync_status = "syncing" if bg_active else db_sync_status
 
     # Estimate completion: 4 pages per batch, ~10 seconds per batch → 0.4 pages/s
-    pages_remaining = max(total_pages - pages_synced, 0)
+    pages_remaining = max(total_pages - displayed_pages_synced, 0)
     estimated_completion_minutes: Optional[float] = None
     if bg_active and pages_remaining > 0:
         pages_per_second = 0.4
@@ -1054,20 +1110,23 @@ async def orders_sync_status(
         errors = [db_last_error] + errors
 
     logger.info(
-        "[OrdersSync] status_response brand=%s active=%s pages=%s/%s percent=%.1f%% orders_in_db=%s",
+        "[OrdersSyncStatus] response brand=%s stored_page=%s inferred_page=%s displayed_page=%s/%s percent=%.1f%% orders=%s active=%s status=%s",
         brand,
-        bg_active,
-        pages_synced,
+        db_pages_synced_raw,
+        inferred_pages_from_orders,
+        displayed_pages_synced,
         total_pages,
         percent_complete,
         total_orders_in_db,
+        bg_active,
+        effective_sync_status,
     )
 
     return make_json_safe({
         "ok": True,
         "brand_id": brand,
         "background_sync_active": bg_active,
-        "pages_synced": pages_synced,
+        "pages_synced": displayed_pages_synced,
         "total_pages": total_pages,
         "percent_complete": percent_complete,
         "total_orders_in_db": total_orders_in_db,
