@@ -95,6 +95,15 @@ async def _load_leaflink_credential(
                     cred.brand_id,
                     cred.company_id,
                 )
+                # Strip whitespace from credentials to prevent auth failures
+                cred.api_key = (cred.api_key or "").strip()
+                cred.company_id = (cred.company_id or "").strip()
+                logger.info(
+                    "[LeafLinkAuth] credential_loaded source=db api_key_prefix=%s api_key_len=%s company_id=%s",
+                    cred.api_key[:6] if cred.api_key else "MISSING",
+                    len(cred.api_key),
+                    cred.company_id,
+                )
                 return cred
             else:
                 logger.info("[OrdersSyncCredential] exact_brand_lookup found=false")
@@ -117,6 +126,15 @@ async def _load_leaflink_credential(
                 cred.brand_id,
                 cred.company_id,
             )
+            # Strip whitespace from credentials to prevent auth failures
+            cred.api_key = (cred.api_key or "").strip()
+            cred.company_id = (cred.company_id or "").strip()
+            logger.info(
+                "[LeafLinkAuth] credential_loaded source=db api_key_prefix=%s api_key_len=%s company_id=%s",
+                cred.api_key[:6] if cred.api_key else "MISSING",
+                len(cred.api_key),
+                cred.company_id,
+            )
             return cred
         else:
             logger.info("[OrdersSyncCredential] active_leaflink_lookup found=false")
@@ -129,8 +147,17 @@ async def _load_leaflink_credential(
     env_company_id = os.getenv("LEAFLINK_COMPANY_ID")
 
     if env_api_key and env_company_id:
+        # Strip whitespace from env var credentials too
+        env_api_key = env_api_key.strip()
+        env_company_id = env_company_id.strip()
         logger.info(
             "[OrdersSyncCredential] env_fallback found=true company_id=%s",
+            env_company_id,
+        )
+        logger.info(
+            "[LeafLinkAuth] credential_loaded source=env api_key_prefix=%s api_key_len=%s company_id=%s",
+            env_api_key[:6] if env_api_key else "MISSING",
+            len(env_api_key),
             env_company_id,
         )
         # Create a temporary credential object from env vars
@@ -588,6 +615,12 @@ async def orders_sync(
                 _resolved_brand_id,
                 _resolved_company_id,
                 _api_key_present,
+            )
+            logger.info(
+                "[LeafLinkAuth] orders_sync_credential source=db company_id=%s api_key_prefix=%s api_key_len=%s",
+                _resolved_company_id,
+                _active_cred.api_key[:6] if _active_cred.api_key else "MISSING",
+                len(_active_cred.api_key or ""),
             )
         else:
             logger.warning(
