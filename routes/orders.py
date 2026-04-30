@@ -156,6 +156,10 @@ async def orders_sync(
     """
     Paginated incremental sync from LeafLink with background continuation.
 
+    Returns sync STATUS and PROGRESS ONLY — no order data.
+    Use the ``/orders`` endpoint (with pagination) to fetch actual order records.
+    This endpoint is for monitoring sync progress, not retrieving orders.
+
     Phase 1 (synchronous, < 5 seconds):
     - Decodes cursor to determine which LeafLink page to start from
     - Fetches only ``pages_per_request`` pages (default 3 = ~300 orders)
@@ -172,15 +176,26 @@ async def orders_sync(
     - page: next LeafLink page number to fetch
     - url: LeafLink's own ``next`` URL for that page (avoids re-computing offset)
 
+    Response fields (metadata only):
+    - ok: boolean
+    - sync_status: \"idle\" | \"syncing\" | \"complete\" | \"paused\" | \"error\"
+    - background_sync_active: true if a background task is running
+    - pages_synced: number of LeafLink pages fetched so far
+    - total_pages: total pages reported by LeafLink
+    - total_orders_in_db: COUNT(*) of orders stored for this brand
+    - total_orders_available: total orders reported by LeafLink
+    - percent_complete: (total_orders_in_db / total_orders_available) * 100
+    - next_cursor: opaque cursor to pass on the next call
+    - error: error string if something went wrong, else null
+
     Query params:
     - brand_id / brand_slug: Brand slug or ID (e.g., \"noble-nectar\")
     - updated_after: ISO timestamp — ignored when force_full=true
     - cursor: Pagination cursor from previous response
-    - limit: Orders to return from DB (1-1000, default 500)
     - force_full: true/false — force complete backfill from LeafLink
     - pages_per_request: LeafLink pages per sync call (1-20, default 3)
     """
-    endpoint_start = time.monotonic()
+
 
     # Resolve brand filter — accept brand_id, brand_slug, or camelCase brandId
     brand_filter: Optional[str] = (
@@ -740,236 +755,67 @@ async def orders_sync(
             sync_metadata["force_db_only"] = True
 
     # ------------------------------------------------------------------ #
-    # Phase 2 (read): Serve orders from DB — always a fresh session       #
+    # Build next_cursor for LeafLink page pagination                      #
     # ------------------------------------------------------------------ #
-    logger.info("[OrdersSync] phase=2_read new_session_created")
+    next_cursor: Optional[str] = None
+    if next_leaflink_url and next_page_number:
+        cursor_payload = f"page={next_page_number}&url={next_leaflink_url}"
+        next_cursor = base64.b64encode(cursor_payload.encode()).decode()
 
-    # Parse updated_after (ignored when force_full=true)
-    updated_after_dt = None
-    if updated_after and not force_full:
-        try:
-            updated_after_dt = datetime.fromisoformat(updated_after.replace("Z", "+00:00"))
-            logger.info("[OrdersSync] filter updated_after=%s", updated_after_dt.isoformat())
-        except ValueError as e:
-            logger.error("[OrdersSync] validation_error detail=invalid_updated_after error=%s", e)
-            return {
-                "ok": False,
-                "error": "Invalid updated_after timestamp format. Use ISO 8601 (e.g., 2026-04-25T12:30:00Z)",
-                "data_source": "error",
-            }
-    elif force_full and updated_after:
-        logger.info("[OrdersSync] force_full=true — ignoring updated_after=%s", updated_after)
+    # ------------------------------------------------------------------ #
+    # Count total orders in DB (lightweight — no order data returned)     #
+    # ------------------------------------------------------------------ #
+    try:
+        count_result = await db.execute(
+            select(func.count(Order.id)).where(Order.brand_id == _resolved_brand_id)
+        )
+        total_in_database = count_result.scalar_one() or 0
+    except Exception:
+        total_in_database = 0
 
-    # Decode DB cursor (separate from LeafLink page cursor — this is the DB row ID cursor)
-    db_cursor_id = None
-    # Note: the `cursor` param is now used for LeafLink page pagination, not DB row pagination.
-    # DB pagination uses the `limit` param only. If the client needs DB-level pagination,
-    # they should use the returned next_cursor from the DB read below.
+    # Determine sync_status from available state
+    if sync_error:
+        _sync_status = "error"
+    elif sync_metadata.get("background_sync_active"):
+        _sync_status = "syncing"
+    elif phase1_orders_upserted > 0 or sync_metadata.get("pages_fetched"):
+        _sync_status = "syncing"
+    else:
+        _sync_status = "idle"
 
-    async with AsyncSessionLocal() as read_session:
-        try:
-            logger.info("[OrdersSync] phase=2_read read_start brand=%s", brand_filter)
+    # Determine percent_complete
+    _total_orders_available = sync_metadata.get("total_count_leaflink") or sync_metadata.get("total_orders_available")
+    if _total_orders_available and _total_orders_available > 0:
+        _percent_complete = round((total_in_database / _total_orders_available) * 100, 1)
+        _percent_complete = min(100.0, _percent_complete)
+    else:
+        _pages_fetched = sync_metadata.get("pages_fetched", 0) or 0
+        _total_pages = total_pages_available or 0
+        _percent_complete = round((_pages_fetched / _total_pages) * 100, 1) if _total_pages else 0.0
+        _percent_complete = min(100.0, _percent_complete)
 
-            query = select(Order)
+    logger.info(
+        "[OrdersSync] response_metadata_only brand=%s pages=%s/%s orders=%s percent=%.1f%%",
+        _resolved_brand_id,
+        sync_metadata.get("pages_fetched", 0),
+        total_pages_available,
+        total_in_database,
+        _percent_complete,
+    )
 
-            if brand_filter:
-                query = query.where(Order.brand_id == brand_filter)
-                logger.info("[OrdersSync] filter brand=%s", brand_filter)
+    return make_json_safe({
+        "ok": True,
+        "sync_status": _sync_status,
+        "background_sync_active": sync_metadata.get("background_sync_active", False),
+        "pages_synced": sync_metadata.get("pages_fetched", 0),
+        "total_pages": total_pages_available,
+        "total_orders_in_db": total_in_database,
+        "total_orders_available": _total_orders_available,
+        "percent_complete": _percent_complete,
+        "next_cursor": next_cursor,
+        "error": sync_error,
+    })
 
-            if updated_after_dt:
-                query = query.where(Order.updated_at >= updated_after_dt)
-
-            # Sort by updated_at ascending for consistent incremental sync
-            query = query.order_by(Order.updated_at.asc(), Order.id.asc())
-
-            # Fetch limit + 1 to determine if there are more DB results
-            query_with_limit = query.limit(limit + 1)
-
-            result = await read_session.execute(query_with_limit)
-            orders = result.scalars().all()
-
-            db_has_more = len(orders) > limit
-            if db_has_more:
-                orders = orders[:limit]
-
-            # Count total orders in DB for this brand
-            count_query = select(func.count(Order.id))
-            if brand_filter:
-                count_query = count_query.where(Order.brand_id == brand_filter)
-            count_result = await read_session.execute(count_query)
-            total_in_database = count_result.scalar_one()
-
-            logger.info("[OrdersSync] phase=2_read read_success count=%s total_in_db=%s", len(orders), total_in_database)
-
-            # Build response orders list
-            orders_data = []
-            db_next_cursor = None
-            newest_order_date: Optional[datetime] = None
-            oldest_order_date: Optional[datetime] = None
-
-            for order in orders:
-                order_dict = {
-                    "id": order.id,
-                    "external_order_id": order.external_order_id,
-                    "order_number": order.order_number,
-                    "customer_name": order.customer_name,
-                    "amount": float(order.amount) if order.amount else 0,
-                    "status": order.status,
-                    "brand_id": order.brand_id,
-                    "source": order.source,
-                    "review_status": order.review_status,
-                    "item_count": order.item_count,
-                    "unit_count": order.unit_count,
-                    "external_created_at": order.external_created_at.isoformat() if order.external_created_at else None,
-                    "external_updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
-                    "created_at": order.created_at.isoformat() if order.created_at else None,
-                    "updated_at": order.updated_at.isoformat() if order.updated_at else None,
-                    "last_synced_at": order.last_synced_at.isoformat() if order.last_synced_at else None,
-                }
-                orders_data.append(order_dict)
-
-                order_date = order.external_updated_at or order.external_created_at or order.updated_at
-                if order_date is not None:
-                    if newest_order_date is None or order_date > newest_order_date:
-                        newest_order_date = order_date
-                    if oldest_order_date is None or order_date < oldest_order_date:
-                        oldest_order_date = order_date
-
-                if order == orders[-1]:
-                    db_next_cursor = base64.b64encode(str(order.id).encode()).decode()
-
-            server_time = datetime.now(timezone.utc).isoformat()
-            newest_order_date_iso = newest_order_date.isoformat() if newest_order_date else None
-            oldest_order_date_iso = oldest_order_date.isoformat() if oldest_order_date else None
-
-            # Build next_cursor for LeafLink page pagination
-            leaflink_next_cursor: Optional[str] = None
-            if next_leaflink_url and next_page_number:
-                cursor_payload = f"page={next_page_number}&url={next_leaflink_url}"
-                leaflink_next_cursor = base64.b64encode(cursor_payload.encode()).decode()
-
-            leaflink_has_more = bool(next_leaflink_url)
-
-            # Populate sync_metadata defaults
-            sync_metadata.setdefault("total_fetched_from_leaflink", None)
-            sync_metadata.setdefault("pages_fetched", None)
-            sync_metadata.setdefault("sync_duration_seconds", None)
-            sync_metadata.setdefault("latest_order_date", None)
-            sync_metadata.setdefault("background_sync_active", False)
-            sync_metadata.setdefault("current_page", start_page)
-            sync_metadata.setdefault("total_pages_available", total_pages_available)
-            sync_metadata["total_in_database"] = total_in_database
-            sync_metadata["total_returned"] = len(orders_data)
-            sync_metadata["brand_id"] = _resolved_brand_id or brand_filter
-            sync_metadata["company_id"] = _resolved_company_id
-
-            # Determine response source
-            fetched_from_leaflink = sync_metadata.get("total_fetched_from_leaflink")
-            returning_cache = False
-
-            if live_refresh_failed:
-                source = "database_fallback"
-                returning_cache = True
-            elif total_in_database == 0:
-                source = "empty"
-            elif fetched_from_leaflink:
-                source = "live"
-            else:
-                source = "database"
-                returning_cache = True
-
-            sync_metadata["returning_cache"] = returning_cache
-
-            sync_status = "error" if sync_error else "success"
-
-            logger.info("[OrdersAPI] source=%s", source)
-            logger.info("[OrdersAPI] db_count=%s", len(orders_data))
-            logger.info("[OrdersAPI] newest_order_date=%s", newest_order_date_iso)
-            logger.info("[OrdersAPI] refreshed_at=%s", server_time)
-            logger.info(
-                "[OrdersSync] response count=%s has_more=%s brand=%s total_in_db=%s",
-                len(orders_data),
-                leaflink_has_more,
-                brand_filter,
-                total_in_database,
-            )
-            logger.info(
-                "[OrdersSync] response_returned source=%s count=%s next_cursor=%s",
-                source,
-                len(orders_data),
-                leaflink_next_cursor[:8] + "..." if leaflink_next_cursor else "none",
-            )
-
-            return make_json_safe({
-                "ok": True,
-                "sync_status": sync_status,
-                "source": source,
-                "data_source": source,
-                "count": len(orders_data),
-                "total_in_database": total_in_database,
-                "newest_order_date": newest_order_date_iso,
-                "oldest_order_date": oldest_order_date_iso,
-                "refreshed_at": server_time,
-                "synced_at": server_time,
-                "orders": orders_data,
-                "sync_metadata": {
-                    **sync_metadata,
-                    "current_page": start_page,
-                    "pages_fetched": sync_metadata.get("pages_fetched"),
-                    "total_pages_available": total_pages_available,
-                    "total_fetched_from_leaflink": phase1_orders_upserted,
-                    "background_sync_active": sync_metadata.get("background_sync_active", False),
-                },
-                "pagination": {
-                    "has_more": leaflink_has_more,
-                    "next_cursor": leaflink_next_cursor,
-                },
-                # Legacy fields kept for backwards compatibility
-                "next_cursor": leaflink_next_cursor,
-                "has_more": leaflink_has_more,
-                "server_time": server_time,
-                "sync_version": 2,
-                "last_synced_at": server_time,
-                "last_error": sync_error,
-                "live_refresh_failed": live_refresh_failed,
-                "error": sync_error if live_refresh_failed else None,
-            })
-
-
-        except Exception as phase2_exc:
-            _p2_etype = type(phase2_exc).__name__
-            _p2_emsg = str(phase2_exc)
-            logger.error(
-                "[OrdersSync] phase=2_read error_type=%s error=%s brand=%s",
-                _p2_etype, _p2_emsg, brand_filter, exc_info=True,
-            )
-            server_time = datetime.now(timezone.utc).isoformat()
-            return make_json_safe({
-                "ok": False,
-                "error": "internal_error",
-                "error_type": _p2_etype,
-                "error_message": _p2_emsg,
-                "failing_step": "phase_2_read",
-                "brand_id": _resolved_brand_id or brand_filter,
-                "company_id": _resolved_company_id,
-                "sync_status": "error",
-                "data_source": "error",
-                "source": "error",
-                "orders": [],
-                "count": 0,
-                "total_in_database": 0,
-                "newest_order_date": None,
-                "oldest_order_date": None,
-                "refreshed_at": server_time,
-                "synced_at": server_time,
-                "server_time": server_time,
-                "has_more": False,
-                "next_cursor": None,
-                "pagination": {"has_more": False, "next_cursor": None},
-                "sync_metadata": sync_metadata,
-                "last_error": _p2_emsg,
-                "traceback": traceback.format_exc(),
-            })
 
 
 @router.get("/sync/status")
