@@ -84,7 +84,9 @@ class LeafLinkClient:
 
         # Clean the API key: strip whitespace and remove "Token " prefix if present
         # api_key is required — no env var fallback (multi-tenant: each brand has its own key)
-        self.api_key = (api_key or "").strip()
+        _raw_api_key = api_key or ""
+        self.api_key = _raw_api_key.strip()
+        _had_whitespace = self.api_key != _raw_api_key  # True if we stripped something
         if self.api_key.startswith("Token "):
             logger.warning(
                 "leaflink: client_init brand=%s api_key starts with 'Token ' prefix, removing it",
@@ -121,12 +123,24 @@ class LeafLinkClient:
             self.brand_id,
         )
         logger.info(
+            "[LeafLinkAuth] api_key_prefix=%s api_key_len=%s company_id=%s auth_scheme=Token has_whitespace=%s",
+            self.api_key[:6] if self.api_key else "MISSING",
+            len(self.api_key),
+            self.company_id,
+            _had_whitespace,
+        )
+        logger.info(
             "leaflink: client_init brand=%s base_url=%s company_id=%s api_key_set=%s",
             self.brand_id,
             self.base_url,
             self.company_id,
             bool(self.api_key),
         )
+
+        if not self.api_key:
+            logger.error("[LeafLinkAuth] MISSING api_key brand=%s", self.brand_id)
+        if not self.company_id:
+            logger.error("[LeafLinkAuth] MISSING company_id brand=%s", self.brand_id)
 
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         url = f"{self.base_url}/{path.lstrip('/')}"
@@ -140,7 +154,13 @@ class LeafLinkClient:
 
         def _do_request() -> requests.Response:
             # Use the per-brand api_key stored on this instance — never reads from env vars
+            # CORRECT format: Authorization: Token <api_key>
             auth_headers = {"Authorization": f"Token {self.api_key}"}
+            logger.debug(
+                "[LeafLinkAuth] request_headers auth_scheme=Token api_key_prefix=%s url=%s",
+                self.api_key[:6] if self.api_key else "MISSING",
+                url,
+            )
             try:
                 return self.session.get(url, params=params, timeout=45, headers=auth_headers)
             except Exception as exc:
@@ -177,6 +197,14 @@ class LeafLinkClient:
                 url,
             )
         else:
+            if resp.status_code == 403:
+                logger.error(
+                    "[LeafLinkAuth] 403_invalid_token endpoint=%s api_key_prefix=%s api_key_len=%s brand=%s",
+                    url,
+                    self.api_key[:6] if self.api_key else "MISSING",
+                    len(self.api_key),
+                    self.brand_id,
+                )
             if resp.status_code in (401, 403):
                 logger.error(
                     "[LeafLinkAuth] auth_failed brand=%s status=%s reason=%s url=%s",
@@ -206,7 +234,13 @@ class LeafLinkClient:
             url,
         )
 
+        # CORRECT format: Authorization: Token <api_key>
         auth_headers = {"Authorization": f"Token {self.api_key}"}
+        logger.debug(
+            "[LeafLinkAuth] request_headers auth_scheme=Token api_key_prefix=%s url=%s",
+            self.api_key[:6] if self.api_key else "MISSING",
+            url,
+        )
         try:
             resp = self.session.get(url, params=None, timeout=45, headers=auth_headers)
         except Exception as exc:
