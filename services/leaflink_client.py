@@ -146,10 +146,10 @@ class LeafLinkClient:
                     self.auth_scheme,
                 )
             else:
-                # Default to Bearer (most common for modern APIs)
-                self.auth_scheme = "Bearer"
+                # Default to Token — the correct scheme for all LeafLink API calls.
+                self.auth_scheme = "Token"
                 logger.info(
-                    "[LeafLinkAuth] using_default_scheme scheme=Bearer",
+                    "[LeafLinkAuth] using_default_scheme scheme=Token",
                 )
 
         self.session = requests.Session()

@@ -10,7 +10,7 @@ because this __init__.py re-exports everything that was previously in models.py.
 # Base / existing models (previously in root models.py)
 # ---------------------------------------------------------------------------
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy import (
     Boolean,
@@ -55,13 +55,8 @@ class BrandAPICredential(Base):
     last_synced_page: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
     total_pages_available: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_orders_available: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Auto-detected auth scheme for this credential
-    auth_scheme: Mapped[Optional[str]] = mapped_column(
-        String(20),
-        nullable=True,
-        default=None,
-        comment="Auto-detected auth scheme: Bearer, Token, or Raw",
-    )
+    # NOTE: auth_scheme is NOT a database column — it is a runtime-only attribute.
+    # The column was removed from the schema (PR #141). Always use "Token" for LeafLink.
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 

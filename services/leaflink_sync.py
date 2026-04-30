@@ -828,6 +828,10 @@ async def sync_leaflink_background_continuous(
 
     try:
         client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=brand_id)
+        logger.info(
+            "[OrdersSyncWorker] using_auth_scheme=Token brand=%s",
+            brand_id,
+        )
     except Exception as client_exc:
         logger.error(
             "[OrdersSync] bg_sync_client_init_error brand=%s error=%s",
@@ -947,11 +951,21 @@ async def sync_leaflink_background_continuous(
             current_page,
             batch_size,
         )
+        logger.info(
+            "[OrdersSyncWorker] page_start brand=%s page=%s",
+            brand_id,
+            current_page,
+        )
         batch_start = time.monotonic()
 
         # ------------------------------------------------------------------ #
         # Fetch a batch of pages from LeafLink (with retry on transient err) #
         # ------------------------------------------------------------------ #
+        logger.info(
+            "[OrdersSyncWorker] leaflink_request_start brand=%s page=%s",
+            brand_id,
+            current_page,
+        )
         try:
             fetch_result = await _fetch_with_retry(
                 start_page=current_page,
@@ -960,6 +974,13 @@ async def sync_leaflink_background_continuous(
         except Exception as fetch_exc:
             error_code = getattr(fetch_exc, "status_code", None)
             is_transient = error_code in TRANSIENT_ERROR_CODES
+
+            logger.error(
+                "[OrdersSyncWorker] leaflink_request_error brand=%s page=%s error=%s",
+                brand_id,
+                current_page,
+                fetch_exc,
+            )
 
             if is_transient:
                 # Transient error exhausted all retries — mark as paused, not failed
@@ -1010,6 +1031,11 @@ async def sync_leaflink_background_continuous(
 
         batch_fetch_ms = round((time.monotonic() - batch_start) * 1000)
         logger.info(
+            "[OrdersSyncWorker] leaflink_request_success brand=%s page=%s status=200",
+            brand_id,
+            current_page,
+        )
+        logger.info(
             "[OrdersSync] bg_batch_complete page=%s orders=%s duration_ms=%s",
             current_page,
             len(batch_orders),
@@ -1040,6 +1066,13 @@ async def sync_leaflink_background_continuous(
 
         total_orders_synced += len(batch_orders)
         last_completed_page = (next_page - 1) if next_page else total_pages
+
+        logger.info(
+            "[OrdersSyncWorker] page_success brand=%s page=%s orders=%s",
+            brand_id,
+            last_completed_page,
+            len(batch_orders),
+        )
 
         # ------------------------------------------------------------------ #
         # Persist progress to DB                                              #

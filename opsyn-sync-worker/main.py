@@ -140,6 +140,16 @@ async def process_sync_requests() -> None:
                             await err_db.commit()
                     continue
 
+                # Set auth_scheme at runtime — NOT from the database.
+                # The auth_scheme column does not exist in AWS RDS; "Token" is
+                # the correct scheme for all LeafLink API calls.
+                cred.auth_scheme = "Token"
+                logger.info(
+                    "[OrdersSyncWorker] using_auth_scheme=Token brand=%s credential_id=%s",
+                    cred.brand_id,
+                    cred.id,
+                )
+
                 api_key: str = cred.api_key or ""
                 company_id: str = cred.company_id or ""
 
