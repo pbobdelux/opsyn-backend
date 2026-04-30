@@ -2,19 +2,16 @@
 Background sync manager — singleton that tracks active LeafLink background
 syncs per brand.
 
-In-memory state is used for fast status reads; progress is also persisted to
-BrandAPICredential so it survives service restarts.
+In-memory state is used for fast status reads. All durable sync progress is
+persisted exclusively to the SyncRun table via sync_run_manager. The legacy
+BrandAPICredential sync fields (sync_status, last_synced_page,
+total_pages_available) are no longer written.
 """
 
 import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
-
-from sqlalchemy import select
-
-from database import AsyncSessionLocal
-from models import BrandAPICredential
 
 logger = logging.getLogger("background_sync_manager")
 
@@ -196,54 +193,11 @@ class BackgroundSyncManager:
         if error:
             state.setdefault("errors", []).append(error)
 
-    # ------------------------------------------------------------------
-    # DB persistence helpers
-    # ------------------------------------------------------------------
-
-    async def persist_progress(
-        self,
-        brand_id: str,
-        last_synced_page: int,
-        total_pages: int,
-        sync_status: str = "syncing",
-        error: Optional[str] = None,
-        total_orders_available: Optional[int] = None,
-    ) -> None:
-        """Write last_synced_page and sync_status to BrandAPICredential."""
-        try:
-            async with AsyncSessionLocal() as session:
-                async with session.begin():
-                    result = await session.execute(
-                        select(BrandAPICredential).where(
-                            BrandAPICredential.brand_id == brand_id,
-                            BrandAPICredential.integration_name == "leaflink",
-                        )
-                    )
-                    cred = result.scalar_one_or_none()
-                    if cred:
-                        cred.last_synced_page = last_synced_page
-                        cred.total_pages_available = total_pages
-                        if total_orders_available is not None:
-                            cred.total_orders_available = total_orders_available
-                        cred.sync_status = sync_status
-                        cred.last_sync_at = _utc_now()
-                        if error:
-                            cred.last_error = error
-                        elif sync_status not in ("error", "syncing"):
-                            cred.last_error = None
-            logger.info(
-                "[BackgroundSyncManager] progress_persisted brand=%s page=%s/%s status=%s",
-                brand_id,
-                last_synced_page,
-                total_pages,
-                sync_status,
-            )
-        except Exception as exc:
-            logger.error(
-                "[BackgroundSyncManager] persist_progress_failed brand=%s error=%s",
-                brand_id,
-                exc,
-            )
+    # persist_progress() has been removed.
+    # All durable sync state is written exclusively to the SyncRun table
+    # via services/sync_run_manager.py. BrandAPICredential legacy fields
+    # (sync_status, last_synced_page, total_pages_available) must never
+    # be written again.
 
 
 # Module-level singleton instance
