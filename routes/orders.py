@@ -994,50 +994,8 @@ async def orders_sync(
                 newest = sync_result.get("newest_order_date")
                 sync_metadata["latest_order_date"] = newest.isoformat() if newest else None
 
-                # ---------------------------------------------------------- #
-                # Persist Phase 1 progress to BrandAPICredential             #
-                # ---------------------------------------------------------- #
-                _phase1_page = start_page + pages_fetched_phase1 - 1
-                try:
-                    async with AsyncSessionLocal() as _p1_sess:
-                        async with _p1_sess.begin():
-                            from sqlalchemy import select as _sel
-                            _p1_res = await _p1_sess.execute(
-                                _sel(BrandAPICredential).where(
-                                    BrandAPICredential.id == cred.id,
-                                )
-                            )
-                            _p1_cred = _p1_res.scalar_one_or_none()
-                            if _p1_cred:
-                                _p1_cred.last_synced_page = _phase1_page
-                                _p1_cred.total_pages_available = total_pages_available
-                                # Only set if column exists and value is not None — never overwrite with NULL
-                                if total_count_leaflink is not None:
-                                    try:
-                                        _p1_cred.total_orders_available = total_count_leaflink
-                                        logger.info(
-                                            "[OrdersSync] persisted_total_orders_available brand=%s count=%s",
-                                            _resolved_brand_id,
-                                            total_count_leaflink,
-                                        )
-                                    except Exception:
-                                        logger.debug("[OrdersSync] total_orders_available column not yet in schema")
-                                _p1_cred.sync_status = "syncing" if (next_leaflink_url and next_page_number) else "idle"
-                                _p1_cred.last_sync_at = datetime.now(timezone.utc)
-                                _p1_cred.last_error = None
-                    logger.info(
-                        "[OrdersSync] phase1_progress_persisted brand=%s page=%s total_pages=%s total_orders=%s",
-                        _resolved_brand_id,
-                        _phase1_page,
-                        total_pages_available,
-                        total_count_leaflink,
-                    )
-                except Exception as _p1_persist_exc:
-                    logger.error(
-                        "[OrdersSync] phase1_progress_persist_error brand=%s error=%s",
-                        _resolved_brand_id,
-                        _p1_persist_exc,
-                    )
+                # Phase 1 progress is tracked exclusively via SyncRun.
+                # BrandAPICredential legacy fields are no longer written.
 
 
                 # ---------------------------------------------------------- #
@@ -1183,25 +1141,8 @@ async def orders_sync(
                         phase1_exc,
                         existing_count,
                     )
-                    # Update credential to paused state
-                    try:
-                        async with AsyncSessionLocal() as _err_sess:
-                            async with _err_sess.begin():
-                                _err_res = await _err_sess.execute(
-                                    select(BrandAPICredential).where(
-                                        BrandAPICredential.id == cred.id,
-                                    )
-                                )
-                                _err_cred = _err_res.scalar_one_or_none()
-                                if _err_cred:
-                                    _err_cred.sync_status = "paused"
-                                    _err_cred.last_error = _p1_emsg
-                    except Exception as _err_persist_exc:
-                        logger.error(
-                            "[OrdersSync] paused_state_persist_error brand=%s error=%s",
-                            _resolved_brand_id,
-                            _err_persist_exc,
-                        )
+                    # Paused state is tracked exclusively via SyncRun.
+                    # BrandAPICredential legacy fields are no longer written.
                     return make_json_safe({
                         "ok": True,
                         "partial": True,

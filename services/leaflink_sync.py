@@ -797,9 +797,8 @@ async def sync_leaflink_background_continuous(
     Fetch all remaining LeafLink pages in adaptive batches and upsert to DB.
 
     Designed to run as a fire-and-forget asyncio task after Phase 1 completes.
-    Progress is persisted to SyncRun (and BrandAPICredential for legacy compat)
-    after every page so the sync can resume from the last completed page if the
-    service restarts.
+    Progress is persisted exclusively to the SyncRun table after every page so
+    the sync can resume from the last completed page if the service restarts.
 
     Batch size adapts based on observed fetch latency:
       - < 5 s per batch  → increase to _BG_BATCH_MAX (5 pages)
@@ -879,15 +878,6 @@ async def sync_leaflink_background_continuous(
             brand_id,
             client_exc,
         )
-        if manager:
-            await manager.persist_progress(
-                brand_id=brand_id,
-                last_synced_page=start_page - 1,
-                total_pages=total_pages,
-                sync_status="error",
-                error=str(client_exc),
-                total_orders_available=total_orders_available,
-            )
         if sync_run_id:
             try:
                 async with AsyncSessionLocal() as _fail_db:
@@ -1023,15 +1013,6 @@ async def sync_leaflink_background_continuous(
                     fetch_exc,
                 )
 
-                if manager:
-                    await manager.persist_progress(
-                        brand_id=brand_id,
-                        last_synced_page=current_page - 1,
-                        total_pages=total_pages,
-                        sync_status="paused",
-                        error=f"LeafLink temporarily unavailable (HTTP {error_code})",
-                        total_orders_available=total_orders_available,
-                    )
                 if sync_run_id:
                     try:
                         async with AsyncSessionLocal() as _stall_db:
@@ -1055,15 +1036,6 @@ async def sync_leaflink_background_continuous(
                     exc_info=True,
                 )
 
-                if manager:
-                    await manager.persist_progress(
-                        brand_id=brand_id,
-                        last_synced_page=current_page - 1,
-                        total_pages=total_pages,
-                        sync_status="error",
-                        error=_err_str,
-                        total_orders_available=total_orders_available,
-                    )
                 if sync_run_id:
                     try:
                         async with AsyncSessionLocal() as _fail_db2:
@@ -1105,15 +1077,6 @@ async def sync_leaflink_background_continuous(
                 current_page,
                 next_cursor_hash,
             )
-            if manager:
-                await manager.persist_progress(
-                    brand_id=brand_id,
-                    last_synced_page=current_page - 1,
-                    total_pages=total_pages,
-                    sync_status="error",
-                    error=_loop_reason,
-                    total_orders_available=total_orders_available,
-                )
             if sync_run_id:
                 try:
                     async with AsyncSessionLocal() as _loop_db:
@@ -1161,17 +1124,10 @@ async def sync_leaflink_background_continuous(
         last_completed_page = (next_page - 1) if next_page else total_pages
 
         # ------------------------------------------------------------------ #
-        # Persist progress to DB (SyncRun + BackgroundSyncManager)           #
+        # Persist progress to DB (SyncRun) and update in-memory state        #
         # ------------------------------------------------------------------ #
         if manager:
             manager.record_page_complete(brand_id, last_completed_page)
-            await manager.persist_progress(
-                brand_id=brand_id,
-                last_synced_page=last_completed_page,
-                total_pages=total_pages,
-                sync_status="syncing",
-                total_orders_available=total_orders_available,
-            )
 
         await _persist_run_progress(
             pages_synced=last_completed_page,
@@ -1215,15 +1171,6 @@ async def sync_leaflink_background_continuous(
     # ---------------------------------------------------------------------- #
     total_duration = round(time.monotonic() - bg_start, 1)
     final_page = min(current_page - 1, total_pages)
-
-    if manager:
-        await manager.persist_progress(
-            brand_id=brand_id,
-            last_synced_page=final_page,
-            total_pages=total_pages,
-            sync_status="complete",
-            total_orders_available=total_orders_available,
-        )
 
     if sync_run_id:
         try:
