@@ -102,12 +102,6 @@ async def poll_and_execute() -> None:
                         f"no_progress_for_{STALL_THRESHOLD_SECONDS}s "
                         f"last_progress_at={sync_run.last_progress_at}"
                     )
-                    logger.warning(
-                        "[SyncWorker] job_stalled id=%s brand=%s reason=%s",
-                        sync_run_id,
-                        brand_id,
-                        stall_reason,
-                    )
                     await mark_stalled(db, sync_run_id, stall_reason)
                     await db.commit()
                     return
@@ -150,11 +144,6 @@ async def poll_and_execute() -> None:
             cred = cred_result.scalar_one_or_none()
 
             if not cred:
-                logger.error(
-                    "[SyncWorker] credential_not_found id=%s brand=%s",
-                    sync_run_id,
-                    brand_id,
-                )
                 # Mark job as failed
                 fail_result = await db.execute(
                     select(SyncRun).where(SyncRun.id == sync_run_id)
@@ -173,7 +162,6 @@ async def poll_and_execute() -> None:
 
             # Validate api_key
             if not api_key or not api_key.strip():
-                logger.error("[SyncWorker] credential_invalid id=%s api_key_missing", sync_run_id)
                 fail_result = await db.execute(
                     select(SyncRun).where(SyncRun.id == sync_run_id)
                 )
@@ -187,7 +175,6 @@ async def poll_and_execute() -> None:
 
             # Validate company_id
             if not company_id or not company_id.strip():
-                logger.error("[SyncWorker] credential_invalid id=%s company_id_missing", sync_run_id)
                 fail_result = await db.execute(
                     select(SyncRun).where(SyncRun.id == sync_run_id)
                 )
@@ -274,7 +261,6 @@ async def poll_and_execute() -> None:
                     err_run.last_error = str(sync_exc)[:500]  # Truncate to 500 chars
                     err_run.completed_at = datetime.now(timezone.utc)
                     await err_db.commit()
-                    logger.info("[SyncWorker] marked_failed id=%s error_set=true", sync_run_id)
         except Exception as mark_exc:
             logger.error(
                 "[SyncWorker] failed_to_mark_error id=%s error=%s",
