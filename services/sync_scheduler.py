@@ -279,6 +279,12 @@ async def poll_and_execute() -> None:
             start_page,
             total_pages,
         )
+        logger.info(
+            "[SyncWorker] calling sync_leaflink_background_continuous id=%s brand=%s",
+            sync_run_id,
+            brand_id,
+        )
+        sys.stdout.flush()
 
         await sync_leaflink_background_continuous(
             brand_id=brand_id,
