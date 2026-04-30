@@ -62,6 +62,92 @@ async def _safe_db_query(
         )
         return False, fallback_value
 
+async def _load_leaflink_credential(
+    db: AsyncSession,
+    brand_filter: Optional[str] = None,
+) -> Optional["BrandAPICredential"]:
+    """
+    Load LeafLink credential with multiple fallback paths.
+
+    Tries in order:
+    1. Exact brand match (if brand_filter provided)
+    2. Active LeafLink credential for brand
+    3. Most recent active LeafLink credential (any brand)
+    4. Environment variable fallback (LEAFLINK_API_KEY, LEAFLINK_COMPANY_ID)
+    """
+
+    logger.info("[OrdersSyncCredential] requested_brand=%s", brand_filter)
+
+    # Path 1: Exact brand lookup
+    if brand_filter:
+        try:
+            result = await db.execute(
+                select(BrandAPICredential).where(
+                    BrandAPICredential.brand_id == brand_filter,
+                    BrandAPICredential.integration_name == "leaflink",
+                    BrandAPICredential.is_active == True,
+                )
+            )
+            cred = result.scalar_one_or_none()
+            if cred:
+                logger.info(
+                    "[OrdersSyncCredential] exact_brand_lookup found=true brand_id=%s company_id=%s",
+                    cred.brand_id,
+                    cred.company_id,
+                )
+                return cred
+            else:
+                logger.info("[OrdersSyncCredential] exact_brand_lookup found=false")
+        except Exception as exc:
+            logger.error("[OrdersSyncCredential] exact_brand_lookup_error error=%s", exc)
+            await db.rollback()
+
+    # Path 2: Active LeafLink credential (any brand)
+    try:
+        result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+            ).order_by(BrandAPICredential.last_sync_at.desc().nullslast()).limit(1)
+        )
+        cred = result.scalar_one_or_none()
+        if cred:
+            logger.info(
+                "[OrdersSyncCredential] active_leaflink_lookup found=true brand_id=%s company_id=%s",
+                cred.brand_id,
+                cred.company_id,
+            )
+            return cred
+        else:
+            logger.info("[OrdersSyncCredential] active_leaflink_lookup found=false")
+    except Exception as exc:
+        logger.error("[OrdersSyncCredential] active_leaflink_lookup_error error=%s", exc)
+        await db.rollback()
+
+    # Path 3: Environment variable fallback
+    env_api_key = os.getenv("LEAFLINK_API_KEY")
+    env_company_id = os.getenv("LEAFLINK_COMPANY_ID")
+
+    if env_api_key and env_company_id:
+        logger.info(
+            "[OrdersSyncCredential] env_fallback found=true company_id=%s",
+            env_company_id,
+        )
+        # Create a temporary credential object from env vars
+        temp_cred = BrandAPICredential(
+            brand_id=brand_filter or "default",
+            integration_name="leaflink",
+            api_key=env_api_key,
+            company_id=env_company_id,
+            is_active=True,
+        )
+        return temp_cred
+    else:
+        logger.info("[OrdersSyncCredential] env_fallback found=false")
+
+    return None
+
+
 # Thread pool for running synchronous LeafLink HTTP calls without blocking the event loop
 _leaflink_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="leaflink-sync")
 
@@ -481,8 +567,7 @@ async def orders_sync(
 
     # ------------------------------------------------------------------ #
     # Load the active LeafLink credential from DB                         #
-    # Filter by brand_filter when provided; fall back to most-recent      #
-    # active credential so single-tenant deployments still work.          #
+    # Try multiple fallback paths to ensure we find credentials           #
     # ------------------------------------------------------------------ #
     _resolved_brand_id: Optional[str] = None
     _resolved_company_id: Optional[str] = None
@@ -490,63 +575,44 @@ async def orders_sync(
     _credential_found: bool = False
 
     try:
-        # Build query: filter by brand if provided, else get most recent
-        _cred_query = select(BrandAPICredential).where(
-            BrandAPICredential.integration_name == "leaflink",
-            BrandAPICredential.is_active == True,
-        )
-
-        # CRITICAL: Filter by brand_filter if provided
-        if brand_filter:
-            logger.info("[OrdersSync] credential_query_filter brand=%s", brand_filter)
-            _cred_query = _cred_query.where(BrandAPICredential.brand_id == brand_filter)
-
-        _cred_query = _cred_query.order_by(BrandAPICredential.last_sync_at.desc().nullslast()).limit(1)
-
-        cred_result = await db.execute(_cred_query)
-        _active_cred = cred_result.scalar_one_or_none()
+        _active_cred = await _load_leaflink_credential(db, brand_filter)
 
         if _active_cred:
             _credential_found = True
             _resolved_brand_id = _active_cred.brand_id
             _resolved_company_id = _active_cred.company_id
+            _api_key_present = bool(_active_cred.api_key and _active_cred.api_key.strip())
+
             logger.info(
-                "[OrdersSync] credential_resolution brand=%s found=true company_id=%s",
+                "[OrdersSyncCredential] final credential_found=true brand_id=%s company_id=%s api_key_present=%s",
                 _resolved_brand_id,
                 _resolved_company_id,
+                _api_key_present,
             )
         else:
             logger.warning(
-                "[OrdersSync] credential_resolution brand=%s found=false",
+                "[OrdersSyncCredential] final credential_found=false brand=%s",
                 brand_filter,
             )
 
     except Exception as _cred_exc:
         await db.rollback()
         logger.error(
-            "[OrdersSync] credential_load_error brand=%s error=%s",
+            "[OrdersSyncCredential] credential_load_error brand=%s error=%s",
             brand_filter,
             _cred_exc,
+            exc_info=True,
         )
-        return {
-            "ok": False,
-            "error": "Failed to load credentials",
-            "brand_id": brand_filter,
-            "credential_found": False,
-            "sync_triggered": False,
-            "worker_enqueued": False,
-            "leaflink_call_attempted": False,
-        }
 
     if not _credential_found:
         logger.error(
-            "[OrdersSync] no_credentials_found brand=%s — cannot start sync",
+            "[OrdersSyncCredential] no_credentials_found brand=%s — cannot start sync",
             brand_filter,
         )
         return {
             "ok": False,
             "error": f"No active LeafLink credentials found for brand {brand_filter}",
-            "error_detail": "Check that credentials are configured and active in the database",
+            "error_detail": "Check that credentials are configured and active in the database or environment",
             "brand_id": brand_filter,
             "credential_found": False,
             "sync_triggered": False,
@@ -1171,6 +1237,102 @@ async def orders_sync(
         "next_cursor": next_cursor,
         "error": sync_error,
     })
+
+
+@router.get("/sync/debug-credentials")
+async def debug_credentials(
+    brand: Optional[str] = Query(None, description="Brand slug/ID to debug"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Debug endpoint to diagnose credential resolution.
+
+    Shows which credential lookup paths succeed/fail.
+    """
+    logger.info("[OrdersSyncCredential] debug_request brand=%s", brand)
+
+    exact_brand_found = False
+    exact_brand_cred = None
+
+    active_leaflink_found = False
+    active_leaflink_cred = None
+
+    leaflink_debug_found = False
+    leaflink_debug_cred = None
+
+    # Try exact brand lookup
+    if brand:
+        try:
+            result = await db.execute(
+                select(BrandAPICredential).where(
+                    BrandAPICredential.brand_id == brand,
+                    BrandAPICredential.integration_name == "leaflink",
+                    BrandAPICredential.is_active == True,
+                )
+            )
+            exact_brand_cred = result.scalar_one_or_none()
+            exact_brand_found = exact_brand_cred is not None
+        except Exception as exc:
+            logger.error("[OrdersSyncCredential] debug_exact_brand_error error=%s", exc)
+            await db.rollback()
+
+    # Try active LeafLink lookup
+    try:
+        result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+            ).order_by(BrandAPICredential.last_sync_at.desc().nullslast()).limit(1)
+        )
+        active_leaflink_cred = result.scalar_one_or_none()
+        active_leaflink_found = active_leaflink_cred is not None
+    except Exception as exc:
+        logger.error("[OrdersSyncCredential] debug_active_leaflink_error error=%s", exc)
+        await db.rollback()
+
+    # Try /leaflink/debug style lookup (no is_active filter)
+    try:
+        result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.integration_name == "leaflink",
+            ).order_by(BrandAPICredential.last_sync_at.desc().nullslast()).limit(1)
+        )
+        leaflink_debug_cred = result.scalar_one_or_none()
+        leaflink_debug_found = leaflink_debug_cred is not None
+    except Exception as exc:
+        logger.error("[OrdersSyncCredential] debug_leaflink_debug_error error=%s", exc)
+        await db.rollback()
+
+    # Determine which credential would be used
+    final_cred = exact_brand_cred or active_leaflink_cred or leaflink_debug_cred
+
+    return {
+        "ok": True,
+        "requested_brand": brand,
+        "exact_brand_found": exact_brand_found,
+        "exact_brand_cred": {
+            "brand_id": exact_brand_cred.brand_id,
+            "company_id": exact_brand_cred.company_id,
+            "api_key_present": bool(exact_brand_cred.api_key),
+        } if exact_brand_cred else None,
+        "active_leaflink_found": active_leaflink_found,
+        "active_leaflink_cred": {
+            "brand_id": active_leaflink_cred.brand_id,
+            "company_id": active_leaflink_cred.company_id,
+            "api_key_present": bool(active_leaflink_cred.api_key),
+        } if active_leaflink_cred else None,
+        "leaflink_debug_found": leaflink_debug_found,
+        "leaflink_debug_cred": {
+            "brand_id": leaflink_debug_cred.brand_id,
+            "company_id": leaflink_debug_cred.company_id,
+            "api_key_present": bool(leaflink_debug_cred.api_key),
+        } if leaflink_debug_cred else None,
+        "final_credential": {
+            "brand_id": final_cred.brand_id,
+            "company_id": final_cred.company_id,
+            "api_key_present": bool(final_cred.api_key),
+        } if final_cred else None,
+    }
 
 
 @router.get("/sync/status")
