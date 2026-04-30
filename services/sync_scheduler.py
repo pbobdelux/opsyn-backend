@@ -325,6 +325,9 @@ async def run_scheduler() -> None:
     """
     Main scheduler loop. Polls for SyncRun jobs every POLL_INTERVAL_SECONDS.
     """
+    print("=== RUN_SCHEDULER ASYNC FUNCTION ENTERED ===")
+    sys.stdout.flush()
+
     logger.info("===================================")
     logger.info("Opsyn Sync Worker Started")
     logger.info("===================================")
@@ -377,6 +380,9 @@ async def run_scheduler() -> None:
 
 
 def main() -> None:
+    print("=== MAIN FUNCTION ENTERED ===")
+    sys.stdout.flush()
+
     logger.info("[SyncWorker] main() called")
     sys.stdout.flush()
 
