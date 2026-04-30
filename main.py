@@ -215,6 +215,19 @@ async def lifespan(app: FastAPI):
     await _resume_interrupted_syncs()
     route_count = len(app.routes)
     logger.info("[Startup] routes_registered count=%s", route_count)
+
+    # Log all registered routes
+    logger.info("[OrdersRoutes] registered_routes:")
+    for route in app.routes:
+        if hasattr(route, "path") and "/orders" in route.path:
+            methods = getattr(route, "methods", ["GET"])
+            logger.info(
+                "[OrdersRoutes] path=%s methods=%s endpoint=%s",
+                route.path,
+                methods,
+                getattr(route, "endpoint", "unknown"),
+            )
+
     yield
     logger.info("Shutting down")
 

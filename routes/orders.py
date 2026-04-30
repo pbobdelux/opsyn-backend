@@ -255,7 +255,7 @@ async def get_orders(
         "ok": True,
         "brand_id": brand,
         "orders": serialized_orders,
-        "count": len(serialized_orders),
+        "returned_count": len(serialized_orders),
         "total_in_database": total_in_database,
         "offset": offset,
         "limit": limit,
@@ -488,41 +488,75 @@ async def orders_sync(
     _resolved_company_id: Optional[str] = None
     _active_cred = None
     _credential_found: bool = False
+
     try:
+        # Build query: filter by brand if provided, else get most recent
         _cred_query = select(BrandAPICredential).where(
             BrandAPICredential.integration_name == "leaflink",
             BrandAPICredential.is_active == True,
         )
+
+        # CRITICAL: Filter by brand_filter if provided
         if brand_filter:
+            logger.info("[OrdersSync] credential_query_filter brand=%s", brand_filter)
             _cred_query = _cred_query.where(BrandAPICredential.brand_id == brand_filter)
+
         _cred_query = _cred_query.order_by(BrandAPICredential.last_sync_at.desc().nullslast()).limit(1)
+
         cred_result = await db.execute(_cred_query)
         _active_cred = cred_result.scalar_one_or_none()
+
+        if _active_cred:
+            _credential_found = True
+            _resolved_brand_id = _active_cred.brand_id
+            _resolved_company_id = _active_cred.company_id
+            logger.info(
+                "[OrdersSync] credential_resolution brand=%s found=true company_id=%s",
+                _resolved_brand_id,
+                _resolved_company_id,
+            )
+        else:
+            logger.warning(
+                "[OrdersSync] credential_resolution brand=%s found=false",
+                brand_filter,
+            )
+
     except Exception as _cred_exc:
-        # Rollback the failed transaction so the session is not left in a broken state
         await db.rollback()
-        logger.error("[OrdersSync] credential_load_error error=%s", _cred_exc)
-
-    if _active_cred is not None:
-        _credential_found = True
-        _resolved_brand_id = _active_cred.brand_id
-        _resolved_company_id = _active_cred.company_id
-        _api_key_present = bool(_active_cred.api_key and _active_cred.api_key.strip())
-        logger.info("[OrdersSync] credential_source=database")
-        logger.info("[OrdersSync] resolved_brand_id=%s", _resolved_brand_id)
-        logger.info("[OrdersSync] resolved_company_id=%s", _resolved_company_id)
-        logger.info("[OrdersSync] api_key_present=%s", str(_api_key_present).lower())
-        logger.info(
-            "[OrdersSync] credential_found brand=%s company_id=%s",
-            _resolved_brand_id,
-            _resolved_company_id,
+        logger.error(
+            "[OrdersSync] credential_load_error brand=%s error=%s",
+            brand_filter,
+            _cred_exc,
         )
-    else:
-        logger.warning("[OrdersSync] credential_source=missing — no active LeafLink credential found for brand=%s", brand_filter)
+        return {
+            "ok": False,
+            "error": "Failed to load credentials",
+            "brand_id": brand_filter,
+            "credential_found": False,
+            "sync_triggered": False,
+            "worker_enqueued": False,
+            "leaflink_call_attempted": False,
+        }
 
-    # Use brand_filter as the effective brand ID when no credential was found
-    # so that DB counts still reflect the correct brand
-    _effective_brand_id: Optional[str] = _resolved_brand_id or brand_filter
+    if not _credential_found:
+        logger.error(
+            "[OrdersSync] no_credentials_found brand=%s — cannot start sync",
+            brand_filter,
+        )
+        return {
+            "ok": False,
+            "error": f"No active LeafLink credentials found for brand {brand_filter}",
+            "error_detail": "Check that credentials are configured and active in the database",
+            "brand_id": brand_filter,
+            "credential_found": False,
+            "sync_triggered": False,
+            "worker_enqueued": False,
+            "leaflink_call_attempted": False,
+            "total_orders_in_db": 0,
+        }
+
+    # Use resolved brand ID for all subsequent operations
+    _effective_brand_id: Optional[str] = _resolved_brand_id
 
 
 
