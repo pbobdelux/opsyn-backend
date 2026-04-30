@@ -276,6 +276,23 @@ class LeafLinkClient:
                 result_type,
                 result_count,
             )
+            # DIAGNOSTIC LOGGING — remove after debugging
+            logger.info(
+                "[LeafLink DEBUG] response_keys=%s",
+                list(data.keys()) if isinstance(data, dict) else "not_a_dict",
+            )
+            logger.info(
+                "[LeafLink DEBUG] meta=%s",
+                data.get("meta") if isinstance(data, dict) else None,
+            )
+            logger.info(
+                "[LeafLink DEBUG] count=%s",
+                data.get("count") if isinstance(data, dict) else None,
+            )
+            logger.info(
+                "[LeafLink DEBUG] total=%s",
+                data.get("total") if isinstance(data, dict) else None,
+            )
             return data
 
         if resp.status_code in (401, 403):
@@ -569,6 +586,29 @@ class LeafLinkClient:
                 else:
                     payload = self.list_orders(page=current_page, page_size=page_size)
 
+                # DIAGNOSTIC LOGGING — log first page only to avoid spam
+                if pages_fetched == 0:
+                    logger.info(
+                        "[LeafLink DEBUG] first_page response_keys=%s",
+                        list(payload.keys()) if isinstance(payload, dict) else "not_a_dict",
+                    )
+                    logger.info(
+                        "[LeafLink DEBUG] first_page meta=%s",
+                        payload.get("meta") if isinstance(payload, dict) else None,
+                    )
+                    logger.info(
+                        "[LeafLink DEBUG] first_page count=%s",
+                        payload.get("count") if isinstance(payload, dict) else None,
+                    )
+                    logger.info(
+                        "[LeafLink DEBUG] first_page total=%s",
+                        payload.get("total") if isinstance(payload, dict) else None,
+                    )
+                    logger.info(
+                        "[LeafLink DEBUG] first_page_response=%s",
+                        str(payload)[:500],
+                    )
+
                 if isinstance(payload, list):
                     results = payload
                     next_url = None
@@ -748,6 +788,29 @@ class LeafLinkClient:
                     payload = resp.json()
                 else:
                     payload = self.list_orders(page=page, page_size=100)
+
+                # DIAGNOSTIC LOGGING — log first page only to avoid spam
+                if page == 1:
+                    logger.info(
+                        "[LeafLink DEBUG] first_page response_keys=%s",
+                        list(payload.keys()) if isinstance(payload, dict) else "not_a_dict",
+                    )
+                    logger.info(
+                        "[LeafLink DEBUG] first_page meta=%s",
+                        payload.get("meta") if isinstance(payload, dict) else None,
+                    )
+                    logger.info(
+                        "[LeafLink DEBUG] first_page count=%s",
+                        payload.get("count") if isinstance(payload, dict) else None,
+                    )
+                    logger.info(
+                        "[LeafLink DEBUG] first_page total=%s",
+                        payload.get("total") if isinstance(payload, dict) else None,
+                    )
+                    logger.info(
+                        "[LeafLink DEBUG] first_page_response=%s",
+                        str(payload)[:500],
+                    )
 
                 if isinstance(payload, list):
                     results = payload
