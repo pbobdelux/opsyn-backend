@@ -109,6 +109,27 @@ class LeafLinkClient:
             logger.warning("leaflink: client_init brand=%s missing company_id", self.brand_id)
             raise ValueError("Missing LEAFLINK_COMPANY_ID")
 
+        # CRITICAL: Validate API key length
+        if len(self.api_key) > 50:
+            logger.error(
+                "[LeafLinkAuth] INVALID_KEY_LENGTH brand=%s len=%s — REJECTING",
+                self.brand_id,
+                len(self.api_key),
+            )
+            raise ValueError(
+                f"Invalid LeafLink API key length: {len(self.api_key)} (expected ~40)"
+            )
+
+        if len(self.api_key) < 20:
+            logger.error(
+                "[LeafLinkAuth] INVALID_KEY_LENGTH brand=%s len=%s — TOO SHORT",
+                self.brand_id,
+                len(self.api_key),
+            )
+            raise ValueError(
+                f"Invalid LeafLink API key length: {len(self.api_key)} (expected ~40)"
+            )
+
         # Determine auth scheme
         if auth_scheme:
             self.auth_scheme: str = auth_scheme
@@ -162,6 +183,13 @@ class LeafLinkClient:
             self.base_url,
             self.company_id,
             bool(self.api_key),
+        )
+        logger.info(
+            "[LeafLinkAuth] client_init brand=%s key_len=%s company_id=%s scheme=%s",
+            self.brand_id,
+            len(self.api_key),
+            self.company_id,
+            self.auth_scheme,
         )
 
         if not self.api_key:

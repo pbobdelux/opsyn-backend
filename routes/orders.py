@@ -67,18 +67,22 @@ async def _load_leaflink_credential(
     brand_filter: Optional[str] = None,
 ) -> Optional["BrandAPICredential"]:
     """
-    Load LeafLink credential with multiple fallback paths.
+    Load LeafLink credential with STRICT priority.
 
-    Tries in order:
-    1. Exact brand match (if brand_filter provided)
-    2. Active LeafLink credential for brand
-    3. Most recent active LeafLink credential (any brand)
-    4. Environment variable fallback (LEAFLINK_API_KEY, LEAFLINK_COMPANY_ID)
+    PRIORITY (in order):
+    1. Exact brand match from DB (brand_id = requested brand AND is_active=true)
+       → STOP if found, do NOT fallback
+    2. Only use ENV if NO DB credential exists for ANY brand
+
+    NEVER:
+    - Fall back to different brand
+    - Fall back to test-brand
+    - Use ENV if DB credential exists
     """
 
-    logger.info("[OrdersSyncCredential] requested_brand=%s", brand_filter)
+    logger.info("[LeafLinkAuth] credential_load_request brand=%s", brand_filter)
 
-    # Path 1: Exact brand lookup
+    # PRIORITY 1: Exact brand match from DB
     if brand_filter:
         try:
             result = await db.execute(
@@ -89,78 +93,102 @@ async def _load_leaflink_credential(
                 )
             )
             cred = result.scalar_one_or_none()
+
             if cred:
+                # Found exact match — STOP, do NOT fallback
+                api_key = (cred.api_key or "").strip()
+
+                # Safety check: validate key length
+                if len(api_key) > 50:
+                    logger.error(
+                        "[LeafLinkAuth] WRONG_KEY_LENGTH brand=%s len=%s — REJECTING",
+                        brand_filter,
+                        len(api_key),
+                    )
+                    raise ValueError(f"Invalid LeafLink API key length: {len(api_key)}")
+
                 logger.info(
-                    "[OrdersSyncCredential] exact_brand_lookup found=true brand_id=%s company_id=%s",
+                    "[LeafLinkAuth] credential_source=DB brand=%s key_len=%s company_id=%s",
                     cred.brand_id,
+                    len(api_key),
                     cred.company_id,
                 )
-                # Strip whitespace from credentials to prevent auth failures
-                cred.api_key = (cred.api_key or "").strip()
+
+                # Strip whitespace from credentials
+                cred.api_key = api_key
                 cred.company_id = (cred.company_id or "").strip()
-                logger.info(
-                    "[LeafLinkAuth] credential_loaded source=db api_key_prefix=%s api_key_len=%s company_id=%s",
-                    cred.api_key[:6] if cred.api_key else "MISSING",
-                    len(cred.api_key),
-                    cred.company_id,
-                )
+
                 return cred
             else:
-                logger.info("[OrdersSyncCredential] exact_brand_lookup found=false")
+                logger.info(
+                    "[LeafLinkAuth] exact_brand_not_found brand=%s",
+                    brand_filter,
+                )
+
+        except ValueError as val_exc:
+            # Re-raise validation errors
+            logger.error(
+                "[LeafLinkAuth] credential_validation_error brand=%s error=%s",
+                brand_filter,
+                val_exc,
+            )
+            raise
+
         except Exception as exc:
-            logger.error("[OrdersSyncCredential] exact_brand_lookup_error error=%s", exc)
+            logger.error(
+                "[LeafLinkAuth] exact_brand_lookup_error brand=%s error=%s",
+                brand_filter,
+                exc,
+            )
             await db.rollback()
 
-    # Path 2: Active LeafLink credential (any brand)
+    # PRIORITY 2: Check if ANY active DB credential exists
+    # If yes, do NOT use ENV (ENV is only for single-tenant deployments with no DB)
     try:
         result = await db.execute(
             select(BrandAPICredential).where(
                 BrandAPICredential.integration_name == "leaflink",
                 BrandAPICredential.is_active == True,
-            ).order_by(BrandAPICredential.last_sync_at.desc().nullslast()).limit(1)
+            ).limit(1)
         )
-        cred = result.scalar_one_or_none()
-        if cred:
-            logger.info(
-                "[OrdersSyncCredential] active_leaflink_lookup found=true brand_id=%s company_id=%s",
-                cred.brand_id,
-                cred.company_id,
+        any_db_cred = result.scalar_one_or_none()
+
+        if any_db_cred:
+            # DB credentials exist — do NOT use ENV
+            logger.warning(
+                "[LeafLinkAuth] db_credentials_exist brand=%s — ignoring ENV vars",
+                brand_filter,
             )
-            # Strip whitespace from credentials to prevent auth failures
-            cred.api_key = (cred.api_key or "").strip()
-            cred.company_id = (cred.company_id or "").strip()
-            logger.info(
-                "[LeafLinkAuth] credential_loaded source=db api_key_prefix=%s api_key_len=%s company_id=%s",
-                cred.api_key[:6] if cred.api_key else "MISSING",
-                len(cred.api_key),
-                cred.company_id,
-            )
-            return cred
-        else:
-            logger.info("[OrdersSyncCredential] active_leaflink_lookup found=false")
+            return None
+
     except Exception as exc:
-        logger.error("[OrdersSyncCredential] active_leaflink_lookup_error error=%s", exc)
+        logger.error(
+            "[LeafLinkAuth] db_check_error error=%s",
+            exc,
+        )
         await db.rollback()
 
-    # Path 3: Environment variable fallback
-    env_api_key = os.getenv("LEAFLINK_API_KEY")
-    env_company_id = os.getenv("LEAFLINK_COMPANY_ID")
+    # PRIORITY 3: ENV fallback (only if NO DB credentials exist)
+    env_api_key = os.getenv("LEAFLINK_API_KEY", "").strip()
+    env_company_id = os.getenv("LEAFLINK_COMPANY_ID", "").strip()
 
     if env_api_key and env_company_id:
-        # Strip whitespace from env var credentials too
-        env_api_key = env_api_key.strip()
-        env_company_id = env_company_id.strip()
+        # Validate ENV key length
+        if len(env_api_key) > 50:
+            logger.error(
+                "[LeafLinkAuth] WRONG_KEY_LENGTH env_key len=%s — REJECTING",
+                len(env_api_key),
+            )
+            raise ValueError(f"Invalid LeafLink API key length in ENV: {len(env_api_key)}")
+
         logger.info(
-            "[OrdersSyncCredential] env_fallback found=true company_id=%s",
-            env_company_id,
-        )
-        logger.info(
-            "[LeafLinkAuth] credential_loaded source=env api_key_prefix=%s api_key_len=%s company_id=%s",
-            env_api_key[:6] if env_api_key else "MISSING",
+            "[LeafLinkAuth] credential_source=ENV brand=%s key_len=%s company_id=%s",
+            brand_filter or "default",
             len(env_api_key),
             env_company_id,
         )
-        # Create a temporary credential object from env vars
+
+        # Create temporary credential from ENV
         temp_cred = BrandAPICredential(
             brand_id=brand_filter or "default",
             integration_name="leaflink",
@@ -170,9 +198,11 @@ async def _load_leaflink_credential(
         )
         return temp_cred
     else:
-        logger.info("[OrdersSyncCredential] env_fallback found=false")
-
-    return None
+        logger.warning(
+            "[LeafLinkAuth] no_credentials_found brand=%s — no DB, no ENV",
+            brand_filter,
+        )
+        return None
 
 
 # Thread pool for running synchronous LeafLink HTTP calls without blocking the event loop
@@ -616,17 +646,53 @@ async def orders_sync(
                 _resolved_company_id,
                 _api_key_present,
             )
+
+            _api_key = (_active_cred.api_key or "").strip()
+
+            # Safety check: validate key length
+            if len(_api_key) > 50:
+                logger.error(
+                    "[LeafLinkAuth] WRONG_KEY_LENGTH brand=%s len=%s — REJECTING",
+                    _resolved_brand_id,
+                    len(_api_key),
+                )
+                return {
+                    "ok": False,
+                    "error": f"Invalid API key length: {len(_api_key)} (expected ~40)",
+                    "brand_id": _resolved_brand_id,
+                    "credential_found": True,
+                    "sync_triggered": False,
+                    "worker_enqueued": False,
+                    "leaflink_call_attempted": False,
+                }
+
             logger.info(
-                "[LeafLinkAuth] orders_sync_credential source=db company_id=%s api_key_prefix=%s api_key_len=%s",
+                "[LeafLinkAuth] orders_sync_credential brand=%s key_len=%s company_id=%s",
+                _resolved_brand_id,
+                len(_api_key),
                 _resolved_company_id,
-                _active_cred.api_key[:6] if _active_cred.api_key else "MISSING",
-                len(_active_cred.api_key or ""),
             )
         else:
             logger.warning(
                 "[OrdersSyncCredential] final credential_found=false brand=%s",
                 brand_filter,
             )
+
+    except ValueError as _val_exc:
+        logger.error(
+            "[OrdersSyncCredential] credential_validation_error brand=%s error=%s",
+            brand_filter,
+            _val_exc,
+        )
+        return {
+            "ok": False,
+            "error": str(_val_exc),
+            "brand_id": brand_filter,
+            "credential_found": False,
+            "sync_triggered": False,
+            "worker_enqueued": False,
+            "leaflink_call_attempted": False,
+        }
 
     except Exception as _cred_exc:
         await db.rollback()
