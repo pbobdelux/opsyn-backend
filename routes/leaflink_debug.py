@@ -619,14 +619,14 @@ async def leaflink_auth_test(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Test LeafLink authentication.
+    Test LeafLink authentication with multiple auth schemes.
 
-    Loads credential using the same resolver as /orders/sync and tests auth
-    against the LeafLink API.  Returns structured diagnostics including
-    credential source, key prefix/length, and the HTTP status from LeafLink.
+    Tries Bearer, Token, and Raw schemes in order.
+    Returns which scheme succeeds and saves it to the database.
 
     GET /leaflink/auth-test?brand=noble-nectar
     """
+    from database import AsyncSessionLocal
     from routes.orders import _load_leaflink_credential
 
     logger.info("[LeafLinkAuth] auth_test_request brand=%s", brand)
@@ -643,86 +643,132 @@ async def leaflink_auth_test(
             "error": f"No credential found for brand {brand}",
         }
 
-    credential_source = "db"
     api_key = (cred.api_key or "").strip()
     company_id = (cred.company_id or "").strip()
+    brand_id = cred.brand_id
 
     logger.info(
-        "[LeafLinkAuth] auth_test_credential source=%s company_id=%s api_key_prefix=%s api_key_len=%s",
-        credential_source,
+        "[LeafLinkAuth] auth_test_credential brand=%s company_id=%s prefix=%s len=%s",
+        brand_id,
         company_id,
         api_key[:6] if api_key else "MISSING",
         len(api_key),
     )
 
-    # Test auth by calling a lightweight LeafLink endpoint
-    try:
-        client = LeafLinkClient(
-            api_key=api_key,
-            company_id=company_id,
-            brand_id=cred.brand_id,
-        )
+    # Try auth schemes in order
+    schemes_to_try = ["Bearer", "Token", "Raw"]
+    attempts = []
+    successful_scheme = None
 
-        logger.info("[LeafLinkAuth] auth_test_calling_leaflink brand=%s", cred.brand_id)
+    for scheme in schemes_to_try:
+        try:
+            logger.info("[LeafLinkAuth] attempt scheme=%s brand=%s", scheme, brand_id)
 
-        # Use orders-received/ with page_size=1 — same endpoint as /orders/sync
-        resp = client._get_raw("orders-received/", params={"page": 1, "page_size": 1})
-        status_code = resp.status_code
+            client = LeafLinkClient(
+                api_key=api_key,
+                company_id=company_id,
+                brand_id=brand_id,
+                auth_scheme=scheme,
+            )
+
+            # Call lightweight endpoint to test auth
+            resp = client._get_raw("orders-received/", params={"page": 1, "page_size": 1})
+            status_code = resp.status_code
+
+            logger.info(
+                "[LeafLinkAuth] attempt scheme=%s status=%s brand=%s",
+                scheme,
+                status_code,
+                brand_id,
+            )
+
+            attempts.append({
+                "scheme": scheme,
+                "status_code": status_code,
+            })
+
+            if status_code == 200:
+                successful_scheme = scheme
+                logger.info(
+                    "[LeafLinkAuth] selected_scheme=%s brand=%s",
+                    scheme,
+                    brand_id,
+                )
+                break
+
+        except Exception as exc:
+            logger.error(
+                "[LeafLinkAuth] attempt_error scheme=%s error=%s brand=%s",
+                scheme,
+                exc,
+                brand_id,
+            )
+            attempts.append({
+                "scheme": scheme,
+                "status_code": None,
+                "error": str(exc),
+            })
+
+    if successful_scheme:
+        # Save detected scheme to database
+        try:
+            if AsyncSessionLocal is not None:
+                async with AsyncSessionLocal() as save_sess:
+                    async with save_sess.begin():
+                        save_result = await save_sess.execute(
+                            select(BrandAPICredential).where(
+                                BrandAPICredential.brand_id == brand_id,
+                                BrandAPICredential.integration_name == "leaflink",
+                            )
+                        )
+                        save_cred = save_result.scalar_one_or_none()
+                        if save_cred:
+                            save_cred.auth_scheme = successful_scheme
+                            logger.info(
+                                "[LeafLinkAuth] saved_scheme scheme=%s brand=%s",
+                                successful_scheme,
+                                brand_id,
+                            )
+        except Exception as save_exc:
+            logger.error(
+                "[LeafLinkAuth] save_scheme_error error=%s brand=%s",
+                save_exc,
+                brand_id,
+            )
 
         logger.info(
-            "[LeafLinkAuth] auth_test_response status_code=%s brand=%s",
-            status_code,
-            cred.brand_id,
-        )
-
-        if status_code == 200:
-            logger.info("[LeafLinkAuth] auth_test_success brand=%s", cred.brand_id)
-            return {
-                "ok": True,
-                "status_code": status_code,
-                "credential_found": True,
-                "credential_source": credential_source,
-                "company_id": company_id,
-                "api_key_prefix": api_key[:6] if api_key else "MISSING",
-                "api_key_len": len(api_key),
-                "auth_scheme": "Token",
-                "error": None,
-            }
-        else:
-            error_msg = resp.text[:500] if resp.text else f"HTTP {status_code}"
-            logger.error(
-                "[LeafLinkAuth] auth_test_failed status_code=%s error=%s brand=%s",
-                status_code,
-                error_msg,
-                cred.brand_id,
-            )
-            return {
-                "ok": False,
-                "status_code": status_code,
-                "credential_found": True,
-                "credential_source": credential_source,
-                "company_id": company_id,
-                "api_key_prefix": api_key[:6] if api_key else "MISSING",
-                "api_key_len": len(api_key),
-                "auth_scheme": "Token",
-                "error": error_msg,
-            }
-
-    except Exception as exc:
-        logger.error(
-            "[LeafLinkAuth] auth_test_error error=%s brand=%s",
-            exc,
-            cred.brand_id if cred else "unknown",
-            exc_info=True,
+            "[LeafLinkAuth] auth_test_success scheme=%s brand=%s",
+            successful_scheme,
+            brand_id,
         )
         return {
-            "ok": False,
-            "status_code": None,
+            "ok": True,
+            "status_code": 200,
             "credential_found": True,
-            "credential_source": credential_source,
+            "credential_source": "db",
+            "brand_id": brand_id,
             "company_id": company_id,
             "api_key_prefix": api_key[:6] if api_key else "MISSING",
             "api_key_len": len(api_key),
-            "auth_scheme": "Token",
-            "error": str(exc),
+            "successful_auth_scheme": successful_scheme,
+            "attempts": attempts,
+            "error": None,
+        }
+    else:
+        logger.error(
+            "[LeafLinkAuth] auth_test_failed all_schemes_failed brand=%s",
+            brand_id,
+        )
+        return {
+            "ok": False,
+            "status_code": attempts[-1].get("status_code") if attempts else None,
+            "credential_found": True,
+            "credential_source": "db",
+            "brand_id": brand_id,
+            "company_id": company_id,
+            "api_key_prefix": api_key[:6] if api_key else "MISSING",
+            "api_key_len": len(api_key),
+            "successful_auth_scheme": None,
+            "attempts": attempts,
+            "error": "All auth schemes failed",
         }
