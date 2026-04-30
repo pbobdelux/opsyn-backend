@@ -199,10 +199,30 @@ async def _resume_interrupted_syncs() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"Starting {APP_NAME} in {APP_ENV}")
+    """Application lifespan: startup and shutdown."""
 
-    # Log database connection info (masked for security)
+    # PRODUCTION FAIL-FAST: Ensure AWS RDS is used
+    environment = os.getenv("ENVIRONMENT", "development").lower()
     database_url = os.getenv("DATABASE_URL", "")
+
+    if environment == "production":
+        if not database_url:
+            logger.error("[BOOT_DB] PRODUCTION mode but DATABASE_URL is empty")
+            raise RuntimeError("Production DATABASE_URL is not set")
+
+        # Check if using AWS RDS
+        if "rds.amazonaws.com" not in database_url:
+            logger.error(
+                "[BOOT_DB] PRODUCTION mode but DATABASE_URL is not AWS RDS canonical database"
+            )
+            raise RuntimeError(
+                "Production DATABASE_URL is not AWS RDS canonical database. "
+                "Expected host to contain 'rds.amazonaws.com'"
+            )
+
+        logger.info("[BOOT_DB] PRODUCTION mode using AWS RDS canonical database")
+
+    # Log active database connection at startup
     if database_url:
         try:
             from urllib.parse import urlparse as _urlparse
@@ -210,16 +230,27 @@ async def lifespan(app: FastAPI):
             db_host = _parsed.hostname or "unknown"
             db_port = _parsed.port or 5432
             db_name = _parsed.path.lstrip("/") or "unknown"
+
+            # Detect provider
+            if "rds.amazonaws.com" in db_host:
+                provider = "aws-rds"
+            elif "railway" in db_host:
+                provider = "railway"
+            else:
+                provider = "unknown"
+
             logger.info(
-                "[DB] connected_to=postgres://<user>@%s:%s/%s",
+                "[BOOT_DB] host=%s db=%s provider=%s",
                 db_host,
-                db_port,
                 db_name,
+                provider,
             )
         except Exception as exc:
-            logger.error("[DB] parse_error error=%s", exc)
+            logger.error("[BOOT_DB] failed_to_parse_database_url error=%s", exc)
     else:
-        logger.error("[DB] DATABASE_URL not set")
+        logger.error("[BOOT_DB] DATABASE_URL not set or empty")
+
+    logger.info(f"Starting {APP_NAME} in {APP_ENV}")
 
     await _create_assistant_tables()
     from services.migration_runner import run_migrations

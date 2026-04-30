@@ -20,22 +20,42 @@ async def debug_db_check(
     db: AsyncSession = Depends(get_db),
 ):
     """Debug endpoint to diagnose database connection and tenant credentials."""
-    logger.info("[DB] debug_db_check_request brand=%s", brand)
 
-    # Parse DATABASE_URL
-    database_url = os.getenv("DATABASE_URL", "")
+    # Log the active DATABASE_URL being used
+    database_url = os.getenv("DATABASE_URL", "NOT_SET")
+    db_provider = "unknown"
     db_host = "unknown"
     db_port = 5432
     db_name = "unknown"
 
-    if database_url:
+    if database_url and database_url != "NOT_SET":
         try:
             parsed = urlparse(database_url)
             db_host = parsed.hostname or "unknown"
             db_port = parsed.port or 5432
             db_name = parsed.path.lstrip("/") or "unknown"
+
+            # Detect provider
+            if "rds.amazonaws.com" in db_host:
+                db_provider = "aws-rds"
+            elif "railway" in db_host:
+                db_provider = "railway"
+            else:
+                db_provider = "unknown"
+
+            logger.info(
+                "[DB] debug_check_active_url host=%s port=%s database=%s provider=%s",
+                db_host,
+                db_port,
+                db_name,
+                db_provider,
+            )
         except Exception as exc:
-            logger.error("[DB] parse_error error=%s", exc)
+            logger.error("[DB] debug_check_parse_error error=%s", exc)
+    else:
+        logger.error("[DB] debug_check DATABASE_URL not set")
+
+    logger.info("[DB] debug_db_check_request brand=%s", brand)
 
     # Count total credentials
     total_count = None
@@ -87,6 +107,7 @@ async def debug_db_check(
         return {
             "ok": True,
             "database_name": db_name,
+            "database_provider": db_provider,
             "brand_id": brand,
             "credential_exists": credential_exists,
             "credential_id": credential_id,
@@ -104,6 +125,7 @@ async def debug_db_check(
             "database_url_host": db_host,
             "database_url_port": db_port,
             "database_name": db_name,
+            "database_provider": db_provider,
             "brand_api_credentials_count": total_count,
             "credential_source": "db_only",
             "env_checked": False,
