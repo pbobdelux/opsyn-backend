@@ -687,7 +687,11 @@ async def orders_sync(
                             if _p1_cred:
                                 _p1_cred.last_synced_page = _phase1_page
                                 _p1_cred.total_pages_available = total_pages_available
-                                _p1_cred.total_orders_available = total_count_leaflink
+                                # Only set if column exists — may be missing before schema migration
+                                try:
+                                    _p1_cred.total_orders_available = total_count_leaflink
+                                except Exception:
+                                    logger.debug("[OrdersSync] total_orders_available column not yet in schema")
                                 _p1_cred.sync_status = "syncing" if (next_leaflink_url and next_page_number) else "idle"
                                 _p1_cred.last_sync_at = datetime.now(timezone.utc)
                                 _p1_cred.last_error = None
@@ -1014,25 +1018,62 @@ async def orders_sync_status(
         )
         cred = cred_result.scalar_one_or_none()
     except Exception as cred_exc:
-        error_type = type(cred_exc).__name__
-        error_msg = str(cred_exc)
-        tb = traceback.format_exc()
-        logger.error(
-            "[OrdersSync] status_check_error brand=%s type=%s msg=%s",
+        logger.warning(
+            "[OrdersSync] credential_load_error brand=%s error=%s — trying fallback",
             brand,
-            error_type,
-            error_msg,
-            exc_info=True,
+            cred_exc,
         )
-        return {
-            "ok": False,
-            "brand_id": brand,
-            "error": "Database error during credential lookup",
-            "error_type": error_type,
-            "error_message": error_msg,
-            "traceback": tb,
-            "timestamp": timestamp,
-        }
+        # Fallback: query without total_orders_available using raw SQL to avoid
+        # ORM selecting a column that may not yet exist in the schema.
+        try:
+            from sqlalchemy import text
+            _fb_result = await db.execute(
+                text("""
+                    SELECT id, brand_id, integration_name, api_key, company_id,
+                           is_active, sync_status, last_sync_at, last_error,
+                           last_synced_page, total_pages_available
+                    FROM brand_api_credentials
+                    WHERE brand_id = :brand AND integration_name = 'leaflink'
+                    LIMIT 1
+                """),
+                {"brand": brand},
+            )
+            _fb_row = _fb_result.fetchone()
+            if _fb_row:
+                cred = BrandAPICredential(
+                    id=_fb_row[0],
+                    brand_id=_fb_row[1],
+                    integration_name=_fb_row[2],
+                    api_key=_fb_row[3],
+                    company_id=_fb_row[4],
+                    is_active=_fb_row[5],
+                    sync_status=_fb_row[6],
+                    last_sync_at=_fb_row[7],
+                    last_error=_fb_row[8],
+                    last_synced_page=_fb_row[9],
+                    total_pages_available=_fb_row[10],
+                    total_orders_available=None,  # Column doesn't exist yet
+                )
+            else:
+                cred = None
+        except Exception as fallback_exc:
+            error_type = type(fallback_exc).__name__
+            error_msg = str(fallback_exc)
+            tb = traceback.format_exc()
+            logger.error(
+                "[OrdersSync] credential_fallback_error brand=%s error=%s",
+                brand,
+                fallback_exc,
+            )
+            return {
+                "ok": False,
+                "brand_id": brand,
+                "error": "Database error during credential lookup",
+                "error_type": error_type,
+                "error_message": error_msg,
+                "traceback": tb,
+                "timestamp": timestamp,
+            }
 
     # ------------------------------------------------------------------ #
     # Count orders in DB for this brand                                   #
@@ -1058,7 +1099,11 @@ async def orders_sync_status(
         db_sync_status = cred.sync_status or "idle"
         db_last_synced_at = cred.last_sync_at.isoformat() if cred.last_sync_at else None
         db_last_error = cred.last_error
-        total_orders_available = cred.total_orders_available
+        # Load total_orders_available safely — column may not exist yet in schema
+        try:
+            total_orders_available = cred.total_orders_available
+        except AttributeError:
+            total_orders_available = None
     else:
         db_pages_synced = 0
         db_total_pages = 0
