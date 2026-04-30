@@ -580,9 +580,14 @@ class LeafLinkClient:
                         or []
                     )
                     next_url = payload.get("next")
-                    # Capture total count from first page
-                    if total_count is None and "count" in payload:
-                        total_count = payload.get("count")
+                    # Capture total count from first page — try multiple API response formats
+                    if total_count is None:
+                        if "meta" in payload and isinstance(payload["meta"], dict) and "total" in payload["meta"]:
+                            total_count = payload["meta"]["total"]
+                        elif "count" in payload:
+                            total_count = payload.get("count")
+                        elif "total" in payload:
+                            total_count = payload.get("total")
                 else:
                     raise RuntimeError(f"Unexpected LeafLink response type: {type(payload).__name__}")
 
