@@ -25,6 +25,7 @@ from routes.leaflink_debug import router as leaflink_debug_router
 from routes.orders import router as orders_router
 from routes.voice import router as voice_router
 from routes.voice_brain import router as voice_brain_router
+from routes.admin import router as admin_router
 from routes.debug import router as debug_router
 from utils.json_utils import make_json_safe
 
@@ -344,6 +345,7 @@ app.include_router(orders_router)
 app.include_router(voice_router)
 app.include_router(voice_brain_router)
 app.include_router(debug_router)
+app.include_router(admin_router)
 logger.info("[Routes] registered debug routes")
 
 
