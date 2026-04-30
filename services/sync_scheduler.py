@@ -88,7 +88,10 @@ async def poll_and_execute() -> None:
             sync_run_id = sync_run.id
             brand_id = sync_run.brand_id
             start_page = sync_run.current_page or 1
-            total_pages = sync_run.total_pages or 1
+            # total_pages may be None for cursor-based pagination (LeafLink).
+            # Pass None through so sync_leaflink_background_continuous uses
+            # cursor termination rather than a page-count bound.
+            total_pages = sync_run.total_pages  # May be None
             total_orders_available = sync_run.total_orders_available
 
             # ------------------------------------------------------------------ #

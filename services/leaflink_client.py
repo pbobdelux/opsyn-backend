@@ -750,10 +750,10 @@ class LeafLinkClient:
             )
             raise
 
-        import math
+        # LeafLink uses cursor-based pagination — total_pages cannot be reliably
+        # calculated from the API response. Leave it as None so callers do not
+        # display a misleading "4 / 1" style progress indicator.
         total_pages: Optional[int] = None
-        if total_count is not None and page_size > 0:
-            total_pages = math.ceil(total_count / page_size)
 
         next_page = start_page + pages_fetched if next_url else None
 

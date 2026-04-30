@@ -1011,7 +1011,9 @@ async def orders_sync(
 
                 pages_remaining = (total_pages_available - start_page - pages_fetched_phase1 + 1) if total_pages_available else None
 
-                if next_leaflink_url and next_page_number and total_pages_available:
+                # Enqueue background sync when there is a next cursor URL and page number.
+                # total_pages_available may be None for cursor-based pagination (LeafLink).
+                if next_leaflink_url and next_page_number:
                     logger.info(
                         "[OrdersSync] phase2_before_enqueue brand=%s start_page=%s total_pages=%s pages_remaining=%s",
                         _resolved_brand_id,
@@ -1514,16 +1516,14 @@ async def orders_sync_status(
             "timestamp": timestamp,
         })
 
-    # Compute percent_complete correctly: pages_synced / total_pages * 100.
-    # For a freshly queued run (pages_synced=0, total_pages=None) return 0
-    # rather than None so callers always get a numeric value when a run exists.
+    # Compute percent_complete only when total_pages is known.
+    # For cursor-based pagination (LeafLink), total_pages is None — return None
+    # so callers display an indeterminate progress indicator rather than a
+    # misleading value like "400%" or "4 / 1".
     percent_complete: Optional[float] = None
     if run.total_pages and run.total_pages > 0:
         raw_pct = (run.pages_synced / run.total_pages) * 100
         percent_complete = round(min(100.0, max(0.0, raw_pct)), 2)
-    elif run.status in ("queued", "syncing"):
-        # Run exists but total_pages not yet known — report 0 progress
-        percent_complete = 0
 
     # ETA: only when actively syncing, not stalled, and enough data
     estimated_completion_minutes: Optional[float] = None

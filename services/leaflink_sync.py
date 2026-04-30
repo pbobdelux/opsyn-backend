@@ -690,7 +690,7 @@ async def sync_leaflink_background_continuous(
     api_key: str,
     company_id: str,
     start_page: int,
-    total_pages: int,
+    total_pages: Optional[int],
     manager: Optional["BackgroundSyncManager"] = None,
     total_orders_available: Optional[int] = None,
     sync_run_id: Optional[int] = None,
@@ -716,7 +716,7 @@ async def sync_leaflink_background_continuous(
         api_key:                LeafLink API key.
         company_id:             LeafLink company ID.
         start_page:             First page to fetch (Phase 1 already fetched pages before this).
-        total_pages:            Total pages reported by LeafLink API.
+        total_pages:            Total pages reported by LeafLink API, or None for cursor-based pagination.
         manager:                Optional BackgroundSyncManager instance for in-memory tracking.
         total_orders_available: Total orders reported by LeafLink (for progress display).
         sync_run_id:            Optional SyncRun.id to persist progress against.
@@ -857,16 +857,20 @@ async def sync_leaflink_background_continuous(
 
             raise last_error
 
-        while current_page <= total_pages:
+        # When total_pages is None (cursor-based pagination), loop until the API
+        # returns no next_url. When total_pages is known, also enforce the page bound.
+        while total_pages is None or current_page <= total_pages:
             # Hard timeout guard
             elapsed_total = time.monotonic() - bg_start
             if elapsed_total > _BG_SYNC_TIMEOUT:
+                pages_done = current_page - start_page
+                pages_total = (total_pages - start_page + 1) if total_pages is not None else "?"
                 logger.warning(
                     "[OrdersSync] bg_sync_timeout brand=%s elapsed=%.1fs pages_done=%s/%s",
                     brand_id,
                     elapsed_total,
-                    current_page - start_page,
-                    total_pages - start_page + 1,
+                    pages_done,
+                    pages_total,
                 )
                 break
 
@@ -1009,7 +1013,8 @@ async def sync_leaflink_background_continuous(
                     )
 
             total_orders_synced += len(batch_orders)
-            last_completed_page = (next_page - 1) if next_page else total_pages
+            # When total_pages is None (cursor-based), fall back to current_page
+            last_completed_page = (next_page - 1) if next_page else (total_pages or current_page)
 
             # ------------------------------------------------------------------ #
             # Persist progress to DB (SyncRun) and update in-memory state        #
@@ -1059,7 +1064,8 @@ async def sync_leaflink_background_continuous(
         # Sync complete                                                           #
         # ---------------------------------------------------------------------- #
         total_duration = round(time.monotonic() - bg_start, 1)
-        final_page = min(current_page - 1, total_pages)
+        # When total_pages is None (cursor-based), final_page is simply the last page visited
+        final_page = (current_page - 1) if total_pages is None else min(current_page - 1, total_pages)
 
         if sync_run_id:
             try:
