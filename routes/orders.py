@@ -617,15 +617,41 @@ async def orders_sync(
 
     # ------------------------------------------------------------------ #
     # Load the active LeafLink credential — tenant-safe, DB-first        #
+    # Normalize brand_filter before lookup to handle whitespace/case     #
     # ------------------------------------------------------------------ #
+    from services.credential_resolver import resolve_brand_credential
+
     _resolved_brand_id: Optional[str] = None
     _resolved_company_id: Optional[str] = None
     _active_cred = None
     _credential_found: bool = False
 
-    # Load credential using tenant-safe resolver
+    # Use shared resolver with normalization to confirm credential exists
+    _cred_row = await resolve_brand_credential(db, brand_filter, "leaflink")
+
+    if not _cred_row:
+        logger.error(
+            "[CredentialResolver] sync_no_credentials_found brand=%s",
+            brand_filter,
+        )
+        return {
+            "ok": False,
+            "error": "tenant_leaflink_credential_not_found",
+            "brand_id": brand_filter,
+            "credential_found": False,
+            "credential_source": "db",
+            "env_checked": False,
+            "sync_triggered": False,
+            "worker_enqueued": False,
+            "leaflink_call_attempted": False,
+        }
+
+    # Use the normalized brand_id from the resolver for all subsequent lookups
+    _normalized_brand_filter = _cred_row[1]
+
+    # Load full ORM credential (needed for auth_scheme and other fields)
     try:
-        _active_cred = await resolve_leaflink_credential(db, brand_id=brand_filter, allow_env_fallback=False)
+        _active_cred = await resolve_leaflink_credential(db, brand_id=_normalized_brand_filter, allow_env_fallback=False)
     except ValueError as _val_exc:
         logger.error(
             "[CredentialResolver] sync_credential_error error=%s",
