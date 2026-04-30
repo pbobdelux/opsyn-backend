@@ -22,6 +22,13 @@ import os
 import sys
 from datetime import datetime, timezone
 
+# Retry configuration for transient LeafLink errors
+MAX_RETRIES = 3
+INITIAL_BACKOFF_SECONDS = 2
+MAX_BACKOFF_SECONDS = 60
+BACKOFF_MULTIPLIER = 2.0
+TRANSIENT_ERROR_CODES = {429, 502, 503, 504}
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -174,6 +181,13 @@ async def process_sync_requests() -> None:
                     start_page,
                     total_pages,
                 )
+                logger.info(
+                    "[OrdersSyncResume] brand=%s db_count_before=%s starting_page=%s total_pages=%s",
+                    brand_id,
+                    0,
+                    start_page,
+                    total_pages,
+                )
 
                 await sync_leaflink_background_continuous(
                     brand_id=brand_id,
@@ -201,26 +215,55 @@ async def process_sync_requests() -> None:
                     request_id,
                     brand_id,
                 )
+                logger.info("[OrdersSyncResume] complete brand=%s", brand_id)
 
             except Exception as sync_exc:
-                logger.error(
-                    "[SyncWorker] sync_error id=%s brand=%s error=%s",
-                    request_id,
-                    brand_id,
-                    sync_exc,
-                    exc_info=True,
-                )
-                # Mark error
-                async with AsyncSessionLocal() as err_db:
-                    err_result = await err_db.execute(
-                        select(SyncRequest).where(SyncRequest.id == request_id)
+                error_code = getattr(sync_exc, "status_code", None)
+                is_transient = error_code in TRANSIENT_ERROR_CODES
+
+                if is_transient:
+                    # Transient error — mark as paused so startup resume logic retries it
+                    logger.warning(
+                        "[OrdersSyncResume] paused_transient_error brand=%s error_code=%s error=%s",
+                        brand_id,
+                        error_code,
+                        sync_exc,
                     )
-                    err_req = err_result.scalar_one_or_none()
-                    if err_req:
-                        err_req.status = "error"
-                        err_req.error = str(sync_exc)
-                        err_req.completed_at = datetime.now(timezone.utc)
-                        await err_db.commit()
+                    async with AsyncSessionLocal() as err_db:
+                        err_result = await err_db.execute(
+                            select(SyncRequest).where(SyncRequest.id == request_id)
+                        )
+                        err_req = err_result.scalar_one_or_none()
+                        if err_req:
+                            err_req.status = "paused"
+                            err_req.error = f"LeafLink temporarily unavailable (HTTP {error_code})"
+                            err_req.completed_at = datetime.now(timezone.utc)
+                            await err_db.commit()
+                else:
+                    # Permanent error — mark as error
+                    logger.error(
+                        "[OrdersSyncResume] failed_permanent_error brand=%s error=%s",
+                        brand_id,
+                        sync_exc,
+                        exc_info=True,
+                    )
+                    logger.error(
+                        "[SyncWorker] sync_error id=%s brand=%s error=%s",
+                        request_id,
+                        brand_id,
+                        sync_exc,
+                        exc_info=True,
+                    )
+                    async with AsyncSessionLocal() as err_db:
+                        err_result = await err_db.execute(
+                            select(SyncRequest).where(SyncRequest.id == request_id)
+                        )
+                        err_req = err_result.scalar_one_or_none()
+                        if err_req:
+                            err_req.status = "error"
+                            err_req.error = str(sync_exc)
+                            err_req.completed_at = datetime.now(timezone.utc)
+                            await err_db.commit()
 
         except Exception as loop_exc:
             logger.error(

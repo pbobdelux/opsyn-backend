@@ -118,16 +118,13 @@ async def _verify_database_schema() -> None:
 
 async def _resume_interrupted_syncs() -> None:
     """
-    On startup, re-enqueue any syncs that were in-progress when the service
-    last shut down by inserting a pending SyncRequest row for each interrupted
-    credential.  The opsyn-sync-worker will pick these up and resume from
-    last_synced_page + 1.
+    On startup, re-enqueue any syncs that were paused or interrupted.
 
-    A sync is considered interrupted when:
-      - sync_status = "syncing"
-      - last_synced_page is not None
-      - total_pages_available is not None
-      - last_synced_page < total_pages_available
+    A sync is considered resumable when:
+      - sync_status = "paused" (transient error, should retry)
+      - sync_status = "syncing" (interrupted by restart)
+      - last_synced_page > 0 (has made progress)
+      - total_pages_available > last_synced_page (more pages to fetch)
     """
     try:
         from database import AsyncSessionLocal
@@ -142,7 +139,7 @@ async def _resume_interrupted_syncs() -> None:
                 select(BrandAPICredential).where(
                     BrandAPICredential.integration_name == "leaflink",
                     BrandAPICredential.is_active == True,
-                    BrandAPICredential.sync_status == "syncing",
+                    BrandAPICredential.sync_status.in_(["paused", "syncing"]),
                 )
             )
             interrupted = result.scalars().all()
@@ -165,8 +162,9 @@ async def _resume_interrupted_syncs() -> None:
         for cred in resumable:
             resume_from = (cred.last_synced_page or 0) + 1
             logger.info(
-                "startup: re_enqueuing_interrupted_sync brand=%s from_page=%s total_pages=%s",
+                "[OrdersSyncResume] brand=%s db_count_before=%s starting_page=%s total_pages=%s",
                 cred.brand_id,
+                0,
                 resume_from,
                 cred.total_pages_available,
             )
@@ -181,19 +179,19 @@ async def _resume_interrupted_syncs() -> None:
                             total_orders_available=cred.total_orders_available,
                         ))
                 logger.info(
-                    "startup: enqueued_interrupted_sync brand=%s start_page=%s",
+                    "[OrdersSyncResume] worker_enqueued=true brand=%s start_page=%s",
                     cred.brand_id,
                     resume_from,
                 )
             except Exception as enqueue_exc:
                 logger.error(
-                    "startup: enqueue_interrupted_sync_failed brand=%s error=%s",
+                    "[OrdersSyncResume] enqueue_error brand=%s error=%s",
                     cred.brand_id,
                     enqueue_exc,
                 )
 
     except Exception as exc:
-        logger.error("startup: resume_interrupted_syncs_failed error=%s", exc, exc_info=True)
+        logger.error("[OrdersSyncResume] failed error=%s", exc, exc_info=True)
 
 
 @asynccontextmanager
