@@ -523,6 +523,7 @@ async def orders_sync(
                             if _p1_cred:
                                 _p1_cred.last_synced_page = _phase1_page
                                 _p1_cred.total_pages_available = total_pages_available
+                                _p1_cred.total_orders_available = total_count_leaflink
                                 _p1_cred.sync_status = "syncing" if (next_leaflink_url and next_page_number) else "idle"
                                 _p1_cred.last_sync_at = datetime.now(timezone.utc)
                                 _p1_cred.last_error = None
@@ -531,6 +532,11 @@ async def orders_sync(
                         _resolved_brand_id,
                         _phase1_page,
                         total_pages_available,
+                    )
+                    logger.info(
+                        "[OrdersSync] persisted_total_orders_available brand=%s count=%s",
+                        _resolved_brand_id,
+                        total_count_leaflink,
                     )
                 except Exception as _p1_persist_exc:
                     logger.error(
@@ -575,6 +581,7 @@ async def orders_sync(
                             company_id=company_id,
                             total_pages=total_pages_available,
                             start_page=next_page_number,
+                            total_orders_available=total_count_leaflink,
                         )
 
                         logger.info(
@@ -652,6 +659,51 @@ async def orders_sync(
                     await db.rollback()
                 except Exception as rb_exc:
                     logger.warning("[OrdersSync] phase=1 rollback_failed error=%s", rb_exc)
+
+                # Check if we already have orders in DB — if so, pause instead of error
+                try:
+                    async with AsyncSessionLocal() as _exc_count_sess:
+                        _exc_count_res = await _exc_count_sess.execute(
+                            select(func.count(Order.id)).where(Order.brand_id == _resolved_brand_id)
+                        )
+                        existing_count = _exc_count_res.scalar_one() or 0
+                except Exception:
+                    existing_count = 0
+
+                if existing_count > 0:
+                    logger.warning(
+                        "[OrdersSync] leaflink_error_with_existing_data brand=%s error=%s existing_orders=%s",
+                        _resolved_brand_id,
+                        phase1_exc,
+                        existing_count,
+                    )
+                    # Update credential to paused state
+                    try:
+                        async with AsyncSessionLocal() as _err_sess:
+                            async with _err_sess.begin():
+                                _err_res = await _err_sess.execute(
+                                    select(BrandAPICredential).where(
+                                        BrandAPICredential.id == cred.id,
+                                    )
+                                )
+                                _err_cred = _err_res.scalar_one_or_none()
+                                if _err_cred:
+                                    _err_cred.sync_status = "paused"
+                                    _err_cred.last_error = _p1_emsg
+                    except Exception as _err_persist_exc:
+                        logger.error(
+                            "[OrdersSync] paused_state_persist_error brand=%s error=%s",
+                            _resolved_brand_id,
+                            _err_persist_exc,
+                        )
+                    return make_json_safe({
+                        "ok": True,
+                        "partial": True,
+                        "message": "LeafLink temporarily unavailable, returning cached data",
+                        "error": _p1_emsg,
+                        "sync_status": "paused",
+                        "existing_orders": existing_count,
+                    })
 
                 live_refresh_failed = True
                 sync_error = _p1_emsg
@@ -1011,12 +1063,14 @@ async def orders_sync_status(
         db_sync_status = cred.sync_status or "idle"
         db_last_synced_at = cred.last_sync_at.isoformat() if cred.last_sync_at else None
         db_last_error = cred.last_error
+        total_orders_available = cred.total_orders_available
     else:
         db_pages_synced = 0
         db_total_pages = 0
         db_sync_status = "idle"
         db_last_synced_at = None
         db_last_error = None
+        total_orders_available = None
 
     # In-memory state is more current than DB when a sync is active
     db_pages_synced_raw = db_pages_synced  # preserve original stored value for logging
@@ -1071,13 +1125,46 @@ async def orders_sync_status(
                 exc_info=True,
             )
 
-    # Calculate percent complete (capped at 100%)
-    percent_complete = round((displayed_pages_synced / total_pages) * 100, 1) if total_pages else 0.0
-    percent_complete = min(100.0, percent_complete)
-
-    # Detect sync completion: if we've synced all pages, mark as complete
+    # ------------------------------------------------------------------ #
+    # Calculate percent complete based on actual order counts (preferred) #
+    # ------------------------------------------------------------------ #
     effective_sync_status = None
-    if total_pages and displayed_pages_synced >= total_pages:
+
+    if total_orders_available and total_orders_available > 0:
+        percent_complete = round((total_orders_in_db / total_orders_available) * 100, 1)
+        percent_complete = min(100.0, percent_complete)
+        logger.info(
+            "[OrdersSyncStatus] percent_from_orders brand=%s orders=%s/%s percent=%.1f%%",
+            brand,
+            total_orders_in_db,
+            total_orders_available,
+            percent_complete,
+        )
+    else:
+        # Fallback to page-based calculation if total_orders_available not available
+        percent_complete = round((displayed_pages_synced / total_pages) * 100, 1) if total_pages else 0.0
+        percent_complete = min(100.0, percent_complete)
+        logger.info(
+            "[OrdersSyncStatus] percent_from_pages brand=%s pages=%s/%s percent=%.1f%%",
+            brand,
+            displayed_pages_synced,
+            total_pages,
+            percent_complete,
+        )
+
+    # Detect completion: if we've loaded all available orders
+    if total_orders_available and total_orders_in_db >= total_orders_available:
+        effective_sync_status = "complete"
+        bg_active = False
+        percent_complete = 100.0
+        logger.info(
+            "[OrdersSyncStatus] detected_completion_from_orders brand=%s orders=%s/%s",
+            brand,
+            total_orders_in_db,
+            total_orders_available,
+        )
+    # Fallback: detect completion from page count if order count not available
+    elif total_pages and displayed_pages_synced >= total_pages:
         effective_sync_status = "complete"
         bg_active = False
         percent_complete = 100.0
@@ -1094,7 +1181,7 @@ async def orders_sync_status(
         effective_sync_status = "syncing"
         bg_active = True  # Infer that sync is still running
     else:
-        # Use effective_sync_status from above (may be "complete" if all pages synced)
+        # Use effective_sync_status from above (may be "complete" if all orders/pages synced)
         if effective_sync_status is None:
             effective_sync_status = "syncing" if bg_active else db_sync_status
 
@@ -1110,7 +1197,7 @@ async def orders_sync_status(
         errors = [db_last_error] + errors
 
     logger.info(
-        "[OrdersSyncStatus] response brand=%s stored_page=%s inferred_page=%s displayed_page=%s/%s percent=%.1f%% orders=%s active=%s status=%s",
+        "[OrdersSyncStatus] response brand=%s stored_page=%s inferred_page=%s displayed_page=%s/%s percent=%.1f%% orders=%s/%s active=%s status=%s",
         brand,
         db_pages_synced_raw,
         inferred_pages_from_orders,
@@ -1118,6 +1205,7 @@ async def orders_sync_status(
         total_pages,
         percent_complete,
         total_orders_in_db,
+        total_orders_available,
         bg_active,
         effective_sync_status,
     )
@@ -1128,8 +1216,9 @@ async def orders_sync_status(
         "background_sync_active": bg_active,
         "pages_synced": displayed_pages_synced,
         "total_pages": total_pages,
-        "percent_complete": percent_complete,
         "total_orders_in_db": total_orders_in_db,
+        "total_orders_available": total_orders_available,
+        "percent_complete": percent_complete,
         "last_synced_at": db_last_synced_at,
         "sync_status": effective_sync_status,
         "estimated_completion_minutes": estimated_completion_minutes,

@@ -94,6 +94,7 @@ class BackgroundSyncManager:
         company_id: str,
         total_pages: int,
         start_page: int,
+        total_orders_available: Optional[int] = None,
     ) -> asyncio.Task:
         """
         Spawn a background asyncio task that calls
@@ -135,6 +136,7 @@ class BackgroundSyncManager:
                     start_page=start_page,
                     total_pages=total_pages,
                     manager=self,
+                    total_orders_available=total_orders_available,
                 )
             except asyncio.CancelledError:
                 logger.info(
@@ -205,6 +207,7 @@ class BackgroundSyncManager:
         total_pages: int,
         sync_status: str = "syncing",
         error: Optional[str] = None,
+        total_orders_available: Optional[int] = None,
     ) -> None:
         """Write last_synced_page and sync_status to BrandAPICredential."""
         try:
@@ -220,6 +223,8 @@ class BackgroundSyncManager:
                     if cred:
                         cred.last_synced_page = last_synced_page
                         cred.total_pages_available = total_pages
+                        if total_orders_available is not None:
+                            cred.total_orders_available = total_orders_available
                         cred.sync_status = sync_status
                         cred.last_sync_at = _utc_now()
                         if error:
