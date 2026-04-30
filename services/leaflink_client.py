@@ -266,6 +266,12 @@ class LeafLinkClient:
                 logger.error("[LeafLinkAuth] invalid_headers aborting_request path=%s", path)
                 raise ValueError("Invalid Authorization header")
 
+            logger.info(
+                "[LeafLinkAuth] request_start path=%s scheme=%s api_key_len=%s",
+                path,
+                self.auth_scheme,
+                len(self.api_key),
+            )
             logger.debug(
                 "[LeafLinkAuth] sending_request url=%s has_auth_header=true scheme=%s",
                 url,
@@ -288,6 +294,12 @@ class LeafLinkClient:
                 raise
 
         resp = _do_request()
+
+        logger.info(
+            "[LeafLinkSync] page_response status=%s path=%s",
+            resp.status_code,
+            path,
+        )
 
         content_type = resp.headers.get("Content-Type", "")
         logger.info(

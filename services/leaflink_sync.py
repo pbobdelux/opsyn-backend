@@ -793,6 +793,7 @@ async def sync_leaflink_background_continuous(
     manager: Optional["BackgroundSyncManager"] = None,
     total_orders_available: Optional[int] = None,
     sync_run_id: Optional[int] = None,
+    auth_scheme: str = "Token",
 ) -> None:
     """
     Fetch all remaining LeafLink pages in adaptive batches and upsert to DB.
@@ -881,7 +882,12 @@ async def sync_leaflink_background_continuous(
                     )
 
         try:
-            client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=brand_id)
+            client = LeafLinkClient(
+                api_key=api_key,
+                company_id=company_id,
+                brand_id=brand_id,
+                auth_scheme=auth_scheme,
+            )
         except Exception as client_exc:
             logger.error(
                 "[OrdersSync] bg_sync_client_init_error brand=%s error=%s",
