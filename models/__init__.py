@@ -24,6 +24,8 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -101,6 +103,8 @@ class Order(Base):
 
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     last_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+    sync_run_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("sync_runs.id"), nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
@@ -240,6 +244,132 @@ class TenantCredential(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+
+# =============================================================================
+# Sync Run Model
+# =============================================================================
+
+class SyncRun(Base):
+    """
+    Tracks a single sync operation for a brand.
+
+    One active SyncRun per brand at a time.
+    Completed/failed runs are archived for audit.
+    """
+    __tablename__ = "sync_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    brand_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    integration_name: Mapped[str] = mapped_column(String(50), nullable=False, default="leaflink")
+
+    # Sync run state
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="queued",
+        comment="idle | queued | syncing | completed | stalled | failed"
+    )
+    mode: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="incremental",
+        comment="full | incremental"
+    )
+
+    # Progress tracking
+    pages_synced: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_pages: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    orders_loaded_this_run: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_orders_available: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Cursor/resumption
+    current_cursor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_page: Mapped[int | None] = mapped_column(Integer, nullable=True, default=1)
+    last_successful_cursor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_successful_page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Timing
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    last_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Error tracking
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    stalled_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # Worker tracking
+    worker_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Metadata
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+    # Indexes for efficient queries
+    __table_args__ = (
+        Index("ix_sync_runs_brand_status", "brand_id", "status"),
+        Index("ix_sync_runs_brand_started", "brand_id", "started_at"),
+    )
+
+    @classmethod
+    async def get_active_run(cls, db: AsyncSession, brand_id: str) -> Optional["SyncRun"]:
+        """Get the currently active sync run for a brand."""
+        result = await db.execute(
+            select(cls).where(
+                cls.brand_id == brand_id,
+                cls.status.in_(["queued", "syncing"])
+            ).order_by(cls.started_at.desc()).limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    @classmethod
+    async def get_last_completed_run(cls, db: AsyncSession, brand_id: str) -> Optional["SyncRun"]:
+        """Get the last completed sync run for a brand."""
+        result = await db.execute(
+            select(cls).where(
+                cls.brand_id == brand_id,
+                cls.status == "completed"
+            ).order_by(cls.completed_at.desc()).limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    def percent_complete(self) -> float | None:
+        """Calculate percent complete from pages_synced / total_pages."""
+        if self.total_pages is None or self.total_pages == 0:
+            return None
+        percent = (self.pages_synced / self.total_pages) * 100
+        return min(100.0, max(0.0, percent))  # Clamp 0-100
+
+    def is_stalled(self, stall_threshold_seconds: int = 90) -> bool:
+        """Check if sync is stalled (no progress for threshold seconds)."""
+        if self.status not in ["syncing", "queued"]:
+            return False
+        if self.last_progress_at is None:
+            return False
+        elapsed = (datetime.now(timezone.utc) - self.last_progress_at).total_seconds()
+        return elapsed > stall_threshold_seconds
+
+    def estimated_completion_minutes(self) -> float | None:
+        """Estimate completion time based on current progress."""
+        if self.status != "syncing" or self.is_stalled():
+            return None
+        if self.total_pages is None or self.total_pages == 0:
+            return None
+        if self.pages_synced == 0:
+            return None
+
+        # Calculate average time per page
+        elapsed_seconds = (datetime.now(timezone.utc) - self.started_at).total_seconds()
+        if elapsed_seconds < 1:
+            return None
+
+        avg_seconds_per_page = elapsed_seconds / self.pages_synced
+        remaining_pages = self.total_pages - self.pages_synced
+        estimated_seconds = remaining_pages * avg_seconds_per_page
+
+        return estimated_seconds / 60.0  # Convert to minutes
 
 
 # =============================================================================
