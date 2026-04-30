@@ -618,24 +618,17 @@ async def leaflink_auth_test(
     brand: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Test LeafLink authentication with multiple auth schemes.
-
-    Tries Bearer, Token, and Raw schemes in order.
-    Returns which scheme succeeds and saves it to the database.
-
-    GET /leaflink/auth-test?brand=noble-nectar
-    """
+    """Test LeafLink authentication with multiple auth schemes."""
     from database import AsyncSessionLocal
     from routes.orders import _load_leaflink_credential
 
-    logger.info("[LeafLinkAuth] auth_test_request brand=%s", brand)
+    logger.info("[CredentialResolver] auth_test_request brand=%s", brand)
 
-    # Load credential using strict priority
+    # Load credential using strict priority (DB first, then ENV)
     try:
         cred = await _load_leaflink_credential(db, brand)
     except ValueError as val_exc:
-        logger.error("[LeafLinkAuth] auth_test_credential_error error=%s", val_exc)
+        logger.error("[CredentialResolver] auth_test_credential_error error=%s", val_exc)
         return {
             "ok": False,
             "status_code": None,
@@ -644,7 +637,7 @@ async def leaflink_auth_test(
         }
 
     if not cred:
-        logger.error("[LeafLinkAuth] auth_test_no_credential brand=%s", brand)
+        logger.error("[CredentialResolver] auth_test_no_credential brand=%s", brand)
         return {
             "ok": False,
             "status_code": None,
@@ -656,10 +649,10 @@ async def leaflink_auth_test(
     company_id = (cred.company_id or "").strip()
     brand_id = cred.brand_id
 
-    # Safety check: validate key length
+    # Safety check: validate key length (should not happen if _load_leaflink_credential works)
     if len(api_key) > 50:
         logger.error(
-            "[LeafLinkAuth] WRONG_KEY_LENGTH brand=%s len=%s — REJECTING",
+            "[CredentialResolver] WRONG_KEY_LENGTH brand=%s len=%s — REJECTING",
             brand_id,
             len(api_key),
         )
@@ -676,7 +669,7 @@ async def leaflink_auth_test(
         }
 
     logger.info(
-        "[LeafLinkAuth] auth_test_credential brand=%s key_len=%s company_id=%s",
+        "[CredentialResolver] auth_test_credential brand=%s key_len=%s company_id=%s",
         brand_id,
         len(api_key),
         company_id,
@@ -689,7 +682,7 @@ async def leaflink_auth_test(
 
     for scheme in schemes_to_try:
         try:
-            logger.info("[LeafLinkAuth] attempt scheme=%s brand=%s", scheme, brand_id)
+            logger.info("[CredentialResolver] attempt scheme=%s brand=%s", scheme, brand_id)
 
             client = LeafLinkClient(
                 api_key=api_key,
@@ -703,7 +696,7 @@ async def leaflink_auth_test(
             status_code = resp.status_code
 
             logger.info(
-                "[LeafLinkAuth] attempt scheme=%s status=%s brand=%s",
+                "[CredentialResolver] attempt scheme=%s status=%s brand=%s",
                 scheme,
                 status_code,
                 brand_id,
@@ -717,7 +710,7 @@ async def leaflink_auth_test(
             if status_code == 200:
                 successful_scheme = scheme
                 logger.info(
-                    "[LeafLinkAuth] selected_scheme=%s brand=%s",
+                    "[CredentialResolver] selected_scheme=%s brand=%s",
                     scheme,
                     brand_id,
                 )
@@ -725,7 +718,7 @@ async def leaflink_auth_test(
 
         except Exception as exc:
             logger.error(
-                "[LeafLinkAuth] attempt_error scheme=%s error=%s brand=%s",
+                "[CredentialResolver] attempt_error scheme=%s error=%s brand=%s",
                 scheme,
                 exc,
                 brand_id,
@@ -752,19 +745,19 @@ async def leaflink_auth_test(
                         if save_cred:
                             save_cred.auth_scheme = successful_scheme
                             logger.info(
-                                "[LeafLinkAuth] saved_scheme scheme=%s brand=%s",
+                                "[CredentialResolver] saved_scheme scheme=%s brand=%s",
                                 successful_scheme,
                                 brand_id,
                             )
         except Exception as save_exc:
             logger.error(
-                "[LeafLinkAuth] save_scheme_error error=%s brand=%s",
+                "[CredentialResolver] save_scheme_error error=%s brand=%s",
                 save_exc,
                 brand_id,
             )
 
         logger.info(
-            "[LeafLinkAuth] auth_test_success scheme=%s brand=%s",
+            "[CredentialResolver] auth_test_success scheme=%s brand=%s",
             successful_scheme,
             brand_id,
         )
@@ -783,7 +776,7 @@ async def leaflink_auth_test(
         }
     else:
         logger.error(
-            "[LeafLinkAuth] auth_test_failed all_schemes_failed brand=%s",
+            "[CredentialResolver] auth_test_failed all_schemes_failed brand=%s",
             brand_id,
         )
         return {
