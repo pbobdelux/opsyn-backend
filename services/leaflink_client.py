@@ -766,6 +766,131 @@ class LeafLinkClient:
             "total_pages": total_pages,
         }
 
+    def fetch_orders_since(
+        self,
+        since: "datetime",
+        page_size: int = 100,
+        normalize: bool = True,
+        brand: str = "unknown",
+        max_pages: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Fetch orders updated since a given timestamp (incremental sync).
+
+        Args:
+            since: Only fetch orders updated at or after this timestamp.
+            page_size: Orders per page.
+            normalize: When True, run each raw order through _normalize_order.
+            brand: Brand slug used only for structured log messages.
+            max_pages: Maximum pages to fetch (None = unlimited, capped at 10 000).
+
+        Returns:
+            {
+                "orders": [...],
+                "pages_fetched": <int>,
+            }
+        """
+        from datetime import datetime as _datetime
+
+        effective_max = max_pages if max_pages is not None else 10_000
+
+        all_orders: List[Dict[str, Any]] = []
+        pages_fetched = 0
+        page = 1
+        next_url: Optional[str] = None
+
+        # Format timestamp for LeafLink API (ISO 8601)
+        since_str = since.isoformat() if isinstance(since, _datetime) else str(since)
+
+        try:
+            while pages_fetched < effective_max:
+                if next_url:
+                    resp = self._get_raw_url(next_url)
+                    if resp.status_code in (401, 403):
+                        logger.error(
+                            "[LeafLinkAuth] pagination_auth_failed status=%s",
+                            resp.status_code,
+                        )
+                        raise RuntimeError(
+                            f"LeafLink pagination auth failed: {resp.text[:200]}"
+                        )
+                    if not resp.ok:
+                        raise RuntimeError(
+                            f"LeafLink API error: {resp.status_code} {resp.text[:200]}"
+                        )
+                    payload = resp.json()
+                else:
+                    # Fetch with updated_at filter
+                    params: Dict[str, Any] = {
+                        "page": page,
+                        "page_size": page_size,
+                        "include_children": "line_items,customer,sales_reps",
+                        "updated_at__gte": since_str,  # Only orders updated at or after this time
+                    }
+                    resp = self._get_raw("orders-received/", params=params)
+                    if not resp.ok:
+                        raise RuntimeError(
+                            f"LeafLink API error: {resp.status_code} {resp.text[:200]}"
+                        )
+                    payload = resp.json()
+
+                if isinstance(payload, list):
+                    results = payload
+                    next_url = None
+                elif isinstance(payload, dict):
+                    results = (
+                        payload.get("results")
+                        or payload.get("data")
+                        or payload.get("orders")
+                        or []
+                    )
+                    next_url = payload.get("next")  # Cursor-based pagination
+                else:
+                    raise RuntimeError(
+                        f"Unexpected LeafLink response type: {type(payload).__name__}"
+                    )
+
+                if not isinstance(results, list):
+                    raise RuntimeError(
+                        f"Unexpected LeafLink results type: {type(results).__name__}"
+                    )
+
+                if not results:
+                    break
+
+                if normalize:
+                    for raw in results:
+                        if isinstance(raw, dict):
+                            all_orders.append(self._normalize_order(raw))
+                else:
+                    for raw in results:
+                        if isinstance(raw, dict):
+                            all_orders.append(raw)
+
+                pages_fetched += 1
+                page += 1
+
+                if not next_url:
+                    break
+
+        except Exception as exc:
+            logger.error(
+                "[LeafLinkSync] incremental_fetch_error brand=%s error=%s",
+                brand,
+                str(exc)[:500],
+                exc_info=True,
+            )
+            raise
+
+        logger.info(
+            "[LeafLinkSync] incremental_fetch_complete brand=%s since=%s pages=%s orders=%s",
+            brand,
+            since_str,
+            pages_fetched,
+            len(all_orders),
+        )
+
+        return {"orders": all_orders, "pages_fetched": pages_fetched}
+
     def fetch_recent_orders(
         self,
         max_pages: Optional[int] = None,

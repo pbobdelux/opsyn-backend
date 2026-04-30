@@ -170,7 +170,7 @@ async def update_progress(
 
 
 async def mark_completed(db: AsyncSession, sync_run_id: int) -> None:
-    """Mark a SyncRun as completed."""
+    """Mark a SyncRun as completed and record last_successful_sync_at."""
     result = await db.execute(
         select(SyncRun).where(SyncRun.id == sync_run_id)
     )
@@ -182,6 +182,7 @@ async def mark_completed(db: AsyncSession, sync_run_id: int) -> None:
     now = _utc_now()
     run.status = "completed"
     run.completed_at = now
+    run.last_successful_sync_at = now  # Used as lower bound for next incremental sync
     run.updated_at = now
     run.last_error = None
 
@@ -374,6 +375,7 @@ def serialize_sync_run(run: SyncRun, is_stalled: bool = False) -> dict:
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "last_progress_at": run.last_progress_at.isoformat() if run.last_progress_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "last_successful_sync_at": run.last_successful_sync_at.isoformat() if run.last_successful_sync_at else None,
         "created_at": run.created_at.isoformat() if run.created_at else None,
         "updated_at": run.updated_at.isoformat() if run.updated_at else None,
         "estimated_completion_minutes": round(eta_minutes, 1) if eta_minutes is not None else None,

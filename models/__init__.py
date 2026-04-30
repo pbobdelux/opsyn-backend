@@ -293,6 +293,11 @@ class SyncRun(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     last_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_successful_sync_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Timestamp of the last successfully completed sync run; used as the lower bound for incremental fetches",
+    )
 
     # Error tracking
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
