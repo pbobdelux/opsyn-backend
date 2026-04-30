@@ -757,6 +757,7 @@ async def sync_leaflink_background_continuous(
     start_page: int,
     total_pages: int,
     manager: Optional["BackgroundSyncManager"] = None,
+    total_orders_available: Optional[int] = None,
 ) -> None:
     """
     Fetch all remaining LeafLink pages in adaptive batches and upsert to DB.
@@ -815,6 +816,7 @@ async def sync_leaflink_background_continuous(
                 total_pages=total_pages,
                 sync_status="error",
                 error=str(client_exc),
+                total_orders_available=total_orders_available,
             )
         return
 
@@ -929,6 +931,7 @@ async def sync_leaflink_background_continuous(
                 last_synced_page=last_completed_page,
                 total_pages=total_pages,
                 sync_status="syncing",
+                total_orders_available=total_orders_available,
             )
 
         percent = round((last_completed_page / total_pages) * 100, 1) if total_pages else 0
@@ -971,6 +974,7 @@ async def sync_leaflink_background_continuous(
             last_synced_page=final_page,
             total_pages=total_pages,
             sync_status="complete",
+            total_orders_available=total_orders_available,
         )
 
     logger.info(
