@@ -1,116 +1,276 @@
+"""
+sync_scheduler.py — SyncRun-based background sync worker.
+
+Polls the `sync_runs` table for queued or syncing jobs, claims them, fetches
+the brand's LeafLink credentials, and drives the full page-by-page sync via
+sync_leaflink_background_continuous().
+
+Replaces the old HTTP-based scheduler that POSTed to /sync/leaflink/run.
+
+Environment variables:
+  DATABASE_URL          — PostgreSQL connection string (required)
+  POLL_INTERVAL_SECONDS — seconds to sleep when no jobs are found (default 5)
+  WORKER_ID             — unique identifier for this worker instance (default "worker-1")
+  STALL_THRESHOLD_SECONDS — seconds without progress before marking a job stalled (default 90)
+"""
+
+import asyncio
 import logging
 import os
-import time
-from datetime import datetime
+import sys
+from datetime import datetime, timezone
 
-import requests
-
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    stream=sys.stdout,
 )
-
 logger = logging.getLogger("opsyn-sync-worker")
 
-# =============================================================================
-# CONFIG
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "5"))
+WORKER_ID = os.getenv("WORKER_ID", "worker-1")
+STALL_THRESHOLD_SECONDS = int(os.getenv("STALL_THRESHOLD_SECONDS", "90"))
 
-SYNC_URL = os.getenv(
-    "SYNC_URL",
-    "https://opsyn-backend-production.up.railway.app/sync/leaflink/run",
-)
-
-SYNC_SECRET = os.getenv("OPSYN_SYNC_SECRET", "")
-
-SYNC_ORG_ID = os.getenv("SYNC_ORG_ID", "org_onboarding")
-SYNC_BRAND_ID = os.getenv("SYNC_BRAND_ID", "noble-nectar")
-
-# Default = every 30 minutes
-SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", "1800"))
-
-# Retry settings
-MAX_RETRIES = 3
-RETRY_DELAY_SECONDS = 5
+# ---------------------------------------------------------------------------
+# Bootstrap: ensure the repo root is on sys.path so shared modules resolve.
+# The scheduler lives in services/ which is one level below the root.
+# ---------------------------------------------------------------------------
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 
-# =============================================================================
-# CORE SYNC FUNCTION
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Core poll-and-execute function
+# ---------------------------------------------------------------------------
 
-def run_single_sync():
-    logger.info("🚀 Starting LeafLink sync")
+async def poll_and_execute() -> None:
+    """
+    Single poll iteration:
+      1. Query SyncRun for the oldest queued or syncing job.
+      2. Claim it (set worker_id, status=syncing, last_progress_at).
+      3. Fetch the brand's LeafLink credential.
+      4. Execute sync_leaflink_background_continuous().
+      5. Handle errors: mark job as failed with last_error.
+    """
+    from sqlalchemy import select
 
-    headers = {}
-    if SYNC_SECRET:
-        headers["X-OPSYN-SECRET"] = SYNC_SECRET
-        logger.info("sync_auth: header_present=true")
-    else:
-        logger.warning("sync_auth: OPSYN_SYNC_SECRET not set — requests will be unauthorized")
+    from database import AsyncSessionLocal
+    from models import BrandAPICredential, SyncRun
+    from services.leaflink_sync import sync_leaflink_background_continuous
+    from services.sync_run_manager import detect_stalled, mark_stalled
 
-    payload = {
-        "org_id": SYNC_ORG_ID,
-        "brand_id": SYNC_BRAND_ID,
-    }
+    logger.info("[SyncWorker] polling for jobs")
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    # ---------------------------------------------------------------------- #
+    # Step 1: Query for queued or syncing jobs                                #
+    # ---------------------------------------------------------------------- #
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(SyncRun)
+            .where(SyncRun.status.in_(["queued", "syncing"]))
+            .order_by(SyncRun.started_at.asc())
+            .limit(1)
+        )
+        sync_run = result.scalar_one_or_none()
+
+        if not sync_run:
+            logger.info("[SyncWorker] polling for jobs - none found")
+            return
+
+        sync_run_id = sync_run.id
+        brand_id = sync_run.brand_id
+        start_page = sync_run.current_page or 1
+        total_pages = sync_run.total_pages or 1
+        total_orders_available = sync_run.total_orders_available
+
+        logger.info(
+            "[SyncWorker] job_found id=%s brand=%s status=%s start_page=%s total_pages=%s",
+            sync_run_id,
+            brand_id,
+            sync_run.status,
+            start_page,
+            total_pages,
+        )
+
+        # ------------------------------------------------------------------ #
+        # Stall detection: if the job is already syncing but has made no      #
+        # progress for STALL_THRESHOLD_SECONDS, mark it stalled and skip it.  #
+        # ------------------------------------------------------------------ #
+        if detect_stalled(sync_run, stall_threshold_seconds=STALL_THRESHOLD_SECONDS):
+            stall_reason = (
+                f"no_progress_for_{STALL_THRESHOLD_SECONDS}s "
+                f"last_progress_at={sync_run.last_progress_at}"
+            )
+            logger.warning(
+                "[SyncWorker] job_stalled id=%s brand=%s reason=%s",
+                sync_run_id,
+                brand_id,
+                stall_reason,
+            )
+            await mark_stalled(db, sync_run_id, stall_reason)
+            await db.commit()
+            return
+
+        # ------------------------------------------------------------------ #
+        # Step 2: Claim the job                                               #
+        # ------------------------------------------------------------------ #
+        sync_run.worker_id = WORKER_ID
+        sync_run.status = "syncing"
+        sync_run.last_progress_at = datetime.now(timezone.utc)
+        await db.commit()
+
+        logger.info(
+            "[SyncWorker] job_claimed id=%s worker_id=%s brand=%s",
+            sync_run_id,
+            WORKER_ID,
+            brand_id,
+        )
+
+    # ---------------------------------------------------------------------- #
+    # Step 3: Fetch credential                                                #
+    # ---------------------------------------------------------------------- #
+    async with AsyncSessionLocal() as db:
+        cred_result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.brand_id == brand_id,
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+            )
+        )
+        cred = cred_result.scalar_one_or_none()
+
+        if not cred:
+            logger.error(
+                "[SyncWorker] credential_not_found id=%s brand=%s",
+                sync_run_id,
+                brand_id,
+            )
+            # Mark job as failed
+            fail_result = await db.execute(
+                select(SyncRun).where(SyncRun.id == sync_run_id)
+            )
+            fail_run = fail_result.scalar_one_or_none()
+            if fail_run:
+                fail_run.status = "failed"
+                fail_run.last_error = "LeafLink credential not found"
+                fail_run.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+            return
+
+        api_key: str = cred.api_key or ""
+        company_id: str = cred.company_id or ""
+
+        if not api_key.strip() or not company_id.strip():
+            logger.error(
+                "[SyncWorker] credential_incomplete id=%s brand=%s "
+                "api_key_present=%s company_id_present=%s",
+                sync_run_id,
+                brand_id,
+                bool(api_key.strip()),
+                bool(company_id.strip()),
+            )
+            fail_result = await db.execute(
+                select(SyncRun).where(SyncRun.id == sync_run_id)
+            )
+            fail_run = fail_result.scalar_one_or_none()
+            if fail_run:
+                fail_run.status = "failed"
+                fail_run.last_error = "LeafLink api_key or company_id is empty"
+                fail_run.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+            return
+
+    # ---------------------------------------------------------------------- #
+    # Step 4: Execute sync                                                    #
+    # ---------------------------------------------------------------------- #
+    logger.info(
+        "[SyncWorker] starting page fetch id=%s start_page=%s total_pages=%s",
+        sync_run_id,
+        start_page,
+        total_pages,
+    )
+
+    try:
+        await sync_leaflink_background_continuous(
+            brand_id=brand_id,
+            api_key=api_key,
+            company_id=company_id,
+            start_page=start_page,
+            total_pages=total_pages,
+            manager=None,  # No in-memory manager needed — DB-only progress tracking
+            sync_run_id=sync_run_id,  # Pass SyncRun ID for direct DB updates
+            total_orders_available=total_orders_available,
+        )
+
+        logger.info("[SyncWorker] sync_complete id=%s brand=%s", sync_run_id, brand_id)
+
+    except Exception as sync_exc:
+        logger.error(
+            "[SyncWorker] sync_error id=%s brand=%s error=%s",
+            sync_run_id,
+            brand_id,
+            sync_exc,
+            exc_info=True,
+        )
+        # Mark job as failed
         try:
-            start_time = datetime.utcnow()
-
-            response = requests.post(
-                SYNC_URL,
-                json=payload,
-                headers=headers,
-                timeout=120,
-            )
-
-            duration = (datetime.utcnow() - start_time).total_seconds()
-
-            if response.status_code == 200:
-                logger.info("✅ Sync successful (%.2fs)", duration)
-                logger.info("Response: %s", response.text[:500])
-                return True
-            else:
-                logger.warning(
-                    "⚠️ Sync failed (attempt %s/%s) - status: %s",
-                    attempt,
-                    MAX_RETRIES,
-                    response.status_code,
+            async with AsyncSessionLocal() as err_db:
+                err_result = await err_db.execute(
+                    select(SyncRun).where(SyncRun.id == sync_run_id)
                 )
-                logger.warning("Response: %s", response.text[:500])
-
-        except Exception as exc:
-            logger.exception(
-                "❌ Sync exception (attempt %s/%s): %s",
-                attempt,
-                MAX_RETRIES,
-                exc,
+                err_run = err_result.scalar_one_or_none()
+                if err_run:
+                    err_run.status = "failed"
+                    err_run.last_error = str(sync_exc)
+                    err_run.completed_at = datetime.now(timezone.utc)
+                    await err_db.commit()
+        except Exception as mark_exc:
+            logger.error(
+                "[SyncWorker] failed_to_mark_error id=%s error=%s",
+                sync_run_id,
+                mark_exc,
             )
 
-        if attempt < MAX_RETRIES:
-            logger.info("Retrying in %s seconds...", RETRY_DELAY_SECONDS)
-            time.sleep(RETRY_DELAY_SECONDS)
 
-    logger.error("🚨 Sync failed after %s attempts", MAX_RETRIES)
-    return False
+# ---------------------------------------------------------------------------
+# Scheduler loop
+# ---------------------------------------------------------------------------
 
-
-# =============================================================================
-# SCHEDULER LOOP
-# =============================================================================
-
-def run_scheduler():
+async def run_scheduler() -> None:
+    """
+    Main scheduler loop. Polls for SyncRun jobs every POLL_INTERVAL_SECONDS.
+    """
     logger.info("===================================")
-    logger.info("Opsyn Sync Scheduler Started")
+    logger.info("Opsyn Sync Worker Started")
     logger.info("===================================")
-    logger.info("Sync URL: %s", SYNC_URL)
-    logger.info("Org ID: %s", SYNC_ORG_ID)
-    logger.info("Brand ID: %s", SYNC_BRAND_ID)
-    logger.info("Interval: %s seconds", SYNC_INTERVAL_SECONDS)
+    logger.info("Worker ID: %s", WORKER_ID)
+    logger.info("Poll interval: %s seconds", POLL_INTERVAL_SECONDS)
+    logger.info("Stall threshold: %s seconds", STALL_THRESHOLD_SECONDS)
     logger.info("===================================")
 
     while True:
-        run_single_sync()
+        try:
+            await poll_and_execute()
+        except Exception as loop_exc:
+            logger.error(
+                "[SyncWorker] loop_error error=%s",
+                loop_exc,
+                exc_info=True,
+            )
 
-        logger.info("😴 Sleeping for %s seconds...", SYNC_INTERVAL_SECONDS)
-        time.sleep(SYNC_INTERVAL_SECONDS)
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+def main() -> None:
+    asyncio.run(run_scheduler())
+
+
+if __name__ == "__main__":
+    main()
