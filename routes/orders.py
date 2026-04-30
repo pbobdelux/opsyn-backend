@@ -615,23 +615,19 @@ async def orders_sync(
                 "data_source": "error",
             }
 
-    # ------------------------------------------------------------------ #
-    # Load the active LeafLink credential — tenant-safe, DB-first        #
-    # Normalize brand_filter before lookup to handle whitespace/case     #
-    # ------------------------------------------------------------------ #
+    # ================================================================
+    # Load the active LeafLink credential using unified resolver
+    # ================================================================
     from services.credential_resolver import resolve_brand_credential
 
-    _resolved_brand_id: Optional[str] = None
-    _resolved_company_id: Optional[str] = None
-    _active_cred = None
-    _credential_found: bool = False
+    logger.info("[SYNC] resolver_lookup_start brand=%s", brand_filter)
 
-    # Use shared resolver with normalization to confirm credential exists
+    # Use shared resolver with normalization
     _cred_row = await resolve_brand_credential(db, brand_filter, "leaflink")
 
     if not _cred_row:
         logger.error(
-            "[CredentialResolver] sync_no_credentials_found brand=%s",
+            "[SYNC] resolver_credential_not_found brand=%s",
             brand_filter,
         )
         return {
@@ -646,66 +642,38 @@ async def orders_sync(
             "leaflink_call_attempted": False,
         }
 
-    # Use the normalized brand_id from the resolver for all subsequent lookups
-    _normalized_brand_filter = _cred_row[1]
+    # Extract credential data from resolver result
+    _credential_id = _cred_row[0]
+    _resolved_brand_id = _cred_row[1]
+    _resolved_integration = _cred_row[2]
+    _resolved_company_id = _cred_row[3]
+    _api_key = _cred_row[4]
+    _is_active = _cred_row[5]
+    _sync_status = _cred_row[6]
+    _last_synced_page = _cred_row[7]
 
-    # Load full ORM credential (needed for auth_scheme and other fields)
-    try:
-        _active_cred = await resolve_leaflink_credential(db, brand_id=_normalized_brand_filter, allow_env_fallback=False)
-    except ValueError as _val_exc:
-        logger.error(
-            "[CredentialResolver] sync_credential_error error=%s",
-            _val_exc,
-        )
-        return {
-            "ok": False,
-            "error": str(_val_exc),
-            "brand_id": brand_filter,
-            "credential_found": False,
-            "credential_source": "db",
-            "env_checked": False,
-            "sync_triggered": False,
-            "worker_enqueued": False,
-            "leaflink_call_attempted": False,
-        }
+    logger.info(
+        "[SYNC] resolver_credential_found brand=%s company_id=%s credential_id=%s",
+        _resolved_brand_id,
+        _resolved_company_id,
+        _credential_id,
+    )
 
-    except Exception as _cred_exc:
-        await db.rollback()
-        logger.error(
-            "[CredentialResolver] sync_credential_load_error brand=%s error=%s",
-            brand_filter,
-            _cred_exc,
-            exc_info=True,
-        )
+    # Create a minimal credential object for compatibility with existing code
+    # that expects a BrandAPICredential-like object
+    class _CredentialProxy:
+        def __init__(self, row_data):
+            self.id = row_data[0]
+            self.brand_id = row_data[1]
+            self.integration_name = row_data[2]
+            self.company_id = row_data[3]
+            self.api_key = row_data[4]
+            self.is_active = row_data[5]
+            self.sync_status = row_data[6]
+            self.last_synced_page = row_data[7]
 
-    if _active_cred:
-        _credential_found = True
-        _resolved_brand_id = _active_cred.brand_id
-        _resolved_company_id = _active_cred.company_id
-
-        logger.info(
-            "[CredentialResolver] sync_credential_loaded brand=%s credential_id=%s key_len=%s company_id=%s",
-            _resolved_brand_id,
-            _active_cred.id,
-            len((_active_cred.api_key or "").strip()),
-            _resolved_company_id,
-        )
-    else:
-        logger.error(
-            "[CredentialResolver] sync_no_credentials_found brand=%s",
-            brand_filter,
-        )
-        return {
-            "ok": False,
-            "error": "tenant_leaflink_credential_not_found",
-            "brand_id": brand_filter,
-            "credential_found": False,
-            "credential_source": "db",
-            "env_checked": False,
-            "sync_triggered": False,
-            "worker_enqueued": False,
-            "leaflink_call_attempted": False,
-        }
+    _active_cred = _CredentialProxy(_cred_row)
+    _credential_found = True
 
     # Use resolved brand ID for all subsequent operations
     _effective_brand_id: Optional[str] = _resolved_brand_id
