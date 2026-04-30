@@ -662,6 +662,7 @@ async def orders_sync(
     # Create a minimal credential object for compatibility with existing code
     # that expects a BrandAPICredential-like object
     class _CredentialProxy:
+        """Lightweight proxy for credential data from resolver tuple."""
         def __init__(self, row_data):
             self.id = row_data[0]
             self.brand_id = row_data[1]
@@ -671,9 +672,19 @@ async def orders_sync(
             self.is_active = row_data[5]
             self.sync_status = row_data[6]
             self.last_synced_page = row_data[7]
+            # Default auth_scheme to "Token" (verified by /leaflink/auth-test)
+            self.auth_scheme = "Token"
+            # Nullable fields
+            self.total_pages_available = None
+            self.total_orders_available = None
 
     _active_cred = _CredentialProxy(_cred_row)
     _credential_found = True
+
+    # Ensure auth_scheme is set (default to Token if missing)
+    if not hasattr(_active_cred, 'auth_scheme') or not _active_cred.auth_scheme:
+        _active_cred.auth_scheme = "Token"
+        logger.info("[SYNC] auth_scheme_defaulted to Token")
 
     # Use resolved brand ID for all subsequent operations
     _effective_brand_id: Optional[str] = _resolved_brand_id
