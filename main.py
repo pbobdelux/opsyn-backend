@@ -118,8 +118,10 @@ async def _verify_database_schema() -> None:
 
 async def _resume_interrupted_syncs() -> None:
     """
-    On startup, check BrandAPICredential for any syncs that were in-progress
-    when the service last shut down and resume them from last_synced_page + 1.
+    On startup, re-enqueue any syncs that were in-progress when the service
+    last shut down by inserting a pending SyncRequest row for each interrupted
+    credential.  The opsyn-sync-worker will pick these up and resume from
+    last_synced_page + 1.
 
     A sync is considered interrupted when:
       - sync_status = "syncing"
@@ -129,8 +131,7 @@ async def _resume_interrupted_syncs() -> None:
     """
     try:
         from database import AsyncSessionLocal
-        from models import BrandAPICredential
-        from services.background_sync_manager import sync_manager
+        from models import BrandAPICredential, SyncRequest
 
         if AsyncSessionLocal is None:
             logger.warning("startup: DATABASE_URL not set — skipping sync resume check")
@@ -164,18 +165,32 @@ async def _resume_interrupted_syncs() -> None:
         for cred in resumable:
             resume_from = (cred.last_synced_page or 0) + 1
             logger.info(
-                "startup: resuming_sync brand=%s from_page=%s total_pages=%s",
+                "startup: re_enqueuing_interrupted_sync brand=%s from_page=%s total_pages=%s",
                 cred.brand_id,
                 resume_from,
                 cred.total_pages_available,
             )
-            sync_manager.start_sync(
-                brand_id=cred.brand_id,
-                api_key=cred.api_key,
-                company_id=cred.company_id,
-                total_pages=cred.total_pages_available,
-                start_page=resume_from,
-            )
+            try:
+                async with AsyncSessionLocal() as enqueue_sess:
+                    async with enqueue_sess.begin():
+                        enqueue_sess.add(SyncRequest(
+                            brand_id=cred.brand_id,
+                            status="pending",
+                            start_page=resume_from,
+                            total_pages=cred.total_pages_available,
+                            total_orders_available=cred.total_orders_available,
+                        ))
+                logger.info(
+                    "startup: enqueued_interrupted_sync brand=%s start_page=%s",
+                    cred.brand_id,
+                    resume_from,
+                )
+            except Exception as enqueue_exc:
+                logger.error(
+                    "startup: enqueue_interrupted_sync_failed brand=%s error=%s",
+                    cred.brand_id,
+                    enqueue_exc,
+                )
 
     except Exception as exc:
         logger.error("startup: resume_interrupted_syncs_failed error=%s", exc, exc_info=True)

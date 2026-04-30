@@ -235,6 +235,25 @@ class TenantCredential(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
 
+# =============================================================================
+# Sync Queue Model
+# =============================================================================
+
+class SyncRequest(Base):
+    __tablename__ = "sync_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    brand_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(50), default="pending")  # pending, processing, complete, error
+    start_page: Mapped[int] = mapped_column(Integer, default=1)
+    total_pages: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_orders_available: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 # ---------------------------------------------------------------------------
 # Assistant models
 # ---------------------------------------------------------------------------
