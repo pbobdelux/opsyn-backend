@@ -444,13 +444,17 @@ async def sync_leaflink_orders_headers_only(
     brand_id: str,
     orders: list[dict],
     pages_fetched: int = 0,
+    batch_size: int = HEADER_BATCH_SIZE,
 ) -> dict[str, Any]:
     """Upsert ONLY order headers (Order table) for Phase 1 — no line items.
 
-    Opens its own DB sessions and commits in small batches of HEADER_BATCH_SIZE
+    Opens its own DB sessions and commits in small batches of ``batch_size``
     so that no single transaction holds locks for more than a handful of rows.
     Line item data is preserved in ``line_items_json`` on the Order row so the
     background worker can read it back without re-fetching from LeafLink.
+
+    After all header batches are committed a fire-and-forget asyncio task is
+    spawned to write the corresponding OrderLine rows in the background.
 
     Returns a summary dict compatible with the existing sync_result contract.
     """
@@ -468,16 +472,16 @@ async def sync_leaflink_orders_headers_only(
     errors: list[str] = []
     newest_order_date: datetime | None = None
 
-    # Split orders into batches of HEADER_BATCH_SIZE
+    # Split orders into batches of batch_size
     batches = [
-        orders[i : i + HEADER_BATCH_SIZE]
-        for i in range(0, len(orders), HEADER_BATCH_SIZE)
+        orders[i : i + batch_size]
+        for i in range(0, len(orders), batch_size)
     ]
 
     for batch in batches:
         batch_start = time.monotonic()
-        batch_size = len(batch)
-        logger.info("[OrdersSync] upsert_batch_start size=%s", batch_size)
+        current_batch_size = len(batch)
+        logger.info("[OrdersSync] upsert_batch_start batch_size=%s", current_batch_size)
 
         try:
             async with AsyncSessionLocal() as db:
@@ -593,16 +597,24 @@ async def sync_leaflink_orders_headers_only(
             logger.error(
                 "[OrdersSync] upsert_batch_error brand=%s batch_size=%s error=%s",
                 brand_id,
-                batch_size,
+                current_batch_size,
                 err_msg,
                 exc_info=True,
             )
             errors.append(err_msg)
-            skipped += batch_size
+            skipped += current_batch_size
             continue
 
         batch_ms = round((time.monotonic() - batch_start) * 1000)
-        logger.info("[OrdersSync] upsert_batch_done size=%s duration_ms=%s", batch_size, batch_ms)
+        logger.info("[OrdersSync] upsert_batch_done batch_size=%s duration_ms=%s", current_batch_size, batch_ms)
+
+    # Spawn a fire-and-forget background task to write OrderLine rows so the
+    # caller is not blocked waiting for line-item DB writes.
+    async def _background_line_items() -> None:
+        await sync_leaflink_line_items(brand_id, orders)
+
+    asyncio.create_task(_background_line_items())
+    logger.info("[OrdersSync] line_items_deferred count=%s", len(orders))
 
     sync_duration = round(time.monotonic() - sync_start, 2)
     logger.info(
@@ -900,14 +912,8 @@ async def sync_leaflink_background_continuous(
                     orders=batch_orders,
                     pages_fetched=pages_fetched_this_batch,
                 )
-
-                # Defer line items to a separate fire-and-forget task
-                _li_orders = batch_orders
-
-                async def _write_line_items():
-                    await sync_leaflink_line_items(brand_id, _li_orders)
-
-                asyncio.create_task(_write_line_items())
+                # Line items are deferred inside sync_leaflink_orders_headers_only
+                # via asyncio.create_task — no need to spawn a second task here.
 
             except Exception as upsert_exc:
                 logger.error(
