@@ -22,6 +22,22 @@ logger = logging.getLogger("orders")
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 
+async def _get_brand_order_count(
+    db: AsyncSession,
+    brand_id: str,
+) -> int:
+    """Get total order count for a brand. Used by all endpoints."""
+    try:
+        result = await db.execute(
+            select(func.count(Order.id)).where(Order.brand_id == brand_id)
+        )
+        return result.scalar_one() or 0
+    except Exception as exc:
+        logger.error("[OrdersAPI] order_count_error brand=%s error=%s", brand_id, exc)
+        await db.rollback()
+        return 0
+
+
 async def _safe_db_query(
     db: AsyncSession,
     query,
@@ -67,10 +83,14 @@ async def get_orders(
     cursor: Optional[str] = Query(None, description="Opaque cursor for cursor-based pagination"),
     sort_by: str = Query("updated_at", description="Sort field: updated_at, created_at, external_updated_at"),
     sort_order: str = Query("desc", description="asc or desc"),
+    include_line_items: bool = Query(False, description="Include full line_items (default false for list mode)"),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Fetch paginated orders for a brand.
+
+    By default returns order headers only (lightweight list mode).
+    Use include_line_items=true to get full line_items (detail mode).
 
     Supports two pagination modes:
     1. Limit/Offset: Use limit and offset parameters
@@ -79,6 +99,14 @@ async def get_orders(
     Response includes next_cursor / prev_cursor for navigating pages.
     """
     from leaflink.orders import serialize_order
+
+    logger.info(
+        "[OrdersAPI] request brand=%s limit=%s offset=%s include_line_items=%s",
+        brand,
+        limit,
+        offset,
+        include_line_items,
+    )
 
     # ------------------------------------------------------------------ #
     # Decode cursor → (cursor_id, cursor_updated_at)                      #
@@ -157,15 +185,9 @@ async def get_orders(
         orders = orders[:limit]
 
     # ------------------------------------------------------------------ #
-    # Total count for the brand (separate query)                           #
+    # Total count for the brand (shared helper)                            #
     # ------------------------------------------------------------------ #
-    try:
-        total_count_result = await db.execute(
-            select(func.count(Order.id)).where(Order.brand_id == brand)
-        )
-        total_in_database = total_count_result.scalar_one() or 0
-    except Exception:
-        total_in_database = len(orders)
+    total_in_database = await _get_brand_order_count(db, brand)
 
     # ------------------------------------------------------------------ #
     # Build next / prev cursors                                            #
@@ -188,19 +210,45 @@ async def get_orders(
         ).decode()
 
     # ------------------------------------------------------------------ #
-    # Serialize                                                            #
+    # Serialize — list mode (headers only) or detail mode (with           #
+    # line_items) depending on include_line_items query param             #
     # ------------------------------------------------------------------ #
-    serialized_orders = [serialize_order(o) for o in orders]
+    if include_line_items:
+        # Detail mode: full serialization with line_items
+        serialized_orders = [serialize_order(o) for o in orders]
+    else:
+        # List mode: headers only, no line_items (lightweight)
+        serialized_orders = [
+            {
+                "id": o.id,
+                "external_id": o.external_order_id,
+                "order_number": o.order_number,
+                "customer_name": o.customer_name,
+                "status": o.status,
+                "amount": float(o.amount) if o.amount else 0,
+                "item_count": o.item_count,
+                "unit_count": o.unit_count,
+                "review_status": o.review_status or "ok",
+                "sync_status": o.sync_status or "ok",
+                "last_synced_at": o.last_synced_at or o.synced_at,
+                "source": o.source,
+                "external_created_at": o.external_created_at,
+                "external_updated_at": o.external_updated_at,
+                "created_at": o.created_at,
+                "updated_at": o.updated_at,
+            }
+            for o in orders
+        ]
 
     logger.info(
-        "[OrdersAPI] get_orders brand=%s count=%s total=%s offset=%s limit=%s has_more=%s cursor=%s",
+        "[OrdersAPI] pagination brand=%s limit=%s offset=%s returned=%s total=%s has_more=%s include_line_items=%s",
         brand,
+        limit,
+        offset,
         len(serialized_orders),
         total_in_database,
-        offset,
-        limit,
         has_more,
-        bool(cursor),
+        include_line_items,
     )
 
     return make_json_safe({
@@ -500,15 +548,9 @@ async def orders_sync(
     _leaflink_call_attempted: bool = False
 
     # ------------------------------------------------------------------ #
-    # Count existing orders in DB before sync (diagnostic)               #
+    # Count existing orders in DB before sync (shared helper)            #
     # ------------------------------------------------------------------ #
-    try:
-        _pre_count_result = await db.execute(
-            select(func.count(Order.id)).where(Order.brand_id == _effective_brand_id)
-        )
-        _db_count_before = _pre_count_result.scalar_one() or 0
-    except Exception:
-        _db_count_before = 0
+    _db_count_before = await _get_brand_order_count(db, _effective_brand_id)
 
     logger.info(
         "[OrdersSync] db_count_before brand=%s count=%s",
@@ -1028,15 +1070,15 @@ async def orders_sync(
         next_cursor = base64.b64encode(cursor_payload.encode()).decode()
 
     # ------------------------------------------------------------------ #
-    # Count total orders in DB (lightweight — no order data returned)     #
+    # Count total orders in DB after sync (shared helper)                #
     # ------------------------------------------------------------------ #
-    try:
-        count_result = await db.execute(
-            select(func.count(Order.id)).where(Order.brand_id == _effective_brand_id)
-        )
-        total_in_database = count_result.scalar_one() or 0
-    except Exception:
-        total_in_database = _db_count_before
+    total_in_database = await _get_brand_order_count(db, _effective_brand_id)
+
+    logger.info(
+        "[OrdersSync] db_count_after brand=%s count=%s",
+        _effective_brand_id,
+        total_in_database,
+    )
 
     # Determine sync_status from available state
     if sync_error:
@@ -1058,6 +1100,14 @@ async def orders_sync(
         _total_pages = total_pages_available or 0
         _percent_complete = round((_pages_fetched / _total_pages) * 100, 1) if _total_pages else 0.0
         _percent_complete = min(100.0, _percent_complete)
+
+    logger.info(
+        "[OrdersSync] sync_trigger_mode brand=%s mode=worker sync_triggered=%s worker_enqueued=%s leaflink_attempted=%s",
+        _effective_brand_id,
+        str(_sync_triggered).lower(),
+        str(_worker_enqueued).lower(),
+        str(_leaflink_call_attempted).lower(),
+    )
 
     logger.info(
         "[OrdersSync] response brand=%s sync_status=%s total_orders_in_db=%s total_orders_available=%s sync_triggered=%s worker_enqueued=%s",
@@ -1201,18 +1251,15 @@ async def orders_sync_status(
             }
 
     # ------------------------------------------------------------------ #
-    # Count orders in DB for this brand                                   #
+    # Count orders in DB for this brand (shared helper)                  #
     # ------------------------------------------------------------------ #
-    try:
-        count_result = await db.execute(
-            select(func.count(Order.id)).where(Order.brand_id == brand)
-        )
-        total_orders_in_db = count_result.scalar_one() or 0
-    except Exception as count_exc:
-        # Rollback the failed transaction before any further queries on this session
-        await db.rollback()
-        logger.error("[OrdersSync] status_check count_error brand=%s error=%s", brand, count_exc)
-        total_orders_in_db = 0
+    total_orders_in_db = await _get_brand_order_count(db, brand)
+
+    logger.info(
+        "[OrdersSyncStatus] db_count brand=%s count=%s",
+        brand,
+        total_orders_in_db,
+    )
 
     # ------------------------------------------------------------------ #
     # Check sync_requests queue for active worker activity                #
@@ -1308,30 +1355,38 @@ async def orders_sync_status(
 
     # ------------------------------------------------------------------ #
     # Calculate percent complete based on actual order counts (preferred) #
+    # Distinguish between actual (from LeafLink API) and estimated        #
+    # (inferred from page count) totals.                                  #
     # ------------------------------------------------------------------ #
     effective_sync_status = None
 
-    if total_orders_available and total_orders_available > 0:
-        percent_complete = round((total_orders_in_db / total_orders_available) * 100, 1)
+    # Distinguish between actual and estimated
+    total_orders_estimated: Optional[int] = None  # Fallback estimate from page count
+
+    if cred and total_orders_available:
+        # total_orders_available is the actual count from LeafLink API
+        pass
+    elif total_pages and total_pages > 0:
+        # Estimate: assume 100 orders per page
+        total_orders_estimated = total_pages * 100
+
+    # Use actual if available, else estimated
+    _total_for_percent = total_orders_available or total_orders_estimated
+
+    if _total_for_percent and _total_for_percent > 0:
+        percent_complete = round((total_orders_in_db / _total_for_percent) * 100, 1)
         percent_complete = min(100.0, percent_complete)
-        logger.info(
-            "[OrdersSyncStatus] percent_from_orders brand=%s orders=%s/%s percent=%.1f%%",
-            brand,
-            total_orders_in_db,
-            total_orders_available,
-            percent_complete,
-        )
     else:
-        # Fallback to page-based calculation if total_orders_available not available
-        percent_complete = round((displayed_pages_synced / total_pages) * 100, 1) if total_pages else 0.0
-        percent_complete = min(100.0, percent_complete)
-        logger.info(
-            "[OrdersSyncStatus] percent_from_pages brand=%s pages=%s/%s percent=%.1f%%",
-            brand,
-            displayed_pages_synced,
-            total_pages,
-            percent_complete,
-        )
+        percent_complete = 0.0
+
+    logger.info(
+        "[OrdersSyncStatus] progress brand=%s orders=%s/%s estimated=%s percent=%.1f%%",
+        brand,
+        total_orders_in_db,
+        total_orders_available or total_orders_estimated,
+        total_orders_estimated is not None,
+        percent_complete,
+    )
 
     # Detect completion: if we've loaded all available orders
     if total_orders_available and total_orders_in_db >= total_orders_available:
@@ -1428,6 +1483,7 @@ async def orders_sync_status(
         "total_pages": total_pages,
         "total_orders_in_db": total_orders_in_db,
         "total_orders_available": total_orders_available,
+        "total_orders_estimated": total_orders_estimated,
         "percent_complete": percent_complete,
         "last_synced_at": db_last_synced_at,
         "sync_status": effective_sync_status,
