@@ -200,6 +200,10 @@ async def _resume_interrupted_syncs() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Starting {APP_NAME} in {APP_ENV}")
+    logger.info("[CredentialResolver] DB_ONLY_MODE=true")
+    logger.info("[CredentialResolver] env_checked=false")
+    logger.info("[CredentialResolver] LEAFLINK_API_KEY env var is ignored")
+    logger.info("[CredentialResolver] LEAFLINK_COMPANY_ID env var is ignored")
 
     # Log database connection info (masked for security)
     database_url = os.getenv("DATABASE_URL", "")

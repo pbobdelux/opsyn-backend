@@ -109,4 +109,6 @@ async def debug_db_check(db: AsyncSession = Depends(get_db)):
         "noble_nectar_key_len": noble_nectar_key_len,
         "noble_nectar_company_id": cred.company_id if cred else None,
         "noble_nectar_is_active": cred.is_active if cred else None,
+        "credential_source": "db_only",
+        "env_checked": False,
     }

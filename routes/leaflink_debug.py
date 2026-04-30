@@ -618,13 +618,13 @@ async def leaflink_auth_test(
     brand: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Test LeafLink authentication with multiple auth schemes."""
+    """Test LeafLink authentication (DB credentials only)."""
     from database import AsyncSessionLocal
     from routes.orders import _load_leaflink_credential
 
     logger.info("[CredentialResolver] auth_test_request brand=%s", brand)
 
-    # Load credential using strict priority (DB first, then ENV)
+    # Load credential from DB only
     try:
         cred = await _load_leaflink_credential(db, brand)
     except ValueError as val_exc:
@@ -633,6 +633,9 @@ async def leaflink_auth_test(
             "ok": False,
             "status_code": None,
             "credential_found": False,
+            "credential_source": "db",
+            "env_checked": False,
+            "env_ignored": True,
             "error": str(val_exc),
         }
 
@@ -642,35 +645,20 @@ async def leaflink_auth_test(
             "ok": False,
             "status_code": None,
             "credential_found": False,
-            "error": f"No credential found for brand {brand}",
+            "credential_source": "db",
+            "env_checked": False,
+            "env_ignored": True,
+            "error": "DB credential not found",
         }
 
     api_key = (cred.api_key or "").strip()
     company_id = (cred.company_id or "").strip()
     brand_id = cred.brand_id
 
-    # Safety check: validate key length (should not happen if _load_leaflink_credential works)
-    if len(api_key) > 50:
-        logger.error(
-            "[CredentialResolver] WRONG_KEY_LENGTH brand=%s len=%s — REJECTING",
-            brand_id,
-            len(api_key),
-        )
-        return {
-            "ok": False,
-            "status_code": None,
-            "credential_found": True,
-            "credential_source": "db",
-            "brand_id": brand_id,
-            "company_id": company_id,
-            "api_key_prefix": api_key[:6] if api_key else "MISSING",
-            "api_key_len": len(api_key),
-            "error": f"Invalid API key length: {len(api_key)} (expected ~40)",
-        }
-
     logger.info(
-        "[CredentialResolver] auth_test_credential brand=%s key_len=%s company_id=%s",
+        "[CredentialResolver] auth_test_credential brand=%s credential_id=%s key_len=%s company_id=%s",
         brand_id,
+        cred.id,
         len(api_key),
         company_id,
     )
@@ -737,23 +725,21 @@ async def leaflink_auth_test(
                     async with save_sess.begin():
                         save_result = await save_sess.execute(
                             select(BrandAPICredential).where(
-                                BrandAPICredential.brand_id == brand_id,
-                                BrandAPICredential.integration_name == "leaflink",
+                                BrandAPICredential.id == cred.id,
                             )
                         )
                         save_cred = save_result.scalar_one_or_none()
                         if save_cred:
                             save_cred.auth_scheme = successful_scheme
                             logger.info(
-                                "[CredentialResolver] saved_scheme scheme=%s brand=%s",
+                                "[CredentialResolver] saved_scheme scheme=%s credential_id=%s",
                                 successful_scheme,
-                                brand_id,
+                                cred.id,
                             )
         except Exception as save_exc:
             logger.error(
-                "[CredentialResolver] save_scheme_error error=%s brand=%s",
+                "[CredentialResolver] save_scheme_error error=%s",
                 save_exc,
-                brand_id,
             )
 
         logger.info(
@@ -766,10 +752,13 @@ async def leaflink_auth_test(
             "status_code": 200,
             "credential_found": True,
             "credential_source": "db",
+            "credential_id": cred.id,
             "brand_id": brand_id,
             "company_id": company_id,
             "api_key_prefix": api_key[:6] if api_key else "MISSING",
             "api_key_len": len(api_key),
+            "env_checked": False,
+            "env_ignored": True,
             "successful_auth_scheme": successful_scheme,
             "attempts": attempts,
             "error": None,
@@ -784,10 +773,13 @@ async def leaflink_auth_test(
             "status_code": attempts[-1].get("status_code") if attempts else None,
             "credential_found": True,
             "credential_source": "db",
+            "credential_id": cred.id,
             "brand_id": brand_id,
             "company_id": company_id,
             "api_key_prefix": api_key[:6] if api_key else "MISSING",
             "api_key_len": len(api_key),
+            "env_checked": False,
+            "env_ignored": True,
             "successful_auth_scheme": None,
             "attempts": attempts,
             "error": "All auth schemes failed",
