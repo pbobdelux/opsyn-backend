@@ -67,6 +67,55 @@ async def _create_assistant_tables() -> None:
         logger.error("startup: failed to create assistant tables: %s", exc)
 
 
+async def _verify_database_schema() -> None:
+    """
+    Verify that the database has the expected schema columns.
+    Logs the database host and all columns in brand_api_credentials.
+    """
+    from sqlalchemy import text
+    from database import engine
+
+    if engine is None:
+        logger.warning("[Startup] DATABASE_URL not set — skipping schema verification")
+        return
+
+    try:
+        async with engine.connect() as conn:
+            # Get database host from connection
+            result = await conn.execute(text("SELECT current_database(), inet_server_addr()"))
+            db_name, db_host = result.fetchone()
+            logger.info("[Startup] database_url_host=%s database_name=%s", db_host or "localhost", db_name)
+
+            # Get all columns in brand_api_credentials
+            result = await conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'brand_api_credentials'
+                ORDER BY column_name
+            """))
+            columns = [row[0] for row in result.fetchall()]
+            logger.info("[Startup] brand_api_credentials_columns=%s", ",".join(columns))
+
+            # Check for required columns
+            required_columns = [
+                'id', 'brand_id', 'integration_name', 'api_key', 'company_id',
+                'is_active', 'sync_status', 'last_sync_at', 'last_error',
+                'last_synced_page', 'total_pages_available', 'total_orders_available'
+            ]
+            missing = [col for col in required_columns if col not in columns]
+
+            if missing:
+                logger.error(
+                    "[Startup] schema_verification_failed missing_columns=%s",
+                    ",".join(missing),
+                )
+            else:
+                logger.info("[Startup] schema_verification_passed all_required_columns_present")
+
+    except Exception as exc:
+        logger.error("[Startup] schema_verification_error error=%s", exc, exc_info=True)
+
+
 async def _resume_interrupted_syncs() -> None:
     """
     On startup, check BrandAPICredential for any syncs that were in-progress
@@ -139,6 +188,15 @@ async def lifespan(app: FastAPI):
     from services.migration_runner import run_migrations
     applied = await run_migrations()
     logger.info("[Startup] migrations_complete count=%s", len(applied))
+
+    # Refresh connection pool after migrations so new connections see updated schema
+    if applied:
+        from database import refresh_connection_pool
+        await refresh_connection_pool()
+
+    # Verify database schema and log connection details
+    await _verify_database_schema()
+
     await _resume_interrupted_syncs()
     route_count = len(app.routes)
     logger.info("[Startup] routes_registered count=%s", route_count)
