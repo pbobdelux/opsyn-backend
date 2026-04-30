@@ -30,7 +30,80 @@ def normalize_database_url(url: str) -> str:
     return urlunparse(rebuilt)
 
 
-DATABASE_URL = normalize_database_url(os.getenv("DATABASE_URL", ""))
+# ============================================================================
+# DATABASE CONFIGURATION
+# ============================================================================
+# Production uses AWS RDS Postgres (opsyn_prod database)
+# Development can use Railway Postgres or local Postgres
+#
+# DATABASE_URL format:
+#   AWS RDS: postgresql+asyncpg://user:pass@host:5432/database
+#   Railway: postgresql+asyncpg://user:pass@postgres.railway.internal:5432/railway
+#   Local:   postgresql+asyncpg://user:pass@localhost:5432/opsyn_dev
+#
+# Production startup will FAIL if DATABASE_URL does not contain 'rds.amazonaws.com'
+# ============================================================================
+
+_raw_database_url = os.getenv("DATABASE_URL", "")
+
+# Validate DATABASE_URL format before normalization
+if _raw_database_url:
+    logger.info("[BOOT_DB] validating_database_url")
+
+    # Check for common malformations
+    if _raw_database_url.startswith("DATABASE_URL"):
+        logger.error(
+            "[BOOT_DB] invalid_database_url malformed=true reason=starts_with_DATABASE_URL"
+        )
+        raise ValueError(
+            "DATABASE_URL is malformed: value starts with 'DATABASE_URL'. "
+            "Remove the 'DATABASE_URL=' prefix from the value."
+        )
+
+    if "\n" in _raw_database_url or "\r" in _raw_database_url:
+        logger.error(
+            "[BOOT_DB] invalid_database_url malformed=true reason=contains_newlines"
+        )
+        raise ValueError(
+            "DATABASE_URL is malformed: contains newlines. "
+            "Ensure the value is a single line with no line breaks."
+        )
+
+    if _raw_database_url.startswith('"') or _raw_database_url.startswith("'"):
+        logger.error(
+            "[BOOT_DB] invalid_database_url malformed=true reason=starts_with_quote"
+        )
+        raise ValueError(
+            "DATABASE_URL is malformed: value starts with a quote. "
+            "Remove quotes from the variable value."
+        )
+
+    # Try to parse as SQLAlchemy URL
+    try:
+        from sqlalchemy.engine.url import make_url
+        _parsed_url = make_url(_raw_database_url)
+
+        logger.info(
+            "[BOOT_DB] database_url_valid drivername=%s host=%s database=%s",
+            _parsed_url.drivername,
+            _parsed_url.host or "unknown",
+            _parsed_url.database or "unknown",
+        )
+    except Exception as _parse_exc:
+        logger.error(
+            "[BOOT_DB] invalid_database_url raw_prefix=%s error=%s",
+            _raw_database_url[:25] if _raw_database_url else "EMPTY",
+            str(_parse_exc),
+        )
+        raise ValueError(
+            f"DATABASE_URL is not a valid SQLAlchemy URL: {str(_parse_exc)}. "
+            f"Expected format: postgresql+asyncpg://user:pass@host:5432/database"
+        )
+else:
+    logger.error("[BOOT_DB] DATABASE_URL is empty or not set")
+    raise ValueError("DATABASE_URL environment variable is not set")
+
+DATABASE_URL = normalize_database_url(_raw_database_url)
 
 if DATABASE_URL:
     _parsed = urlparse(DATABASE_URL)
