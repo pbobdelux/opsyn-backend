@@ -62,9 +62,6 @@ async def poll_and_execute() -> None:
       4. Execute sync_leaflink_background_continuous().
       5. Handle errors: mark job as failed with last_error.
     """
-    logger.info("[SyncWorker] entered poll_and_execute")
-    sys.stdout.flush()
-
     from sqlalchemy import select
 
     from database import AsyncSessionLocal
@@ -72,20 +69,11 @@ async def poll_and_execute() -> None:
     from services.leaflink_sync import sync_leaflink_background_continuous
     from services.sync_run_manager import detect_stalled, mark_stalled
 
-    logger.info("[SyncWorker] imports successful")
-    sys.stdout.flush()
-
-    logger.info("[SyncWorker] querying for jobs")
-    sys.stdout.flush()
-
     # ---------------------------------------------------------------------- #
     # Step 1: Query for queued or syncing jobs                                #
     # ---------------------------------------------------------------------- #
     try:
         async with AsyncSessionLocal() as db:
-            logger.info("[SyncWorker] db session created")
-            sys.stdout.flush()
-
             result = await db.execute(
                 select(SyncRun)
                 .where(SyncRun.status.in_(["queued", "syncing"]))
@@ -94,12 +82,7 @@ async def poll_and_execute() -> None:
             )
             sync_run = result.scalar_one_or_none()
 
-            logger.info("[SyncWorker] job query result: %s", repr(sync_run))
-            sys.stdout.flush()
-
             if not sync_run:
-                logger.info("[SyncWorker] no jobs found")
-                sys.stdout.flush()
                 return
 
             sync_run_id = sync_run.id
@@ -107,16 +90,6 @@ async def poll_and_execute() -> None:
             start_page = sync_run.current_page or 1
             total_pages = sync_run.total_pages or 1
             total_orders_available = sync_run.total_orders_available
-
-            logger.info(
-                "[SyncWorker] job_found id=%s brand=%s status=%s start_page=%s total_pages=%s",
-                sync_run_id,
-                brand_id,
-                sync_run.status,
-                start_page,
-                total_pages,
-            )
-            logger.info("[SyncWorker] job_started id=%s brand=%s", sync_run_id, brand_id)
 
             # ------------------------------------------------------------------ #
             # Stall detection: only check jobs that have been claimed            #
@@ -138,9 +111,6 @@ async def poll_and_execute() -> None:
                     await mark_stalled(db, sync_run_id, stall_reason)
                     await db.commit()
                     return
-            else:
-                # Job is queued and not yet claimed — proceed to claim it
-                logger.info("[SyncWorker] job_unclaimed id=%s - proceeding to claim", sync_run_id)
 
             # ------------------------------------------------------------------ #
             # Step 2: Claim the job                                               #
@@ -168,7 +138,6 @@ async def poll_and_execute() -> None:
     # ---------------------------------------------------------------------- #
     # Step 3: Fetch credential                                                #
     # ---------------------------------------------------------------------- #
-    logger.info("[SyncWorker] fetching credentials brand=%s", brand_id)
     try:
         async with AsyncSessionLocal() as db:
             cred_result = await db.execute(
@@ -202,18 +171,6 @@ async def poll_and_execute() -> None:
             company_id: str = cred.company_id or ""
             auth_scheme: str = cred.auth_scheme or "Token"
 
-            logger.info(
-                "[SyncWorker] credentials_loaded brand=%s api_key_len=%s company_id=%s",
-                brand_id,
-                len(api_key),
-                company_id,
-            )
-            logger.info(
-                "[LeafLinkAuth] auth_header_present=true scheme=%s api_key_len=%s",
-                auth_scheme,
-                len(api_key),
-            )
-
             # Validate api_key
             if not api_key or not api_key.strip():
                 logger.error("[SyncWorker] credential_invalid id=%s api_key_missing", sync_run_id)
@@ -242,7 +199,6 @@ async def poll_and_execute() -> None:
                     await db.commit()
                 return
 
-            logger.info("[SyncWorker] credentials_validated id=%s", sync_run_id)
     except Exception as db_exc:
         logger.error(
             "[SyncWorker] database error fetching credentials: %s",
@@ -255,7 +211,6 @@ async def poll_and_execute() -> None:
     # ---------------------------------------------------------------------- #
     # Step 4: Execute sync                                                    #
     # ---------------------------------------------------------------------- #
-    logger.info("[SyncWorker] requesting page=1 id=%s brand=%s", sync_run_id, brand_id)
 
     # Stamp last_progress_at immediately before the first API call so the
     # stall detector does not fire while we are waiting for the first page.
@@ -276,7 +231,6 @@ async def poll_and_execute() -> None:
         )
         sys.stdout.flush()
         raise
-    logger.info("[SyncWorker] first_progress_update id=%s", sync_run_id)
 
     try:
         logger.info(
@@ -375,9 +329,6 @@ async def run_scheduler() -> None:
     # Main polling loop
     while True:
         try:
-            logger.info("[SyncWorker] polling loop start")
-            sys.stdout.flush()
-
             await poll_and_execute()
 
         except Exception as loop_exc:
@@ -395,17 +346,8 @@ def main() -> None:
     print("=== MAIN FUNCTION ENTERED ===")
     sys.stdout.flush()
 
-    logger.info("[SyncWorker] main() called")
-    sys.stdout.flush()
-
     try:
-        logger.info("[SyncWorker] importing asyncio")
         import asyncio as _asyncio
-        sys.stdout.flush()
-
-        logger.info("[SyncWorker] calling asyncio.run()")
-        sys.stdout.flush()
-
         _asyncio.run(run_scheduler())
 
     except Exception as main_exc:

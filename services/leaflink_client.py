@@ -163,35 +163,6 @@ class LeafLinkClient:
         if LEAFLINK_API_VERSION:
             self.session.headers["LeafLink-Version"] = LEAFLINK_API_VERSION
 
-        logger.info(
-            "[LeafLinkAuth] tenant=%s brand=%s auth_present=true source=db",
-            self.brand_id,
-            self.brand_id,
-        )
-        logger.info(
-            "[LeafLinkAuth] credential brand=%s company_id=%s prefix=%s len=%s scheme=%s has_whitespace=%s",
-            self.brand_id,
-            self.company_id,
-            self.api_key[:6] if self.api_key else "MISSING",
-            len(self.api_key),
-            self.auth_scheme,
-            _had_whitespace,
-        )
-        logger.info(
-            "leaflink: client_init brand=%s base_url=%s company_id=%s api_key_set=%s",
-            self.brand_id,
-            self.base_url,
-            self.company_id,
-            bool(self.api_key),
-        )
-        logger.info(
-            "[LeafLinkAuth] client_init brand=%s key_len=%s company_id=%s scheme=%s",
-            self.brand_id,
-            len(self.api_key),
-            self.company_id,
-            self.auth_scheme,
-        )
-
         if not self.api_key:
             logger.error("[LeafLinkAuth] MISSING api_key brand=%s", self.brand_id)
         if not self.company_id:
@@ -243,18 +214,6 @@ class LeafLinkClient:
         url = f"{self.base_url}/{path.lstrip('/')}"
         safe_params = {k: v for k, v in (params or {}).items() if k not in ("api_key", "token", "secret")}
 
-        logger.debug(
-            "[LeafLinkAuth] request_start path=%s params=%s",
-            path,
-            safe_params,
-        )
-        logger.info(
-            "[LeafLink] request brand=%s auth_present=true url=%s params=%s",
-            self.brand_id,
-            url,
-            safe_params,
-        )
-
         def _do_request() -> requests.Response:
             # Build headers with explicit Authorization
             headers = {
@@ -271,11 +230,6 @@ class LeafLinkClient:
                 path,
                 self.auth_scheme,
                 len(self.api_key),
-            )
-            logger.debug(
-                "[LeafLinkAuth] sending_request url=%s has_auth_header=true scheme=%s",
-                url,
-                self.auth_scheme,
             )
 
             try:
@@ -302,13 +256,6 @@ class LeafLinkClient:
         )
 
         content_type = resp.headers.get("Content-Type", "")
-        logger.info(
-            "leaflink: API response url=%s status=%s content_type=%s size=%s",
-            url,
-            resp.status_code,
-            content_type,
-            len(resp.content),
-        )
         if "application/json" not in content_type.lower():
             logger.warning(
                 "leaflink: API response is not JSON url=%s status=%s content_type=%s body_preview=%s",
@@ -317,13 +264,7 @@ class LeafLinkClient:
                 content_type,
                 resp.text[:200],
             )
-        if resp.ok:
-            logger.info(
-                "[LeafLinkAuth] request_authorized=true brand=%s url=%s",
-                self.brand_id,
-                url,
-            )
-        else:
+        if not resp.ok:
             if resp.status_code == 403:
                 logger.error(
                     "[LeafLinkAuth] 403_invalid_token endpoint=%s scheme=%s api_key_prefix=%s api_key_len=%s brand=%s",
@@ -353,15 +294,6 @@ class LeafLinkClient:
 
     def _get_raw_url(self, url: str) -> requests.Response:
         """Make GET request to full URL with explicit Authorization header."""
-        logger.debug(
-            "[LeafLinkAuth] request_start url=%s",
-            url,
-        )
-        logger.info(
-            "[LeafLink] page_request auth_present=true url=%s",
-            url,
-        )
-
         # Build headers with explicit Authorization
         headers = {
             **self._get_auth_header(),
@@ -371,12 +303,6 @@ class LeafLinkClient:
         if not self._validate_request_headers(headers):
             logger.error("[LeafLinkAuth] invalid_headers aborting_request url=%s", url)
             raise ValueError("Invalid Authorization header")
-
-        logger.debug(
-            "[LeafLinkAuth] sending_request url=%s has_auth_header=true scheme=%s",
-            url,
-            self.auth_scheme,
-        )
 
         try:
             resp = self.session.get(
@@ -392,12 +318,6 @@ class LeafLinkClient:
                 exc,
             )
             raise
-
-        logger.info(
-            "[LeafLink] page_response status=%s url=%s",
-            resp.status_code,
-            url,
-        )
 
         if resp.status_code == 403:
             logger.error(
@@ -471,12 +391,6 @@ class LeafLinkClient:
         page_size: int = 100,
         status: Optional[str] = None,
     ) -> Any:
-        logger.info(
-            "leaflink: list_orders start page=%s page_size=%s status=%s",
-            page,
-            page_size,
-            status,
-        )
         params: Dict[str, Any] = {
             "page": page,
             "page_size": page_size,
@@ -499,32 +413,6 @@ class LeafLinkClient:
 
         if resp.ok and "application/json" in content_type.lower():
             data = resp.json()
-            result_type = type(data).__name__
-            result_count = len(data) if isinstance(data, list) else len(data.get("results") or data.get("data") or data.get("orders") or [])
-            logger.info(
-                "leaflink: list_orders success brand=%s page=%s result_type=%s result_count=%s",
-                self.brand_id,
-                page,
-                result_type,
-                result_count,
-            )
-            # DIAGNOSTIC LOGGING — remove after debugging
-            logger.info(
-                "[LeafLink DEBUG] response_keys=%s",
-                list(data.keys()) if isinstance(data, dict) else "not_a_dict",
-            )
-            logger.info(
-                "[LeafLink DEBUG] meta=%s",
-                data.get("meta") if isinstance(data, dict) else None,
-            )
-            logger.info(
-                "[LeafLink DEBUG] count=%s",
-                data.get("count") if isinstance(data, dict) else None,
-            )
-            logger.info(
-                "[LeafLink DEBUG] total=%s",
-                data.get("total") if isinstance(data, dict) else None,
-            )
             return data
 
         if resp.status_code in (401, 403):
@@ -591,13 +479,6 @@ class LeafLinkClient:
             or raw.get("order_lines")
             or []
         )
-
-        # Log if we found line items
-        if candidate:
-            logger.info(
-                "leaflink: extract_line_items found candidate count=%s",
-                len(candidate) if isinstance(candidate, list) else 1,
-            )
 
         if not isinstance(candidate, list):
             return []
@@ -783,14 +664,6 @@ class LeafLinkClient:
                 ``total_count``       – total order count reported by LeafLink (first page only)
                 ``total_pages``       – estimated total pages (total_count / page_size, rounded up)
         """
-        logger.info(
-            "[LeafLink] fetch_page_range_start brand=%s start_page=%s num_pages=%s resume_url=%s",
-            brand,
-            start_page,
-            num_pages,
-            resume_url or "none",
-        )
-
         all_orders: List[Dict[str, Any]] = []
         pages_fetched = 0
         next_url: Optional[str] = resume_url
@@ -800,15 +673,6 @@ class LeafLinkClient:
         try:
             while pages_fetched < num_pages:
                 if next_url:
-                    logger.info(
-                        "[LeafLink] page_range page=%s fetching next_url=%s",
-                        current_page,
-                        next_url,
-                    )
-                    logger.debug(
-                        "[LeafLinkAuth] following_pagination next_url=%s",
-                        next_url,
-                    )
                     resp = self._get_raw_url(next_url)
                     if resp.status_code == 403:
                         logger.error(
@@ -827,29 +691,6 @@ class LeafLinkClient:
                     payload = resp.json()
                 else:
                     payload = self.list_orders(page=current_page, page_size=page_size)
-
-                # DIAGNOSTIC LOGGING — log first page only to avoid spam
-                if pages_fetched == 0:
-                    logger.info(
-                        "[LeafLink DEBUG] first_page response_keys=%s",
-                        list(payload.keys()) if isinstance(payload, dict) else "not_a_dict",
-                    )
-                    logger.info(
-                        "[LeafLink DEBUG] first_page meta=%s",
-                        payload.get("meta") if isinstance(payload, dict) else None,
-                    )
-                    logger.info(
-                        "[LeafLink DEBUG] first_page count=%s",
-                        payload.get("count") if isinstance(payload, dict) else None,
-                    )
-                    logger.info(
-                        "[LeafLink DEBUG] first_page total=%s",
-                        payload.get("total") if isinstance(payload, dict) else None,
-                    )
-                    logger.info(
-                        "[LeafLink DEBUG] first_page_response=%s",
-                        str(payload)[:500],
-                    )
 
                 if isinstance(payload, list):
                     results = payload
@@ -894,14 +735,6 @@ class LeafLinkClient:
                             all_orders.append(raw)
 
                 pages_fetched += 1
-                total_so_far = len(all_orders)
-                logger.info(
-                    "[LeafLink] page_range page=%s fetched=%s total_so_far=%s next=%s",
-                    current_page,
-                    len(results),
-                    total_so_far,
-                    next_url or "None",
-                )
 
                 if not next_url:
                     break
@@ -923,16 +756,6 @@ class LeafLinkClient:
             total_pages = math.ceil(total_count / page_size)
 
         next_page = start_page + pages_fetched if next_url else None
-
-        logger.info(
-            "[LeafLink] fetch_page_range_complete brand=%s pages_fetched=%s orders=%s next_page=%s total_count=%s total_pages=%s",
-            brand,
-            pages_fetched,
-            len(all_orders),
-            next_page,
-            total_count,
-            total_pages,
-        )
 
         return {
             "orders": all_orders,
@@ -964,23 +787,6 @@ class LeafLinkClient:
                 ``pages_fetched`` – number of pages retrieved
         """
         effective_max = max_pages if max_pages is not None else 10_000
-        logger.info(
-            "[LeafLink] fetch_start brand=%s max_pages=%s",
-            brand,
-            max_pages if max_pages is not None else "unlimited",
-        )
-        logger.info(
-            "[LeafLinkSync] mock_mode_enabled=%s brand=%s",
-            str(MOCK_MODE).lower(),
-            brand,
-        )
-        logger.info(
-            "[LeafLinkSync] start brand=%s max_pages=%s normalize=%s mock_mode=%s",
-            brand,
-            max_pages if max_pages is not None else "unlimited",
-            normalize,
-            MOCK_MODE,
-        )
 
         all_orders: List[Dict[str, Any]] = []
         pages_fetched = 0
@@ -996,21 +802,7 @@ class LeafLinkClient:
                     # Use the full ``next`` URL returned by LeafLink directly.
                     # _get_raw_url() explicitly attaches the Authorization header so
                     # that pagination requests are authenticated the same way as page 1.
-                    logger.info(
-                        "[LeafLinkSync] page=%s auth_present=true fetching next_url=%s",
-                        page,
-                        next_url,
-                    )
-                    logger.debug(
-                        "[LeafLinkAuth] following_pagination next_url=%s",
-                        next_url,
-                    )
                     resp = self._get_raw_url(next_url)
-                    logger.info(
-                        "[LeafLinkSync] page=%s status=%s",
-                        page,
-                        resp.status_code,
-                    )
                     if resp.status_code in (401, 403):
                         logger.error(
                             "[LeafLinkAuth] pagination_auth_failed page=%s status=%s body=%s",
@@ -1035,29 +827,6 @@ class LeafLinkClient:
                 else:
                     payload = self.list_orders(page=page, page_size=100)
 
-                # DIAGNOSTIC LOGGING — log first page only to avoid spam
-                if page == 1:
-                    logger.info(
-                        "[LeafLink DEBUG] first_page response_keys=%s",
-                        list(payload.keys()) if isinstance(payload, dict) else "not_a_dict",
-                    )
-                    logger.info(
-                        "[LeafLink DEBUG] first_page meta=%s",
-                        payload.get("meta") if isinstance(payload, dict) else None,
-                    )
-                    logger.info(
-                        "[LeafLink DEBUG] first_page count=%s",
-                        payload.get("count") if isinstance(payload, dict) else None,
-                    )
-                    logger.info(
-                        "[LeafLink DEBUG] first_page total=%s",
-                        payload.get("total") if isinstance(payload, dict) else None,
-                    )
-                    logger.info(
-                        "[LeafLink DEBUG] first_page_response=%s",
-                        str(payload)[:500],
-                    )
-
                 if isinstance(payload, list):
                     results = payload
                     next_url = None
@@ -1076,10 +845,6 @@ class LeafLinkClient:
                     raise RuntimeError(f"Unexpected LeafLink results type: {type(results).__name__}")
 
                 if not results:
-                    logger.info(
-                        "[LeafLinkSync] page=%s empty_results — stopping pagination",
-                        page,
-                    )
                     break
 
                 if normalize:
@@ -1090,21 +855,6 @@ class LeafLinkClient:
                     for raw in results:
                         if isinstance(raw, dict):
                             all_orders.append(raw)
-
-                total_so_far = len(all_orders)
-                logger.info(
-                    "[LeafLink] page=%s count=%s total_so_far=%s",
-                    page,
-                    len(results),
-                    total_so_far,
-                )
-                logger.info(
-                    "[LeafLinkSync] page=%s count=%s total_so_far=%s next=%s",
-                    page,
-                    len(results),
-                    total_so_far,
-                    next_url or "None",
-                )
 
                 if not next_url:
                     break
@@ -1127,20 +877,5 @@ class LeafLinkClient:
                 raise  # Re-raise the original exception instead of returning mock
             logger.info("[LeafLinkSync] returning_mock=false")
             raise
-
-        total = len(all_orders)
-        logger.info(
-            "[LeafLink] fetch_complete total=%s pages=%s brand=%s",
-            total,
-            pages_fetched,
-            brand,
-        )
-        logger.info(
-            "[LeafLinkSync] finished brand=%s total_fetched=%s pages_fetched=%s normalize=%s",
-            brand,
-            total,
-            pages_fetched,
-            normalize,
-        )
 
         return {"orders": all_orders, "pages_fetched": pages_fetched}

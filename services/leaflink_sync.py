@@ -180,15 +180,6 @@ async def sync_leaflink_orders(
         pages_fetched: Number of API pages retrieved (for metadata).
     """
     sync_start = time.monotonic()
-    logger.info("[LeafLinkSync] upsert_start transaction_active=%s", db.in_transaction())
-    logger.info(
-        "[LeafLink] sync_start brand=%s orders=%s pages_fetched=%s",
-        brand_id,
-        len(orders),
-        pages_fetched,
-    )
-    logger.info("leaflink: sync_start brand_id=%s orders=%s pages_fetched=%s", brand_id, len(orders), pages_fetched)
-    logger.info("leaflink: sync_json_sanitized brand_id=%s", brand_id)
 
     using_mock = any(isinstance(o, dict) and o.get("mock_data") for o in orders)
     if using_mock:
@@ -196,14 +187,6 @@ async def sync_leaflink_orders(
             "leaflink: sync_using_mock_data brand_id=%s — real API unavailable, MOCK_MODE active",
             brand_id,
         )
-    else:
-        logger.info(
-            "leaflink: sync_using_real_api_data brand_id=%s orders_fetched=%s",
-            brand_id,
-            len(orders),
-        )
-
-    logger.info("leaflink: sync_orders_processed brand_id=%s count=%s", brand_id, len(orders))
 
     created = 0
     updated = 0
@@ -217,13 +200,6 @@ async def sync_leaflink_orders(
     # No begin() here — the route handler owns the transaction.
     # ------------------------------------------------------------------
     try:
-        logger.info(
-            "leaflink: sync_api_response brand_id=%s orders_count=%s mock_data=%s",
-            brand_id,
-            len(orders),
-            using_mock,
-        )
-
         for o in orders:
             if not isinstance(o, dict):
                 skipped += 1
@@ -249,14 +225,7 @@ async def sync_leaflink_orders(
                 or o.get("price")
             )
 
-            # Log the mapping result
-            if amount_decimal is not None:
-                logger.info(
-                    "leaflink: sync_amount_mapped external_id=%s amount=%s",
-                    external_id,
-                    amount_decimal,
-                )
-            else:
+            if amount_decimal is None:
                 logger.warning(
                     "leaflink: sync_amount_missing external_id=%s — no pricing field found in order",
                     external_id,
@@ -269,19 +238,6 @@ async def sync_leaflink_orders(
 
             raw_line_items = o.get("line_items", [])
             normalized_line_items = normalize_line_items(raw_line_items)
-
-            if normalized_line_items:
-                logger.info(
-                    "leaflink: sync_line_items_extracted external_id=%s count=%s unit_count=%s",
-                    external_id,
-                    len(normalized_line_items),
-                    sum(item.get("quantity", 0) or 0 for item in normalized_line_items),
-                )
-            else:
-                logger.warning(
-                    "leaflink: sync_line_items_empty external_id=%s — no line items found in order",
-                    external_id,
-                )
 
             if item_count == 0:
                 item_count = len(normalized_line_items)
@@ -381,38 +337,7 @@ async def sync_leaflink_orders(
 
             total_lines_written += len(normalized_line_items)
 
-        logger.info(
-            "leaflink: sync_line_items_written brand_id=%s count=%s",
-            brand_id,
-            total_lines_written,
-        )
         sync_duration = round(time.monotonic() - sync_start, 2)
-        logger.info(
-            "[LeafLink] upserted=%s created=%s updated=%s skipped=%s brand=%s",
-            len(orders),
-            created,
-            updated,
-            skipped,
-            brand_id,
-        )
-        logger.info(
-            "[LeafLink] sync_complete duration=%ss brand=%s pages=%s",
-            sync_duration,
-            brand_id,
-            pages_fetched,
-        )
-        logger.info(
-            "leaflink: sync_complete brand_id=%s fetched=%s created=%s updated=%s skipped=%s lines_written=%s pages_fetched=%s duration_seconds=%s mock_data=%s",
-            brand_id,
-            len(orders),
-            created,
-            updated,
-            skipped,
-            total_lines_written,
-            pages_fetched,
-            sync_duration,
-            using_mock,
-        )
 
         return {
             "ok": True,
@@ -472,12 +397,6 @@ async def sync_leaflink_orders_headers_only(
     Returns a summary dict compatible with the existing sync_result contract.
     """
     sync_start = time.monotonic()
-    logger.info(
-        "[LeafLinkSync] headers_only_start brand=%s orders=%s pages_fetched=%s",
-        brand_id,
-        len(orders),
-        pages_fetched,
-    )
 
     created = 0
     updated = 0
@@ -494,7 +413,6 @@ async def sync_leaflink_orders_headers_only(
     for batch in batches:
         batch_start = time.monotonic()
         current_batch_size = len(batch)
-        logger.info("[OrdersSync] upsert_batch_start batch_size=%s", current_batch_size)
 
         try:
             async with AsyncSessionLocal() as db:
@@ -618,26 +536,14 @@ async def sync_leaflink_orders_headers_only(
             skipped += current_batch_size
             continue
 
-        batch_ms = round((time.monotonic() - batch_start) * 1000)
-        logger.info("[OrdersSync] upsert_batch_done batch_size=%s duration_ms=%s", current_batch_size, batch_ms)
-
     # Spawn a fire-and-forget background task to write OrderLine rows so the
     # caller is not blocked waiting for line-item DB writes.
     async def _background_line_items() -> None:
         await sync_leaflink_line_items(brand_id, orders)
 
     asyncio.create_task(_background_line_items())
-    logger.info("[OrdersSync] line_items_deferred count=%s", len(orders))
 
     sync_duration = round(time.monotonic() - sync_start, 2)
-    logger.info(
-        "[LeafLinkSync] headers_only_complete brand=%s created=%s updated=%s skipped=%s duration=%ss",
-        brand_id,
-        created,
-        updated,
-        skipped,
-        sync_duration,
-    )
 
     return {
         "ok": len(errors) == 0,
@@ -668,11 +574,6 @@ async def sync_leaflink_line_items(
     bg_start = time.monotonic()
     total_lines_written = 0
     errors: list[str] = []
-
-    logger.info(
-        "[OrdersSync] line_items_deferred count=%s",
-        len(orders),
-    )
 
     for o in orders:
         if not isinstance(o, dict):
@@ -828,14 +729,6 @@ async def sync_leaflink_background_continuous(
         mark_failed as _srm_mark_failed,
     )
 
-    logger.info(
-        "[LeafLinkSync] ENTERED sync_leaflink_background_continuous id=%s brand=%s start_page=%s",
-        sync_run_id,
-        brand_id,
-        start_page,
-    )
-    sys.stdout.flush()
-
     try:
         bg_start = time.monotonic()
         current_page = start_page
@@ -843,14 +736,6 @@ async def sync_leaflink_background_continuous(
         total_orders_synced = 0
         resume_url: Optional[str] = None
         _prev_cursor: Optional[str] = None  # for cursor-loop detection
-
-        logger.info(
-            "[OrdersSync] bg_sync_start brand=%s start_page=%s total_pages=%s sync_run_id=%s",
-            brand_id,
-            start_page,
-            total_pages,
-            sync_run_id,
-        )
 
         async def _persist_run_progress(
             pages_synced: int,
@@ -917,14 +802,6 @@ async def sync_leaflink_background_continuous(
 
             for attempt in range(max_retries + 1):
                 try:
-                    logger.info(
-                        "[OrdersSync] fetch_attempt brand=%s page=%s attempt=%s/%s",
-                        brand_id,
-                        start_page,
-                        attempt + 1,
-                        max_retries + 1,
-                    )
-
                     _capture_page = start_page
                     _capture_url = resume_url
                     _capture_num = num_pages
@@ -939,13 +816,6 @@ async def sync_leaflink_background_continuous(
                             brand=brand_id,
                             resume_url=_capture_url,
                         ),
-                    )
-
-                    logger.info(
-                        "[OrdersSync] fetch_success brand=%s page=%s orders=%s",
-                        brand_id,
-                        start_page,
-                        len(result.get("orders", [])),
                     )
 
                     return result
@@ -1000,18 +870,11 @@ async def sync_leaflink_background_continuous(
                 )
                 break
 
-            logger.info(
-                "[OrdersSync] bg_batch_start page=%s batch_size=%s",
-                current_page,
-                batch_size,
-            )
             batch_start = time.monotonic()
 
             # ------------------------------------------------------------------ #
             # Fetch a batch of pages from LeafLink (with retry on transient err) #
             # ------------------------------------------------------------------ #
-            logger.info("[LeafLinkSync] requesting_page id=%s page=%s", sync_run_id, current_page)
-            sys.stdout.flush()
             try:
                 fetch_result = await _fetch_with_retry(
                     start_page=current_page,
@@ -1091,31 +954,16 @@ async def sync_leaflink_background_continuous(
             next_cursor = fetch_result.get("next_url")
             next_page = fetch_result.get("next_page")
 
-            logger.info("[LeafLinkSync] page_response id=%s page=%s orders=%s", sync_run_id, current_page, len(batch_orders))
-            sys.stdout.flush()
-
-            batch_fetch_ms = round((time.monotonic() - batch_start) * 1000)
-
             # ------------------------------------------------------------------ #
             # Cursor-loop detection: same cursor returned twice → stalled         #
             # ------------------------------------------------------------------ #
             next_cursor_hash = _cursor_hash(next_cursor)
-            prev_cursor_hash = _cursor_hash(_prev_cursor)
+
             logger.info(
                 "[LeafLinkSync] page_fetched id=%s page=%s orders=%s",
                 sync_run_id,
                 current_page,
                 len(batch_orders),
-            )
-            logger.info(
-                "[OrdersSync] page_fetched brand=%s page=%s orders=%s next_cursor_hash=%s "
-                "prev_cursor_hash=%s duration_ms=%s",
-                brand_id,
-                current_page,
-                len(batch_orders),
-                next_cursor_hash,
-                prev_cursor_hash,
-                batch_fetch_ms,
             )
 
             if next_cursor and next_cursor == _prev_cursor:
@@ -1137,15 +985,6 @@ async def sync_leaflink_background_continuous(
 
             _prev_cursor = next_cursor
             resume_url = next_cursor
-
-            # Log anomaly: 0 orders but next_cursor present
-            if len(batch_orders) == 0 and next_cursor:
-                logger.warning(
-                    "[OrdersSync] zero_orders_but_next_cursor brand=%s page=%s cursor_hash=%s",
-                    brand_id,
-                    current_page,
-                    next_cursor_hash,
-                )
 
             # ------------------------------------------------------------------ #
             # Upsert order headers (headers-only, line items deferred)            #
@@ -1178,8 +1017,6 @@ async def sync_leaflink_background_continuous(
             if manager:
                 manager.record_page_complete(brand_id, last_completed_page)
 
-            logger.info("[LeafLinkSync] updating_progress id=%s pages_synced=%s", sync_run_id, last_completed_page)
-            sys.stdout.flush()
             await _persist_run_progress(
                 pages_synced=last_completed_page,
                 orders_loaded=total_orders_synced,
@@ -1188,14 +1025,15 @@ async def sync_leaflink_background_continuous(
                 total_pages_val=total_pages,
             )
 
-            percent = round((last_completed_page / total_pages) * 100, 1) if total_pages else 0
-            logger.info(
-                "[OrdersSync] bg_batch_progress page=%s/%s percent=%.1f%% orders=%s",
-                last_completed_page,
-                total_pages,
-                percent,
-                total_orders_synced,
-            )
+            # Log sampled progress every 10 pages
+            if total_pages and last_completed_page % 10 == 0:
+                logger.info(
+                    "[LeafLinkSync] progress id=%s page=%s/%s orders=%s",
+                    sync_run_id,
+                    last_completed_page,
+                    total_pages,
+                    total_orders_synced,
+                )
 
             # ------------------------------------------------------------------ #
             # Adaptive batch sizing based on fetch latency                        #
