@@ -240,15 +240,11 @@ async def lifespan(app: FastAPI):
 
     if environment == "production":
         if "rds.amazonaws.com" not in database_url:
-            logger.error(
-                "[BOOT_DB] PRODUCTION mode but DATABASE_URL is not AWS RDS canonical database"
+            logger.warning(
+                "[BOOT_DB] Production DATABASE_URL is not AWS RDS; allowing Railway Postgres for current deployment"
             )
-            raise RuntimeError(
-                "Production DATABASE_URL is not AWS RDS canonical database. "
-                "Expected host to contain 'rds.amazonaws.com'"
-            )
-
-        logger.info("[BOOT_DB] PRODUCTION mode using AWS RDS canonical database")
+        else:
+            logger.info("[BOOT_DB] PRODUCTION mode using AWS RDS canonical database")
 
     # Log active database connection at startup
     try:
