@@ -39,7 +39,7 @@ async def seed_noble_nectar_credential(
         raise HTTPException(status_code=403, detail="Invalid X-Admin-Seed-Token")
 
     try:
-        # Execute UPSERT
+        # Execute UPSERT with all required NOT NULL fields
         logger.info("[SEED] executing_upsert")
 
         await db.execute(
@@ -50,6 +50,10 @@ async def seed_noble_nectar_credential(
                     company_id,
                     api_key,
                     is_active,
+                    sync_status,
+                    last_synced_page,
+                    total_pages_available,
+                    total_orders_available,
                     created_at,
                     updated_at
                 ) VALUES (
@@ -58,6 +62,10 @@ async def seed_noble_nectar_credential(
                     '9008',
                     'daa1586d10978bb5bc104b0fc63685ae47a6308e',
                     true,
+                    'idle',
+                    0,
+                    NULL,
+                    NULL,
                     NOW(),
                     NOW()
                 )
@@ -66,6 +74,8 @@ async def seed_noble_nectar_credential(
                     company_id = EXCLUDED.company_id,
                     api_key = EXCLUDED.api_key,
                     is_active = true,
+                    sync_status = COALESCE(brand_api_credentials.sync_status, 'idle'),
+                    last_synced_page = COALESCE(brand_api_credentials.last_synced_page, 0),
                     updated_at = NOW()
             """)
         )
@@ -78,7 +88,7 @@ async def seed_noble_nectar_credential(
 
         result = await db.execute(
             text("""
-                SELECT brand_id, company_id, is_active, LENGTH(api_key) AS key_len
+                SELECT brand_id, integration_name, company_id, is_active, sync_status, last_synced_page, LENGTH(api_key) AS key_len
                 FROM brand_api_credentials
                 WHERE brand_id='noble-nectar'
                 AND integration_name='leaflink'
@@ -91,20 +101,25 @@ async def seed_noble_nectar_credential(
             logger.error("[SEED] verification_failed credential_not_found")
             raise RuntimeError("Credential not found after insert")
 
-        brand_id, company_id, is_active, key_len = row
+        brand_id, integration_name, company_id, is_active, sync_status, last_synced_page, key_len = row
 
         logger.info(
-            "[SEED] noble_nectar_seed_success key_len=%s company_id=%s",
+            "[SEED] noble_nectar_seed_success key_len=%s company_id=%s sync_status=%s last_synced_page=%s",
             key_len,
             company_id,
+            sync_status,
+            last_synced_page,
         )
 
         return {
             "ok": True,
             "seeded": True,
             "brand_id": brand_id,
+            "integration_name": integration_name,
             "company_id": company_id,
             "is_active": is_active,
+            "sync_status": sync_status,
+            "last_synced_page": last_synced_page,
             "api_key_len": key_len,
         }
 
