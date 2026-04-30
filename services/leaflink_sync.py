@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Optional
@@ -16,6 +17,9 @@ if TYPE_CHECKING:
     from services.background_sync_manager import BackgroundSyncManager
 
 logger = logging.getLogger("leaflink_sync")
+
+# Thread pool for running synchronous LeafLink HTTP calls without blocking the event loop
+_leaflink_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="leaflink-bg-sync")
 
 # Number of order headers committed per batch in Phase 1
 HEADER_BATCH_SIZE = 25
@@ -754,6 +758,15 @@ _BG_BATCH_MIN = 3
 _BG_BATCH_MAX = 5
 _BG_BATCH_DEFAULT = 4
 
+# Retry configuration
+MAX_RETRIES = 3
+INITIAL_BACKOFF_SECONDS = 2
+MAX_BACKOFF_SECONDS = 60
+BACKOFF_MULTIPLIER = 2.0
+
+# Transient error codes (retry these)
+TRANSIENT_ERROR_CODES = {429, 502, 503, 504}
+
 # Thresholds (seconds) for adaptive batch sizing
 _BG_BATCH_FAST_THRESHOLD = 5.0   # < 5 s → increase batch size
 _BG_BATCH_SLOW_THRESHOLD = 15.0  # > 15 s → decrease batch size
@@ -834,6 +847,88 @@ async def sync_leaflink_background_continuous(
 
     loop = asyncio.get_event_loop()
 
+    async def _fetch_with_retry(
+        start_page: int,
+        num_pages: int,
+        max_retries: int = MAX_RETRIES,
+    ) -> dict:
+        """Fetch pages with exponential backoff retry on transient errors."""
+
+        backoff_seconds = INITIAL_BACKOFF_SECONDS
+        last_error = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                logger.info(
+                    "[OrdersSync] fetch_attempt brand=%s page=%s attempt=%s/%s",
+                    brand_id,
+                    start_page,
+                    attempt + 1,
+                    max_retries + 1,
+                )
+
+                _capture_page = start_page
+                _capture_url = resume_url
+                _capture_num = num_pages
+
+                result = await loop.run_in_executor(
+                    _leaflink_executor,
+                    lambda: client.fetch_orders_page_range(
+                        start_page=_capture_page,
+                        num_pages=_capture_num,
+                        page_size=HEADER_BATCH_SIZE * 4,  # 100 orders per page
+                        normalize=True,
+                        brand=brand_id,
+                        resume_url=_capture_url,
+                    ),
+                )
+
+                logger.info(
+                    "[OrdersSync] fetch_success brand=%s page=%s orders=%s",
+                    brand_id,
+                    start_page,
+                    len(result.get("orders", [])),
+                )
+
+                return result
+
+            except Exception as fetch_exc:
+                last_error = fetch_exc
+                error_code = getattr(fetch_exc, "status_code", None)
+
+                # Check if error is transient
+                is_transient = error_code in TRANSIENT_ERROR_CODES
+
+                if not is_transient or attempt >= max_retries:
+                    # Not transient or out of retries — give up
+                    logger.error(
+                        "[OrdersSync] fetch_failed brand=%s page=%s error_code=%s transient=%s attempt=%s/%s error=%s",
+                        brand_id,
+                        start_page,
+                        error_code,
+                        is_transient,
+                        attempt + 1,
+                        max_retries + 1,
+                        fetch_exc,
+                    )
+                    raise
+
+                # Transient error — retry with backoff
+                logger.warning(
+                    "[OrdersSync] fetch_transient_error brand=%s page=%s error_code=%s attempt=%s/%s backoff_seconds=%s",
+                    brand_id,
+                    start_page,
+                    error_code,
+                    attempt + 1,
+                    max_retries + 1,
+                    backoff_seconds,
+                )
+
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds = min(backoff_seconds * BACKOFF_MULTIPLIER, MAX_BACKOFF_SECONDS)
+
+        raise last_error
+
     while current_page <= total_pages:
         # Hard timeout guard
         elapsed_total = time.monotonic() - bg_start
@@ -855,39 +950,58 @@ async def sync_leaflink_background_continuous(
         batch_start = time.monotonic()
 
         # ------------------------------------------------------------------ #
-        # Fetch a batch of pages from LeafLink (runs in thread pool)          #
+        # Fetch a batch of pages from LeafLink (with retry on transient err) #
         # ------------------------------------------------------------------ #
-        _capture_page = current_page
-        _capture_url = resume_url
-        _capture_batch = batch_size
-
-        def _fetch_batch():
-            return client.fetch_orders_page_range(
-                start_page=_capture_page,
-                num_pages=_capture_batch,
-                page_size=HEADER_BATCH_SIZE * 4,  # 100 orders per page
-                normalize=True,
-                brand=brand_id,
-                resume_url=_capture_url,
-            )
-
         try:
-            fetch_result = await loop.run_in_executor(None, _fetch_batch)
-        except Exception as fetch_exc:
-            err_msg = str(fetch_exc)
-            logger.error(
-                "[OrdersSync] bg_batch_fetch_error brand=%s page=%s error=%s",
-                brand_id,
-                current_page,
-                err_msg,
-                exc_info=True,
+            fetch_result = await _fetch_with_retry(
+                start_page=current_page,
+                num_pages=batch_size,
             )
-            if manager:
-                manager.record_page_complete(brand_id, current_page - 1, error=err_msg)
-            # Skip this batch and advance to avoid infinite loop
-            current_page += batch_size
-            await asyncio.sleep(2)
-            continue
+        except Exception as fetch_exc:
+            error_code = getattr(fetch_exc, "status_code", None)
+            is_transient = error_code in TRANSIENT_ERROR_CODES
+
+            if is_transient:
+                # Transient error exhausted all retries — mark as paused, not failed
+                logger.warning(
+                    "[OrdersSync] sync_paused_transient_error brand=%s error_code=%s error=%s",
+                    brand_id,
+                    error_code,
+                    fetch_exc,
+                )
+
+                if manager:
+                    await manager.persist_progress(
+                        brand_id=brand_id,
+                        last_synced_page=current_page - 1,
+                        total_pages=total_pages,
+                        sync_status="paused",
+                        error=f"LeafLink temporarily unavailable (HTTP {error_code})",
+                        total_orders_available=total_orders_available,
+                    )
+
+                # Return gracefully — worker will retry on next poll
+                return
+            else:
+                # Permanent error — mark as error and propagate
+                logger.error(
+                    "[OrdersSync] sync_failed_permanent_error brand=%s error=%s",
+                    brand_id,
+                    fetch_exc,
+                    exc_info=True,
+                )
+
+                if manager:
+                    await manager.persist_progress(
+                        brand_id=brand_id,
+                        last_synced_page=current_page - 1,
+                        total_pages=total_pages,
+                        sync_status="error",
+                        error=str(fetch_exc),
+                        total_orders_available=total_orders_available,
+                    )
+
+                raise
 
         batch_orders = fetch_result.get("orders", [])
         pages_fetched_this_batch = fetch_result.get("pages_fetched", batch_size)
