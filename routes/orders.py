@@ -13,8 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal, get_db
-from models import BrandAPICredential, Order
-from services.background_sync_manager import sync_manager
+from models import BrandAPICredential, Order, SyncRequest
 from services.watchdog_client import emit_watchdog_event
 from utils.json_utils import make_json_safe
 
@@ -724,7 +723,7 @@ async def orders_sync(
 
                 if next_leaflink_url and next_page_number and total_pages_available:
                     logger.info(
-                        "[OrdersSync] phase2_before_manager_start brand=%s start_page=%s total_pages=%s pages_remaining=%s",
+                        "[OrdersSync] phase2_before_enqueue brand=%s start_page=%s total_pages=%s pages_remaining=%s",
                         _resolved_brand_id,
                         next_page_number,
                         total_pages_available,
@@ -732,36 +731,30 @@ async def orders_sync(
                     )
 
                     try:
+                        async with AsyncSessionLocal() as _enqueue_sess:
+                            async with _enqueue_sess.begin():
+                                _enqueue_sess.add(SyncRequest(
+                                    brand_id=_resolved_brand_id,
+                                    status="pending",
+                                    start_page=next_page_number,
+                                    total_pages=total_pages_available,
+                                    total_orders_available=total_count_leaflink,
+                                ))
                         logger.info(
-                            "[OrdersSync] phase2_calling_manager_start_sync brand=%s api_key_len=%s company_id=%s",
+                            "[OrdersSync] enqueued_background_sync brand=%s start_page=%s total_pages=%s",
                             _resolved_brand_id,
-                            len(api_key) if api_key else 0,
-                            company_id,
-                        )
-
-                        sync_manager.start_sync(
-                            brand_id=_resolved_brand_id,
-                            api_key=api_key,
-                            company_id=company_id,
-                            total_pages=total_pages_available,
-                            start_page=next_page_number,
-                            total_orders_available=total_count_leaflink,
-                        )
-
-                        logger.info(
-                            "[OrdersSync] phase2_manager_started brand=%s task_created=true",
-                            _resolved_brand_id,
+                            next_page_number,
+                            total_pages_available,
                         )
                         sync_metadata["background_sync_active"] = True
-                    except Exception as bg_task_exc:
+                    except Exception as enqueue_exc:
                         logger.error(
-                            "[OrdersSync] phase2_manager_error brand=%s error=%s",
+                            "[OrdersSync] enqueue_error brand=%s error=%s",
                             _resolved_brand_id,
-                            bg_task_exc,
-                            exc_info=True,
+                            enqueue_exc,
                         )
                         sync_metadata["background_sync_active"] = False
-                        sync_metadata["background_sync_error"] = str(bg_task_exc)
+                        sync_metadata["background_sync_error"] = str(enqueue_exc)
                 else:
                     logger.info(
                         "[OrdersSync] phase2_skipped brand=%s reason=no_more_pages next_url=%s next_page=%s",
@@ -975,13 +968,13 @@ async def orders_sync_status(
     """
     Return the current background sync progress for a brand.
 
-    Combines in-memory state from BackgroundSyncManager with persisted
-    progress from BrandAPICredential and a live order count from the DB.
+    Combines sync_requests queue state (pending/processing rows) with
+    persisted progress from BrandAPICredential and a live order count from DB.
 
     Response fields:
       ok                           — always true unless brand is missing
       brand_id                     — echoed brand slug
-      background_sync_active       — true if a background task is running
+      background_sync_active       — true if a worker request is pending/processing
       pages_synced                 — last page number successfully synced
       total_pages                  — total pages reported by LeafLink
       percent_complete             — (pages_synced / total_pages) * 100
@@ -1047,10 +1040,24 @@ async def orders_sync_status(
         total_orders_in_db = 0
 
     # ------------------------------------------------------------------ #
-    # Merge in-memory manager state with DB state                         #
+    # Check sync_requests queue for active worker activity                #
     # ------------------------------------------------------------------ #
-    manager_status = sync_manager.get_status(brand)
-    bg_active = sync_manager.is_syncing(brand)
+    try:
+        queue_result = await db.execute(
+            select(SyncRequest)
+            .where(
+                SyncRequest.brand_id == brand,
+                SyncRequest.status.in_(["pending", "processing"]),
+            )
+            .order_by(SyncRequest.created_at.desc())
+            .limit(1)
+        )
+        active_queue_request = queue_result.scalar_one_or_none()
+    except Exception as queue_exc:
+        logger.error("[OrdersSync] status_queue_check_error brand=%s error=%s", brand, queue_exc)
+        active_queue_request = None
+
+    bg_active = active_queue_request is not None
 
     if cred is not None:
         db_pages_synced = cred.last_synced_page or 0
@@ -1069,8 +1076,8 @@ async def orders_sync_status(
 
     # In-memory state is more current than DB when a sync is active
     db_pages_synced_raw = db_pages_synced  # preserve original stored value for logging
-    pages_synced = manager_status["pages_synced"] if bg_active else db_pages_synced
-    total_pages = manager_status["total_pages"] if manager_status["total_pages"] else db_total_pages
+    pages_synced = db_pages_synced
+    total_pages = db_total_pages
 
     # ------------------------------------------------------------------ #
     # Calculate inferred progress from actual order count                 #
@@ -1187,7 +1194,7 @@ async def orders_sync_status(
         pages_per_second = 0.4
         estimated_completion_minutes = round(pages_remaining / pages_per_second / 60, 1)
 
-    errors = list(manager_status.get("errors", []))
+    errors: list[str] = []
     if db_last_error and db_last_error not in errors:
         errors = [db_last_error] + errors
 
