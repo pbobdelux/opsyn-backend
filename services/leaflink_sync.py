@@ -432,6 +432,27 @@ async def sync_leaflink_orders_headers_only(
         initial_db_count,
     )
 
+    logger.info(
+        "[OrdersPersist] called brand=%s total_orders=%s batch_size=%s total_batches=%s",
+        brand_id,
+        len(orders),
+        batch_size,
+        len(batches),
+    )
+
+    # Sample first 5 orders to verify field mapping
+    for idx, o in enumerate(orders[:5]):
+        if isinstance(o, dict):
+            logger.info(
+                "[OrdersPersist] sample_order idx=%s order_keys=%s id=%s external_id=%s external_order_id=%s order_number=%s",
+                idx,
+                list(o.keys()),
+                o.get("id"),
+                o.get("external_id"),
+                o.get("external_order_id"),
+                o.get("order_number"),
+            )
+
     for batch_num, batch in enumerate(batches, 1):
         batch_start = time.monotonic()
         current_batch_size = len(batch)
@@ -458,22 +479,32 @@ async def sync_leaflink_orders_headers_only(
         try:
             async with AsyncSessionLocal() as db:
                 async with db.begin():
+                    batch_order_count = 0
+                    batch_insert_count = 0
+                    batch_update_count = 0
+                    batch_skip_count = 0
+                    batch_skip_reasons: dict[str, int] = {}
+
                     for o in batch:
+                        batch_order_count += 1
+
                         if not isinstance(o, dict):
                             batch_skipped += 1
+                            batch_skip_count += 1
+                            batch_skip_reasons["not_dict"] = batch_skip_reasons.get("not_dict", 0) + 1
                             continue
 
                         external_id = safe_str(o.get("external_id"))
                         if not external_id:
                             batch_null_external_ids += 1
                             batch_skipped += 1
-                            # CRITICAL: Log the raw order to see what fields are available
+                            batch_skip_count += 1
+                            batch_skip_reasons["null_external_id"] = batch_skip_reasons.get("null_external_id", 0) + 1
                             logger.error(
-                                "[OrdersSync] CRITICAL_NULL_EXTERNAL_ID batch=%s order_number=%s raw_order_keys=%s leaflink_id=%s",
+                                "[OrdersPersist] skip_null_external_id batch=%s order_number=%s raw_id=%s",
                                 batch_num,
                                 safe_str(o.get("order_number")),
-                                list(o.keys()) if isinstance(o, dict) else "not_dict",
-                                o.get("id"),  # Try raw 'id' field
+                                o.get("id"),
                             )
                             continue
 
@@ -549,6 +580,7 @@ async def sync_leaflink_orders_headers_only(
                             existing.external_created_at = external_created_at
                             existing.external_updated_at = external_updated_at
                             batch_updated += 1
+                            batch_update_count += 1
                         else:
                             db.add(
                                 Order(
@@ -573,6 +605,20 @@ async def sync_leaflink_orders_headers_only(
                                 )
                             )
                             batch_created += 1
+                            batch_insert_count += 1
+
+                    # Log batch summary before commit
+                    logger.info(
+                        "[OrdersPersist] batch_ready_to_commit batch=%s/%s brand=%s orders_processed=%s inserts=%s updates=%s skips=%s skip_reasons=%s",
+                        batch_num,
+                        len(batches),
+                        brand_id,
+                        batch_order_count,
+                        batch_insert_count,
+                        batch_update_count,
+                        batch_skip_count,
+                        batch_skip_reasons,
+                    )
 
             # Batch committed successfully — log and accumulate totals
             batch_duration = round(time.monotonic() - batch_start, 2)
@@ -592,7 +638,36 @@ async def sync_leaflink_orders_headers_only(
             total_skipped += batch_skipped
             total_null_external_ids += batch_null_external_ids
 
-            # CRITICAL: Query DB count after each batch to verify persistence
+            # [OrdersPersist] commit_done — mirrors batch_committed with the new tag
+            logger.info(
+                "[OrdersPersist] commit_done batch=%s/%s brand=%s created=%s updated=%s skipped=%s duration=%ss",
+                batch_num,
+                len(batches),
+                brand_id,
+                batch_created,
+                batch_updated,
+                batch_skipped,
+                batch_duration,
+            )
+
+            # CRITICAL: Query DB count immediately after commit in same session
+            async with AsyncSessionLocal() as db_verify:
+                verify_result = await db_verify.execute(
+                    select(func.count(Order.id)).where(Order.brand_id == brand_id)
+                )
+                post_commit_count = verify_result.scalar() or 0
+
+            logger.info(
+                "[OrdersPersist] post_commit_count batch=%s/%s brand=%s db_count=%s expected_min=%s delta=%s",
+                batch_num,
+                len(batches),
+                brand_id,
+                post_commit_count,
+                initial_db_count + total_created + total_updated,
+                post_commit_count - initial_db_count,
+            )
+
+            # Legacy batch_db_count log kept for backward compatibility
             async with AsyncSessionLocal() as db_check:
                 count_result = await db_check.execute(
                     select(func.count(Order.id)).where(Order.brand_id == brand_id)
@@ -671,6 +746,35 @@ async def sync_leaflink_orders_headers_only(
         initial_db_count + total_created + total_updated,
         null_external_ids_in_db,
         len(duplicate_external_ids),
+    )
+
+    # Query final brand_id distribution
+    async with AsyncSessionLocal() as db_final_check:
+        brand_dist_result = await db_final_check.execute(
+            select(Order.brand_id, func.count(Order.id))
+            .group_by(Order.brand_id)
+        )
+        brand_distribution = {row[0]: row[1] for row in brand_dist_result.fetchall()}
+
+    logger.info(
+        "[OrdersPersist] final_brand_distribution brand_counts=%s",
+        brand_distribution,
+    )
+
+    # Query for NULL external_order_id
+    async with AsyncSessionLocal() as db_null_check:
+        null_result = await db_null_check.execute(
+            select(func.count(Order.id)).where(
+                Order.brand_id == brand_id,
+                Order.external_order_id == None,
+            )
+        )
+        null_count = null_result.scalar() or 0
+
+    logger.info(
+        "[OrdersPersist] final_null_external_order_id brand=%s count=%s",
+        brand_id,
+        null_count,
     )
 
     # Spawn a fire-and-forget background task to write OrderLine rows so the
