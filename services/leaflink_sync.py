@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Optional
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal
@@ -401,7 +401,6 @@ async def sync_leaflink_orders_headers_only(
     total_created = 0
     total_updated = 0
     total_skipped = 0
-    total_null_external_ids = 0
     errors: list[str] = []
     newest_order_date: datetime | None = None
 
@@ -419,93 +418,24 @@ async def sync_leaflink_orders_headers_only(
         len(batches),
     )
 
-    # Get initial DB count
-    async with AsyncSessionLocal() as db_init:
-        init_count_result = await db_init.execute(
-            select(func.count(Order.id)).where(Order.brand_id == brand_id)
-        )
-        initial_db_count = init_count_result.scalar() or 0
-
-    logger.info(
-        "[OrdersSync] initial_db_count brand=%s count=%s",
-        brand_id,
-        initial_db_count,
-    )
-
-    logger.info(
-        "[OrdersPersist] called brand=%s total_orders=%s batch_size=%s total_batches=%s",
-        brand_id,
-        len(orders),
-        batch_size,
-        len(batches),
-    )
-
-    # Sample first 5 orders to verify field mapping
-    for idx, o in enumerate(orders[:5]):
-        if isinstance(o, dict):
-            logger.info(
-                "[OrdersPersist] sample_order idx=%s order_keys=%s id=%s external_id=%s external_order_id=%s order_number=%s",
-                idx,
-                list(o.keys()),
-                o.get("id"),
-                o.get("external_id"),
-                o.get("external_order_id"),
-                o.get("order_number"),
-            )
-
     for batch_num, batch in enumerate(batches, 1):
         batch_start = time.monotonic()
         current_batch_size = len(batch)
         batch_created = 0
         batch_updated = 0
         batch_skipped = 0
-        batch_null_external_ids = 0
-
-        # Log first few orders in batch for debugging
-        if batch_num <= 3:  # Log first 3 batches
-            for idx, o in enumerate(batch[:5]):  # Log first 5 orders in batch
-                ext_id = safe_str(o.get("external_id"))
-                order_num = safe_str(o.get("order_number"))
-                cust_name = safe_str(o.get("customer_name"))
-                logger.info(
-                    "[OrdersSync] batch_sample batch=%s order_idx=%s external_id=%s order_number=%s customer=%s",
-                    batch_num,
-                    idx,
-                    ext_id,
-                    order_num,
-                    cust_name,
-                )
 
         try:
             async with AsyncSessionLocal() as db:
                 async with db.begin():
-                    batch_order_count = 0
-                    batch_insert_count = 0
-                    batch_update_count = 0
-                    batch_skip_count = 0
-                    batch_skip_reasons: dict[str, int] = {}
-
                     for o in batch:
-                        batch_order_count += 1
-
                         if not isinstance(o, dict):
                             batch_skipped += 1
-                            batch_skip_count += 1
-                            batch_skip_reasons["not_dict"] = batch_skip_reasons.get("not_dict", 0) + 1
                             continue
 
                         external_id = safe_str(o.get("external_id"))
                         if not external_id:
-                            batch_null_external_ids += 1
                             batch_skipped += 1
-                            batch_skip_count += 1
-                            batch_skip_reasons["null_external_id"] = batch_skip_reasons.get("null_external_id", 0) + 1
-                            logger.error(
-                                "[OrdersPersist] skip_null_external_id batch=%s order_number=%s raw_id=%s",
-                                batch_num,
-                                safe_str(o.get("order_number")),
-                                o.get("id"),
-                            )
                             continue
 
                         customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
@@ -554,7 +484,6 @@ async def sync_leaflink_orders_headers_only(
                                     newest_order_date = ts_dt
                                 break
 
-                        # CRITICAL: Query by (brand_id, external_order_id) — the unique constraint
                         existing_result = await db.execute(
                             select(Order).where(
                                 Order.brand_id == brand_id,
@@ -580,7 +509,6 @@ async def sync_leaflink_orders_headers_only(
                             existing.external_created_at = external_created_at
                             existing.external_updated_at = external_updated_at
                             batch_updated += 1
-                            batch_update_count += 1
                         else:
                             db.add(
                                 Order(
@@ -605,83 +533,22 @@ async def sync_leaflink_orders_headers_only(
                                 )
                             )
                             batch_created += 1
-                            batch_insert_count += 1
-
-                    # Log batch summary before commit
-                    logger.info(
-                        "[OrdersPersist] batch_ready_to_commit batch=%s/%s brand=%s orders_processed=%s inserts=%s updates=%s skips=%s skip_reasons=%s",
-                        batch_num,
-                        len(batches),
-                        brand_id,
-                        batch_order_count,
-                        batch_insert_count,
-                        batch_update_count,
-                        batch_skip_count,
-                        batch_skip_reasons,
-                    )
 
             # Batch committed successfully — log and accumulate totals
             batch_duration = round(time.monotonic() - batch_start, 2)
             logger.info(
-                "[OrdersSync] batch_committed batch=%s/%s brand=%s created=%s updated=%s skipped=%s null_external_ids=%s duration=%ss",
+                "[OrdersSync] batch_committed batch=%s/%s brand=%s created=%s updated=%s skipped=%s duration=%ss",
                 batch_num,
                 len(batches),
                 brand_id,
                 batch_created,
                 batch_updated,
                 batch_skipped,
-                batch_null_external_ids,
                 batch_duration,
             )
             total_created += batch_created
             total_updated += batch_updated
             total_skipped += batch_skipped
-            total_null_external_ids += batch_null_external_ids
-
-            # [OrdersPersist] commit_done — mirrors batch_committed with the new tag
-            logger.info(
-                "[OrdersPersist] commit_done batch=%s/%s brand=%s created=%s updated=%s skipped=%s duration=%ss",
-                batch_num,
-                len(batches),
-                brand_id,
-                batch_created,
-                batch_updated,
-                batch_skipped,
-                batch_duration,
-            )
-
-            # CRITICAL: Query DB count immediately after commit in same session
-            async with AsyncSessionLocal() as db_verify:
-                verify_result = await db_verify.execute(
-                    select(func.count(Order.id)).where(Order.brand_id == brand_id)
-                )
-                post_commit_count = verify_result.scalar() or 0
-
-            logger.info(
-                "[OrdersPersist] post_commit_count batch=%s/%s brand=%s db_count=%s expected_min=%s delta=%s",
-                batch_num,
-                len(batches),
-                brand_id,
-                post_commit_count,
-                initial_db_count + total_created + total_updated,
-                post_commit_count - initial_db_count,
-            )
-
-            # Legacy batch_db_count log kept for backward compatibility
-            async with AsyncSessionLocal() as db_check:
-                count_result = await db_check.execute(
-                    select(func.count(Order.id)).where(Order.brand_id == brand_id)
-                )
-                current_db_count = count_result.scalar() or 0
-
-            logger.info(
-                "[OrdersSync] batch_db_count batch=%s/%s brand=%s db_count=%s expected_min=%s",
-                batch_num,
-                len(batches),
-                brand_id,
-                current_db_count,
-                initial_db_count + total_created + total_updated,
-            )
 
         except Exception as batch_exc:
             batch_duration = round(time.monotonic() - batch_start, 2)
@@ -700,81 +567,15 @@ async def sync_leaflink_orders_headers_only(
             total_skipped += current_batch_size
             continue
 
-    # Get final DB count
-    async with AsyncSessionLocal() as db_final:
-        final_count_result = await db_final.execute(
-            select(func.count(Order.id)).where(Order.brand_id == brand_id)
-        )
-        final_db_count = final_count_result.scalar() or 0
-
-        # Check for null external_ids in DB
-        null_ext_result = await db_final.execute(
-            select(func.count(Order.id)).where(
-                Order.brand_id == brand_id,
-                Order.external_order_id == None,
-            )
-        )
-        null_external_ids_in_db = null_ext_result.scalar() or 0
-
-        # Check for duplicate external_ids
-        dup_result = await db_final.execute(
-            select(Order.external_order_id, func.count(Order.id))
-            .where(Order.brand_id == brand_id)
-            .group_by(Order.external_order_id)
-            .having(func.count(Order.id) > 1)
-        )
-        duplicate_external_ids = {row[0]: row[1] for row in dup_result.fetchall()}
-
-    # Log final summary across all batches
     sync_duration = round(time.monotonic() - sync_start, 2)
     logger.info(
-        "[OrdersSync] all_batches_complete brand=%s total_batches=%s total_created=%s total_updated=%s total_skipped=%s total_null_external_ids=%s sync_duration=%ss",
+        "[OrdersSync] all_batches_complete brand=%s total_batches=%s total_created=%s total_updated=%s total_skipped=%s sync_duration=%ss",
         brand_id,
         len(batches),
         total_created,
         total_updated,
         total_skipped,
-        total_null_external_ids,
         sync_duration,
-    )
-
-    logger.info(
-        "[OrdersSync] final_verification brand=%s initial_db_count=%s final_db_count=%s expected_count=%s null_external_ids_in_db=%s duplicate_external_ids=%s",
-        brand_id,
-        initial_db_count,
-        final_db_count,
-        initial_db_count + total_created + total_updated,
-        null_external_ids_in_db,
-        len(duplicate_external_ids),
-    )
-
-    # Query final brand_id distribution
-    async with AsyncSessionLocal() as db_final_check:
-        brand_dist_result = await db_final_check.execute(
-            select(Order.brand_id, func.count(Order.id))
-            .group_by(Order.brand_id)
-        )
-        brand_distribution = {row[0]: row[1] for row in brand_dist_result.fetchall()}
-
-    logger.info(
-        "[OrdersPersist] final_brand_distribution brand_counts=%s",
-        brand_distribution,
-    )
-
-    # Query for NULL external_order_id
-    async with AsyncSessionLocal() as db_null_check:
-        null_result = await db_null_check.execute(
-            select(func.count(Order.id)).where(
-                Order.brand_id == brand_id,
-                Order.external_order_id == None,
-            )
-        )
-        null_count = null_result.scalar() or 0
-
-    logger.info(
-        "[OrdersPersist] final_null_external_order_id brand=%s count=%s",
-        brand_id,
-        null_count,
     )
 
     # Spawn a fire-and-forget background task to write OrderLine rows so the
@@ -790,18 +591,13 @@ async def sync_leaflink_orders_headers_only(
         "created": total_created,
         "updated": total_updated,
         "skipped": total_skipped,
-        "null_external_ids": total_null_external_ids,
         "line_items_written": 0,
         "newest_order_date": newest_order_date,
         "pages_fetched": pages_fetched,
         "sync_duration_seconds": sync_duration,
         "errors": errors,
         "mock_data": any(isinstance(o, dict) and o.get("mock_data") for o in orders),
-        "initial_db_count": initial_db_count,
-        "final_db_count": final_db_count,
-        "duplicate_external_ids": len(duplicate_external_ids),
-        "null_external_ids_in_db": null_external_ids_in_db,
-        "message": f"Upserted {total_created + total_updated} order headers ({total_created} new, {total_updated} updated). Final DB count: {final_db_count}",
+        "message": f"Upserted {total_created + total_updated} order headers ({total_created} new, {total_updated} updated)",
     }
 
 
