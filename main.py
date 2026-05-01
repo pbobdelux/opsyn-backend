@@ -302,8 +302,24 @@ async def lifespan(app: FastAPI):
                 getattr(route, "endpoint", "unknown"),
             )
 
+    # Start background sync scheduler as an asyncio task
+    logger.info("[Startup] starting background sync scheduler")
+
+    from services.sync_scheduler import run_scheduler
+
+    scheduler_task = asyncio.create_task(run_scheduler())
+
+    logger.info("[Startup] background sync scheduler started")
+
     yield
-    logger.info("Shutting down")
+
+    # On shutdown, cancel the scheduler task
+    logger.info("[Shutdown] cancelling background sync scheduler")
+    scheduler_task.cancel()
+    try:
+        await scheduler_task
+    except asyncio.CancelledError:
+        logger.info("[Shutdown] background sync scheduler cancelled")
 
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
