@@ -498,6 +498,176 @@ async def orders_credentials(
     }
 
 
+@router.get("/sync/diagnostic")
+async def orders_sync_diagnostic(
+    brand: str = Query(..., description="Brand slug/ID (e.g., 'noble-nectar')"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read-only diagnostic for order sync issues.
+
+    Reports:
+    - Current DB order count
+    - Order counts by status/review_status
+    - Newest/oldest order dates
+    - Last sync metadata
+    - Pagination state
+    - Potential issues (duplicates, missing line items, mapping blocks)
+    """
+    try:
+        # 1. Get current order count for brand
+        count_result = await db.execute(
+            select(func.count(Order.id)).where(Order.brand_id == brand)
+        )
+        total_orders = count_result.scalar() or 0
+
+        # 2. Count by status
+        status_result = await db.execute(
+            select(Order.status, func.count(Order.id))
+            .where(Order.brand_id == brand)
+            .group_by(Order.status)
+        )
+        orders_by_status = {row[0]: row[1] for row in status_result.fetchall()}
+
+        # 3. Count by review_status
+        review_result = await db.execute(
+            select(Order.review_status, func.count(Order.id))
+            .where(Order.brand_id == brand)
+            .group_by(Order.review_status)
+        )
+        orders_by_review_status = {row[0]: row[1] for row in review_result.fetchall()}
+
+        # 4. Newest and oldest order dates
+        date_result = await db.execute(
+            select(
+                func.max(Order.external_updated_at),
+                func.min(Order.external_updated_at),
+                func.max(Order.synced_at),
+                func.min(Order.synced_at),
+            ).where(Order.brand_id == brand)
+        )
+        newest_ext_date, oldest_ext_date, newest_sync_date, oldest_sync_date = date_result.fetchone()
+
+        # 5. Last sync metadata
+        sync_result = await db.execute(
+            select(SyncRun)
+            .where(SyncRun.brand_id == brand)
+            .order_by(SyncRun.started_at.desc())
+            .limit(1)
+        )
+        last_sync = sync_result.scalar_one_or_none()
+
+        # 6. Count orders with missing line items
+        missing_lines_result = await db.execute(
+            select(func.count(Order.id))
+            .where(
+                Order.brand_id == brand,
+                (Order.line_items_json == None) | (Order.line_items_json == "[]")
+            )
+        )
+        orders_missing_line_items = missing_lines_result.scalar() or 0
+
+        # 7. Count orders blocked by product mapping
+        blocked_result = await db.execute(
+            select(func.count(Order.id))
+            .where(
+                Order.brand_id == brand,
+                Order.review_status == "blocked"
+            )
+        )
+        orders_blocked_mapping = blocked_result.scalar() or 0
+
+        # 8. Check for duplicate external_order_ids
+        dup_result = await db.execute(
+            select(Order.external_order_id, func.count(Order.id))
+            .where(Order.brand_id == brand)
+            .group_by(Order.external_order_id)
+            .having(func.count(Order.id) > 1)
+        )
+        duplicate_external_ids = {row[0]: row[1] for row in dup_result.fetchall()}
+
+        # 9. Check pagination state from last sync
+        last_cursor = last_sync.current_cursor if last_sync else None
+        last_page = last_sync.current_page if last_sync else None
+        pages_synced = last_sync.pages_synced if last_sync else None
+        total_pages = last_sync.total_pages if last_sync else None
+
+        # 10. Check if pagination stopped early
+        pagination_stopped_early = False
+        pagination_reason = None
+        if last_sync and last_sync.status in ("completed", "stalled"):
+            if last_sync.status == "stalled":
+                pagination_stopped_early = True
+                pagination_reason = last_sync.last_error or "stalled"
+            elif last_sync.status == "completed" and last_cursor:
+                pagination_stopped_early = True
+                pagination_reason = "cursor_present_at_completion"
+
+        # 11. Get most recently synced order as a data quality sample
+        sample_result = await db.execute(
+            select(Order)
+            .where(Order.brand_id == brand)
+            .order_by(Order.synced_at.desc())
+            .limit(1)
+        )
+        sample_order = sample_result.scalar_one_or_none()
+
+        return {
+            "brand": brand,
+            "diagnostic": {
+                "order_counts": {
+                    "total_orders": total_orders,
+                    "by_status": orders_by_status,
+                    "by_review_status": orders_by_review_status,
+                    "missing_line_items": orders_missing_line_items,
+                    "blocked_by_mapping": orders_blocked_mapping,
+                },
+                "order_dates": {
+                    "newest_external_updated_at": newest_ext_date.isoformat() if newest_ext_date else None,
+                    "oldest_external_updated_at": oldest_ext_date.isoformat() if oldest_ext_date else None,
+                    "newest_synced_at": newest_sync_date.isoformat() if newest_sync_date else None,
+                    "oldest_synced_at": oldest_sync_date.isoformat() if oldest_sync_date else None,
+                },
+                "last_sync": {
+                    "sync_run_id": last_sync.id if last_sync else None,
+                    "status": last_sync.status if last_sync else None,
+                    "mode": last_sync.mode if last_sync else None,
+                    "started_at": last_sync.started_at.isoformat() if last_sync and last_sync.started_at else None,
+                    "completed_at": last_sync.completed_at.isoformat() if last_sync and last_sync.completed_at else None,
+                    "last_error": last_sync.last_error if last_sync else None,
+                    "pages_synced": pages_synced,
+                    "total_pages": total_pages,
+                    "orders_loaded_this_run": last_sync.orders_loaded_this_run if last_sync else None,
+                    "last_successful_sync_at": last_sync.completed_at.isoformat() if last_sync and last_sync.completed_at else None,
+                },
+                "pagination_state": {
+                    "last_cursor": last_cursor,
+                    "last_page": last_page,
+                    "stopped_early": pagination_stopped_early,
+                    "stopped_reason": pagination_reason,
+                },
+                "data_quality": {
+                    "duplicate_external_order_ids": duplicate_external_ids,
+                    "duplicate_count": len(duplicate_external_ids),
+                },
+                "sample_order": {
+                    "id": sample_order.id if sample_order else None,
+                    "external_order_id": sample_order.external_order_id if sample_order else None,
+                    "status": sample_order.status if sample_order else None,
+                    "review_status": sample_order.review_status if sample_order else None,
+                    "synced_at": sample_order.synced_at.isoformat() if sample_order and sample_order.synced_at else None,
+                    "line_items_count": len(sample_order.line_items_json) if sample_order and sample_order.line_items_json else 0,
+                } if sample_order else None,
+            },
+        }
+
+    except Exception as exc:
+        logger.error("[OrdersDiagnostic] error brand=%s error=%s", brand, str(exc)[:500], exc_info=True)
+        return {
+            "ok": False,
+            "error": str(exc)[:500],
+        }
+
+
 @router.get("/sync")
 async def orders_sync(
     request: Request,
