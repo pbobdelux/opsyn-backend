@@ -89,10 +89,10 @@ async def run_migrations() -> list[str]:
         # in one file does not abort the remaining migrations.
         for filename in sql_files:
             try:
-                async with engine.connect() as conn:
-                    # Check whether this migration has already been applied
-                    # (outside the migration transaction so we can safely skip)
-                    row = await conn.exec_driver_sql(
+                # Use a short-lived connection just to check whether this migration
+                # has already been applied, before opening the write transaction.
+                async with engine.connect() as check_conn:
+                    row = await check_conn.exec_driver_sql(
                         "SELECT 1 FROM schema_migrations WHERE migration_name = $1",
                         (filename,),
                     )
@@ -100,46 +100,48 @@ async def run_migrations() -> list[str]:
                         logger.debug("[Migration] already applied migration=%s — skipping", filename)
                         continue
 
-                    # Read and execute the migration SQL
-                    migration_path = os.path.join(MIGRATIONS_DIR, filename)
-                    with open(migration_path, "r", encoding="utf-8") as fh:
-                        sql = fh.read()
+                # Read and execute the migration SQL
+                migration_path = os.path.join(MIGRATIONS_DIR, filename)
+                with open(migration_path, "r", encoding="utf-8") as fh:
+                    sql = fh.read()
 
-                    logger.info("[Migration] applying migration=%s", filename)
-                    start_ms = time.monotonic()
+                logger.info("[Migration] applying migration=%s", filename)
+                start_ms = time.monotonic()
 
-                    # Each migration runs in its own explicit transaction so that
-                    # a failure rolls back cleanly and does not leave the connection
-                    # in a broken state for subsequent migrations.
-                    async with conn.begin():
-                        # Execute each statement individually — asyncpg does not
-                        # support multiple statements in a single prepared call.
-                        statements = _split_statements(sql)
-                        logger.debug(
-                            "[Migration] migration=%s statement_count=%s",
-                            filename,
-                            len(statements),
-                        )
-                        for stmt in statements:
-                            await conn.exec_driver_sql(stmt)
-
-                        duration_ms = int((time.monotonic() - start_ms) * 1000)
-
-                        # Record the migration as applied (inside the same transaction
-                        # so it is atomically committed or rolled back with the migration)
-                        await conn.exec_driver_sql(
-                            "INSERT INTO schema_migrations (migration_name, duration_ms) "
-                            "VALUES ($1, $2)",
-                            (filename, duration_ms),
-                        )
-                    # Commit happens automatically when the `async with conn.begin()` block exits
-
-                    logger.info(
-                        "[Migration] applied migration=%s duration_ms=%s",
+                # engine.begin() opens a connection and starts a transaction in one
+                # step, so there is no prior autobegin to conflict with.  Calling
+                # conn.begin() on top of an engine.connect() connection would raise
+                # "can't call begin() here" because SQLAlchemy already issued an
+                # implicit BEGIN via autobegin.
+                async with engine.begin() as conn:
+                    # Execute each statement individually — asyncpg does not
+                    # support multiple statements in a single prepared call.
+                    statements = _split_statements(sql)
+                    logger.debug(
+                        "[Migration] migration=%s statement_count=%s",
                         filename,
-                        duration_ms,
+                        len(statements),
                     )
-                    applied.append(filename)
+                    for stmt in statements:
+                        await conn.exec_driver_sql(stmt)
+
+                    duration_ms = int((time.monotonic() - start_ms) * 1000)
+
+                    # Record the migration as applied (inside the same transaction
+                    # so it is atomically committed or rolled back with the migration)
+                    await conn.exec_driver_sql(
+                        "INSERT INTO schema_migrations (migration_name, duration_ms) "
+                        "VALUES ($1, $2)",
+                        (filename, duration_ms),
+                    )
+                # Commit happens automatically when the `async with engine.begin()` block exits
+
+                logger.info(
+                    "[Migration] applied migration=%s duration_ms=%s",
+                    filename,
+                    duration_ms,
+                )
+                applied.append(filename)
 
             except Exception as migration_exc:
                 # Transaction is automatically rolled back by the context manager on exception
