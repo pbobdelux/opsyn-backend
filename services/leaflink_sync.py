@@ -1246,14 +1246,7 @@ async def sync_leaflink_background_continuous(
                     )
                     # Line items are deferred inside sync_leaflink_orders_headers_only
                     # via asyncio.create_task — no need to spawn a second task here.
-
-                    logger.info(
-                        "[OrdersSync] page_persisted page=%s created=%s updated=%s skipped=%s",
-                        current_page,
-                        persist_result.get("created"),
-                        persist_result.get("updated"),
-                        persist_result.get("skipped"),
-                    )
+                    # persist_result captured but logging removed to avoid potential exceptions
 
                 except Exception as upsert_exc:
                     logger.error(
