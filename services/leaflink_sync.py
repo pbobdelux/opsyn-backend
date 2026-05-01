@@ -418,6 +418,17 @@ async def sync_leaflink_orders_headers_only(
         len(batches),
     )
 
+    # Sample first order to verify external_order_id mapping
+    if orders:
+        sample = orders[0]
+        if isinstance(sample, dict):
+            sample_external_id = sample.get("id") or sample.get("external_id") or sample.get("external_order_id")
+            logger.info(
+                "[OrdersSync] sample_order_mapping external_order_id=%s order_number=%s",
+                sample_external_id,
+                sample.get("order_number"),
+            )
+
     for batch_num, batch in enumerate(batches, 1):
         batch_start = time.monotonic()
         current_batch_size = len(batch)
@@ -433,10 +444,23 @@ async def sync_leaflink_orders_headers_only(
                             batch_skipped += 1
                             continue
 
-                        external_id = safe_str(o.get("external_id"))
+                        # Map external_order_id: use order["id"] as primary source
+                        external_id = safe_str(o.get("id") or o.get("external_id") or o.get("external_order_id"))
                         if not external_id:
+                            logger.error(
+                                "[OrdersSync] skip_no_external_id batch=%s order_number=%s",
+                                batch_num,
+                                safe_str(o.get("order_number")),
+                            )
                             batch_skipped += 1
                             continue
+
+                        # Log the mapped external_order_id before insert
+                        logger.info(
+                            "[OrdersSync] order_mapped external_order_id=%s order_number=%s",
+                            external_id,
+                            safe_str(o.get("order_number")),
+                        )
 
                         customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
                         status = (safe_str(o.get("status")) or "submitted").lower()
