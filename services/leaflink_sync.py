@@ -1239,13 +1239,21 @@ async def sync_leaflink_background_continuous(
             # ------------------------------------------------------------------ #
             if batch_orders:
                 try:
-                    await sync_leaflink_orders_headers_only(
+                    persist_result = await sync_leaflink_orders_headers_only(
                         brand_id=brand_id,
                         orders=batch_orders,
                         pages_fetched=pages_fetched_this_batch,
                     )
                     # Line items are deferred inside sync_leaflink_orders_headers_only
                     # via asyncio.create_task — no need to spawn a second task here.
+
+                    logger.info(
+                        "[OrdersSync] page_persisted page=%s created=%s updated=%s skipped=%s",
+                        current_page,
+                        persist_result.get("created"),
+                        persist_result.get("updated"),
+                        persist_result.get("skipped"),
+                    )
 
                 except Exception as upsert_exc:
                     logger.error(
