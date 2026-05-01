@@ -377,6 +377,21 @@ async def get_orders(
         ]
 
     logger.info(
+        "[OrdersAPI] returned brand=%s count=%s total_in_db=%s latest_order_date=%s",
+        brand,
+        len(serialized_orders),
+        total_in_database,
+        serialized_orders[0]["updated_at"] if serialized_orders else None,
+    )
+
+    if serialized_orders:
+        logger.info(
+            "[OrdersAPI] latest_updated_at=%s oldest_updated_at=%s",
+            serialized_orders[0]["updated_at"],
+            serialized_orders[-1]["updated_at"] if len(serialized_orders) > 1 else serialized_orders[0]["updated_at"],
+        )
+
+    logger.info(
         "[OrdersAPI] pagination brand=%s limit=%s offset=%s returned=%s total=%s has_more=%s include_line_items=%s",
         brand,
         limit,
@@ -678,6 +693,167 @@ async def orders_sync_diagnostic(
         logger.error("[OrdersDiagnostic] error brand=%s error=%s", brand, str(exc)[:500], exc_info=True)
         return {
             "ok": False,
+            "error": str(exc)[:500],
+        }
+
+
+@router.get("/api-freshness")
+async def orders_api_freshness(
+    brand: str = Query(..., description="Brand slug/ID (e.g., 'noble-nectar')"),
+    limit: int = Query(10, ge=1, le=100, description="Number of recent orders to return"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Verify Orders API returns freshly synced orders for a brand.
+
+    Checks:
+    - Database order count for brand
+    - API returned order count
+    - Latest order date
+    - Latest updated_at timestamp
+    - Response includes required fields
+    - No stale caching
+    """
+    try:
+        logger.info("[OrdersAPI] freshness_check brand=%s limit=%s", brand, limit)
+
+        # 1. Get total order count for brand
+        count_result = await db.execute(
+            select(func.count(Order.id)).where(Order.brand_id == brand)
+        )
+        db_total_orders = count_result.scalar() or 0
+
+        # 2. Get most recent orders for the brand
+        orders_result = await db.execute(
+            select(Order)
+            .where(Order.brand_id == brand)
+            .order_by(Order.updated_at.desc())
+            .limit(limit)
+        )
+        recent_orders = orders_result.scalars().all()
+
+        # 3. Get date range
+        date_result = await db.execute(
+            select(
+                func.max(Order.updated_at),
+                func.min(Order.updated_at),
+                func.max(Order.external_updated_at),
+                func.min(Order.external_updated_at),
+            ).where(Order.brand_id == brand)
+        )
+        latest_updated_at, oldest_updated_at, latest_external_updated_at, oldest_external_updated_at = date_result.fetchone()
+
+        # 4. Serialize recent orders with all required fields
+        serialized_orders = []
+        for order in recent_orders:
+            serialized_orders.append({
+                "id": order.id,
+                "external_id": order.external_order_id,
+                "order_number": order.order_number,
+                "customer_name": order.customer_name,
+                "status": order.status,
+                "review_status": order.review_status,
+                "amount": float(order.amount) if order.amount else 0,
+                "item_count": order.item_count,
+                "unit_count": order.unit_count,
+                "sync_status": order.sync_status,
+                "source": order.source,
+                "external_created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+                "external_updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
+                "created_at": order.created_at.isoformat() if order.created_at else None,
+                "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+                "synced_at": order.synced_at.isoformat() if order.synced_at else None,
+                "last_synced_at": order.last_synced_at.isoformat() if order.last_synced_at else None,
+                "line_items_count": len(order.line_items_json) if order.line_items_json else 0,
+            })
+
+        # 5. Check for orders with missing critical fields
+        missing_customer_result = await db.execute(
+            select(func.count(Order.id))
+            .where(Order.brand_id == brand, Order.customer_name == None)
+        )
+        orders_missing_customer = missing_customer_result.scalar() or 0
+
+        missing_amount_result = await db.execute(
+            select(func.count(Order.id))
+            .where(Order.brand_id == brand, Order.amount == None)
+        )
+        orders_missing_amount = missing_amount_result.scalar() or 0
+
+        # 6. Get sync status for this brand
+        sync_result = await db.execute(
+            select(SyncRun)
+            .where(SyncRun.brand_id == brand)
+            .order_by(SyncRun.started_at.desc())
+            .limit(1)
+        )
+        last_sync = sync_result.scalar_one_or_none()
+
+        logger.info(
+            "[OrdersAPI] freshness_check_complete brand=%s db_total=%s api_returned=%s latest_updated=%s",
+            brand,
+            db_total_orders,
+            len(serialized_orders),
+            latest_updated_at.isoformat() if latest_updated_at else None,
+        )
+
+        return {
+            "ok": True,
+            "brand": brand,
+            "database": {
+                "total_orders": db_total_orders,
+                "date_range": {
+                    "latest_updated_at": latest_updated_at.isoformat() if latest_updated_at else None,
+                    "oldest_updated_at": oldest_updated_at.isoformat() if oldest_updated_at else None,
+                    "latest_external_updated_at": latest_external_updated_at.isoformat() if latest_external_updated_at else None,
+                    "oldest_external_updated_at": oldest_external_updated_at.isoformat() if oldest_external_updated_at else None,
+                },
+            },
+            "api": {
+                "returned_count": len(serialized_orders),
+                "requested_limit": limit,
+                "recent_orders": serialized_orders,
+            },
+            "freshness": {
+                "latest_order_date": serialized_orders[0]["updated_at"] if serialized_orders else None,
+                "latest_external_updated_at": latest_external_updated_at.isoformat() if latest_external_updated_at else None,
+                "orders_are_fresh": latest_updated_at is not None and (datetime.now(timezone.utc) - latest_updated_at).total_seconds() < 3600,  # Within 1 hour
+            },
+            "data_quality": {
+                "orders_missing_customer": orders_missing_customer,
+                "orders_missing_amount": orders_missing_amount,
+            },
+            "last_sync": {
+                "sync_run_id": last_sync.id if last_sync else None,
+                "status": last_sync.status if last_sync else None,
+                "completed_at": last_sync.completed_at.isoformat() if last_sync and last_sync.completed_at else None,
+                "orders_loaded_this_run": last_sync.orders_loaded_this_run if last_sync else None,
+                "pages_synced": last_sync.pages_synced if last_sync else None,
+            },
+            "response_fields": {
+                "id": "Database order ID (stable, unique)",
+                "external_id": "LeafLink order ID (stable, unique)",
+                "order_number": "Order number from LeafLink",
+                "customer_name": "Customer/account name",
+                "status": "Order status (submitted, confirmed, etc)",
+                "review_status": "Review status (ready, blocked, needs_review)",
+                "amount": "Order total amount",
+                "item_count": "Number of line items",
+                "unit_count": "Total units ordered",
+                "sync_status": "Sync status (ok, error, etc)",
+                "external_created_at": "Order creation date from LeafLink",
+                "external_updated_at": "Order update date from LeafLink",
+                "updated_at": "Last database update timestamp",
+                "synced_at": "When order was synced to database",
+                "line_items_count": "Number of line items in order",
+            },
+        }
+
+    except Exception as exc:
+        logger.error("[OrdersAPI] freshness_check_error brand=%s error=%s", brand, str(exc)[:500], exc_info=True)
+        return {
+            "ok": False,
+            "brand": brand,
             "error": str(exc)[:500],
         }
 
