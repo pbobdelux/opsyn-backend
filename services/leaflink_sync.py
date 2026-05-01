@@ -1067,17 +1067,51 @@ async def sync_leaflink_background_continuous(
         # When total_pages is None (cursor-based), final_page is simply the last page visited
         final_page = (current_page - 1) if total_pages is None else min(current_page - 1, total_pages)
 
-        if sync_run_id:
-            try:
-                async with AsyncSessionLocal() as _done_db:
-                    async with _done_db.begin():
-                        await _srm_mark_completed(_done_db, sync_run_id)
-            except Exception as _done_exc:
-                logger.error(
-                    "[OrdersSync] sync_run_mark_completed_error run_id=%s error=%s",
-                    sync_run_id,
-                    _done_exc,
-                )
+        # CRITICAL: Do NOT mark completed if next_cursor exists — pagination is incomplete.
+        # A non-None next_cursor means LeafLink has more pages; the loop exited early
+        # (e.g. timeout) rather than reaching the true end of the result set.
+        if next_cursor:
+            logger.warning(
+                "[LeafLinkSync] stopped_with_cursor id=%s brand=%s total_loaded=%s cursor_hash=%s",
+                sync_run_id,
+                brand_id,
+                total_orders_synced,
+                _cursor_hash(next_cursor),
+            )
+            if sync_run_id:
+                try:
+                    async with AsyncSessionLocal() as _stall_db:
+                        async with _stall_db.begin():
+                            await _srm_mark_stalled(
+                                _stall_db,
+                                sync_run_id,
+                                f"pagination_incomplete: next_cursor_present after {final_page} pages",
+                            )
+                except Exception as _stall_exc:
+                    logger.error(
+                        "[LeafLinkSync] mark_stalled_error id=%s error=%s",
+                        sync_run_id,
+                        _stall_exc,
+                    )
+        else:
+            # No next cursor — pagination complete, safe to mark completed
+            logger.info(
+                "[LeafLinkSync] completed_no_cursor id=%s brand=%s total_loaded=%s",
+                sync_run_id,
+                brand_id,
+                total_orders_synced,
+            )
+            if sync_run_id:
+                try:
+                    async with AsyncSessionLocal() as _done_db:
+                        async with _done_db.begin():
+                            await _srm_mark_completed(_done_db, sync_run_id)
+                except Exception as _done_exc:
+                    logger.error(
+                        "[LeafLinkSync] mark_completed_error id=%s error=%s",
+                        sync_run_id,
+                        _done_exc,
+                    )
 
         logger.info(
             "[OrdersSync] bg_sync_complete brand=%s final_page=%s total_pages=%s "
