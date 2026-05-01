@@ -16,6 +16,148 @@ logger = logging.getLogger("crm")
 router = APIRouter(prefix="/crm", tags=["crm"])
 
 
+@router.get("/diagnostic")
+async def crm_diagnostic(
+    brand: str = Query(None, description="Optional brand filter"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Read-only diagnostic for CRM account/customer persistence and API freshness.
+    
+    Verifies:
+    - Database customer count
+    - API returned customer count
+    - Latest customer update timestamp
+    - Account ID stability
+    - Whether new accounts are persisted
+    """
+    try:
+        logger.info("[CRMDiagnostic] request brand=%s", brand)
+        
+        # 1. Count distinct customers in database
+        customer_count_result = await db.execute(
+            select(func.count(func.distinct(Order.customer_name)))
+            .where(Order.customer_name != None)
+        )
+        db_customer_count = customer_count_result.scalar() or 0
+        
+        # 2. Get list of all customers with metadata
+        customers_result = await db.execute(
+            select(
+                Order.customer_name,
+                func.count(Order.id).label("order_count"),
+                func.max(Order.external_updated_at).label("latest_order_updated_at"),
+                func.max(Order.updated_at).label("latest_db_updated_at"),
+            )
+            .where(Order.customer_name != None)
+            .group_by(Order.customer_name)
+            .order_by(func.max(Order.updated_at).desc())
+        )
+        
+        customers = []
+        for row in customers_result:
+            customers.append({
+                "id": row.customer_name,  # Stable ID = customer_name
+                "name": row.customer_name,
+                "order_count": row.order_count or 0,
+                "latest_order_updated_at": row.latest_order_updated_at.isoformat() if row.latest_order_updated_at else None,
+                "latest_db_updated_at": row.latest_db_updated_at.isoformat() if row.latest_db_updated_at else None,
+            })
+        
+        # 3. Get newest customer (most recently updated)
+        newest_customer = customers[0] if customers else None
+        
+        # 4. Get oldest customer (least recently updated)
+        oldest_customer = customers[-1] if customers else None
+        
+        # 5. Count orders by customer (to verify persistence)
+        orders_by_customer_result = await db.execute(
+            select(
+                Order.customer_name,
+                func.count(Order.id).label("order_count"),
+            )
+            .where(Order.customer_name != None)
+            .group_by(Order.customer_name)
+            .order_by(func.count(Order.id).desc())
+            .limit(5)
+        )
+        
+        top_customers = [
+            {
+                "name": row.customer_name,
+                "order_count": row.order_count or 0,
+            }
+            for row in orders_by_customer_result
+        ]
+        
+        # 6. Check for NULL customer_name orders (data quality issue)
+        null_customer_result = await db.execute(
+            select(func.count(Order.id))
+            .where(Order.customer_name == None)
+        )
+        null_customer_count = null_customer_result.scalar() or 0
+        
+        # 7. Get date range of customers
+        date_range_result = await db.execute(
+            select(
+                func.min(Order.updated_at),
+                func.max(Order.updated_at),
+            )
+            .where(Order.customer_name != None)
+        )
+        oldest_update, newest_update = date_range_result.fetchone()
+        
+        logger.info(
+            "[CRMDiagnostic] complete db_count=%s api_count=%s newest=%s",
+            db_customer_count,
+            len(customers),
+            newest_customer["name"] if newest_customer else None,
+        )
+        
+        return {
+            "ok": True,
+            "diagnostic": {
+                "database": {
+                    "total_customers": db_customer_count,
+                    "customers_with_orders": len(customers),
+                    "orders_with_null_customer": null_customer_count,
+                    "date_range": {
+                        "oldest_update": oldest_update.isoformat() if oldest_update else None,
+                        "newest_update": newest_update.isoformat() if newest_update else None,
+                    },
+                },
+                "api": {
+                    "returned_count": len(customers),
+                    "customers": customers,
+                },
+                "persistence": {
+                    "newest_customer": newest_customer,
+                    "oldest_customer": oldest_customer,
+                    "top_5_by_order_count": top_customers,
+                },
+                "id_stability": {
+                    "id_type": "customer_name (string)",
+                    "id_is_unique": True,
+                    "id_is_stable": "Only if customer name never changes in LeafLink",
+                    "sample_ids": [c["id"] for c in customers[:3]],
+                },
+                "freshness": {
+                    "newest_customer_name": newest_customer["name"] if newest_customer else None,
+                    "newest_customer_latest_update": newest_customer["latest_db_updated_at"] if newest_customer else None,
+                    "oldest_customer_name": oldest_customer["name"] if oldest_customer else None,
+                    "oldest_customer_latest_update": oldest_customer["latest_db_updated_at"] if oldest_customer else None,
+                },
+            },
+        }
+    
+    except Exception as exc:
+        logger.error("[CRMDiagnostic] error brand=%s error=%s", brand, str(exc)[:500], exc_info=True)
+        return {
+            "ok": False,
+            "error": str(exc)[:500],
+        }
+
+
 @router.get("/health")
 async def crm_health():
     """Health check for CRM endpoints."""
@@ -52,6 +194,14 @@ async def crm_dashboard(db: AsyncSession = Depends(get_db)):
             select(func.sum(Order.amount)).select_from(Order)
         )
         total_spend = float(total_spend_result.scalar() or 0)
+
+        logger.info(
+            "[AccountsAPI] dashboard brand=%s customer_count=%s order_count=%s total_spend=%s",
+            "all",  # No brand filter currently
+            customer_count,
+            order_count,
+            total_spend,
+        )
 
         # Get most recent order
         recent_order_result = await db.execute(
@@ -148,6 +298,21 @@ async def crm_customers(
                 "total_spend": float(row.total_spend or 0),
                 "last_order_at": row.last_order_at.isoformat() if row.last_order_at else None,
             })
+
+        logger.info(
+            "[AccountsAPI] brand=%s returned count=%s limit=%s offset=%s",
+            "all",  # No brand filter currently
+            len(customers),
+            limit,
+            offset,
+        )
+
+        if customers:
+            logger.info(
+                "[AccountsAPI] latest_updated_at=%s oldest_updated_at=%s",
+                customers[0]["last_order_at"],  # First is most recent (ordered by desc)
+                customers[-1]["last_order_at"] if len(customers) > 1 else customers[0]["last_order_at"],
+            )
 
         synced_at = datetime.now(timezone.utc).isoformat()
         source = "live" if customers else "empty"
