@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, Request
-from sqlalchemy import func, select
+from sqlalchemy import func, literal_column, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal, get_db
@@ -561,7 +561,7 @@ async def orders_sync_diagnostic(
             select(func.count(Order.id))
             .where(
                 Order.brand_id == brand,
-                (Order.line_items_json == None) | (Order.line_items_json == "[]")
+                (Order.line_items_json == None) | (Order.line_items_json == literal_column("'[]'::jsonb"))
             )
         )
         orders_missing_line_items = missing_lines_result.scalar() or 0
