@@ -398,9 +398,9 @@ async def sync_leaflink_orders_headers_only(
     """
     sync_start = time.monotonic()
 
-    created = 0
-    updated = 0
-    skipped = 0
+    total_created = 0
+    total_updated = 0
+    total_skipped = 0
     errors: list[str] = []
     newest_order_date: datetime | None = None
 
@@ -410,21 +410,24 @@ async def sync_leaflink_orders_headers_only(
         for i in range(0, len(orders), batch_size)
     ]
 
-    for batch in batches:
+    for batch_num, batch in enumerate(batches, 1):
         batch_start = time.monotonic()
         current_batch_size = len(batch)
+        batch_created = 0
+        batch_updated = 0
+        batch_skipped = 0
 
         try:
             async with AsyncSessionLocal() as db:
                 async with db.begin():
                     for o in batch:
                         if not isinstance(o, dict):
-                            skipped += 1
+                            batch_skipped += 1
                             continue
 
                         external_id = safe_str(o.get("external_id"))
                         if not external_id:
-                            skipped += 1
+                            batch_skipped += 1
                             continue
 
                         customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
@@ -497,7 +500,7 @@ async def sync_leaflink_orders_headers_only(
                             existing.last_synced_at = now
                             existing.external_created_at = external_created_at
                             existing.external_updated_at = external_updated_at
-                            updated += 1
+                            batch_updated += 1
                         else:
                             db.add(
                                 Order(
@@ -521,20 +524,50 @@ async def sync_leaflink_orders_headers_only(
                                     external_updated_at=external_updated_at,
                                 )
                             )
-                            created += 1
+                            batch_created += 1
+
+            # Batch committed successfully — log and accumulate totals
+            batch_duration = round(time.monotonic() - batch_start, 2)
+            logger.info(
+                "[OrdersSync] batch_committed batch=%s/%s brand=%s created=%s updated=%s skipped=%s duration=%ss",
+                batch_num,
+                len(batches),
+                brand_id,
+                batch_created,
+                batch_updated,
+                batch_skipped,
+                batch_duration,
+            )
+            total_created += batch_created
+            total_updated += batch_updated
+            total_skipped += batch_skipped
 
         except Exception as batch_exc:
+            batch_duration = round(time.monotonic() - batch_start, 2)
             err_msg = str(batch_exc)
             logger.error(
-                "[OrdersSync] upsert_batch_error brand=%s batch_size=%s error=%s",
+                "[OrdersSync] batch_failed batch=%s/%s brand=%s batch_size=%s error=%s duration=%ss",
+                batch_num,
+                len(batches),
                 brand_id,
                 current_batch_size,
                 err_msg,
+                batch_duration,
                 exc_info=True,
             )
             errors.append(err_msg)
-            skipped += current_batch_size
+            total_skipped += current_batch_size
             continue
+
+    # Log final summary across all batches
+    logger.info(
+        "[OrdersSync] all_batches_complete brand=%s total_batches=%s total_created=%s total_updated=%s total_skipped=%s",
+        brand_id,
+        len(batches),
+        total_created,
+        total_updated,
+        total_skipped,
+    )
 
     # Spawn a fire-and-forget background task to write OrderLine rows so the
     # caller is not blocked waiting for line-item DB writes.
@@ -548,16 +581,16 @@ async def sync_leaflink_orders_headers_only(
     return {
         "ok": len(errors) == 0,
         "orders_fetched": len(orders),
-        "created": created,
-        "updated": updated,
-        "skipped": skipped,
+        "created": total_created,
+        "updated": total_updated,
+        "skipped": total_skipped,
         "line_items_written": 0,
         "newest_order_date": newest_order_date,
         "pages_fetched": pages_fetched,
         "sync_duration_seconds": sync_duration,
         "errors": errors,
         "mock_data": any(isinstance(o, dict) and o.get("mock_data") for o in orders),
-        "message": f"Upserted {created + updated} order headers ({created} new, {updated} updated)",
+        "message": f"Upserted {total_created + total_updated} order headers ({total_created} new, {total_updated} updated)",
     }
 
 
