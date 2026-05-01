@@ -603,13 +603,27 @@ async def orders_sync_diagnostic(
                 pagination_reason = "cursor_present_at_completion"
 
         # 11. Get most recently synced order as a data quality sample
+        # Select only columns that exist in the production schema — do NOT
+        # include sync_run_id, which is mapped in the ORM but absent from the
+        # production orders table (migration not yet applied).
         sample_result = await db.execute(
-            select(Order)
+            select(
+                Order.id,
+                Order.brand_id,
+                Order.external_order_id,
+                Order.status,
+                Order.review_status,
+                Order.synced_at,
+                Order.line_items_json,
+                Order.external_updated_at,
+                Order.created_at,
+                Order.updated_at,
+            )
             .where(Order.brand_id == brand)
             .order_by(Order.synced_at.desc())
             .limit(1)
         )
-        sample_order = sample_result.scalar_one_or_none()
+        sample_row = sample_result.fetchone()
 
         return {
             "brand": brand,
@@ -650,13 +664,13 @@ async def orders_sync_diagnostic(
                     "duplicate_count": len(duplicate_external_ids),
                 },
                 "sample_order": {
-                    "id": sample_order.id if sample_order else None,
-                    "external_order_id": sample_order.external_order_id if sample_order else None,
-                    "status": sample_order.status if sample_order else None,
-                    "review_status": sample_order.review_status if sample_order else None,
-                    "synced_at": sample_order.synced_at.isoformat() if sample_order and sample_order.synced_at else None,
-                    "line_items_count": len(sample_order.line_items_json) if sample_order and sample_order.line_items_json else 0,
-                } if sample_order else None,
+                    "id": sample_row.id if sample_row else None,
+                    "external_order_id": sample_row.external_order_id if sample_row else None,
+                    "status": sample_row.status if sample_row else None,
+                    "review_status": sample_row.review_status if sample_row else None,
+                    "synced_at": sample_row.synced_at.isoformat() if sample_row and sample_row.synced_at else None,
+                    "line_items_count": len(sample_row.line_items_json) if sample_row and sample_row.line_items_json else 0,
+                } if sample_row else None,
             },
         }
 
