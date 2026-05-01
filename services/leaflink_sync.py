@@ -378,35 +378,6 @@ async def sync_leaflink_orders(
         }
 
 
-def _validate_orders_have_external_ids(orders: list[dict]) -> tuple[int, int]:
-    """
-    Validate that orders have external_id values.
-    Returns (valid_count, null_count)
-    """
-    valid_count = 0
-    null_count = 0
-
-    for idx, o in enumerate(orders):
-        if not isinstance(o, dict):
-            continue
-
-        external_id = safe_str(o.get("external_id"))
-        if external_id:
-            valid_count += 1
-        else:
-            null_count += 1
-            # Log first 10 null external_ids
-            if null_count <= 10:
-                logger.error(
-                    "[OrdersSync] CRITICAL_NULL_EXTERNAL_ID order_idx=%s order_number=%s leaflink_id=%s",
-                    idx,
-                    safe_str(o.get("order_number")),
-                    o.get("id"),  # Try to get raw LeafLink id
-                )
-
-    return valid_count, null_count
-
-
 async def sync_leaflink_orders_headers_only(
     brand_id: str,
     orders: list[dict],
@@ -460,22 +431,6 @@ async def sync_leaflink_orders_headers_only(
         brand_id,
         initial_db_count,
     )
-
-    # CRITICAL: Validate all orders have external_id before processing
-    valid_count, null_count = _validate_orders_have_external_ids(orders)
-    logger.error(
-        "[OrdersSync] CRITICAL_VALIDATION brand=%s total_orders=%s valid_external_ids=%s null_external_ids=%s",
-        brand_id,
-        len(orders),
-        valid_count,
-        null_count,
-    )
-
-    if null_count > 0:
-        logger.error(
-            "[OrdersSync] CRITICAL_FAILURE null_external_ids_found=%s — orders cannot be persisted without external_id",
-            null_count,
-        )
 
     for batch_num, batch in enumerate(batches, 1):
         batch_start = time.monotonic()
