@@ -89,6 +89,42 @@ sys.stdout.flush()
 # ============================================================================
 
 
+# ============================================================================
+# DNS RESOLUTION DIAGNOSTICS
+# ============================================================================
+import socket
+
+logger.info("[DNS_DEBUG] Testing DNS resolution for RDS host...")
+
+_rds_host = "opsyn-db-prod.cwj08oy8u09z.us-east-1.rds.amazonaws.com"
+_rds_port = 5432
+
+# Test 1: gethostbyname
+try:
+    _ip = socket.gethostbyname(_rds_host)
+    logger.info("[DNS_DEBUG] socket.gethostbyname() SUCCESS: %s -> %s", _rds_host, _ip)
+except Exception as e:
+    logger.error("[DNS_DEBUG] socket.gethostbyname() FAILED: %s", str(e))
+
+# Test 2: getaddrinfo
+try:
+    _addrs = socket.getaddrinfo(_rds_host, _rds_port)
+    logger.info("[DNS_DEBUG] socket.getaddrinfo() SUCCESS: got %d address(es)", len(_addrs))
+    for _addr in _addrs[:3]:  # Log first 3
+        logger.info("[DNS_DEBUG]   - %s", str(_addr))
+except Exception as e:
+    logger.error("[DNS_DEBUG] socket.getaddrinfo() FAILED: %s", str(e))
+    logger.error("[DNS_DEBUG] DNS resolution failed. Sleeping 30 seconds before exit to prevent crash-loop...")
+    sys.stdout.flush()
+    import time
+    time.sleep(30)
+    sys.exit(1)
+
+logger.info("[DNS_DEBUG] DNS resolution tests complete")
+sys.stdout.flush()
+# ============================================================================
+
+
 # ---------------------------------------------------------------------------
 # Core poll-and-execute function
 # ---------------------------------------------------------------------------
