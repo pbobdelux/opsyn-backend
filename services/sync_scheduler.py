@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import sys
+import urllib.parse
 from datetime import datetime, timezone
 
 # Force unbuffered output so logs are never lost on crash
@@ -294,6 +295,30 @@ async def run_scheduler() -> None:
     """
     Main scheduler loop. Polls for SyncRun jobs every POLL_INTERVAL_SECONDS.
     """
+    # ---------------------------------------------------------------------- #
+    # DATABASE_URL diagnostics — logged before any connection attempt so we  #
+    # can confirm the exact hostname passed to socket.getaddrinfo().          #
+    # ---------------------------------------------------------------------- #
+    _db_url = os.getenv("DATABASE_URL", "")
+    logger.info("[SyncScheduler] DATABASE_URL raw length=%d", len(_db_url))
+
+    if _db_url:
+        try:
+            _parsed = urllib.parse.urlparse(_db_url)
+            _password = _parsed.password or ""
+            logger.info(
+                "[SyncScheduler] DATABASE_URL_PARSED scheme=%s host=%s port=%s database=%s password_len=%d",
+                _parsed.scheme,
+                _parsed.hostname,
+                _parsed.port,
+                _parsed.path.lstrip("/"),
+                len(_password),
+            )
+        except Exception as e:
+            logger.error("[SyncScheduler] failed to parse DATABASE_URL: %s", e)
+    else:
+        logger.error("[SyncScheduler] DATABASE_URL is empty or not set")
+
     print("=== RUN_SCHEDULER ASYNC FUNCTION ENTERED ===")
     sys.stdout.flush()
 
