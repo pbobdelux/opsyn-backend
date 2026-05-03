@@ -23,9 +23,14 @@ def normalize_database_url(url: str) -> str:
     parsed = urlparse(url)
     query_params = parse_qsl(parsed.query, keep_blank_values=True)
 
-    # IMPORTANT: Preserve SSL parameters (sslmode, ssl)
-    # Do NOT filter out sslmode or ssl parameters
-    filtered_params = query_params  # Keep all parameters including SSL
+    # For asyncpg (postgresql+asyncpg driver):
+    # - Remove 'sslmode' (asyncpg doesn't support it in URL)
+    # - Keep 'ssl' (asyncpg does support it in URL)
+    # - SSL will be forced via connect_args={"ssl": "require"} anyway
+    filtered_params = [
+        (k, v) for (k, v) in query_params
+        if k.lower() != "sslmode"  # Remove sslmode - asyncpg doesn't support it
+    ]
 
     rebuilt = parsed._replace(query=urlencode(filtered_params))
     return urlunparse(rebuilt)
@@ -124,12 +129,21 @@ if DATABASE_URL:
         DATABASE_URL[:50] + "..." if DATABASE_URL else "NOT_SET",
     )
 
-    # Check if SSL is in the URL
+    # Parse URL to extract details for logging
     _parsed_url = urlparse(DATABASE_URL)
+    _drivername = _parsed_url.scheme
+    _host = _parsed_url.hostname or "unknown"
     _has_ssl_in_url = "ssl" in _parsed_url.query.lower() or "sslmode" in _parsed_url.query.lower()
-    logger.info("[DB] ssl_in_url=%s", _has_ssl_in_url)
+
+    logger.info(
+        "[DB] drivername=%s host=%s ssl_in_url=%s",
+        _drivername,
+        _host,
+        _has_ssl_in_url,
+    )
 
     # Force SSL in connect_args for asyncpg
+    # asyncpg only accepts 'ssl' in connect_args, not 'sslmode'
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
@@ -137,7 +151,7 @@ if DATABASE_URL:
         connect_args={"ssl": "require"},  # Force SSL for asyncpg
     )
 
-    logger.info("[DB] engine_created with ssl=require")
+    logger.info("[DB] engine_created with connect_args_ssl=require")
 
     AsyncSessionLocal = async_sessionmaker(
         bind=engine,
@@ -187,4 +201,4 @@ async def refresh_connection_pool() -> None:
         expire_on_commit=False,
     )
 
-    logger.info("[Database] connection_pool_recreated with ssl=require")
+    logger.info("[Database] connection_pool_recreated with connect_args_ssl=require")
