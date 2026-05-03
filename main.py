@@ -7,6 +7,8 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
+from services.sync_scheduler import run_scheduler
+
 from fastapi import Depends, FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -302,40 +304,10 @@ async def lifespan(app: FastAPI):
                 getattr(route, "endpoint", "unknown"),
             )
 
-    # Start background sync scheduler as an asyncio task
-    logger.info("[opsyn-backend] Starting LeafLink sync scheduler in background...")
-
-    from services.sync_scheduler import run_scheduler
-
-    async def run_scheduler_with_retry():
-        """
-        Run the scheduler with retry logic to handle transient failures.
-        """
-        retry_count = 0
-        max_retries = 5
-        retry_delay = 5  # seconds
-
-        while True:
-            try:
-                logger.info("[opsyn-backend] Sync scheduler starting (attempt %d)", retry_count + 1)
-                await run_scheduler()
-            except asyncio.CancelledError:
-                logger.info("[opsyn-backend] Sync scheduler cancelled")
-                break
-            except Exception as e:
-                retry_count += 1
-                if retry_count >= max_retries:
-                    logger.error("[opsyn-backend] Sync scheduler failed after %d retries: %s", max_retries, str(e))
-                    break
-                logger.warning(
-                    "[opsyn-backend] Sync scheduler failed (attempt %d/%d), retrying in %d seconds: %s",
-                    retry_count, max_retries, retry_delay, str(e)
-                )
-                await asyncio.sleep(retry_delay)
-
-    # Start the scheduler as a background task (non-blocking)
-    scheduler_task = asyncio.create_task(run_scheduler_with_retry())
-    logger.info("[opsyn-backend] Sync scheduler background task created")
+    # Start background sync scheduler as an asyncio task (non-blocking)
+    print("🚀 Starting sync scheduler...")
+    scheduler_task = asyncio.create_task(run_scheduler())
+    print("✅ Sync scheduler task created")
 
     yield
 
