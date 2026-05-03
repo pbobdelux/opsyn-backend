@@ -418,17 +418,6 @@ async def sync_leaflink_orders_headers_only(
         len(batches),
     )
 
-    # Sample first order to verify external_order_id mapping
-    if orders:
-        sample = orders[0]
-        if isinstance(sample, dict):
-            sample_external_id = sample.get("id") or sample.get("external_id") or sample.get("external_order_id")
-            logger.info(
-                "[OrdersSync] sample_order_mapping external_order_id=%s order_number=%s",
-                sample_external_id,
-                sample.get("order_number"),
-            )
-
     for batch_num, batch in enumerate(batches, 1):
         batch_start = time.monotonic()
         current_batch_size = len(batch)
@@ -454,13 +443,6 @@ async def sync_leaflink_orders_headers_only(
                             )
                             batch_skipped += 1
                             continue
-
-                        # Log the mapped external_order_id before insert
-                        logger.info(
-                            "[OrdersSync] order_mapped external_order_id=%s order_number=%s",
-                            external_id,
-                            safe_str(o.get("order_number")),
-                        )
 
                         customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
                         status = (safe_str(o.get("status")) or "submitted").lower()
@@ -1026,13 +1008,6 @@ async def sync_leaflink_background_continuous(
             # Cursor-loop detection: same cursor returned twice → stalled         #
             # ------------------------------------------------------------------ #
             next_cursor_hash = _cursor_hash(next_cursor)
-
-            logger.info(
-                "[LeafLinkSync] page_fetched id=%s page=%s orders=%s",
-                sync_run_id,
-                current_page,
-                len(batch_orders),
-            )
 
             if next_cursor and next_cursor == _prev_cursor:
                 _loop_reason = "cursor_loop_detected"

@@ -410,7 +410,6 @@ async def run_scheduler() -> None:
     # Main polling loop
     while True:
         try:
-            print("🔁 Sync loop running")
             await poll_and_execute()
 
         except Exception as loop_exc:
