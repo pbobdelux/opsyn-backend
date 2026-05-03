@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import sys
+import urllib.parse
 from datetime import datetime, timezone
 
 # Force unbuffered output so logs are never lost on crash
@@ -295,6 +296,42 @@ async def run_scheduler() -> None:
     Main scheduler loop. Polls for SyncRun jobs every POLL_INTERVAL_SECONDS.
     """
     print("=== RUN_SCHEDULER ASYNC FUNCTION ENTERED ===")
+    sys.stdout.flush()
+
+    # ---------------------------------------------------------------------- #
+    # Startup diagnostics: log env-var presence and parsed DATABASE_URL       #
+    # before any database connection attempt.                                 #
+    # ---------------------------------------------------------------------- #
+    logger.info("[SyncScheduler] Checking environment variables...")
+    _db_url = os.getenv("DATABASE_URL")
+    _db_public_url = os.getenv("DATABASE_PUBLIC_URL")
+    _postgres_url = os.getenv("POSTGRES_URL")
+    _async_db_url = os.getenv("ASYNC_DATABASE_URL")
+
+    logger.info("[SyncScheduler] DATABASE_URL set: %s", _db_url is not None)
+    logger.info("[SyncScheduler] DATABASE_PUBLIC_URL set: %s", _db_public_url is not None)
+    logger.info("[SyncScheduler] POSTGRES_URL set: %s", _postgres_url is not None)
+    logger.info("[SyncScheduler] ASYNC_DATABASE_URL set: %s", _async_db_url is not None)
+
+    _db_url = os.getenv("DATABASE_URL", "")
+    logger.info("[SyncScheduler] DATABASE_URL raw length: %d", len(_db_url))
+
+    if _db_url:
+        try:
+            _parsed = urllib.parse.urlparse(_db_url)
+            logger.info(
+                "[SyncScheduler] PARSED driver=%s host=%s port=%s database=%s password_exists=%s",
+                _parsed.scheme,
+                _parsed.hostname,
+                _parsed.port,
+                _parsed.path.lstrip("/"),
+                _parsed.password is not None,
+            )
+        except Exception as e:
+            logger.error("[SyncScheduler] Failed to parse DATABASE_URL: %s", e)
+    else:
+        logger.error("[SyncScheduler] DATABASE_URL is empty or not set")
+
     sys.stdout.flush()
 
     logger.info("===================================")
