@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import sys
+import urllib.parse
 from datetime import datetime, timezone
 
 # Force unbuffered output so logs are never lost on crash
@@ -305,6 +306,25 @@ async def run_scheduler() -> None:
     logger.info("Stall threshold: %s seconds", STALL_THRESHOLD_SECONDS)
     logger.info("===================================")
     sys.stdout.flush()
+
+    # Log DATABASE_URL components (without password) to aid DNS/connection debugging
+    try:
+        _raw_url = os.getenv("DATABASE_URL", "")
+        if _raw_url:
+            _parsed = urllib.parse.urlparse(_raw_url)
+            logger.info(
+                "[SyncScheduler] DATABASE_URL_COMPONENTS driver=%s host=%s port=%s database=%s",
+                _parsed.scheme,
+                _parsed.hostname,
+                _parsed.port,
+                _parsed.path.lstrip("/"),
+            )
+        else:
+            logger.warning("[SyncScheduler] DATABASE_URL is not set")
+        sys.stdout.flush()
+    except Exception as url_exc:
+        logger.warning("[SyncScheduler] failed to parse DATABASE_URL: %s", url_exc)
+        sys.stdout.flush()
 
     # Validate database connection at startup
     try:
