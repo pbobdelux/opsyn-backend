@@ -125,13 +125,68 @@ sys.stdout.flush()
 # ============================================================================
 
 
+# ============================================================================
+# NETWORK DIAGNOSTICS: Check /etc/resolv.conf and connectivity
+# ============================================================================
+import subprocess
+
+logger.info("[NETWORK_DEBUG] ========== NETWORK DIAGNOSTICS ==========")
+
+# Check /etc/resolv.conf
+try:
+    with open("/etc/resolv.conf", "r") as f:
+        resolv_content = f.read()
+    logger.info("[NETWORK_DEBUG] /etc/resolv.conf exists")
+    for line in resolv_content.split("\n")[:5]:  # Log first 5 lines
+        if line.strip():
+            logger.info("[NETWORK_DEBUG] %s", line)
+except Exception as e:
+    logger.error("[NETWORK_DEBUG] Failed to read /etc/resolv.conf: %s", str(e))
+
+# Test ping to 8.8.8.8 (Google DNS IP)
+try:
+    result = subprocess.run(
+        ["ping", "-c", "1", "8.8.8.8"],
+        capture_output=True,
+        timeout=5,
+        text=True
+    )
+    if result.returncode == 0:
+        logger.info("[NETWORK_DEBUG] ping 8.8.8.8 SUCCESS")
+    else:
+        logger.error("[NETWORK_DEBUG] ping 8.8.8.8 FAILED: %s", result.stderr[:100])
+except Exception as e:
+    logger.error("[NETWORK_DEBUG] ping 8.8.8.8 exception: %s", str(e))
+
+# Test ping to google.com (DNS + connectivity)
+try:
+    result = subprocess.run(
+        ["ping", "-c", "1", "google.com"],
+        capture_output=True,
+        timeout=5,
+        text=True
+    )
+    if result.returncode == 0:
+        logger.info("[NETWORK_DEBUG] ping google.com SUCCESS")
+    else:
+        logger.error("[NETWORK_DEBUG] ping google.com FAILED: %s", result.stderr[:100])
+except Exception as e:
+    logger.error("[NETWORK_DEBUG] ping google.com exception: %s", str(e))
+
+logger.info("[NETWORK_DEBUG] ========== END NETWORK DIAGNOSTICS ==========")
+sys.stdout.flush()
+# ============================================================================
+
+
 # ---------------------------------------------------------------------------
 # Core poll-and-execute function
 # ---------------------------------------------------------------------------
 
+
 async def poll_and_execute() -> None:
     """
     Single poll iteration:
+
       1. Query SyncRun for the oldest queued or syncing job.
       2. Claim it (set worker_id, status=syncing, last_progress_at).
       3. Fetch the brand's LeafLink credential.
