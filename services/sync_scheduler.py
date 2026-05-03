@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import sys
+import urllib.parse
 from datetime import datetime, timezone
 
 # Force unbuffered output so logs are never lost on crash
@@ -47,6 +48,51 @@ STALL_THRESHOLD_SECONDS = int(os.getenv("STALL_THRESHOLD_SECONDS", "90"))
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+
+# ============================================================================
+# STARTUP DIAGNOSTICS: Inspect DATABASE_URL before any engine creation
+# ============================================================================
+logger.info("[STARTUP_DEBUG] ========== DATABASE_URL DIAGNOSTICS ==========")
+
+# Check which env vars are set
+_db_url_raw = os.getenv("DATABASE_URL")
+_db_public_url = os.getenv("DATABASE_PUBLIC_URL")
+_postgres_url = os.getenv("POSTGRES_URL")
+_async_db_url = os.getenv("ASYNC_DATABASE_URL")
+
+logger.info("[STARTUP_DEBUG] DATABASE_URL is None: %s", _db_url_raw is None)
+logger.info("[STARTUP_DEBUG] DATABASE_URL is populated: %s", _db_url_raw is not None)
+logger.info("[STARTUP_DEBUG] DATABASE_PUBLIC_URL is set: %s", _db_public_url is not None)
+logger.info("[STARTUP_DEBUG] POSTGRES_URL is set: %s", _postgres_url is not None)
+logger.info("[STARTUP_DEBUG] ASYNC_DATABASE_URL is set: %s", _async_db_url is not None)
+
+if _db_url_raw:
+    logger.info("[STARTUP_DEBUG] DATABASE_URL raw length: %d characters", len(_db_url_raw))
+
+    # Parse the URL
+    try:
+        _parsed = urllib.parse.urlparse(_db_url_raw)
+        logger.info("[STARTUP_DEBUG] Parsed scheme (driver): %s", _parsed.scheme)
+        logger.info("[STARTUP_DEBUG] Parsed hostname: %s", _parsed.hostname)
+        logger.info("[STARTUP_DEBUG] Parsed port: %s", _parsed.port)
+        logger.info("[STARTUP_DEBUG] Parsed database: %s", _parsed.path.lstrip("/"))
+        logger.info("[STARTUP_DEBUG] Password present: %s", _parsed.password is not None)
+
+        # Check if it's async
+        if "asyncpg" in _parsed.scheme:
+            logger.info("[STARTUP_DEBUG] URL uses asyncpg driver: True")
+        else:
+            logger.info("[STARTUP_DEBUG] URL uses asyncpg driver: False")
+
+    except Exception as e:
+        logger.error("[STARTUP_DEBUG] Failed to parse DATABASE_URL: %s", str(e))
+else:
+    logger.error("[STARTUP_DEBUG] DATABASE_URL is None or empty!")
+
+logger.info("[STARTUP_DEBUG] ========== END DATABASE_URL DIAGNOSTICS ==========")
+sys.stdout.flush()
+# ============================================================================
 
 
 # ---------------------------------------------------------------------------
