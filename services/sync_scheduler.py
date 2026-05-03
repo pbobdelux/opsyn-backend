@@ -49,6 +49,45 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 
+# ============================================================================
+# STARTUP DIAGNOSTICS: Log DATABASE_URL before any connection attempt
+# ============================================================================
+import urllib.parse
+
+logger.info("[STARTUP] Checking environment variables...")
+_db_url = os.getenv("DATABASE_URL")
+_db_public_url = os.getenv("DATABASE_PUBLIC_URL")
+_postgres_url = os.getenv("POSTGRES_URL")
+_async_db_url = os.getenv("ASYNC_DATABASE_URL")
+
+logger.info("[STARTUP] DATABASE_URL set: %s", _db_url is not None)
+logger.info("[STARTUP] DATABASE_PUBLIC_URL set: %s", _db_public_url is not None)
+logger.info("[STARTUP] POSTGRES_URL set: %s", _postgres_url is not None)
+logger.info("[STARTUP] ASYNC_DATABASE_URL set: %s", _async_db_url is not None)
+
+_db_url = os.getenv("DATABASE_URL", "")
+logger.info("[STARTUP] DATABASE_URL raw length: %d", len(_db_url))
+
+if _db_url:
+    try:
+        _parsed = urllib.parse.urlparse(_db_url)
+        logger.info(
+            "[STARTUP] PARSED driver=%s host=%s port=%s database=%s password_exists=%s",
+            _parsed.scheme,
+            _parsed.hostname,
+            _parsed.port,
+            _parsed.path.lstrip("/"),
+            _parsed.password is not None,
+        )
+    except Exception as e:
+        logger.error("[STARTUP] Failed to parse DATABASE_URL: %s", e)
+else:
+    logger.error("[STARTUP] DATABASE_URL is empty or not set")
+
+sys.stdout.flush()
+# ============================================================================
+
+
 # ---------------------------------------------------------------------------
 # Core poll-and-execute function
 # ---------------------------------------------------------------------------
