@@ -214,7 +214,7 @@ async def passcode_login(
 
     Args:
         db: Database session
-        passcode: Plain text passcode
+        passcode: Plain text passcode (e.g., "1234")
         app_id: App ID (brand_app, driver_app, crm_app)
 
     Returns:
@@ -228,7 +228,7 @@ async def passcode_login(
         }
     """
     try:
-        logger.info("[Auth] passcode_login_attempt app_id=%s", app_id)
+        logger.info("[Auth] passcode_login_attempt app_id=%s passcode_length=%d", app_id, len(passcode))
 
         # Find all active passcodes
         logger.info("[Auth] querying_active_passcodes")
@@ -242,27 +242,56 @@ async def passcode_login(
 
         logger.info("[Auth] found_passcodes count=%d", len(passcodes))
 
+        if not passcodes:
+            logger.warning("[Auth] no_active_passcodes_found")
+            return {"ok": False, "error": "Invalid passcode"}
+
         # Find matching passcode
         matching_passcode = None
-        for pc in passcodes:
-            logger.debug("[Auth] comparing_passcode passcode_id=%s", pc.id)
+        for i, pc in enumerate(passcodes):
+            logger.debug("[Auth] comparing_passcode index=%d passcode_id=%s", i, pc.id)
 
-            if verify_passcode(passcode, pc.passcode_hash):
-                logger.info("[Auth] passcode_match passcode_id=%s", pc.id)
-                matching_passcode = pc
-                break
+            # Log hash details for debugging
+            logger.debug("[Auth] passcode_hash_length=%d", len(pc.passcode_hash))
+            logger.debug("[Auth] input_passcode_length=%d", len(passcode))
+
+            try:
+                is_match = verify_passcode(passcode, pc.passcode_hash)
+                logger.debug("[Auth] passcode_comparison result=%s", is_match)
+
+                if is_match:
+                    logger.info("[Auth] passcode_match passcode_id=%s", pc.id)
+                    matching_passcode = pc
+                    break
+            except Exception as verify_exc:
+                logger.error("[Auth] passcode_verify_error error=%s", str(verify_exc)[:200])
+                continue
 
         if not matching_passcode:
-            logger.warning("[Auth] passcode_invalid no_match")
+            logger.warning("[Auth] passcode_invalid no_match found=%d", len(passcodes))
             return {"ok": False, "error": "Invalid passcode"}
 
         logger.info("[Auth] passcode_verified passcode_id=%s", matching_passcode.id)
 
-        # Get employee
-        logger.info("[Auth] querying_employee employee_id=%s", matching_passcode.employee_id)
+        # CRITICAL: Validate employee_id exists and is not empty
+        if not matching_passcode.employee_id:
+            logger.error(
+                "[Auth] passcode_missing_employee_id passcode_id=%s",
+                matching_passcode.id,
+            )
+            return {
+                "ok": False,
+                "error": "Passcode record is missing employee_id - database corruption",
+            }
+
+        employee_id = matching_passcode.employee_id
+        logger.info("[Auth] extracted_employee_id employee_id=%s", employee_id)
+
+        # Get employee by UUID
+        logger.info("[Auth] querying_employee employee_id=%s", employee_id)
 
         result = await db.execute(
-            select(Employee).where(Employee.id == matching_passcode.employee_id)
+            select(Employee).where(Employee.id == employee_id)
         )
         employee = result.scalar_one_or_none()
 
