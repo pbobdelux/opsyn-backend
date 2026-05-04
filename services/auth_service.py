@@ -1,5 +1,6 @@
 import logging
 import uuid
+from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from utils.auth_utils import hash_passcode, verify_passcode
@@ -259,10 +260,24 @@ async def passcode_login(
         logger.info("[Auth] passcode_verified passcode_id=%s", matching_passcode.id)
 
         # Get employee
-        logger.info("[Auth] querying_employee employee_id=%s", matching_passcode.employee_id)
+        employee_id_str = str(matching_passcode.employee_id)
+        logger.info("[Auth] extracted_employee_id employee_id=%s", employee_id_str)
+
+        try:
+            employee_uuid = UUID(employee_id_str)
+            logger.info("[Auth] using_uuid employee_id=%s", employee_uuid)
+        except (ValueError, TypeError) as uuid_exc:
+            logger.error(
+                "[Auth] invalid_employee_id_format employee_id=%s error=%s",
+                employee_id_str,
+                str(uuid_exc)[:200],
+            )
+            return {"ok": False, "error": "Invalid employee_id format"}
+
+        logger.info("[Auth] querying_employee employee_uuid=%s", employee_uuid)
 
         result = await db.execute(
-            select(Employee).where(Employee.id == matching_passcode.employee_id)
+            select(Employee).where(Employee.id == employee_uuid)
         )
         employee = result.scalar_one_or_none()
 
@@ -281,10 +296,22 @@ async def passcode_login(
         )
 
         # Get organization
-        logger.info("[Auth] querying_organization org_id=%s", employee.org_id)
+        org_id_str = str(employee.org_id)
+        logger.info("[Auth] querying_organization org_id=%s", org_id_str)
+
+        try:
+            org_uuid = UUID(org_id_str)
+            logger.info("[Auth] using_uuid org_id=%s", org_uuid)
+        except (ValueError, TypeError) as uuid_exc:
+            logger.error(
+                "[Auth] invalid_org_id_format org_id=%s error=%s",
+                org_id_str,
+                str(uuid_exc)[:200],
+            )
+            return {"ok": False, "error": "Invalid org_id format"}
 
         result = await db.execute(
-            select(Organization).where(Organization.id == employee.org_id)
+            select(Organization).where(Organization.id == org_uuid)
         )
         org = result.scalar_one_or_none()
 
@@ -306,7 +333,7 @@ async def passcode_login(
 
         result = await db.execute(
             select(EmployeeAppAccess).where(
-                EmployeeAppAccess.employee_id == employee.id,
+                EmployeeAppAccess.employee_id == employee_uuid,
                 EmployeeAppAccess.app_id == app_id,
                 EmployeeAppAccess.is_active == True,  # noqa: E712
             )
@@ -329,7 +356,7 @@ async def passcode_login(
         result = await db.execute(
             select(EmployeeBrandAccess)
             .where(
-                EmployeeBrandAccess.employee_id == employee.id,
+                EmployeeBrandAccess.employee_id == employee_uuid,
                 EmployeeBrandAccess.is_active == True,  # noqa: E712
             )
             .limit(1)
@@ -338,10 +365,22 @@ async def passcode_login(
 
         brand = None
         if brand_access:
-            logger.info("[Auth] querying_brand brand_id=%s", brand_access.brand_id)
+            brand_id_str = str(brand_access.brand_id)
+            logger.info("[Auth] querying_brand brand_id=%s", brand_id_str)
+
+            try:
+                brand_uuid = UUID(brand_id_str)
+                logger.info("[Auth] using_uuid brand_id=%s", brand_uuid)
+            except (ValueError, TypeError) as uuid_exc:
+                logger.error(
+                    "[Auth] invalid_brand_id_format brand_id=%s error=%s",
+                    brand_id_str,
+                    str(uuid_exc)[:200],
+                )
+                return {"ok": False, "error": "Invalid brand_id format"}
 
             result = await db.execute(
-                select(Brand).where(Brand.id == brand_access.brand_id)
+                select(Brand).where(Brand.id == brand_uuid)
             )
             brand = result.scalar_one_or_none()
 
@@ -357,17 +396,17 @@ async def passcode_login(
         return {
             "ok": True,
             "employee": {
-                "id": employee.id,
+                "id": str(employee.id),
                 "name": f"{employee.first_name} {employee.last_name}",
                 "email": employee.email,
             },
             "organization": {
-                "id": org.id,
+                "id": str(org.id),
                 "slug": org.slug,
                 "name": org.name,
             },
             "brand": {
-                "id": brand.id if brand else None,
+                "id": str(brand.id) if brand else None,
                 "slug": brand.slug if brand else None,
                 "name": brand.name if brand else None,
             } if brand else None,
@@ -376,8 +415,8 @@ async def passcode_login(
                 "role": app_access.role,
             },
             "tenant_context": {
-                "org_id": org.id,
-                "brand_id": brand.id if brand else None,
+                "org_id": str(org.id),
+                "brand_id": str(brand.id) if brand else None,
                 "app_id": app_access.app_id,
                 "role": app_access.role,
             },
