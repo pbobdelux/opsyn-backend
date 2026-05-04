@@ -1,10 +1,12 @@
 import logging
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from services.auth_service import (
     setup_employee_passcode,
     grant_brand_access,
     grant_app_access,
 )
+from models.auth_models import Employee, EmployeePasscode
 
 logger = logging.getLogger("seed_auth")
 
@@ -13,17 +15,60 @@ async def seed_preston_anderson(db: AsyncSession) -> dict:
     """
     Seed Preston Anderson with passcode and app access.
 
-    This function is idempotent — if the passcode or access records already
-    exist the underlying service calls will return an error and the seed
-    will report the reason without raising.
+    This function is idempotent — checks if passcode already exists
+    before creating a new one.
 
     Returns:
-        {ok: bool, message: str}
+        {ok: bool, message: str, employee_id: str}
     """
     try:
         logger.info("[Seed] starting_preston_anderson_setup")
 
-        # 1. Set up passcode
+        # 1. Look up employee by email
+        logger.info("[Seed] looking_up_employee email=preston@noble420.com")
+
+        result = await db.execute(
+            select(Employee).where(Employee.email == "preston@noble420.com")
+        )
+        employee = result.scalar_one_or_none()
+
+        if not employee:
+            logger.error("[Seed] employee_not_found email=preston@noble420.com")
+            return {"ok": False, "error": "Employee not found"}
+
+        logger.info(
+            "[Seed] employee_found employee_id=%s name=%s %s",
+            employee.id,
+            employee.first_name,
+            employee.last_name,
+        )
+
+        # 2. Check if passcode already exists
+        logger.info("[Seed] checking_existing_passcodes employee_id=%s", employee.id)
+
+        result = await db.execute(
+            select(EmployeePasscode).where(
+                EmployeePasscode.employee_id == employee.id,
+                EmployeePasscode.is_active == True,  # noqa: E712
+            )
+        )
+        existing_passcode = result.scalar_one_or_none()
+
+        if existing_passcode:
+            logger.info(
+                "[Seed] passcode_already_exists employee_id=%s passcode_id=%s",
+                employee.id,
+                existing_passcode.id,
+            )
+            return {
+                "ok": True,
+                "message": "Passcode already exists",
+                "employee_id": employee.id,
+            }
+
+        # 3. Set up passcode
+        logger.info("[Seed] creating_passcode employee_id=%s", employee.id)
+
         result = await setup_employee_passcode(
             db,
             email="preston@noble420.com",
@@ -37,7 +82,9 @@ async def seed_preston_anderson(db: AsyncSession) -> dict:
         employee_id = result.get("employee_id")
         logger.info("[Seed] passcode_created employee_id=%s", employee_id)
 
-        # 2. Grant brand access
+        # 4. Grant brand access
+        logger.info("[Seed] granting_brand_access employee_id=%s brand=noble-nectar", employee_id)
+
         result = await grant_brand_access(
             db,
             employee_id=employee_id,
@@ -51,9 +98,11 @@ async def seed_preston_anderson(db: AsyncSession) -> dict:
 
         logger.info("[Seed] brand_access_granted")
 
-        # 3. Grant app access for all apps
+        # 5. Grant app access
         apps = ["brand_app", "driver_app", "crm_app"]
         for app_id in apps:
+            logger.info("[Seed] granting_app_access employee_id=%s app_id=%s", employee_id, app_id)
+
             result = await grant_app_access(
                 db,
                 employee_id=employee_id,
@@ -71,7 +120,7 @@ async def seed_preston_anderson(db: AsyncSession) -> dict:
 
             logger.info("[Seed] app_access_granted app_id=%s", app_id)
 
-        logger.info("[Seed] preston_anderson_setup_complete")
+        logger.info("[Seed] preston_anderson_setup_complete employee_id=%s", employee_id)
 
         return {
             "ok": True,

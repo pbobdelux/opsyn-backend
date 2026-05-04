@@ -32,7 +32,11 @@ async def setup_employee_passcode(
         {ok: bool, employee_id: str, message: str}
     """
     try:
+        logger.info("[Auth] setup_passcode_start email=%s", email)
+
         # Find employee by email
+        logger.info("[Auth] querying_employee email=%s", email)
+
         result = await db.execute(
             select(Employee).where(Employee.email == email)
         )
@@ -42,8 +46,17 @@ async def setup_employee_passcode(
             logger.error("[Auth] employee_not_found email=%s", email)
             return {"ok": False, "error": "Employee not found"}
 
+        logger.info(
+            "[Auth] employee_found employee_id=%s name=%s %s",
+            employee.id,
+            employee.first_name,
+            employee.last_name,
+        )
+
         # Hash passcode
+        logger.info("[Auth] hashing_passcode")
         passcode_hash = hash_passcode(passcode)
+        logger.info("[Auth] passcode_hashed hash_length=%d", len(passcode_hash))
 
         # Create passcode record
         passcode_id = str(uuid.uuid4())
@@ -54,10 +67,20 @@ async def setup_employee_passcode(
             is_active=True,
         )
 
+        logger.info(
+            "[Auth] inserting_passcode passcode_id=%s employee_id=%s",
+            passcode_id,
+            employee.id,
+        )
+
         db.add(new_passcode)
         await db.commit()
 
-        logger.info("[Auth] passcode_created employee_id=%s", employee.id)
+        logger.info(
+            "[Auth] passcode_created passcode_id=%s employee_id=%s",
+            passcode_id,
+            employee.id,
+        )
 
         return {
             "ok": True,
@@ -207,7 +230,9 @@ async def passcode_login(
     try:
         logger.info("[Auth] passcode_login_attempt app_id=%s", app_id)
 
-        # Find all active passcodes and check for a match
+        # Find all active passcodes
+        logger.info("[Auth] querying_active_passcodes")
+
         result = await db.execute(
             select(EmployeePasscode).where(
                 EmployeePasscode.is_active == True  # noqa: E712
@@ -215,17 +240,27 @@ async def passcode_login(
         )
         passcodes = result.scalars().all()
 
+        logger.info("[Auth] found_passcodes count=%d", len(passcodes))
+
+        # Find matching passcode
         matching_passcode = None
         for pc in passcodes:
+            logger.debug("[Auth] comparing_passcode passcode_id=%s", pc.id)
+
             if verify_passcode(passcode, pc.passcode_hash):
+                logger.info("[Auth] passcode_match passcode_id=%s", pc.id)
                 matching_passcode = pc
                 break
 
         if not matching_passcode:
-            logger.warning("[Auth] passcode_invalid")
+            logger.warning("[Auth] passcode_invalid no_match")
             return {"ok": False, "error": "Invalid passcode"}
 
+        logger.info("[Auth] passcode_verified passcode_id=%s", matching_passcode.id)
+
         # Get employee
+        logger.info("[Auth] querying_employee employee_id=%s", matching_passcode.employee_id)
+
         result = await db.execute(
             select(Employee).where(Employee.id == matching_passcode.employee_id)
         )
@@ -238,7 +273,16 @@ async def passcode_login(
             )
             return {"ok": False, "error": "Employee is inactive"}
 
+        logger.info(
+            "[Auth] employee_verified employee_id=%s name=%s %s",
+            employee.id,
+            employee.first_name,
+            employee.last_name,
+        )
+
         # Get organization
+        logger.info("[Auth] querying_organization org_id=%s", employee.org_id)
+
         result = await db.execute(
             select(Organization).where(Organization.id == employee.org_id)
         )
@@ -251,7 +295,15 @@ async def passcode_login(
             )
             return {"ok": False, "error": "Organization is inactive"}
 
+        logger.info("[Auth] org_verified org_id=%s slug=%s", org.id, org.slug)
+
         # Get app access
+        logger.info(
+            "[Auth] querying_app_access employee_id=%s app_id=%s",
+            employee.id,
+            app_id,
+        )
+
         result = await db.execute(
             select(EmployeeAppAccess).where(
                 EmployeeAppAccess.employee_id == employee.id,
@@ -269,7 +321,11 @@ async def passcode_login(
             )
             return {"ok": False, "error": f"No access to {app_id}"}
 
+        logger.info("[Auth] app_access_verified app_id=%s role=%s", app_id, app_access.role)
+
         # Get brand access (first active brand for this employee)
+        logger.info("[Auth] querying_brand_access employee_id=%s", employee.id)
+
         result = await db.execute(
             select(EmployeeBrandAccess)
             .where(
@@ -282,10 +338,15 @@ async def passcode_login(
 
         brand = None
         if brand_access:
+            logger.info("[Auth] querying_brand brand_id=%s", brand_access.brand_id)
+
             result = await db.execute(
                 select(Brand).where(Brand.id == brand_access.brand_id)
             )
             brand = result.scalar_one_or_none()
+
+            if brand:
+                logger.info("[Auth] brand_verified brand_id=%s slug=%s", brand.id, brand.slug)
 
         logger.info(
             "[Auth] passcode_login_success employee_id=%s app_id=%s",

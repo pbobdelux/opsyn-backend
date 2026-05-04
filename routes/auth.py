@@ -60,6 +60,29 @@ async def login_with_passcode(
         raise HTTPException(status_code=500, detail="Login failed")
 
 
+@router.post("/seed/preston")
+async def seed_preston_endpoint(db: AsyncSession = Depends(get_db)):
+    """
+    Manual endpoint to seed Preston Anderson passcode.
+
+    Use this to manually trigger seeding if automatic seed fails.
+    """
+    try:
+        logger.info("[Auth] manual_seed_requested")
+
+        from services.seed_auth import seed_preston_anderson
+
+        result = await seed_preston_anderson(db)
+
+        logger.info("[Auth] manual_seed_complete ok=%s", result.get("ok"))
+
+        return result
+
+    except Exception as e:
+        logger.error("[Auth] manual_seed_failed error=%s", str(e)[:500], exc_info=True)
+        raise HTTPException(status_code=500, detail="Seed failed")
+
+
 @router.get("/health")
 async def auth_health():
     """Health check for auth endpoints."""
