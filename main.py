@@ -287,6 +287,29 @@ async def lifespan(app: FastAPI):
         from database import refresh_connection_pool
         await refresh_connection_pool()
 
+    # Apply AWS RDS schema migration (idempotent)
+    try:
+        from services.migration_runner import apply_aws_rds_schema_migration
+        from database import AsyncSessionLocal
+
+        logger.info("[Startup] applying_aws_rds_schema_migration")
+
+        async with AsyncSessionLocal() as migration_db:
+            migration_result = await apply_aws_rds_schema_migration(migration_db)
+
+            if migration_result.get("ok"):
+                logger.info("[Startup] aws_rds_migration_complete result=%s", migration_result)
+            else:
+                logger.warning(
+                    "[Startup] aws_rds_migration_failed error=%s",
+                    migration_result.get("error"),
+                )
+
+    except Exception as e:
+        logger.error(
+            "[Startup] aws_rds_migration_error error=%s", str(e)[:500], exc_info=True
+        )
+
     # Verify database schema and log connection details
     await _verify_database_schema()
 
