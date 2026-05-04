@@ -115,6 +115,18 @@ if DATABASE_URL:
     _parsed = urlparse(DATABASE_URL)
     _safe_url = f"{_parsed.scheme}://{_parsed.hostname}:{_parsed.port}/{_parsed.path.lstrip('/')}"
     logger.info("[Database] DATABASE_URL=%s", _safe_url)
+
+    # Log AWS RDS connection details at startup
+    _host = _parsed.hostname or "unknown"
+    _port = _parsed.port or 5432
+    _db = _parsed.path.lstrip("/") or "unknown"
+
+    logger.info("[DB] AWS_RDS_CONNECTION host=%s port=%s database=%s", _host, _port, _db)
+
+    if "rds.amazonaws.com" in _host:
+        logger.info("[DB] CONNECTED_TO_AWS_RDS")
+    else:
+        logger.warning("[DB] NOT_CONNECTED_TO_AWS_RDS host=%s", _host)
 else:
     logger.warning("[Database] DATABASE_URL not set")
 
