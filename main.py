@@ -306,14 +306,26 @@ async def lifespan(app: FastAPI):
                 getattr(route, "endpoint", "unknown"),
             )
 
-    # Database diagnostics - verify connection and employee table
+    # Comprehensive database diagnostics
     try:
         from sqlalchemy import text
         from database import AsyncSessionLocal as _AsyncSessionLocal
 
-        logger.info("[Startup] running_database_diagnostics")
+        logger.info("[Startup] running_comprehensive_database_diagnostics")
 
         async with _AsyncSessionLocal() as diag_db:
+            # Log DATABASE_URL (sanitized)
+            import os as _os
+            db_url = _os.getenv("DATABASE_URL", "NOT_SET")
+            if db_url != "NOT_SET" and "@" in db_url:
+                parts = db_url.split("@")
+                user_part = parts[0].split("://")[1]
+                user_only = user_part.split(":")[0]
+                db_url_safe = f"postgresql://{user_only}:***@{parts[1]}"
+            else:
+                db_url_safe = db_url
+            logger.info("[Startup] DATABASE_URL=%s", db_url_safe)
+
             # Check current database
             result = await diag_db.execute(text("SELECT current_database()"))
             current_db = result.scalar()
@@ -324,22 +336,33 @@ async def lifespan(app: FastAPI):
             employee_count = result.scalar() or 0
             logger.info("[Startup] employee_count=%d", employee_count)
 
-            # List all employee emails
+            # Count passcodes
+            result = await diag_db.execute(text("SELECT COUNT(*) FROM employee_passcodes"))
+            passcode_count = result.scalar() or 0
+            logger.info("[Startup] passcode_count=%d", passcode_count)
+
+            # Count app access
+            result = await diag_db.execute(text("SELECT COUNT(*) FROM employee_app_access"))
+            app_access_count = result.scalar() or 0
+            logger.info("[Startup] app_access_count=%d", app_access_count)
+
+            # Count brand access
+            result = await diag_db.execute(text("SELECT COUNT(*) FROM employee_brand_access"))
+            brand_access_count = result.scalar() or 0
+            logger.info("[Startup] brand_access_count=%d", brand_access_count)
+
+            # Get all employee emails
             result = await diag_db.execute(text("SELECT email FROM employees ORDER BY email"))
             emails = [row[0] for row in result.fetchall()]
             logger.info("[Startup] employee_emails=%s", emails)
 
-            # Check for Preston specifically
-            result = await diag_db.execute(
-                text("SELECT id, email FROM employees WHERE email = 'preston@noble420.com'")
-            )
-            preston = result.fetchone()
-            if preston:
-                logger.info("[Startup] preston_found employee_id=%s email=%s", preston[0], preston[1])
-            else:
-                logger.warning("[Startup] preston_not_found in_employees_table")
+            # Get all passcode employee IDs
+            result = await diag_db.execute(text("SELECT employee_id FROM employee_passcodes"))
+            passcode_employee_ids = [row[0] for row in result.fetchall()]
+            logger.info("[Startup] passcode_employee_ids=%s", passcode_employee_ids)
 
-        logger.info("[Startup] database_diagnostics_complete")
+            logger.info("[Startup] database_diagnostics_complete")
+
     except Exception as e:
         logger.error("[Startup] database_diagnostics_failed error=%s", str(e)[:500], exc_info=True)
 
@@ -353,6 +376,14 @@ async def lifespan(app: FastAPI):
             logger.warning("[Startup] auth_seed_skipped reason=%s", seed_result.get("error"))
     except Exception as e:
         logger.warning("[Startup] auth_seed_error error=%s", str(e)[:500])
+
+    # Verify auth routes are registered
+    auth_routes = [route for route in app.routes if "/auth" in getattr(route, "path", "")]
+    logger.info("[Routes] auth_routes_registered count=%d", len(auth_routes))
+    for route in auth_routes:
+        methods = list(getattr(route, "methods", []))
+        path = getattr(route, "path", "unknown")
+        logger.info("[Routes] auth_route path=%s methods=%s", path, methods)
 
     # Start background sync scheduler as an asyncio task (non-blocking)
     print("🚀 Starting sync scheduler...")

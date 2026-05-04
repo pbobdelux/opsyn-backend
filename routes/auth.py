@@ -139,6 +139,72 @@ async def debug_employees(db: AsyncSession = Depends(get_db)):
         }
 
 
+@router.get("/debug/db")
+async def debug_db(db: AsyncSession = Depends(get_db)):
+    """
+    Debug endpoint to inspect full database state for auth tables.
+
+    Returns counts and IDs for employees, passcodes, app access, and brand access.
+    """
+    try:
+        logger.info("[Auth] debug_db_requested")
+
+        # Get current database
+        result = await db.execute(text("SELECT current_database()"))
+        current_db = result.scalar()
+
+        # Count employees
+        result = await db.execute(text("SELECT COUNT(*) FROM employees"))
+        employee_count = result.scalar() or 0
+
+        # Count passcodes
+        result = await db.execute(text("SELECT COUNT(*) FROM employee_passcodes"))
+        passcode_count = result.scalar() or 0
+
+        # Count app access
+        result = await db.execute(text("SELECT COUNT(*) FROM employee_app_access"))
+        app_access_count = result.scalar() or 0
+
+        # Count brand access
+        result = await db.execute(text("SELECT COUNT(*) FROM employee_brand_access"))
+        brand_access_count = result.scalar() or 0
+
+        # Get all employee emails
+        result = await db.execute(text("SELECT id, email FROM employees ORDER BY email"))
+        employees = [{"id": row[0], "email": row[1]} for row in result.fetchall()]
+
+        # Get all passcode employee IDs
+        result = await db.execute(text("SELECT id, employee_id, is_active FROM employee_passcodes"))
+        passcodes = [{"id": row[0], "employee_id": row[1], "is_active": row[2]} for row in result.fetchall()]
+
+        logger.info(
+            "[Auth] debug_db_complete database=%s employees=%d passcodes=%d app_access=%d brand_access=%d",
+            current_db,
+            employee_count,
+            passcode_count,
+            app_access_count,
+            brand_access_count,
+        )
+
+        return {
+            "ok": True,
+            "database": current_db,
+            "employee_count": employee_count,
+            "passcode_count": passcode_count,
+            "app_access_count": app_access_count,
+            "brand_access_count": brand_access_count,
+            "employees": employees,
+            "passcodes": passcodes,
+        }
+
+    except Exception as e:
+        logger.error("[Auth] debug_db_failed error=%s", str(e)[:500], exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e)[:500],
+        }
+
+
 @router.get("/health")
 async def auth_health():
     """Health check for auth endpoints."""
