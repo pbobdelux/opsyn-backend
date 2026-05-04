@@ -8,6 +8,7 @@ class Organization(Base):
     __tablename__ = "organizations"
 
     id = Column(String, primary_key=True)
+    org_code = Column(String, unique=True, nullable=True)
     slug = Column(String, unique=True, nullable=False)
     name = Column(String, nullable=False)
     is_active = Column(Boolean, default=True)

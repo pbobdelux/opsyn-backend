@@ -16,6 +16,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 class PasscodeLoginRequest(BaseModel):
     passcode: str
     app_id: str
+    org_id: str | None = None  # Optional: can be UUID or org_code like "noble"
 
 
 @router.post("/passcode-login")
@@ -29,23 +30,24 @@ async def login_with_passcode(
     Request:
     {
         "passcode": "1234",
-        "app_id": "brand_app"
+        "app_id": "brand_app",
+        "org_id": "noble"  # or UUID: "ac42f7cb-4937-4920-b6c1-0f964787eb2f" (optional)
     }
 
     Response:
     {
         "ok": true,
         "employee": {id, name, email},
-        "organization": {id, slug, name},
+        "organization": {id, org_code, slug, name},
         "brand": {id, slug, name},
         "app_access": {app_id, role},
         "tenant_context": {org_id, brand_id, app_id, role}
     }
     """
     try:
-        logger.info("[Auth] passcode_login_request app_id=%s", request.app_id)
+        logger.info("[Auth] passcode_login_request app_id=%s org_id=%s", request.app_id, request.org_id)
 
-        result = await passcode_login(db, request.passcode, request.app_id)
+        result = await passcode_login(db, request.passcode, request.app_id, request.org_id)
 
         if not result.get("ok"):
             logger.warning("[Auth] login_failed error=%s", result.get("error"))

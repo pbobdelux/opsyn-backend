@@ -12,6 +12,7 @@ from models.auth_models import (
     Organization,
     Brand,
 )
+from services.organization_service import lookup_organization
 
 logger = logging.getLogger("auth_service")
 
@@ -209,6 +210,7 @@ async def passcode_login(
     db: AsyncSession,
     passcode: str,
     app_id: str,
+    org_id: str | None = None,
 ) -> dict:
     """
     Authenticate employee with passcode and return tenant context.
@@ -217,12 +219,13 @@ async def passcode_login(
         db: Database session
         passcode: Plain text passcode
         app_id: App ID (brand_app, driver_app, crm_app)
+        org_id: Optional organization identifier (UUID or org_code like "noble")
 
     Returns:
         {
             ok: bool,
             employee: {id, name, email},
-            organization: {id, slug, name},
+            organization: {id, org_code, slug, name},
             brand: {id, slug, name},
             app_access: {app_id, role},
             tenant_context: {org_id, brand_id, app_id, role},
@@ -295,34 +298,41 @@ async def passcode_login(
             employee.last_name,
         )
 
-        # Get organization
-        org_id_str = str(employee.org_id)
-        logger.info("[Auth] querying_organization org_id=%s", org_id_str)
+        # Get organization — support both UUID and org_code
+        if org_id:
+            # Caller supplied an org identifier: validate it and confirm it matches the employee
+            logger.info("[Auth] org_id_provided identifier=%s", org_id)
+            org_lookup_result = await lookup_organization(db, org_id)
+            if not org_lookup_result.get("ok"):
+                logger.warning("[Auth] org_lookup_failed error=%s", org_lookup_result.get("error"))
+                return {"ok": False, "error": org_lookup_result.get("error")}
 
-        try:
-            org_uuid = UUID(org_id_str)
-            logger.info("[Auth] using_uuid org_id=%s", org_uuid)
-        except (ValueError, TypeError) as uuid_exc:
-            logger.error(
-                "[Auth] invalid_org_id_format org_id=%s error=%s",
-                org_id_str,
-                str(uuid_exc)[:200],
-            )
-            return {"ok": False, "error": "Invalid org_id format"}
+            provided_org = org_lookup_result.get("organization")
+            employee_org_uuid = str(employee.org_id)
 
-        result = await db.execute(
-            select(Organization).where(Organization.id == org_uuid)
-        )
-        org = result.scalar_one_or_none()
+            if str(provided_org.id) != employee_org_uuid:
+                logger.warning(
+                    "[Auth] org_mismatch employee_org=%s provided_org=%s",
+                    employee_org_uuid,
+                    provided_org.id,
+                )
+                return {"ok": False, "error": "Employee does not belong to this organization"}
 
-        if not org or not org.is_active:
-            logger.warning(
-                "[Auth] org_inactive org_id=%s",
-                org.id if org else "unknown",
-            )
+            org = provided_org
+        else:
+            # No org_id supplied — derive from the employee record
+            org_lookup_result = await lookup_organization(db, str(employee.org_id))
+            if not org_lookup_result.get("ok"):
+                logger.warning("[Auth] org_lookup_failed error=%s", org_lookup_result.get("error"))
+                return {"ok": False, "error": org_lookup_result.get("error")}
+
+            org = org_lookup_result.get("organization")
+
+        if not org.is_active:
+            logger.warning("[Auth] org_inactive org_id=%s", org.id)
             return {"ok": False, "error": "Organization is inactive"}
 
-        logger.info("[Auth] org_verified org_id=%s slug=%s", org.id, org.slug)
+        logger.info("[Auth] org_verified org_id=%s org_code=%s slug=%s", org.id, org.org_code, org.slug)
 
         # Get app access
         logger.info(
@@ -402,6 +412,7 @@ async def passcode_login(
             },
             "organization": {
                 "id": str(org.id),
+                "org_code": org.org_code,
                 "slug": org.slug,
                 "name": org.name,
             },
