@@ -109,6 +109,15 @@ else:
     logger.error("[BOOT_DB] DATABASE_URL is empty or not set")
     raise ValueError("DATABASE_URL environment variable is not set")
 
+# Ensure sslmode=require is in the URL before normalization
+if "sslmode=require" not in _raw_database_url and "ssl=require" not in _raw_database_url:
+    logger.warning("[BOOT_DB] sslmode_not_in_url adding_sslmode=require")
+    if "?" in _raw_database_url:
+        _raw_database_url = _raw_database_url + "&sslmode=require"
+    else:
+        _raw_database_url = _raw_database_url + "?sslmode=require"
+    logger.info("[BOOT_DB] sslmode_added")
+
 DATABASE_URL = normalize_database_url(_raw_database_url)
 
 if DATABASE_URL:

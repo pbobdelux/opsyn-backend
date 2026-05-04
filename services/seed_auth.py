@@ -25,16 +25,37 @@ async def seed_preston_anderson(db: AsyncSession) -> dict:
         logger.info("[Seed] starting_preston_anderson_setup")
 
         # 1. Look up employee by email
-        logger.info("[Seed] looking_up_employee email=preston@noble420.com")
+        email = "preston@noble420.com"
+        logger.info("[Seed] looking_up_employee email=%s", email)
 
+        # First, verify we can query the employees table
+        from sqlalchemy import text
+        result = await db.execute(text("SELECT COUNT(*) FROM employees"))
+        employee_count = result.scalar() or 0
+        logger.info("[Seed] employees_table_count=%d", employee_count)
+
+        # Get all emails for debugging
+        result = await db.execute(text("SELECT email FROM employees ORDER BY email"))
+        all_emails = [row[0] for row in result.fetchall()]
+        logger.info("[Seed] all_employee_emails=%s", all_emails)
+
+        # Now look up Preston
         result = await db.execute(
-            select(Employee).where(Employee.email == "preston@noble420.com")
+            select(Employee).where(Employee.email == email)
         )
         employee = result.scalar_one_or_none()
 
         if not employee:
-            logger.error("[Seed] employee_not_found email=preston@noble420.com")
-            return {"ok": False, "error": "Employee not found"}
+            logger.error(
+                "[Seed] employee_not_found email=%s available_emails=%s",
+                email,
+                all_emails,
+            )
+            return {
+                "ok": False,
+                "error": f"Employee not found: {email}",
+                "available_emails": all_emails,
+            }
 
         logger.info(
             "[Seed] employee_found employee_id=%s name=%s %s",

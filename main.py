@@ -306,6 +306,43 @@ async def lifespan(app: FastAPI):
                 getattr(route, "endpoint", "unknown"),
             )
 
+    # Database diagnostics - verify connection and employee table
+    try:
+        from sqlalchemy import text
+        from database import AsyncSessionLocal as _AsyncSessionLocal
+
+        logger.info("[Startup] running_database_diagnostics")
+
+        async with _AsyncSessionLocal() as diag_db:
+            # Check current database
+            result = await diag_db.execute(text("SELECT current_database()"))
+            current_db = result.scalar()
+            logger.info("[Startup] current_database=%s", current_db)
+
+            # Count employees
+            result = await diag_db.execute(text("SELECT COUNT(*) FROM employees"))
+            employee_count = result.scalar() or 0
+            logger.info("[Startup] employee_count=%d", employee_count)
+
+            # List all employee emails
+            result = await diag_db.execute(text("SELECT email FROM employees ORDER BY email"))
+            emails = [row[0] for row in result.fetchall()]
+            logger.info("[Startup] employee_emails=%s", emails)
+
+            # Check for Preston specifically
+            result = await diag_db.execute(
+                text("SELECT id, email FROM employees WHERE email = 'preston@noble420.com'")
+            )
+            preston = result.fetchone()
+            if preston:
+                logger.info("[Startup] preston_found employee_id=%s email=%s", preston[0], preston[1])
+            else:
+                logger.warning("[Startup] preston_not_found in_employees_table")
+
+        logger.info("[Startup] database_diagnostics_complete")
+    except Exception as e:
+        logger.error("[Startup] database_diagnostics_failed error=%s", str(e)[:500], exc_info=True)
+
     # Seed auth data for known employees (idempotent — skips if already set up)
     from services.seed_auth import seed_preston_anderson
     try:
