@@ -228,7 +228,7 @@ async def passcode_login(
         }
     """
     try:
-        logger.info("[Auth] passcode_login_attempt app_id=%s", app_id)
+        logger.info("[Auth] passcode_login_attempt app_id=%s passcode_length=%d", app_id, len(passcode))
 
         # Find all active passcodes
         logger.info("[Auth] querying_active_passcodes")
@@ -242,18 +242,33 @@ async def passcode_login(
 
         logger.info("[Auth] found_passcodes count=%d", len(passcodes))
 
+        if not passcodes:
+            logger.warning("[Auth] no_active_passcodes_found")
+            return {"ok": False, "error": "Invalid passcode"}
+
         # Find matching passcode
         matching_passcode = None
-        for pc in passcodes:
-            logger.debug("[Auth] comparing_passcode passcode_id=%s", pc.id)
+        for i, pc in enumerate(passcodes):
+            logger.debug("[Auth] comparing_passcode index=%d passcode_id=%s", i, pc.id)
 
-            if verify_passcode(passcode, pc.passcode_hash):
-                logger.info("[Auth] passcode_match passcode_id=%s", pc.id)
-                matching_passcode = pc
-                break
+            # Log hash details for debugging
+            logger.debug("[Auth] passcode_hash_length=%d", len(pc.passcode_hash))
+            logger.debug("[Auth] input_passcode_length=%d", len(passcode))
+
+            try:
+                is_match = verify_passcode(passcode, pc.passcode_hash)
+                logger.debug("[Auth] passcode_comparison result=%s", is_match)
+
+                if is_match:
+                    logger.info("[Auth] passcode_match passcode_id=%s", pc.id)
+                    matching_passcode = pc
+                    break
+            except Exception as verify_exc:
+                logger.error("[Auth] passcode_verify_error error=%s", str(verify_exc)[:200])
+                continue
 
         if not matching_passcode:
-            logger.warning("[Auth] passcode_invalid no_match")
+            logger.warning("[Auth] passcode_invalid no_match found=%d", len(passcodes))
             return {"ok": False, "error": "Invalid passcode"}
 
         logger.info("[Auth] passcode_verified passcode_id=%s", matching_passcode.id)
