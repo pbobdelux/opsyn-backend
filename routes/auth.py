@@ -1,8 +1,10 @@
 import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
+from models.auth_models import Employee
 from services.auth_service import passcode_login
 from utils.json_utils import make_json_safe
 
@@ -81,6 +83,60 @@ async def seed_preston_endpoint(db: AsyncSession = Depends(get_db)):
     except Exception as e:
         logger.error("[Auth] manual_seed_failed error=%s", str(e)[:500], exc_info=True)
         raise HTTPException(status_code=500, detail="Seed failed")
+
+
+@router.get("/debug/employees")
+async def debug_employees(db: AsyncSession = Depends(get_db)):
+    """
+    Debug endpoint to inspect employee table in connected database.
+
+    Returns all employees and their details.
+    """
+    try:
+        logger.info("[Auth] debug_employees_requested")
+
+        # Get current database
+        result = await db.execute(text("SELECT current_database()"))
+        current_db = result.scalar()
+
+        # Get all employees
+        result = await db.execute(
+            select(Employee).order_by(Employee.email)
+        )
+        employees = result.scalars().all()
+
+        employees_data = []
+        for emp in employees:
+            employees_data.append({
+                "id": emp.id,
+                "email": emp.email,
+                "name": f"{emp.first_name} {emp.last_name}",
+                "org_id": emp.org_id,
+                "is_active": emp.is_active,
+            })
+
+        logger.info(
+            "[Auth] debug_employees_complete database=%s count=%d",
+            current_db,
+            len(employees_data),
+        )
+
+        return {
+            "ok": True,
+            "database": current_db,
+            "employee_count": len(employees_data),
+            "employees": employees_data,
+        }
+
+    except Exception as e:
+        logger.error("[Auth] debug_employees_failed error=%s", str(e)[:500], exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e)[:500],
+            "database": "unknown",
+            "employee_count": 0,
+            "employees": [],
+        }
 
 
 @router.get("/health")
