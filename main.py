@@ -29,6 +29,7 @@ from routes.voice import router as voice_router
 from routes.voice_brain import router as voice_brain_router
 from routes.admin import router as admin_router
 from routes.debug import router as debug_router
+from routes.auth import router as auth_router
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("opsyn-backend")
@@ -60,8 +61,9 @@ async def _create_assistant_tables() -> None:
             logger.warning("startup: DATABASE_URL not set — skipping assistant table creation")
             return
 
-        # Import assistant models so SQLAlchemy registers them with Base.metadata
+        # Import models so SQLAlchemy registers them with Base.metadata
         import models.assistant_models  # noqa: F401
+        import models.auth_models  # noqa: F401
 
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -304,6 +306,17 @@ async def lifespan(app: FastAPI):
                 getattr(route, "endpoint", "unknown"),
             )
 
+    # Seed auth data for known employees (idempotent — skips if already set up)
+    from services.seed_auth import seed_preston_anderson
+    try:
+        seed_result = await seed_preston_anderson(AsyncSessionLocal())
+        if seed_result.get("ok"):
+            logger.info("[Startup] auth_seed_complete")
+        else:
+            logger.warning("[Startup] auth_seed_skipped reason=%s", seed_result.get("error"))
+    except Exception as e:
+        logger.warning("[Startup] auth_seed_error error=%s", str(e)[:500])
+
     # Start background sync scheduler as an asyncio task (non-blocking)
     print("🚀 Starting sync scheduler...")
     scheduler_task = asyncio.create_task(run_scheduler())
@@ -356,6 +369,7 @@ app.include_router(voice_router)
 app.include_router(voice_brain_router)
 app.include_router(debug_router)
 app.include_router(admin_router)
+app.include_router(auth_router)
 logger.info("[Routes] registered debug routes")
 
 
