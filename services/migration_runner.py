@@ -15,6 +15,10 @@ does not abort subsequent migrations.
 import logging
 import os
 import time
+from pathlib import Path
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger("migration_runner")
 
@@ -155,3 +159,123 @@ async def run_migrations() -> list[str]:
         logger.error("[Migration] runner error=%s", exc, exc_info=True)
 
     return applied
+
+
+async def apply_aws_rds_schema_migration(db: AsyncSession) -> dict:
+    """
+    Apply the comprehensive AWS RDS schema migration.
+
+    This creates all required tables while preserving existing auth data.
+    Idempotent — safe to run multiple times (uses IF NOT EXISTS throughout).
+
+    Returns:
+        {"ok": bool, "message": str, "tables_created": int, ...}
+    """
+    try:
+        logger.info("[Migration] starting_aws_rds_schema_migration")
+
+        # Locate the migration file
+        migration_path = (
+            Path(__file__).parent.parent
+            / "migrations"
+            / "2026_05_04_02_create_full_schema_aws_rds.sql"
+        )
+
+        if not migration_path.exists():
+            logger.error("[Migration] migration_file_not_found path=%s", migration_path)
+            return {"ok": False, "error": f"Migration file not found: {migration_path}"}
+
+        logger.info("[Migration] reading_migration_file path=%s", migration_path)
+        migration_sql = migration_path.read_text()
+
+        # Apply migration — split on `;` so asyncpg receives one statement at a time
+        logger.info("[Migration] applying_migration")
+        for stmt in _split_statements(migration_sql):
+            await db.execute(text(stmt))
+        await db.commit()
+
+        logger.info("[Migration] migration_applied")
+
+        # Verify tables exist
+        logger.info("[Migration] verifying_tables")
+
+        required_tables = [
+            "brand_api_credentials",
+            "orders",
+            "order_lines",
+            "organization_brand_bindings",
+            "drivers",
+            "dispatch_routes",
+            "route_stops",
+            "tenant_credentials",
+            "sync_runs",
+            "sync_requests",
+            "assistant_sessions",
+            "assistant_messages",
+            "assistant_pending_actions",
+            "assistant_audit_logs",
+            "employees",           # Auth table
+            "employee_passcodes",  # Auth table
+            "employee_brand_access",  # Auth table
+            "employee_app_access",    # Auth table
+        ]
+
+        result = await db.execute(
+            text("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'public'
+                ORDER BY table_name
+            """)
+        )
+        existing_tables = [row[0] for row in result.fetchall()]
+
+        logger.info(
+            "[Migration] existing_tables count=%d tables=%s",
+            len(existing_tables),
+            existing_tables,
+        )
+
+        missing_tables = [t for t in required_tables if t not in existing_tables]
+        if missing_tables:
+            logger.warning("[Migration] missing_tables=%s", missing_tables)
+
+        # Verify auth data is preserved
+        logger.info("[Migration] verifying_auth_data")
+
+        result = await db.execute(text("SELECT COUNT(*) FROM employees"))
+        employee_count = result.scalar() or 0
+        logger.info("[Migration] employee_count=%d", employee_count)
+
+        result = await db.execute(text("SELECT COUNT(*) FROM employee_passcodes"))
+        passcode_count = result.scalar() or 0
+        logger.info("[Migration] passcode_count=%d", passcode_count)
+
+        result = await db.execute(text("SELECT COUNT(*) FROM employee_brand_access"))
+        brand_access_count = result.scalar() or 0
+        logger.info("[Migration] brand_access_count=%d", brand_access_count)
+
+        result = await db.execute(text("SELECT COUNT(*) FROM employee_app_access"))
+        app_access_count = result.scalar() or 0
+        logger.info("[Migration] app_access_count=%d", app_access_count)
+
+        logger.info("[Migration] aws_rds_schema_migration_complete")
+
+        return {
+            "ok": True,
+            "message": "AWS RDS schema migration applied successfully",
+            "tables_created": len(existing_tables),
+            "auth_data_preserved": {
+                "employees": employee_count,
+                "passcodes": passcode_count,
+                "brand_access": brand_access_count,
+                "app_access": app_access_count,
+            },
+        }
+
+    except Exception as e:
+        logger.error(
+            "[Migration] aws_rds_schema_migration_failed error=%s",
+            str(e)[:500],
+            exc_info=True,
+        )
+        return {"ok": False, "error": str(e)[:500]}
