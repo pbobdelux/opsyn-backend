@@ -171,174 +171,385 @@ async def crm_health():
 @router.get("/dashboard")
 async def crm_dashboard(db: AsyncSession = Depends(get_db)):
     """
-    Get CRM dashboard summary with key metrics.
-    Returns: total customers, total orders, total spend, recent activity.
+    Fast CRM dashboard with key metrics and recent data.
+
+    Returns:
+    - total_orders: Total orders in system
+    - total_revenue: Total revenue (dollars)
+    - unique_customers: Count of unique customers
+    - top_customers: Top 10 customers by spend
+    - recent_orders: Last 50 orders
+    - synced_at: Timestamp
+
+    Performance: <500ms
     """
     try:
-        logger.info("crm: dashboard_requested")
+        logger.info("[CRM] dashboard_requested")
 
-        # Count unique customers
-        customer_count_result = await db.execute(
-            select(func.count(func.distinct(Order.customer_name))).select_from(Order)
+        # 1. Get aggregate stats (single query)
+        stats_result = await db.execute(
+            select(
+                func.count(func.distinct(Order.customer_name)).label("unique_customers"),
+                func.count(Order.id).label("total_orders"),
+                func.sum(Order.amount).label("total_revenue_cents"),
+            )
+            .where(Order.customer_name != None)
         )
-        customer_count = customer_count_result.scalar() or 0
+        stats_row = stats_result.fetchone()
 
-        # Count total orders
-        order_count_result = await db.execute(
-            select(func.count(Order.id)).select_from(Order)
-        )
-        order_count = order_count_result.scalar() or 0
+        unique_customers = stats_row.unique_customers or 0
+        total_orders = stats_row.total_orders or 0
+        total_revenue = float(stats_row.total_revenue_cents or 0) / 100.0
 
-        # Sum total spend
-        total_spend_result = await db.execute(
-            select(func.sum(Order.amount)).select_from(Order)
-        )
-        total_spend = float(total_spend_result.scalar() or 0)
-
-        logger.info(
-            "[AccountsAPI] dashboard brand=%s customer_count=%s order_count=%s total_spend=%s",
-            "all",  # No brand filter currently
-            customer_count,
-            order_count,
-            total_spend,
+        # 2. Get top 10 customers by spend
+        top_customers_result = await db.execute(
+            select(
+                Order.customer_name,
+                func.count(Order.id).label("order_count"),
+                func.sum(Order.amount).label("total_spend_cents"),
+                func.max(Order.external_updated_at).label("last_order_at"),
+            )
+            .where(Order.customer_name != None)
+            .group_by(Order.customer_name)
+            .order_by(func.sum(Order.amount).desc())
+            .limit(10)
         )
 
-        # Get most recent order
-        recent_order_result = await db.execute(
-            select(Order).order_by(Order.external_updated_at.desc()).limit(1)
+        top_customers = []
+        for row in top_customers_result:
+            top_customers.append({
+                "name": row.customer_name,
+                "order_count": row.order_count or 0,
+                "total_spend": float(row.total_spend_cents or 0) / 100.0,
+                "last_order_at": row.last_order_at.isoformat() if row.last_order_at else None,
+            })
+
+        # 3. Get recent 50 orders
+        recent_orders_result = await db.execute(
+            select(Order)
+            .order_by(Order.external_updated_at.desc())
+            .limit(50)
         )
-        recent_order = recent_order_result.scalar_one_or_none()
 
-        # Safely extract datetime values
-        last_order_at = None
-        last_synced_at = None
+        recent_orders = []
+        for order in recent_orders_result.scalars().all():
+            recent_orders.append({
+                "id": order.id,
+                "external_id": order.external_order_id,
+                "customer_name": order.customer_name,
+                "order_number": order.order_number,
+                "status": order.status,
+                "amount": float(order.amount or 0) / 100.0,
+                "created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+                "updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
+            })
 
-        if recent_order:
-            if recent_order.external_updated_at:
-                last_order_at = recent_order.external_updated_at.isoformat()
-                logger.info("crm: dashboard_last_order_at=%s", last_order_at)
-            else:
-                logger.warning("crm: dashboard_recent_order_has_no_external_updated_at")
-
-            if recent_order.last_synced_at:
-                last_synced_at = recent_order.last_synced_at.isoformat()
-                logger.info("crm: dashboard_last_synced_at=%s", last_synced_at)
-            else:
-                logger.warning("crm: dashboard_recent_order_has_no_last_synced_at")
-        else:
-            logger.warning("crm: dashboard_no_orders_found")
-
-        # Determine data source
-        data_source = "live" if (customer_count > 0 or order_count > 0) else "empty"
         synced_at = datetime.now(timezone.utc).isoformat()
 
         logger.info(
-            "[CRM] dashboard_complete customers=%s orders=%s source=%s",
-            customer_count,
-            order_count,
-            data_source,
+            "[CRM] dashboard_complete customers=%s orders=%s revenue=%s",
+            unique_customers,
+            total_orders,
+            total_revenue,
         )
 
         return make_json_safe({
             "ok": True,
-            "source": data_source,
-            "data_source": data_source,
+            "stats": {
+                "total_orders": total_orders,
+                "total_revenue": total_revenue,
+                "unique_customers": unique_customers,
+            },
+            "top_customers": top_customers,
+            "recent_orders": recent_orders,
             "synced_at": synced_at,
-            "customer_count": customer_count,
-            "order_count": order_count,
-            "total_spend": total_spend,
-            "last_order_at": last_order_at,
-            "last_synced_at": last_synced_at,
         })
 
     except Exception as e:
-        logger.error("crm: dashboard_failed error=%s", e, exc_info=True)
+        logger.error("[CRM] dashboard_failed error=%s", str(e)[:500], exc_info=True)
         return {
             "ok": False,
-            "error": str(e),
-            "source": "error",
-            "data_source": "error",
+            "error": str(e)[:500],
+            "stats": {
+                "total_orders": 0,
+                "total_revenue": 0.0,
+                "unique_customers": 0,
+            },
+            "top_customers": [],
+            "recent_orders": [],
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+@router.get("/orders")
+async def crm_orders(
+    limit: int = Query(50, ge=10, le=500, description="Records per page (default 50, max 500)"),
+    cursor: Optional[str] = Query(None, description="Pagination cursor from previous response"),
+    customer_name: Optional[str] = Query(None, description="Filter by customer name"),
+    status: Optional[str] = Query(None, description="Filter by order status"),
+    date_from: Optional[str] = Query(None, description="Filter orders from date (ISO format)"),
+    date_to: Optional[str] = Query(None, description="Filter orders to date (ISO format)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get paginated orders with optional filtering.
+
+    Supports:
+    - Cursor-based pagination
+    - Filter by customer_name
+    - Filter by status
+    - Filter by date range
+
+    Returns: orders array + next_cursor (if more results)
+    """
+    try:
+        logger.info(
+            "[CRM] orders_requested limit=%s customer=%s status=%s",
+            limit,
+            customer_name,
+            status,
+        )
+
+        # Build query with filters
+        query = select(Order)
+
+        if customer_name:
+            query = query.where(Order.customer_name.ilike(f"%{customer_name}%"))
+
+        if status:
+            query = query.where(Order.status == status)
+
+        if date_from:
+            try:
+                from_dt = datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+                query = query.where(Order.external_created_at >= from_dt)
+            except Exception:
+                pass
+
+        if date_to:
+            try:
+                to_dt = datetime.fromisoformat(date_to.replace("Z", "+00:00"))
+                query = query.where(Order.external_created_at <= to_dt)
+            except Exception:
+                pass
+
+        # Cursor-based pagination
+        if cursor:
+            try:
+                cursor_id = base64.b64decode(cursor).decode()
+                query = query.where(Order.id > cursor_id)
+            except Exception:
+                pass
+
+        # Fetch limit + 1 to detect if there are more results
+        query = query.order_by(Order.id).limit(limit + 1)
+
+        result = await db.execute(query)
+        orders_list = result.scalars().all()
+
+        has_more = len(orders_list) > limit
+        if has_more:
+            orders_list = orders_list[:limit]
+
+        orders = []
+        for order in orders_list:
+            orders.append({
+                "id": order.id,
+                "external_id": order.external_order_id,
+                "customer_name": order.customer_name,
+                "order_number": order.order_number,
+                "status": order.status,
+                "amount": float(order.amount or 0) / 100.0,
+                "item_count": order.item_count or 0,
+                "created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+                "updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
+            })
+
+        next_cursor = None
+        if has_more and orders:
+            next_cursor = base64.b64encode(str(orders[-1]["id"]).encode()).decode()
+
+        logger.info("[CRM] orders_returned count=%s has_more=%s", len(orders), has_more)
+
+        return make_json_safe({
+            "ok": True,
+            "orders": orders,
+            "count": len(orders),
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    except Exception as e:
+        logger.error("[CRM] orders_failed error=%s", str(e)[:500], exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e)[:500],
+            "orders": [],
+            "count": 0,
+            "has_more": False,
+            "next_cursor": None,
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+@router.get("/full-data")
+async def crm_full_data(
+    limit: int = Query(20000, ge=100, le=50000, description="Max records (default 20k, max 50k)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    DEBUG/INTERNAL ONLY - Get complete CRM dataset.
+
+    Not for production frontend use. Use /crm/dashboard for summaries
+    and /crm/orders for paginated data instead.
+
+    Useful for:
+    - Data exports
+    - Analytics
+    - Internal debugging
+    - Batch operations
+    """
+    try:
+        logger.info("[CRM] full_data_requested limit=%s", limit)
+
+        result = await db.execute(
+            select(Order)
+            .order_by(Order.external_updated_at.desc())
+            .limit(limit)
+        )
+        orders_list = result.scalars().all()
+
+        orders = []
+        for order in orders_list:
+            orders.append({
+                "id": order.id,
+                "external_id": order.external_order_id,
+                "customer_name": order.customer_name,
+                "order_number": order.order_number,
+                "status": order.status,
+                "amount": float(order.amount or 0) / 100.0,
+                "item_count": order.item_count or 0,
+                "created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+                "updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
+            })
+
+        logger.info("[CRM] full_data_returned count=%s", len(orders))
+
+        return make_json_safe({
+            "ok": True,
+            "orders": orders,
+            "count": len(orders),
+            "limit": limit,
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    except Exception as e:
+        logger.error("[CRM] full_data_failed error=%s", str(e)[:500], exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e)[:500],
+            "orders": [],
+            "count": 0,
             "synced_at": datetime.now(timezone.utc).isoformat(),
         }
 
 
 @router.get("/customers")
 async def crm_customers(
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(50, ge=10, le=500, description="Records per page (default 50, max 500)"),
+    cursor: Optional[str] = Query(None, description="Pagination cursor"),
+    search: Optional[str] = Query(None, description="Search customer name"),
+    sort_by: Optional[str] = Query("spend", description="Sort by: spend, orders, recent"),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get list of customers with order counts and total spend.
-    Returns: id, name, order_count, total_spend, last_order_at.
+    Get paginated customers with aggregated stats.
+
+    Returns per-customer:
+    - name
+    - order_count
+    - total_spend (dollars)
+    - last_order_at
+
+    Supports:
+    - Cursor pagination
+    - Name search
+    - Sort by spend, order count, or recency
     """
     try:
-        logger.info("crm: customers_requested limit=%s offset=%s", limit, offset)
+        logger.info("[CRM] customers_requested limit=%s search=%s sort=%s", limit, search, sort_by)
 
-        # Get distinct customers with aggregated data
-        customers_result = await db.execute(
-            select(
-                Order.customer_name,
-                func.count(Order.id).label("order_count"),
-                func.sum(Order.amount).label("total_spend"),
-                func.max(Order.external_updated_at).label("last_order_at"),
-            )
-            .group_by(Order.customer_name)
-            .order_by(func.max(Order.external_updated_at).desc())
-            .limit(limit)
-            .offset(offset)
-        )
+        # Build query
+        query = select(
+            Order.customer_name,
+            func.count(Order.id).label("order_count"),
+            func.sum(Order.amount).label("total_spend_cents"),
+            func.max(Order.external_updated_at).label("last_order_at"),
+        ).where(Order.customer_name != None).group_by(Order.customer_name)
+
+        if search:
+            query = query.where(Order.customer_name.ilike(f"%{search}%"))
+
+        # Sort
+        if sort_by == "orders":
+            query = query.order_by(func.count(Order.id).desc())
+        elif sort_by == "recent":
+            query = query.order_by(func.max(Order.external_updated_at).desc())
+        else:  # spend (default)
+            query = query.order_by(func.sum(Order.amount).desc())
+
+        # Cursor pagination
+        if cursor:
+            try:
+                cursor_name = base64.b64decode(cursor).decode()
+                query = query.where(Order.customer_name > cursor_name)
+            except Exception:
+                pass
+
+        query = query.limit(limit + 1)
+
+        result = await db.execute(query)
+        customers_list = result.fetchall()
+
+        has_more = len(customers_list) > limit
+        if has_more:
+            customers_list = customers_list[:limit]
 
         customers = []
-        for row in customers_result:
+        for row in customers_list:
             customers.append({
-                "id": row.customer_name,  # Use customer_name as ID
                 "name": row.customer_name,
                 "order_count": row.order_count or 0,
-                "total_spend": float(row.total_spend or 0),
+                "total_spend": float(row.total_spend_cents or 0) / 100.0,
                 "last_order_at": row.last_order_at.isoformat() if row.last_order_at else None,
             })
 
-        logger.info(
-            "[AccountsAPI] brand=%s returned count=%s limit=%s offset=%s",
-            "all",  # No brand filter currently
-            len(customers),
-            limit,
-            offset,
-        )
+        next_cursor = None
+        if has_more and customers:
+            next_cursor = base64.b64encode(customers[-1]["name"].encode()).decode()
 
-        if customers:
-            logger.info(
-                "[AccountsAPI] latest_updated_at=%s oldest_updated_at=%s",
-                customers[0]["last_order_at"],  # First is most recent (ordered by desc)
-                customers[-1]["last_order_at"] if len(customers) > 1 else customers[0]["last_order_at"],
-            )
-
-        synced_at = datetime.now(timezone.utc).isoformat()
-        source = "live" if customers else "empty"
-
-        logger.info("[CRM] customers_query count=%s", len(customers))
+        logger.info("[CRM] customers_returned count=%s has_more=%s", len(customers), has_more)
 
         return make_json_safe({
             "ok": True,
-            "source": source,
-            "data_source": source,
-            "synced_at": synced_at,
             "customers": customers,
             "count": len(customers),
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+            "synced_at": datetime.now(timezone.utc).isoformat(),
         })
 
     except Exception as e:
-        logger.error("crm: customers_failed error=%s", e)
-        # Never return empty array on error — return structured error with count
+        logger.error("[CRM] customers_failed error=%s", str(e)[:500], exc_info=True)
         return {
             "ok": False,
-            "error": str(e),
-            "source": "error",
-            "data_source": "error",
-            "synced_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(e)[:500],
             "customers": [],
             "count": 0,
+            "has_more": False,
+            "next_cursor": None,
+            "synced_at": datetime.now(timezone.utc).isoformat(),
         }
 
 
