@@ -139,6 +139,140 @@ async def debug_employees(db: AsyncSession = Depends(get_db)):
         }
 
 
+@router.get("/debug/db")
+async def debug_database(db: AsyncSession = Depends(get_db)):
+    """
+    Comprehensive database diagnostics endpoint.
+
+    Returns:
+    - current_database: Name of connected database
+    - current_schema: Current schema
+    - database_host: Host (password hidden)
+    - employee_count: Total employees
+    - employee_emails: List of all employee emails
+    - passcode_count: Total passcodes
+    - app_access_count: Total app access records
+    - brand_access_count: Total brand access records
+    """
+    try:
+        logger.info("[Auth] debug_db_requested")
+
+        # Get current database
+        result = await db.execute(text("SELECT current_database()"))
+        current_db = result.scalar()
+
+        # Get current schema
+        result = await db.execute(text("SELECT current_schema()"))
+        current_schema = result.scalar()
+
+        # Get database host from connection
+        result = await db.execute(text("SELECT inet_server_addr()"))
+        db_host = result.scalar()
+
+        # Count employees
+        result = await db.execute(text("SELECT COUNT(*) FROM employees"))
+        employee_count = result.scalar() or 0
+
+        # Get all employee emails
+        result = await db.execute(text("SELECT email FROM employees ORDER BY email"))
+        employee_emails = [row[0] for row in result.fetchall()]
+
+        # Count passcodes
+        result = await db.execute(text("SELECT COUNT(*) FROM employee_passcodes"))
+        passcode_count = result.scalar() or 0
+
+        # Count app access
+        result = await db.execute(text("SELECT COUNT(*) FROM employee_app_access"))
+        app_access_count = result.scalar() or 0
+
+        # Count brand access
+        result = await db.execute(text("SELECT COUNT(*) FROM employee_brand_access"))
+        brand_access_count = result.scalar() or 0
+
+        # Get DATABASE_URL from environment (with password hidden)
+        import os
+        db_url = os.getenv("DATABASE_URL", "NOT_SET")
+        if db_url != "NOT_SET":
+            # Hide password
+            if "@" in db_url:
+                parts = db_url.split("@")
+                user_part = parts[0].split("://")[1]
+                user_only = user_part.split(":")[0]
+                db_url_safe = f"postgresql://{user_only}:***@{parts[1]}"
+            else:
+                db_url_safe = db_url
+        else:
+            db_url_safe = "NOT_SET"
+
+        logger.info(
+            "[Auth] debug_db_complete database=%s host=%s employees=%d passcodes=%d",
+            current_db,
+            db_host,
+            employee_count,
+            passcode_count,
+        )
+
+        return {
+            "ok": True,
+            "database": {
+                "current_database": current_db,
+                "current_schema": current_schema,
+                "database_host": str(db_host) if db_host else "unknown",
+                "database_url": db_url_safe,
+            },
+            "tables": {
+                "employee_count": employee_count,
+                "employee_emails": employee_emails,
+                "passcode_count": passcode_count,
+                "app_access_count": app_access_count,
+                "brand_access_count": brand_access_count,
+            },
+            "expected": {
+                "employee_count": 1,
+                "employee_emails": ["preston@noble420.com"],
+                "passcode_count": 1,
+                "app_access_count": 3,
+                "brand_access_count": 1,
+            },
+            "status": {
+                "employees_match": employee_count == 1 and "preston@noble420.com" in employee_emails,
+                "passcodes_match": passcode_count == 1,
+                "app_access_match": app_access_count == 3,
+                "brand_access_match": brand_access_count == 1,
+                "all_match": (
+                    employee_count == 1
+                    and "preston@noble420.com" in employee_emails
+                    and passcode_count == 1
+                    and app_access_count == 3
+                    and brand_access_count == 1
+                ),
+            },
+        }
+
+    except Exception as e:
+        logger.error("[Auth] debug_db_failed error=%s", str(e)[:500], exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e)[:500],
+            "database": {
+                "current_database": "unknown",
+                "current_schema": "unknown",
+                "database_host": "unknown",
+                "database_url": "unknown",
+            },
+            "tables": {
+                "employee_count": 0,
+                "employee_emails": [],
+                "passcode_count": 0,
+                "app_access_count": 0,
+                "brand_access_count": 0,
+            },
+            "status": {
+                "all_match": False,
+            },
+        }
+
+
 @router.get("/health")
 async def auth_health():
     """Health check for auth endpoints."""
