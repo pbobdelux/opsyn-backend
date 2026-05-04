@@ -1123,3 +1123,139 @@ async def crm_recent_orders_sync(
             "count": 0,
             "orders": [],
         }
+
+
+@router.get("/full-data")
+async def crm_full_data(
+    limit: int = Query(5000, ge=100, le=10000, description="Max records to return (default 5000)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get complete CRM dataset for dashboard without pagination.
+
+    Returns all customers and orders up to limit.
+    Optimized for frontend dashboard use - no cursor pagination needed.
+
+    Response:
+    {
+        "ok": true,
+        "customers": [...],
+        "orders": [...],
+        "stats": {
+            "total_customers": N,
+            "total_orders": N,
+            "total_revenue": N.NN,
+            "unique_customers": N
+        },
+        "synced_at": "2026-05-04T..."
+    }
+    """
+    try:
+        logger.info("[CRM] full_data_requested limit=%s", limit)
+
+        # 1. Get all unique customers with aggregated stats
+        customers_result = await db.execute(
+            select(
+                Order.customer_name,
+                func.count(Order.id).label("order_count"),
+                func.sum(Order.amount).label("total_spend"),
+                func.max(Order.external_updated_at).label("last_order_at"),
+            )
+            .where(Order.customer_name != None)
+            .group_by(Order.customer_name)
+            .order_by(func.max(Order.external_updated_at).desc())
+            .limit(limit)
+        )
+
+        customers = []
+        for row in customers_result:
+            customers.append({
+                "id": row.customer_name,
+                "name": row.customer_name,
+                "order_count": row.order_count or 0,
+                "total_spend": float(row.total_spend or 0) / 100.0,  # Convert cents to dollars
+                "last_order_at": row.last_order_at.isoformat() if row.last_order_at else None,
+            })
+
+        # 2. Get all orders (up to limit)
+        orders_result = await db.execute(
+            select(Order)
+            .order_by(Order.external_updated_at.desc())
+            .limit(limit)
+        )
+
+        orders = []
+        for order in orders_result.scalars().all():
+            orders.append({
+                "id": order.id,
+                "external_id": order.external_order_id,
+                "customer_name": order.customer_name,
+                "order_number": order.order_number,
+                "status": order.status,
+                "amount": float(order.amount or 0) / 100.0,  # Convert cents to dollars
+                "item_count": order.item_count or 0,
+                "unit_count": order.unit_count or 0,
+                "review_status": order.review_status,
+                "created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+                "updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
+            })
+
+        # 3. Calculate aggregate stats
+        total_customers_result = await db.execute(
+            select(func.count(func.distinct(Order.customer_name)))
+            .where(Order.customer_name != None)
+        )
+        total_customers = total_customers_result.scalar() or 0
+
+        total_orders_result = await db.execute(
+            select(func.count(Order.id))
+        )
+        total_orders = total_orders_result.scalar() or 0
+
+        total_revenue_result = await db.execute(
+            select(func.sum(Order.amount))
+        )
+        total_revenue_cents = total_revenue_result.scalar() or 0
+        total_revenue = float(total_revenue_cents) / 100.0  # Convert cents to dollars
+
+        synced_at = datetime.now(timezone.utc).isoformat()
+
+        logger.info(
+            "[CRM] full_data_complete customers=%s orders=%s revenue=%s",
+            len(customers),
+            len(orders),
+            total_revenue,
+        )
+
+        return make_json_safe({
+            "ok": True,
+            "customers": customers,
+            "orders": orders,
+            "stats": {
+                "total_customers": total_customers,
+                "total_orders": total_orders,
+                "total_revenue": total_revenue,
+                "unique_customers": len(customers),
+                "returned_customers": len(customers),
+                "returned_orders": len(orders),
+            },
+            "synced_at": synced_at,
+        })
+
+    except Exception as e:
+        logger.error("[CRM] full_data_failed error=%s", str(e)[:500], exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e)[:500],
+            "customers": [],
+            "orders": [],
+            "stats": {
+                "total_customers": 0,
+                "total_orders": 0,
+                "total_revenue": 0.0,
+                "unique_customers": 0,
+                "returned_customers": 0,
+                "returned_orders": 0,
+            },
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+        }
