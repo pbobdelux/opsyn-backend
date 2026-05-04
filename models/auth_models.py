@@ -22,7 +22,7 @@ class Brand(Base):
     org_id = Column(String, ForeignKey("organizations.id"), nullable=False)
     slug = Column(String, nullable=False)
     name = Column(String, nullable=False)
-    is_active = Column(Boolean, default=True)
+    # is_active removed - column doesn't exist in database
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
