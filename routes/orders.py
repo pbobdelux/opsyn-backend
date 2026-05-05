@@ -86,7 +86,11 @@ async def resolve_leaflink_credential(
         BrandAPICredential or None
     """
 
-    logger.info("[CredentialResolver] tenant_lookup_start brand=%s", brand_id)
+    logger.info(
+        "[CredentialResolver] lookup_start brand_id=%s integration_name=leaflink allow_env_fallback=%s",
+        brand_id,
+        allow_env_fallback,
+    )
 
     # TENANT-SCOPED REQUEST: DB only, no ENV
     if brand_id:
@@ -106,10 +110,13 @@ async def resolve_leaflink_credential(
                 api_key = (cred.api_key or "").strip()
 
                 logger.info(
-                    "[CredentialResolver] tenant_lookup_found=true credential_id=%s key_len=%s company_id=%s",
-                    cred.id,
-                    len(api_key),
-                    cred.company_id,
+                    "[CredentialResolver] lookup_result brand_id=%s integration_name=leaflink"
+                    " row_count=1 is_active=%s api_key_present=%s base_url=%s auth_scheme=%s",
+                    brand_id,
+                    cred.is_active,
+                    bool(api_key),
+                    cred.base_url,
+                    cred.auth_scheme,
                 )
 
                 # Validate key length
@@ -128,8 +135,12 @@ async def resolve_leaflink_credential(
 
                 return cred
             else:
+                logger.info(
+                    "[CredentialResolver] lookup_result brand_id=%s integration_name=leaflink row_count=0",
+                    brand_id,
+                )
                 logger.error(
-                    "[CredentialResolver] tenant_lookup_found=false brand=%s",
+                    "[CredentialResolver] lookup_failed brand_id=%s integration_name=leaflink reason=no_rows_found",
                     brand_id,
                 )
                 return None
@@ -150,6 +161,7 @@ async def resolve_leaflink_credential(
             )
             await db.rollback()
             return None
+
 
     # NON-TENANT REQUEST: ENV fallback allowed only if explicitly enabled
     if allow_env_fallback:
