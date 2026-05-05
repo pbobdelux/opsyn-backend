@@ -430,6 +430,8 @@ async def sync_leaflink_orders_headers_only(
 
     Returns a summary dict compatible with the existing sync_result contract.
     """
+    logger.info("[ORDER_SAVE_START] entering order save function brand=%s fetched=%s", brand_id, len(orders))
+
     sync_start = time.monotonic()
 
     # Cast brand_id and org_id to canonical UUID form so that PostgreSQL UUID
@@ -450,7 +452,6 @@ async def sync_leaflink_orders_headers_only(
         for i in range(0, len(orders), batch_size)
     ]
 
-    logger.info("[ORDER_SAVE_START] fetched=%s brand=%s", len(orders), brand_id_value)
     logger.info(
         "[OrdersSync] sync_start brand=%s total_orders=%s batch_size=%s total_batches=%s",
         brand_id_value,
@@ -592,6 +593,9 @@ async def sync_leaflink_orders_headers_only(
                             )
                             batch_created += 1
 
+                # Explicit commit guarantee
+                await db.commit()
+
             # Batch committed successfully (async with db.begin() exited cleanly)
             batch_duration = round(time.monotonic() - batch_start, 2)
             logger.info(
@@ -607,7 +611,7 @@ async def sync_leaflink_orders_headers_only(
                 batch_num,
                 len(batches),
             )
-            logger.info("[ORDER_SAVE_COMMIT] true batch=%s/%s", batch_num, len(batches))
+            logger.info("[ORDER_SAVE_COMMIT] batch committed batch=%s/%s created=%s updated=%s", batch_num, len(batches), batch_created, batch_updated)
             logger.info(
                 "[OrdersSync] batch_committed batch=%s/%s brand=%s created=%s updated=%s skipped=%s duration=%ss",
                 batch_num,
@@ -643,8 +647,8 @@ async def sync_leaflink_orders_headers_only(
 
     # Emit critical alert if we fetched orders but saved none at all
     if fetched_count > 0 and total_created == 0 and total_updated == 0:
-        logger.critical(
-            "[CRITICAL] orders_not_saved fetched=%s brand=%s",
+        logger.error(
+            "[CRITICAL] orders_not_saved fetched=%s but saved=0 brand=%s",
             fetched_count,
             brand_id_value,
         )
@@ -709,6 +713,9 @@ async def sync_leaflink_line_items(
     """
     from sqlalchemy import func
 
+    # Safety guard: verify orders exist before processing line items
+    logger.info("[LINE_ITEM_CHECK_START] checking for parent orders brand=%s", brand_id)
+
     bg_start = time.monotonic()
     total_lines_written = 0
     errors: list[str] = []
@@ -717,46 +724,28 @@ async def sync_leaflink_line_items(
     brand_id_value = safe_uuid(brand_id)
     org_id_value = safe_uuid(org_id) if org_id else None
 
-    # ------------------------------------------------------------------
-    # Safety guard: verify that parent Order rows exist before processing
-    # any line items.  If Phase 1 failed to commit orders (e.g. due to a
-    # UUID type error) we must not attempt FK-dependent inserts.
-    # ------------------------------------------------------------------
-    logger.info("[LINE_ITEM_SAFETY_CHECK] brand=%s checking_parent_orders", brand_id_value)
     try:
-        async with AsyncSessionLocal() as _check_db:
-            async with _check_db.begin():
-                count_result = await _check_db.execute(
-                    select(func.count()).select_from(Order).where(
-                        Order.brand_id == brand_id_value,
-                        Order.source == "leaflink",
-                    )
+        async with AsyncSessionLocal() as check_db:
+            result = await check_db.execute(
+                select(func.count()).select_from(Order).where(
+                    Order.brand_id == brand_id_value,
+                    Order.source == "leaflink"
                 )
-                order_count = count_result.scalar_one()
-    except Exception as check_exc:
-        logger.error(
-            "[LINE_ITEM_SAFETY_CHECK] count_error brand=%s error=%s",
-            brand_id_value,
-            check_exc,
-            exc_info=True,
-        )
+            )
+            order_count = result.scalar_one()
+    except Exception as e:
+        logger.error("[LINE_ITEM_CHECK_ERROR] failed to count orders: %s", e)
         order_count = 0
 
-    logger.info(
-        "[LINE_ITEM_SAFETY_CHECK_RESULT] count=%s brand=%s",
-        order_count,
-        brand_id_value,
-    )
+    logger.info("[LINE_ITEM_CHECK_RESULT] found %s orders brand=%s", order_count, brand_id_value)
+
     if order_count == 0:
-        logger.warning(
-            "[LINE_ITEM_BLOCKED] reason=no_parent_orders brand=%s",
-            brand_id_value,
-        )
+        logger.error("[LINE_ITEM_BLOCKED] no orders in DB — aborting line item sync brand=%s", brand_id_value)
         return {
-            "ok": True,
+            "ok": False,
             "lines_written": 0,
-            "errors": [],
-            "duration_seconds": round(time.monotonic() - bg_start, 2),
+            "errors": ["No parent orders found in database"],
+            "duration_seconds": 0,
         }
 
     for o in orders:
