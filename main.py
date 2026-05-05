@@ -449,6 +449,11 @@ app.include_router(auth_router)
 app.include_router(webhooks_router)
 logger.info("[Routes] registered debug routes")
 
+logger.error("[STARTUP DEBUG] Registered routes:")
+for route in app.routes:
+    if hasattr(route, 'path') and hasattr(route, 'methods'):
+        logger.error("[STARTUP DEBUG] %s %s", route.methods, route.path)
+
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):

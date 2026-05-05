@@ -87,6 +87,7 @@ class LeafLinkClient:
         brand_id: Optional[str] = None,
         auth_scheme: Optional[AuthScheme] = None,
     ) -> None:
+        logger.error("[CLIENT DEBUG] LeafLinkClient.__init__ base_url=%s company_id=%s brand_id=%s", base_url, company_id, brand_id)
         self.brand_id = brand_id or "unknown"
         if not base_url:
             logger.warning("leaflink: client_init brand=%s missing base_url — no env var fallback", self.brand_id)
@@ -222,7 +223,9 @@ class LeafLinkClient:
 
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         """Make GET request with explicit Authorization header and retry logic."""
+        logger.error("[CLIENT DEBUG] _get_raw() called path=%s", path)
         url = f"{self.base_url}/{path.lstrip('/')}"
+        logger.error("[CLIENT DEBUG] FINAL_URL=%s", url)
         logger.error(
             "[LeafLink DEBUG] _get_raw_url=%s",
             url,
@@ -453,6 +456,7 @@ class LeafLinkClient:
         modified__gte: Optional[str] = None,
         status: Optional[str] = None,
     ) -> Any:
+        logger.error("[CLIENT DEBUG] list_orders() called limit=%s offset=%s", limit, offset)
         # Correct endpoint: /orders-received/ (no company_id in path).
         # company_id is stored in DB for metadata only — NOT used in the API path.
         # Auth: Authorization: Token <api_key> (auth_scheme from DB credential).
@@ -888,6 +892,7 @@ class LeafLinkClient:
                 ``orders``       – list of order dicts
                 ``pages_fetched`` – number of pages retrieved
         """
+        logger.error("[CLIENT DEBUG] fetch_recent_orders() called base_url=%s company_id=%s", self.base_url, self.company_id)
         logger.error(
             "[LeafLink DEBUG] fetch_recent_orders_start base_url=%s company_id=%s",
             self.base_url,
