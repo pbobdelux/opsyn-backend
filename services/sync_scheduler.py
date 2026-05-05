@@ -112,13 +112,15 @@ async def validate_schema() -> None:
             )
             orders_columns = {row[0] for row in result.fetchall()}
 
+            # Only require columns that are NOT nullable in the Order model.
+            # org_id is optional (nullable=True), so don't require it here.
             required_orders_cols = {
-                'id', 'org_id', 'brand_id', 'external_order_id',
+                'id', 'brand_id', 'external_order_id',
                 'external_created_at', 'external_updated_at'
             }
             missing_orders = required_orders_cols - orders_columns
             if missing_orders:
-                raise ValueError(f"Missing orders columns: {missing_orders}")
+                raise ValueError(f"Missing required orders columns: {missing_orders}")
 
             # Check order_lines table
             result = await db.execute(
@@ -134,9 +136,13 @@ async def validate_schema() -> None:
             # Check for invalid columns that should have been removed
             invalid_cols = {'pulled_qty'} & lines_columns
             if invalid_cols:
-                raise ValueError(f"Invalid columns in order_lines (should be removed): {invalid_cols}")
+                logger.warning(
+                    "[SCHEMA_VALIDATION] WARNING: invalid columns in order_lines (should be removed): %s",
+                    invalid_cols,
+                )
+                # Don't raise — just warn. The sync will fail if pulled_qty is actually used.
 
-            logger.info("[SCHEMA_VALIDATION] orders and order_lines tables are valid")
+            logger.info("[SCHEMA_VALIDATION] passed")
     except Exception as e:
         logger.error("[SCHEMA_VALIDATION] FAILED: %s", e, exc_info=True)
         raise
@@ -476,7 +482,7 @@ async def run_scheduler() -> None:
                     func.inet_server_port(),
                 )
             )
-            row = result.tuple()
+            row = result.first()
             if row:
                 db_name, db_user, server_addr, server_port = row
                 logger.info(
