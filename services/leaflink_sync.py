@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import logging
 import sys
 import time
@@ -572,6 +573,11 @@ UPDATE orders SET
     updated_at = :updated_at
 WHERE brand_id = CAST(:brand_id AS uuid) AND external_order_id = :external_order_id
 """
+                            # Serialize JSON fields for raw SQL binding — asyncpg
+                            # cannot encode Python list/dict directly; it needs strings.
+                            line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
+                            raw_payload_str = json.dumps(make_json_safe(raw_payload)) if raw_payload else None
+
                             await db.execute(
                                 text(update_stmt),
                                 {
@@ -585,8 +591,8 @@ WHERE brand_id = CAST(:brand_id AS uuid) AND external_order_id = :external_order
                                     "amount": amount_decimal,
                                     "item_count": item_count,
                                     "unit_count": unit_count,
-                                    "line_items_json": make_json_safe(normalized_line_items),
-                                    "raw_payload": make_json_safe(raw_payload),
+                                    "line_items_json": line_items_json_str,
+                                    "raw_payload": raw_payload_str,
                                     "review_status": review_status,
                                     "sync_status": "ok",
                                     "synced_at": now,
@@ -615,6 +621,11 @@ INSERT INTO orders (
     :created_at, :updated_at
 )
 """
+                            # Serialize JSON fields for raw SQL binding — asyncpg
+                            # cannot encode Python list/dict directly; it needs strings.
+                            line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
+                            raw_payload_str = json.dumps(make_json_safe(raw_payload)) if raw_payload else None
+
                             await db.execute(
                                 text(insert_stmt),
                                 {
@@ -628,8 +639,8 @@ INSERT INTO orders (
                                     "amount": amount_decimal,
                                     "item_count": item_count,
                                     "unit_count": unit_count,
-                                    "line_items_json": make_json_safe(normalized_line_items),
-                                    "raw_payload": make_json_safe(raw_payload),
+                                    "line_items_json": line_items_json_str,
+                                    "raw_payload": raw_payload_str,
                                     "source": "leaflink",
                                     "review_status": review_status,
                                     "sync_status": "ok",
