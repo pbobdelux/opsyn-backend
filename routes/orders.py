@@ -3201,6 +3201,7 @@ async def test_leaflink_paths(
 
     api_key = cred.api_key
     company_id = cred.company_id
+    auth_scheme = cred.auth_scheme or "Token"
 
     # Test URLs
     test_urls = [
@@ -3217,7 +3218,7 @@ async def test_leaflink_paths(
     for url in test_urls:
         try:
             headers = {
-                "Authorization": f"Api-Key {api_key}",
+                "Authorization": f"{auth_scheme} {api_key}",
                 "Accept": "application/json",
             }
 
@@ -3232,10 +3233,11 @@ async def test_leaflink_paths(
             })
 
             logger.error(
-                "[LEAFLINK_TEST] url=%s status=%s content_type=%s",
+                "[LEAFLINK_TEST] url=%s status=%s content_type=%s auth_scheme=%s",
                 url,
                 resp.status_code,
                 resp.headers.get("Content-Type", ""),
+                auth_scheme,
             )
 
         except Exception as exc:
