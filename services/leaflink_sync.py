@@ -52,47 +52,34 @@ def parse_dt(val: Any) -> datetime | None:
     return None
 
 
-def normalize_datetime(value: Any) -> datetime | None:
-    """Ensure datetime is timezone-aware UTC, handling all input types.
+def normalize_datetime(dt: Any) -> datetime | None:
+    """Strictly enforce UTC-aware datetime, handling all input types.
 
-    Safely handles:
-    - None → None
-    - Empty strings → None
-    - ISO datetime strings → parsed and converted to UTC-aware
-    - Naive datetimes → assumed UTC and made aware
-    - Aware datetimes → converted to UTC if needed
-    - Already UTC-aware → returned as-is
-
-    Always returns either a timezone-aware UTC datetime or None.
+    ALWAYS returns either a timezone-aware UTC datetime or None.
+    Never returns naive datetimes.
     """
-    # Handle None and empty strings
-    if value is None or value == "":
+    if dt is None or dt == "":
         return None
 
     # Handle ISO datetime strings
-    if isinstance(value, str):
+    if isinstance(dt, str):
         try:
-            # Parse ISO string (handles both with and without timezone)
-            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            # Ensure it's UTC-aware
-            if dt.tzinfo is None:
-                return dt.replace(tzinfo=timezone.utc)
-            if dt.tzinfo != timezone.utc:
-                return dt.astimezone(timezone.utc)
-            return dt
+            # Parse ISO string (handles Z suffix and +00:00)
+            parsed = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+            # Ensure UTC-aware
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
         except (ValueError, TypeError):
             return None
 
     # Handle datetime objects
-    if isinstance(value, datetime):
+    if isinstance(dt, datetime):
         # If naive, assume UTC and make aware
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        # If aware but not UTC, convert to UTC
-        if value.tzinfo != timezone.utc:
-            return value.astimezone(timezone.utc)
-        # Already UTC-aware
-        return value
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        # If aware, convert to UTC
+        return dt.astimezone(timezone.utc)
 
     # Unsupported type
     return None
@@ -220,30 +207,55 @@ def derive_review_status(line_items: list[dict[str, Any]]) -> str:
     return "ready"
 
 
-def validate_datetime_params(params: dict[str, Any], stmt_type: str) -> None:
-    """Scan params dict and raise if any datetime field is naive.
+def validate_datetime_params(params: dict[str, Any], context: str) -> None:
+    """Strictly validate that all datetime fields are UTC-aware.
 
-    This is a safety guard to catch any remaining timezone-naive datetimes
-    before they reach asyncpg, which will reject them with a DataError.
+    Raises ValueError if any datetime is naive or has invalid tzinfo.
+    This is the final guard before asyncpg execution.
     """
-    datetime_fields = {
-        "external_created_at", "external_updated_at",
-        "synced_at", "last_synced_at", "created_at", "updated_at"
-    }
-
-    for field_name in datetime_fields:
-        value = params.get(field_name)
-        if value is not None and isinstance(value, datetime):
+    for field_name, value in params.items():
+        if isinstance(value, datetime):
+            # Check 1: tzinfo must not be None
             if value.tzinfo is None:
                 logger.error(
-                    "[BAD_DATETIME] field=%s value=%s tzinfo=None — aborting %s",
+                    "[BAD_DATETIME] %s field=%s value=%s tzinfo=None",
+                    context,
                     field_name,
                     value,
-                    stmt_type,
                 )
-                raise ValueError(
-                    f"Naive datetime in {field_name}: {value} — must be UTC-aware"
+                raise ValueError(f"Naive datetime in {field_name}: {value}")
+
+            # Check 2: tzinfo must have valid utcoffset
+            try:
+                offset = value.tzinfo.utcoffset(value)
+                if offset is None:
+                    logger.error(
+                        "[BAD_DATETIME] %s field=%s invalid tzinfo",
+                        context,
+                        field_name,
+                    )
+                    raise ValueError(f"Invalid tzinfo in {field_name}")
+            except Exception as e:
+                logger.error(
+                    "[BAD_DATETIME] %s field=%s tzinfo error: %s",
+                    context,
+                    field_name,
+                    e,
                 )
+                raise ValueError(f"Invalid tzinfo in {field_name}: {e}")
+
+
+def log_datetime_check(params: dict[str, Any], context: str) -> None:
+    """Log all datetime fields to confirm they are UTC-aware."""
+    for field_name, value in params.items():
+        if isinstance(value, datetime):
+            logger.info(
+                "[DT_CHECK] %s field=%s tzinfo=%s offset=%s",
+                context,
+                field_name,
+                value.tzinfo,
+                value.tzinfo.utcoffset(value) if value.tzinfo else "None",
+            )
 
 
 async def sync_leaflink_orders(
@@ -671,6 +683,7 @@ WHERE brand_id = CAST(:brand_id AS uuid) AND external_order_id = :external_order
                                 "external_updated_at": normalize_datetime(external_updated_at),
                                 "updated_at": normalize_datetime(now),
                             }
+                            log_datetime_check(update_params, "UPDATE")
                             validate_datetime_params(update_params, "UPDATE")
                             await db.execute(
                                 text(update_stmt),
@@ -723,6 +736,7 @@ INSERT INTO orders (
                                 "created_at": normalize_datetime(now),
                                 "updated_at": normalize_datetime(now),
                             }
+                            log_datetime_check(insert_params, "INSERT")
                             validate_datetime_params(insert_params, "INSERT")
                             await db.execute(
                                 text(insert_stmt),
