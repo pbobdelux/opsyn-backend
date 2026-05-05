@@ -115,7 +115,7 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
             )
 
             try:
-                payload = client.list_orders(page=1, page_size=1)
+                payload = client.list_orders(limit=1, offset=0)
                 api_connected = True
                 logger.info("leaflink: debug api_connected=true payload_type=%s", type(payload).__name__)
             except Exception as api_exc:
@@ -551,7 +551,7 @@ async def raw_orders_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, A
     api_url = f"{client.base_url}/orders-received/"
 
     try:
-        raw = client.list_orders(page=1, page_size=100)
+        raw = client.list_orders(limit=100, offset=0)
     except Exception as api_exc:
         logger.error("[LeafLinkRaw] api_call_failed error=%s", api_exc)
         return {
