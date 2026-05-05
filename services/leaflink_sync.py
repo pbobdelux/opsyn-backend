@@ -52,6 +52,45 @@ def parse_dt(val: Any) -> datetime | None:
     return None
 
 
+def normalize_datetime(value: Any) -> datetime | None:
+    """Convert any datetime value to timezone-aware UTC.
+
+    Handles:
+    - None → None
+    - Naive datetime → attach timezone.utc
+    - Aware datetime → convert to UTC
+    - ISO string → parse and attach timezone.utc
+    - Other types → return None
+    """
+    if value is None:
+        return None
+
+    # Already a datetime object
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            # Naive datetime — attach UTC
+            return value.replace(tzinfo=timezone.utc)
+        else:
+            # Aware datetime — convert to UTC
+            return value.astimezone(timezone.utc)
+
+    # String (ISO format from LeafLink API)
+    if isinstance(value, str):
+        try:
+            # Parse ISO string
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                # Parsed as naive — attach UTC
+                return dt.replace(tzinfo=timezone.utc)
+            else:
+                # Parsed as aware — convert to UTC
+                return dt.astimezone(timezone.utc)
+        except (ValueError, TypeError):
+            return None
+
+    return None
+
+
 def safe_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -531,8 +570,8 @@ async def sync_leaflink_orders_headers_only(
                             else o
                         )
 
-                        external_created_at = parse_dt(o.get("created_at"))
-                        external_updated_at = parse_dt(o.get("updated_at"))
+                        external_created_at = normalize_datetime(parse_dt(o.get("created_at")))
+                        external_updated_at = normalize_datetime(parse_dt(o.get("updated_at")))
 
                         for ts_dt in (external_updated_at, external_created_at):
                             if ts_dt:
@@ -595,11 +634,11 @@ WHERE brand_id = CAST(:brand_id AS uuid) AND external_order_id = :external_order
                                     "raw_payload": raw_payload_str,
                                     "review_status": review_status,
                                     "sync_status": "ok",
-                                    "synced_at": now,
-                                    "last_synced_at": now,
-                                    "external_created_at": external_created_at,
-                                    "external_updated_at": external_updated_at,
-                                    "updated_at": now,
+                                    "synced_at": normalize_datetime(now),
+                                    "last_synced_at": normalize_datetime(now),
+                                    "external_created_at": external_created_at,  # Already normalized above
+                                    "external_updated_at": external_updated_at,  # Already normalized above
+                                    "updated_at": normalize_datetime(now),
                                 }
                             )
                             batch_updated += 1
@@ -644,12 +683,12 @@ INSERT INTO orders (
                                     "source": "leaflink",
                                     "review_status": review_status,
                                     "sync_status": "ok",
-                                    "synced_at": now,
-                                    "last_synced_at": now,
-                                    "external_created_at": external_created_at,
-                                    "external_updated_at": external_updated_at,
-                                    "created_at": now,
-                                    "updated_at": now,
+                                    "synced_at": normalize_datetime(now),
+                                    "last_synced_at": normalize_datetime(now),
+                                    "external_created_at": external_created_at,  # Already normalized above
+                                    "external_updated_at": external_updated_at,  # Already normalized above
+                                    "created_at": normalize_datetime(now),
+                                    "updated_at": normalize_datetime(now),
                                 }
                             )
                             batch_created += 1
