@@ -2575,3 +2575,156 @@ def _cursor_hash_safe(cursor: Optional[str]) -> Optional[str]:
     if not cursor:
         return None
     return hashlib.sha256(cursor.encode()).hexdigest()[:12]
+
+
+@router.post("/sync/leaflink")
+async def sync_orders_leaflink(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Sync orders from LeafLink for a specific brand.
+
+    Request body:
+    {
+        "brand_id": "380e963d-36fc-4928-a4f4-e569cd535f9e"
+    }
+
+    Response:
+    {
+        "ok": true,
+        "brand_id": "...",
+        "synced_count": 42,
+        "created_count": 10,
+        "updated_count": 5,
+        "error_count": 0,
+        "errors": []
+    }
+    """
+    brand_id = body.get("brand_id")
+
+    if not brand_id:
+        logger.warning("[OrdersSync] missing_brand_id")
+        return {"ok": False, "error": "brand_id is required"}
+
+    logger.info("[OrdersSync] sync_start brand_id=%s", brand_id)
+
+    try:
+        # Load LeafLink credentials from database
+        cred = await resolve_leaflink_credential(db, brand_id=brand_id, allow_env_fallback=False)
+
+        if not cred:
+            logger.warning("[OrdersSync] no_credentials brand_id=%s", brand_id)
+            return {
+                "ok": False,
+                "error": f"No LeafLink credentials found for brand {brand_id}",
+                "brand_id": brand_id,
+            }
+
+        logger.info(
+            "[OrdersSync] credentials_found brand_id=%s credential_id=%s",
+            brand_id,
+            cred.id,
+        )
+
+        # Import LeafLink client
+        from services.leaflink_client import LeafLinkClient
+        from services.leaflink_sync import sync_leaflink_orders
+
+        # Fetch orders from LeafLink
+        logger.info("[OrdersSync] fetching_from_leaflink brand_id=%s", brand_id)
+
+        client = LeafLinkClient(
+            api_key=cred.api_key,
+            company_id=cred.company_id,
+            brand_id=brand_id,
+        )
+
+        # Run fetch in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        fetch_result = await asyncio.wait_for(
+            loop.run_in_executor(
+                _leaflink_executor,
+                lambda: client.fetch_recent_orders(normalize=True, brand=brand_id),
+            ),
+            timeout=300,
+        )
+
+        orders = fetch_result.get("orders", [])
+        pages_fetched = fetch_result.get("pages_fetched", 0)
+
+        logger.info(
+            "[OrdersSync] fetched_from_leaflink brand_id=%s orders=%s pages=%s",
+            brand_id,
+            len(orders),
+            pages_fetched,
+        )
+
+        # Upsert orders into database
+        logger.info("[OrdersSync] upserting_to_database brand_id=%s", brand_id)
+
+        async with db.begin():
+            sync_result = await sync_leaflink_orders(db, brand_id, orders, pages_fetched=pages_fetched)
+
+        if not sync_result.get("ok"):
+            logger.error("[OrdersSync] sync_failed brand_id=%s error=%s", brand_id, sync_result.get("error"))
+            return {
+                "ok": False,
+                "error": sync_result.get("error"),
+                "brand_id": brand_id,
+            }
+
+        logger.info(
+            "[OrdersSync] sync_complete brand_id=%s created=%s updated=%s skipped=%s",
+            brand_id,
+            sync_result.get("created", 0),
+            sync_result.get("updated", 0),
+            sync_result.get("skipped", 0),
+        )
+
+        return {
+            "ok": True,
+            "brand_id": brand_id,
+            "synced_count": len(orders),
+            "created_count": sync_result.get("created", 0),
+            "updated_count": sync_result.get("updated", 0),
+            "error_count": sync_result.get("error_count", 0),
+            "errors": sync_result.get("errors", []),
+        }
+
+    except Exception as e:
+        logger.error("[OrdersSync] sync_failed brand_id=%s error=%s", brand_id, str(e)[:500], exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e)[:500],
+            "brand_id": brand_id,
+        }
+
+
+@router.post("/sync/{brand_id}")
+async def sync_orders_by_brand_id(
+    brand_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Alias endpoint for POST /orders/sync/leaflink.
+    Sync orders from LeafLink for a specific brand.
+
+    Path parameter:
+    - brand_id: Brand UUID
+
+    Response:
+    {
+        "ok": true,
+        "brand_id": "...",
+        "synced_count": 42,
+        "created_count": 10,
+        "updated_count": 5,
+        "error_count": 0,
+        "errors": []
+    }
+    """
+    logger.info("[OrdersSync] sync_by_brand_id_start brand_id=%s", brand_id)
+
+    # Delegate to the main sync endpoint
+    return await sync_orders_leaflink({"brand_id": brand_id}, db)

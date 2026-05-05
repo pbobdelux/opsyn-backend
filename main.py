@@ -343,6 +343,41 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("[Startup] database_diagnostics_failed error=%s", str(e)[:500], exc_info=True)
 
+    # After migrations are applied, verify we can query the orders table
+    try:
+        from sqlalchemy import text
+        from database import AsyncSessionLocal as _AsyncSessionLocal2
+
+        async with _AsyncSessionLocal2() as verify_db:
+            # Check if orders table exists
+            result = await verify_db.execute(text("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = 'orders'
+                )
+            """))
+            orders_exists = result.scalar()
+            logger.info("[Startup] orders_table_exists=%s", orders_exists)
+
+            if orders_exists:
+                # Count orders
+                result = await verify_db.execute(text("SELECT COUNT(*) FROM orders"))
+                order_count = result.scalar() or 0
+                logger.info("[Startup] orders_table_row_count=%s", order_count)
+
+            # Check if sync_runs table exists
+            result = await verify_db.execute(text("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = 'sync_runs'
+                )
+            """))
+            sync_runs_exists = result.scalar()
+            logger.info("[Startup] sync_runs_table_exists=%s", sync_runs_exists)
+
+    except Exception as e:
+        logger.error("[Startup] table_verification_failed error=%s", str(e)[:500], exc_info=True)
+
     # Seed auth data for known employees (idempotent — skips if already set up)
     from services.seed_auth import seed_preston_anderson
     try:
