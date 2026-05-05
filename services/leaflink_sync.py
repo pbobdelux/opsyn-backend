@@ -167,19 +167,21 @@ async def sync_leaflink_orders(
 
     The caller is responsible for:
     - Credential lookup and API fetch (before calling this function)
-    - Owning the surrounding ``async with db.begin():`` transaction block
+    - Committing or rolling back the session after this function returns
 
     This function performs only DB writes (no credential lookup, no HTTP).
-    It must be called inside an active transaction — do NOT call db.commit()
-    or db.rollback() here.
+    It must NOT call db.commit(), db.rollback(), or db.begin() — the caller
+    owns the transaction lifecycle.
 
     Args:
-        db: Active async database session (inside a transaction).
+        db: Active async database session.
         brand_id: Brand slug / ID used to scope orders.
         orders: Pre-fetched, normalised order dicts from LeafLink.
         pages_fetched: Number of API pages retrieved (for metadata).
     """
     sync_start = time.monotonic()
+
+    logger.info("[DB] upserting_orders count=%s brand_id=%s", len(orders), brand_id)
 
     using_mock = any(isinstance(o, dict) and o.get("mock_data") for o in orders)
     if using_mock:
@@ -196,8 +198,8 @@ async def sync_leaflink_orders(
     newest_order_date: datetime | None = None
 
     # ------------------------------------------------------------------
-    # Upsert orders and write line items using the caller's transaction.
-    # No begin() here — the route handler owns the transaction.
+    # Upsert orders and write line items using the caller's session.
+    # No begin() here — the route handler owns the transaction lifecycle.
     # ------------------------------------------------------------------
     try:
         for o in orders:
@@ -213,6 +215,7 @@ async def sync_leaflink_orders(
             customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
             status = (safe_str(o.get("status")) or "submitted").lower()
             order_number = safe_str(o.get("order_number"))
+
 
             # Try multiple field names with fallbacks.
             # total_amount is the primary key set by the normalized LeafLink client;
