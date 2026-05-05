@@ -1005,15 +1005,26 @@ async def sync_leaflink_line_items(
                     if not normalized_line_items:
                         continue
 
-                    # Check once per order whether packed_qty exists in the DB
-                    # schema.  The result drives both the SQL column list and the
-                    # params dict so the INSERT never references a missing column.
-                    _packed_qty_exists = has_column("order_lines", "packed_qty")
-                    logger.info("[LINE_ITEM_PACKED_QTY_ENABLED] %s", str(_packed_qty_exists).lower())
+                    # Columns that may not exist in all environments
+                    optional_columns = [
+                        "packed_qty",
+                        "unit_price_cents",
+                        "total_price_cents",
+                    ]
 
-                    # Build the INSERT statement dynamically so that packed_qty
-                    # is only referenced when the column actually exists in the
-                    # live database schema.
+                    # Check which optional columns exist in the database schema
+                    enabled_columns = {}
+                    for col in optional_columns:
+                        enabled_columns[col] = has_column("order_lines", col)
+
+                    logger.info(
+                        "[LINE_ITEM_COLUMNS_ENABLED] packed_qty=%s unit_price_cents=%s total_price_cents=%s",
+                        str(enabled_columns.get("packed_qty", False)).lower(),
+                        str(enabled_columns.get("unit_price_cents", False)).lower(),
+                        str(enabled_columns.get("total_price_cents", False)).lower(),
+                    )
+
+                    # Base columns (always present in order_lines)
                     insert_columns = [
                         "order_id",
                         "sku",
@@ -1021,8 +1032,6 @@ async def sync_leaflink_line_items(
                         "quantity",
                         "unit_price",
                         "total_price",
-                        "unit_price_cents",
-                        "total_price_cents",
                         "mapped_product_id",
                         "mapping_status",
                         "mapping_issue",
@@ -1030,8 +1039,11 @@ async def sync_leaflink_line_items(
                         "created_at",
                         "updated_at",
                     ]
-                    if _packed_qty_exists:
-                        insert_columns.append("packed_qty")
+
+                    # Add optional columns only if they exist in the schema
+                    for col in optional_columns:
+                        if enabled_columns.get(col, False):
+                            insert_columns.append(col)
 
                     columns_str = ", ".join(insert_columns)
                     placeholders = ", ".join([f":{col}" for col in insert_columns])
@@ -1065,6 +1077,7 @@ async def sync_leaflink_line_items(
                             raw_payload_val = item.get("raw_payload")
                             raw_payload_str = json.dumps(make_json_safe(raw_payload_val)) if raw_payload_val is not None else None
 
+                            # Base params (always present)
                             insert_params: dict[str, Any] = {
                                 "order_id": order_id_value,
                                 "sku": sku,
@@ -1072,8 +1085,6 @@ async def sync_leaflink_line_items(
                                 "quantity": item.get("quantity"),
                                 "unit_price": item.get("unit_price"),
                                 "total_price": item.get("total_price"),
-                                "unit_price_cents": item.get("unit_price_cents"),
-                                "total_price_cents": item.get("total_price_cents"),
                                 "mapped_product_id": item.get("mapped_product_id"),
                                 "mapping_status": item.get("mapping_status"),
                                 "mapping_issue": item.get("mapping_issue"),
@@ -1081,8 +1092,14 @@ async def sync_leaflink_line_items(
                                 "created_at": normalize_datetime(utc_now()),
                                 "updated_at": normalize_datetime(utc_now()),
                             }
-                            if _packed_qty_exists:
+
+                            # Add optional params only if columns exist
+                            if enabled_columns.get("packed_qty", False):
                                 insert_params["packed_qty"] = 0
+                            if enabled_columns.get("unit_price_cents", False):
+                                insert_params["unit_price_cents"] = item.get("unit_price_cents")
+                            if enabled_columns.get("total_price_cents", False):
+                                insert_params["total_price_cents"] = item.get("total_price_cents")
 
                             # Log normalized datetimes for first 3 line items
                             if line_number <= 3:
