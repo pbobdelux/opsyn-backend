@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 import requests
 
-AuthScheme = Literal["Bearer", "Token", "Raw"]
+AuthScheme = Literal["Bearer", "Token", "Raw", "Api-Key"]
 
 logger = logging.getLogger("leaflink_client")
 
@@ -94,6 +94,12 @@ class LeafLinkClient:
             raise ValueError("Missing base_url — LeafLink base_url must be provided per brand (not from env vars)")
         self.base_url = base_url.strip().rstrip("/")
 
+        if "marketplace.leaflink.com" not in self.base_url.lower():
+            logger.error(
+                "[LeafLinkAuth] WRONG_BASE_URL=%s expected marketplace.leaflink.com",
+                self.base_url,
+            )
+
         # Clean the API key: strip whitespace and remove "Token " prefix if present
         # api_key is required — no env var fallback (multi-tenant: each brand has its own key)
         _raw_api_key = api_key or ""
@@ -136,7 +142,7 @@ class LeafLinkClient:
                 f"Invalid LeafLink API key length: {len(self.api_key)} (expected ~40)"
             )
 
-        # Determine auth scheme
+        # Determine auth scheme — LeafLink requires Api-Key format
         if auth_scheme:
             self.auth_scheme: str = auth_scheme
             logger.info(
@@ -144,19 +150,11 @@ class LeafLinkClient:
                 auth_scheme,
             )
         else:
-            env_scheme = os.getenv("LEAFLINK_AUTH_SCHEME", "auto").lower()
-            if env_scheme in ("bearer", "token", "raw"):
-                self.auth_scheme = env_scheme.capitalize() if env_scheme != "raw" else "Raw"
-                logger.info(
-                    "[LeafLinkAuth] using_env_scheme scheme=%s",
-                    self.auth_scheme,
-                )
-            else:
-                # Default to Bearer (most common for modern APIs)
-                self.auth_scheme = "Bearer"
-                logger.info(
-                    "[LeafLinkAuth] using_default_scheme scheme=Bearer",
-                )
+            # Default to Api-Key (LeafLink requirement)
+            self.auth_scheme = "Api-Key"
+            logger.info(
+                "[LeafLinkAuth] using_default_scheme scheme=Api-Key",
+            )
 
         self.session = requests.Session()
         # Base session headers — Authorization header is built per-request from
@@ -175,34 +173,15 @@ class LeafLinkClient:
             logger.error("[LeafLinkAuth] MISSING company_id brand=%s", self.brand_id)
 
     def _get_auth_header(self) -> dict:
-        """Build Authorization header based on configured scheme.
-
-        Always returns a valid dict with Authorization key.
-        """
+        """Build Authorization header using Api-Key format (LeafLink requirement)."""
         if not self.api_key:
             logger.error("[LeafLinkAuth] MISSING api_key in _get_auth_header")
-            return {"Authorization": ""}  # Fallback to empty (will fail, but won't crash)
+            return {"Authorization": ""}
 
-        if self.auth_scheme == "Bearer":
-            auth_header = f"Bearer {self.api_key}"
-            logger.info("[LeafLinkAuth] building_header scheme=Bearer api_key_present=true")
-            return {"Authorization": auth_header}
-        elif self.auth_scheme == "Token":
-            auth_header = f"Token {self.api_key}"
-            logger.error("[LEAFLINK_ACTUAL] building_token_auth api_key_len=%s", len(self.api_key))
-            logger.info("[LeafLinkAuth] building_header scheme=Token api_key_present=true")
-            return {"Authorization": auth_header}
-        elif self.auth_scheme == "Raw":
-            logger.info("[LeafLinkAuth] building_header scheme=Raw api_key_present=true")
-            return {"Authorization": self.api_key}
-        else:
-            # Fallback to Bearer
-            logger.warning(
-                "[LeafLinkAuth] unknown_scheme=%s falling_back_to_Bearer",
-                self.auth_scheme,
-            )
-            auth_header = f"Bearer {self.api_key}"
-            return {"Authorization": auth_header}
+        # LeafLink requires: Authorization: Api-Key <api_key>
+        auth_header = f"Api-Key {self.api_key}"
+        logger.error("[LeafLinkAuth] building_header scheme=Api-Key api_key_len=%s", len(self.api_key))
+        return {"Authorization": auth_header}
 
     def _validate_request_headers(self, headers: dict) -> bool:
         """Validate that Authorization header is present and non-empty."""
@@ -237,6 +216,11 @@ class LeafLinkClient:
             **self._get_auth_header(),
             "Content-Type": "application/json",
         }
+
+        logger.error(
+            "[LEAFLINK_ACTUAL] request_headers Authorization=%s",
+            (headers.get("Authorization", "MISSING")[:20] + "..."),
+        )
 
         if not self._validate_request_headers(headers):
             logger.error("[LeafLinkAuth] invalid_headers aborting_request path=%s", path)
@@ -459,10 +443,9 @@ class LeafLinkClient:
         status: Optional[str] = None,
     ) -> Any:
         logger.error("[CLIENT DEBUG] list_orders() called limit=%s offset=%s", limit, offset)
-        # HOTFIX: Use the exact working endpoint
-        # Manual curl proves this works:
-        # GET https://www.leaflink.com/api/v2/orders-received/?limit=1
-        # Authorization: Token <key>
+        # HOTFIX: Use correct LeafLink endpoint
+        # https://marketplace.leaflink.com/api/v2/orders-received/
+        # Authorization: Api-Key <key>
         _orders_path = "orders-received/"
         params: Dict[str, Any] = {
             "limit": limit,
@@ -473,12 +456,11 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
-        # Build final URL
         _param_str = "&".join(f"{k}={v}" for k, v in params.items())
         url = f"{self.base_url.rstrip('/')}/orders-received/?{_param_str}"
 
         logger.error("[LEAFLINK_ACTUAL] url=%s", url)
-        logger.error("[LEAFLINK_ACTUAL] auth_scheme=%s key_len=%s", self.auth_scheme, len(self.api_key or ""))
+        logger.error("[LEAFLINK_ACTUAL] auth_header_format=Api-Key key_len=%s", len(self.api_key or ""))
 
         try:
             resp = self._get_raw(_orders_path, params=params)
