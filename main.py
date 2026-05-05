@@ -292,6 +292,12 @@ async def lifespan(app: FastAPI):
         from database import refresh_connection_pool
         await refresh_connection_pool()
 
+    # Dispose and recreate the engine to flush asyncpg prepared-statement cache,
+    # then inspect the live schema so sync code can check column existence at runtime.
+    from database import dispose_and_recreate_engine, inspect_schema_at_startup
+    await dispose_and_recreate_engine()
+    await inspect_schema_at_startup()
+
     # Verify database schema and log connection details
     await _verify_database_schema()
 

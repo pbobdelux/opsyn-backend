@@ -223,3 +223,104 @@ async def refresh_connection_pool() -> None:
     )
 
     logger.info("[Database] connection_pool_recreated with connect_args_ssl=require")
+
+
+# ---------------------------------------------------------------------------
+# Module-level dict populated by inspect_schema_at_startup().
+# Keys: table name (str), Values: dict mapping column_name → data_type.
+# ---------------------------------------------------------------------------
+_schema_column_types: dict[str, dict[str, str]] = {}
+
+
+def get_schema_column_types() -> dict[str, dict[str, str]]:
+    """Return the schema column type map populated at startup."""
+    return _schema_column_types
+
+
+async def dispose_and_recreate_engine() -> None:
+    """Dispose the engine to flush asyncpg prepared-statement cache, then recreate it.
+
+    Call this once at startup (after migrations) so that any stale prepared
+    statement metadata from a previous deploy is discarded before the first
+    sync operation runs.
+    """
+    global engine, AsyncSessionLocal
+
+    if engine is None:
+        return
+
+    logger.info("[DB_STARTUP] disposing_engine_for_fresh_cache")
+    await engine.dispose()
+
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_pre_ping=True,
+        connect_args={"ssl": "require"},
+    )
+
+    AsyncSessionLocal = async_sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+
+    logger.info("[DB_STARTUP] engine_recreated_after_dispose")
+
+
+async def inspect_schema_at_startup() -> None:
+    """Query information_schema to log and cache actual PostgreSQL column types.
+
+    Inspects the ``orders`` and ``order_lines`` tables and stores the results
+    in the module-level ``_schema_column_types`` dict so that sync code can
+    check column existence at runtime without hitting the DB again.
+
+    Logs:
+        [SCHEMA_COLUMNS] table=orders columns={...}
+        [SCHEMA_COLUMNS] table=order_lines columns={...}
+        [SCHEMA_VALIDATION] packed_qty_exists=true|false
+    """
+    global _schema_column_types
+
+    if engine is None:
+        logger.warning("[SCHEMA_INSPECT] engine not available — skipping schema inspection")
+        return
+
+    try:
+        async with engine.connect() as conn:
+            from sqlalchemy import text as _text
+
+            for table_name in ("orders", "order_lines"):
+                result = await conn.execute(
+                    _text(
+                        """
+                        SELECT column_name, data_type
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = :table_name
+                        ORDER BY ordinal_position
+                        """
+                    ),
+                    {"table_name": table_name},
+                )
+                rows = result.fetchall()
+                col_map = {row[0]: row[1] for row in rows}
+                _schema_column_types[table_name] = col_map
+                logger.info(
+                    "[SCHEMA_COLUMNS] table=%s columns=%s",
+                    table_name,
+                    col_map,
+                )
+
+        packed_qty_exists = "packed_qty" in _schema_column_types.get("order_lines", {})
+        logger.info(
+            "[SCHEMA_VALIDATION] packed_qty_exists=%s",
+            str(packed_qty_exists).lower(),
+        )
+
+    except Exception as exc:
+        logger.error(
+            "[SCHEMA_INSPECT] failed to inspect schema: %s",
+            exc,
+            exc_info=True,
+        )

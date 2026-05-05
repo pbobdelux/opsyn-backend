@@ -13,7 +13,7 @@ from uuid import UUID
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import AsyncSessionLocal
+from database import AsyncSessionLocal, get_schema_column_types
 from models import Order, OrderLine
 from utils.json_utils import make_json_safe
 
@@ -119,78 +119,7 @@ def force_utc(dt: Any) -> datetime | None:
     return None
 
 
-def serialize_datetimes_for_sql(params: dict[str, Any]) -> dict[str, Any]:
-    """Convert all datetime values to ISO strings for SQL execution.
 
-    This bypasses SQLAlchemy/asyncpg datetime handling by converting
-    all datetimes to ISO strings before binding. PostgreSQL will parse
-    the ISO strings and handle timezone conversion automatically.
-
-    Args:
-        params: Parameter dict for SQL execution
-
-    Returns:
-        New dict with all datetimes converted to ISO strings
-    """
-    fixed = {}
-    for k, v in params.items():
-        if isinstance(v, datetime):
-            # Ensure UTC
-            if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
-                v = v.replace(tzinfo=timezone.utc)
-            else:
-                v = v.astimezone(timezone.utc)
-            # Convert to ISO string
-            fixed[k] = v.isoformat()
-        else:
-            fixed[k] = v
-    return fixed
-
-
-def enforce_all_datetimes_utc(params: dict[str, Any]) -> dict[str, Any]:
-    """Force all datetime values to naive UTC.
-
-    The orders table uses 'timestamp without time zone' columns,
-    which expect naive UTC datetimes, not timezone-aware.
-
-    This sanitizer converts all datetimes to naive UTC before SQL execution.
-
-    Args:
-        params: Parameter dict for SQL execution
-
-    Returns:
-        New dict with all datetimes converted to naive UTC
-    """
-    fixed = {}
-    for k, v in params.items():
-        if isinstance(v, datetime):
-            # FORCE NAIVE UTC (critical for timestamp without time zone columns)
-            if v.tzinfo is None:
-                # Already naive, ensure it's UTC
-                v = v.replace(tzinfo=timezone.utc).replace(tzinfo=None)
-            else:
-                # Aware datetime, convert to UTC then strip tzinfo
-                v = v.astimezone(timezone.utc).replace(tzinfo=None)
-        fixed[k] = v
-    return fixed
-
-
-def log_final_datetime_params(params: dict[str, Any], op: str) -> None:
-    """Log all datetime parameters immediately before SQL execution.
-
-    Scans every parameter and logs all datetime fields.
-    This is the final audit trail before asyncpg execution.
-    """
-    for field_name, value in params.items():
-        if isinstance(value, datetime):
-            logger.error(
-                "[FINAL_DT_PARAM] op=%s field=%s value=%s tzinfo=%s offset=%s",
-                op,
-                field_name,
-                value,
-                value.tzinfo,
-                value.utcoffset() if value.tzinfo else None,
-            )
 
 
 def safe_str(value: Any) -> str | None:
@@ -315,55 +244,7 @@ def derive_review_status(line_items: list[dict[str, Any]]) -> str:
     return "ready"
 
 
-def validate_datetime_params(params: dict[str, Any], context: str) -> None:
-    """Strictly validate that all datetime fields are UTC-aware.
 
-    Raises ValueError if any datetime is naive or has invalid tzinfo.
-    This is the final guard before asyncpg execution.
-    """
-    for field_name, value in params.items():
-        if isinstance(value, datetime):
-            # Check 1: tzinfo must not be None
-            if value.tzinfo is None:
-                logger.error(
-                    "[BAD_DATETIME] %s field=%s value=%s tzinfo=None",
-                    context,
-                    field_name,
-                    value,
-                )
-                raise ValueError(f"Naive datetime in {field_name}: {value}")
-
-            # Check 2: tzinfo must have valid utcoffset
-            try:
-                offset = value.tzinfo.utcoffset(value)
-                if offset is None:
-                    logger.error(
-                        "[BAD_DATETIME] %s field=%s invalid tzinfo",
-                        context,
-                        field_name,
-                    )
-                    raise ValueError(f"Invalid tzinfo in {field_name}")
-            except Exception as e:
-                logger.error(
-                    "[BAD_DATETIME] %s field=%s tzinfo error: %s",
-                    context,
-                    field_name,
-                    e,
-                )
-                raise ValueError(f"Invalid tzinfo in {field_name}: {e}")
-
-
-def log_datetime_check(params: dict[str, Any], context: str) -> None:
-    """Log all datetime fields to confirm they are UTC-aware."""
-    for field_name, value in params.items():
-        if isinstance(value, datetime):
-            logger.info(
-                "[DT_CHECK] %s field=%s tzinfo=%s offset=%s",
-                context,
-                field_name,
-                value.tzinfo,
-                value.tzinfo.utcoffset(value) if value.tzinfo else "None",
-            )
 
 
 async def sync_leaflink_orders(
@@ -829,10 +710,14 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 "external_updated_at": force_utc(external_updated_at),
                                 "updated_at": force_utc(now),
                             }
-                            log_datetime_check(update_params, "UPDATE")
-                            validate_datetime_params(update_params, "UPDATE")
-                            update_params = serialize_datetimes_for_sql(update_params)
-                            log_final_datetime_params(update_params, "UPDATE")
+                            for _field, _val in update_params.items():
+                                if isinstance(_val, datetime):
+                                    logger.info(
+                                        "[DB_PARAM_TYPE] field=%s type=datetime tzinfo=%s offset=%s",
+                                        _field,
+                                        _val.tzinfo,
+                                        _val.utcoffset() if _val.tzinfo else None,
+                                    )
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -886,10 +771,14 @@ INSERT INTO orders (
                                 "created_at": force_utc(now),
                                 "updated_at": force_utc(now),
                             }
-                            log_datetime_check(insert_params, "INSERT")
-                            validate_datetime_params(insert_params, "INSERT")
-                            insert_params = serialize_datetimes_for_sql(insert_params)
-                            log_final_datetime_params(insert_params, "INSERT")
+                            for _field, _val in insert_params.items():
+                                if isinstance(_val, datetime):
+                                    logger.info(
+                                        "[DB_PARAM_TYPE] field=%s type=datetime tzinfo=%s offset=%s",
+                                        _field,
+                                        _val.tzinfo,
+                                        _val.utcoffset() if _val.tzinfo else None,
+                                    )
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
@@ -914,7 +803,7 @@ INSERT INTO orders (
                 batch_num,
                 len(batches),
             )
-            logger.info("[ORDER_SAVE_COMMIT] batch committed batch=%s/%s created=%s updated=%s", batch_num, len(batches), batch_created, batch_updated)
+            logger.info("[ORDER_SAVE_COMMIT] brand_id=%s created=%s updated=%s batch=%s/%s", brand_id_value, batch_created, batch_updated, batch_num, len(batches))
             logger.info(
                 "[OrdersSync] batch_committed batch=%s/%s brand=%s created=%s updated=%s skipped=%s duration=%ss",
                 batch_num,
@@ -1134,22 +1023,34 @@ async def sync_leaflink_line_items(
 
                         # Fail-safe: one bad line item must not crash the entire batch
                         try:
-                            db.add(
-                                OrderLine(
-                                    order_id=order_id_value,
-                                    sku=sku,
-                                    product_name=item.get("product_name"),
-                                    quantity=item.get("quantity"),
-                                    unit_price=item.get("unit_price"),
-                                    total_price=item.get("total_price"),
-                                    unit_price_cents=item.get("unit_price_cents"),
-                                    total_price_cents=item.get("total_price_cents"),
-                                    mapped_product_id=item.get("mapped_product_id"),
-                                    mapping_status=item.get("mapping_status"),
-                                    mapping_issue=item.get("mapping_issue"),
-                                    raw_payload=make_json_safe(item.get("raw_payload")),
+                            # Check whether packed_qty column exists in the DB schema
+                            # (populated at startup by inspect_schema_at_startup).
+                            _order_lines_cols = get_schema_column_types().get("order_lines", {})
+                            _packed_qty_exists = "packed_qty" in _order_lines_cols
+
+                            if not _packed_qty_exists:
+                                logger.info(
+                                    "[LINE_ITEM_COLUMN_SKIPPED] field=packed_qty reason=column_not_found"
                                 )
-                            )
+
+                            _line_kwargs: dict[str, Any] = {
+                                "order_id": order_id_value,
+                                "sku": sku,
+                                "product_name": item.get("product_name"),
+                                "quantity": item.get("quantity"),
+                                "unit_price": item.get("unit_price"),
+                                "total_price": item.get("total_price"),
+                                "unit_price_cents": item.get("unit_price_cents"),
+                                "total_price_cents": item.get("total_price_cents"),
+                                "mapped_product_id": item.get("mapped_product_id"),
+                                "mapping_status": item.get("mapping_status"),
+                                "mapping_issue": item.get("mapping_issue"),
+                                "raw_payload": make_json_safe(item.get("raw_payload")),
+                            }
+                            if _packed_qty_exists:
+                                _line_kwargs["packed_qty"] = 0
+
+                            db.add(OrderLine(**_line_kwargs))
                             inserted_count += 1
                         except Exception as line_error:
                             logger.error(
@@ -1165,6 +1066,7 @@ async def sync_leaflink_line_items(
 
                     total_lines_written += inserted_count
                     logger.info("[LINE_ITEM_SAVE] inserted=%s external_id=%s", inserted_count, external_id)
+                    logger.info("[LINE_ITEM_SAVE_COMMIT] brand_id=%s created=%s updated=0", brand_id_value, inserted_count)
 
         except Exception as line_exc:
             err_msg = str(line_exc)
