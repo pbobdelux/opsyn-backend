@@ -1182,7 +1182,47 @@ async def orders_sync(
     # Use resolved brand ID for all subsequent operations
     _effective_brand_id: Optional[str] = _resolved_brand_id
 
-
+    # ------------------------------------------------------------------ #
+    # Resolve org_id from X-OPSYN-ORG header for multi-tenant isolation.  #
+    # org_id is written to every order row so GET /orders can filter by   #
+    # org_id AND brand_id. Without it, orders are invisible to the API.   #
+    # ------------------------------------------------------------------ #
+    _resolved_org_id: Optional[str] = None
+    _raw_org_header = (
+        request.headers.get("x-opsyn-org")
+        or request.headers.get("x-org-id")
+    )
+    if _raw_org_header:
+        try:
+            from services.organization_service import lookup_organization as _lookup_org
+            _org_lookup = await _lookup_org(db, _raw_org_header)
+            if _org_lookup.get("ok"):
+                _resolved_org_id = str(_org_lookup["organization"].id)
+                logger.info(
+                    "[OrdersSync] org_resolved org_header=%s org_id=%s brand=%s",
+                    _raw_org_header,
+                    _resolved_org_id,
+                    _effective_brand_id,
+                )
+            else:
+                logger.warning(
+                    "[OrdersSync] org_resolve_failed org_header=%s error=%s brand=%s",
+                    _raw_org_header,
+                    _org_lookup.get("error"),
+                    _effective_brand_id,
+                )
+        except Exception as _org_exc:
+            logger.warning(
+                "[OrdersSync] org_resolve_error org_header=%s error=%s brand=%s",
+                _raw_org_header,
+                _org_exc,
+                _effective_brand_id,
+            )
+    else:
+        logger.warning(
+            "[OrdersSync] org_header_missing brand=%s — orders will be saved without org_id",
+            _effective_brand_id,
+        )
 
     # ------------------------------------------------------------------ #
     # FORCE_DB_ONLY: emergency debug mode — skip LeafLink entirely        #
@@ -1413,6 +1453,7 @@ async def orders_sync(
                             _resolved_brand_id,
                             orders_from_leaflink,
                             pages_fetched=pages_fetched_phase1,
+                            org_id=_resolved_org_id,
                         ),
                         timeout=DB_TIMEOUT_SECONDS,
                     )
