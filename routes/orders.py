@@ -2738,8 +2738,13 @@ async def sync_orders_leaflink(
         try:
             logger.info("[OrdersSync] upserting_to_database brand_id=%s order_count=%s", brand_id, len(orders))
 
-            async with db.begin():
-                sync_result = await sync_leaflink_orders(db, brand_id, orders, pages_fetched=pages_fetched)
+            # Do NOT wrap in `async with db.begin()` — the session provided by
+            # get_db() uses SQLAlchemy's autobegin, so a transaction is already
+            # active by the time we reach this point.  Calling db.begin() again
+            # raises "connection already initialized a Transaction()".
+            # sync_leaflink_orders() is designed to work inside the caller's
+            # existing transaction; it must not open its own.
+            sync_result = await sync_leaflink_orders(db, brand_id, orders, pages_fetched=pages_fetched)
 
             if not sync_result.get("ok"):
                 logger.error("[OrdersSync] sync_failed brand_id=%s error=%s", brand_id, sync_result.get("error"))
