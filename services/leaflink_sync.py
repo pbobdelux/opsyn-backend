@@ -636,8 +636,8 @@ WHERE brand_id = CAST(:brand_id AS uuid) AND external_order_id = :external_order
                                     "sync_status": "ok",
                                     "synced_at": normalize_datetime(now),
                                     "last_synced_at": normalize_datetime(now),
-                                    "external_created_at": external_created_at,  # Already normalized above
-                                    "external_updated_at": external_updated_at,  # Already normalized above
+                                    "external_created_at": normalize_datetime(external_created_at),
+                                    "external_updated_at": normalize_datetime(external_updated_at),
                                     "updated_at": normalize_datetime(now),
                                 }
                             )
@@ -685,8 +685,8 @@ INSERT INTO orders (
                                     "sync_status": "ok",
                                     "synced_at": normalize_datetime(now),
                                     "last_synced_at": normalize_datetime(now),
-                                    "external_created_at": external_created_at,  # Already normalized above
-                                    "external_updated_at": external_updated_at,  # Already normalized above
+                                    "external_created_at": normalize_datetime(external_created_at),
+                                    "external_updated_at": normalize_datetime(external_updated_at),
                                     "created_at": normalize_datetime(now),
                                     "updated_at": normalize_datetime(now),
                                 }
