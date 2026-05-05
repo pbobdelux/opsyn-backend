@@ -64,6 +64,19 @@ class BrandAPICredential(Base):
         default=None,
         comment="Auto-detected auth scheme: Bearer, Token, or Raw",
     )
+    # Webhook support
+    webhook_key: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        default=None,
+        comment="LeafLink webhook secret for HMAC-SHA256 signature verification",
+    )
+    org_id: Mapped[Optional[str]] = mapped_column(
+        String(120),
+        nullable=True,
+        default=None,
+        comment="Organization UUID for fast tenant resolution from webhook payloads",
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
