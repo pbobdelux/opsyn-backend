@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal
@@ -548,48 +548,98 @@ async def sync_leaflink_orders_headers_only(
                         existing = existing_result.scalar_one_or_none()
 
                         if existing:
-                            existing.customer_name = customer_name
-                            existing.status = status
-                            existing.order_number = order_number
-                            existing.total_cents = total_cents
-                            existing.amount = amount_decimal
-                            existing.item_count = item_count
-                            existing.unit_count = unit_count
-                            existing.line_items_json = make_json_safe(normalized_line_items)
-                            existing.raw_payload = make_json_safe(raw_payload)
-                            existing.review_status = review_status
-                            existing.sync_status = "ok"
-                            existing.synced_at = now
-                            existing.last_synced_at = now
-                            existing.external_created_at = external_created_at
-                            existing.external_updated_at = external_updated_at
-                            # Backfill org_id on existing rows when available
-                            if org_id_value:
-                                existing.org_id = org_id_value
+                            # Use raw SQL UPDATE with CAST so PostgreSQL receives
+                            # explicit type coercion for UUID columns instead of
+                            # rejecting a character-varying bound parameter.
+                            update_stmt = """
+UPDATE orders SET
+    org_id = CAST(:org_id AS uuid),
+    customer_name = :customer_name,
+    status = :status,
+    order_number = :order_number,
+    total_cents = :total_cents,
+    amount = :amount,
+    item_count = :item_count,
+    unit_count = :unit_count,
+    line_items_json = :line_items_json,
+    raw_payload = :raw_payload,
+    review_status = :review_status,
+    sync_status = :sync_status,
+    synced_at = :synced_at,
+    last_synced_at = :last_synced_at,
+    external_created_at = :external_created_at,
+    external_updated_at = :external_updated_at,
+    updated_at = :updated_at
+WHERE brand_id = CAST(:brand_id AS uuid) AND external_order_id = :external_order_id
+"""
+                            await db.execute(
+                                text(update_stmt),
+                                {
+                                    "org_id": org_id_value,
+                                    "brand_id": brand_id_value,
+                                    "external_order_id": external_id,
+                                    "customer_name": customer_name,
+                                    "status": status,
+                                    "order_number": order_number,
+                                    "total_cents": total_cents,
+                                    "amount": amount_decimal,
+                                    "item_count": item_count,
+                                    "unit_count": unit_count,
+                                    "line_items_json": make_json_safe(normalized_line_items),
+                                    "raw_payload": make_json_safe(raw_payload),
+                                    "review_status": review_status,
+                                    "sync_status": "ok",
+                                    "synced_at": now,
+                                    "last_synced_at": now,
+                                    "external_created_at": external_created_at,
+                                    "external_updated_at": external_updated_at,
+                                    "updated_at": now,
+                                }
+                            )
                             batch_updated += 1
                         else:
-                            db.add(
-                                Order(
-                                    org_id=org_id_value,
-                                    brand_id=brand_id_value,
-                                    external_order_id=external_id,
-                                    order_number=order_number,
-                                    customer_name=customer_name,
-                                    status=status,
-                                    total_cents=total_cents,
-                                    amount=amount_decimal,
-                                    item_count=item_count,
-                                    unit_count=unit_count,
-                                    line_items_json=make_json_safe(normalized_line_items),
-                                    raw_payload=make_json_safe(raw_payload),
-                                    source="leaflink",
-                                    review_status=review_status,
-                                    sync_status="ok",
-                                    synced_at=now,
-                                    last_synced_at=now,
-                                    external_created_at=external_created_at,
-                                    external_updated_at=external_updated_at,
-                                )
+                            # Use raw SQL INSERT with CAST so PostgreSQL receives
+                            # explicit type coercion for UUID columns instead of
+                            # rejecting a character-varying bound parameter.
+                            insert_stmt = """
+INSERT INTO orders (
+    org_id, brand_id, external_order_id, order_number, customer_name, status,
+    total_cents, amount, item_count, unit_count, line_items_json, raw_payload,
+    source, review_status, sync_status, synced_at, last_synced_at,
+    external_created_at, external_updated_at, created_at, updated_at
+) VALUES (
+    CAST(:org_id AS uuid), CAST(:brand_id AS uuid), :external_order_id, :order_number,
+    :customer_name, :status, :total_cents, :amount, :item_count, :unit_count,
+    :line_items_json, :raw_payload, :source, :review_status, :sync_status,
+    :synced_at, :last_synced_at, :external_created_at, :external_updated_at,
+    :created_at, :updated_at
+)
+"""
+                            await db.execute(
+                                text(insert_stmt),
+                                {
+                                    "org_id": org_id_value,
+                                    "brand_id": brand_id_value,
+                                    "external_order_id": external_id,
+                                    "order_number": order_number,
+                                    "customer_name": customer_name,
+                                    "status": status,
+                                    "total_cents": total_cents,
+                                    "amount": amount_decimal,
+                                    "item_count": item_count,
+                                    "unit_count": unit_count,
+                                    "line_items_json": make_json_safe(normalized_line_items),
+                                    "raw_payload": make_json_safe(raw_payload),
+                                    "source": "leaflink",
+                                    "review_status": review_status,
+                                    "sync_status": "ok",
+                                    "synced_at": now,
+                                    "last_synced_at": now,
+                                    "external_created_at": external_created_at,
+                                    "external_updated_at": external_updated_at,
+                                    "created_at": now,
+                                    "updated_at": now,
+                                }
                             )
                             batch_created += 1
 
