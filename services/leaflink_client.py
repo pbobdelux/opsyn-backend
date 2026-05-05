@@ -223,6 +223,10 @@ class LeafLinkClient:
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         """Make GET request with explicit Authorization header and retry logic."""
         url = f"{self.base_url}/{path.lstrip('/')}"
+        logger.error(
+            "[LeafLink DEBUG] _get_raw_url=%s",
+            url,
+        )
 
         # Build headers with explicit Authorization
         headers = {
@@ -466,6 +470,10 @@ class LeafLinkClient:
         _param_str = "&".join(f"{k}={v}" for k, v in params.items())
         final_url = f"{self.base_url}/{_orders_path}?{_param_str}"
 
+        logger.error(
+            "[LeafLink DEBUG] FINAL_URL=%s",
+            final_url,
+        )
         logger.info("[LeafLink] final_url=%s", final_url)
         logger.info("[LeafLink] auth_scheme=%s", self.auth_scheme)
 
@@ -741,6 +749,11 @@ class LeafLinkClient:
                 ``total_count``       – total order count reported by LeafLink (first page only)
                 ``total_pages``       – estimated total pages (total_count / page_size, rounded up)
         """
+        logger.error(
+            "[LeafLink DEBUG] fetch_orders_page_range_start base_url=%s company_id=%s",
+            self.base_url,
+            self.company_id,
+        )
         all_orders: List[Dict[str, Any]] = []
         pages_fetched = 0
         next_url: Optional[str] = resume_url
@@ -875,6 +888,11 @@ class LeafLinkClient:
                 ``orders``       – list of order dicts
                 ``pages_fetched`` – number of pages retrieved
         """
+        logger.error(
+            "[LeafLink DEBUG] fetch_recent_orders_start base_url=%s company_id=%s",
+            self.base_url,
+            self.company_id,
+        )
         effective_max = max_pages if max_pages is not None else 10_000
 
         all_orders: List[Dict[str, Any]] = []
