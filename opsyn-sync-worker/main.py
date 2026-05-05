@@ -68,6 +68,16 @@ async def process_sync_requests() -> None:
 
     logger.info("[SyncWorker] started poll_interval_seconds=%s", POLL_INTERVAL_SECONDS)
 
+    # Dispose and recreate the engine on startup to flush asyncpg prepared-statement
+    # cache from any previous deploy, then inspect the live schema so sync code can
+    # check column existence without hitting the DB on every row.
+    try:
+        from database import dispose_and_recreate_engine, inspect_schema_at_startup
+        await dispose_and_recreate_engine()
+        await inspect_schema_at_startup()
+    except Exception as _startup_exc:
+        logger.error("[SyncWorker] startup_db_init_error error=%s", _startup_exc, exc_info=True)
+
     while True:
         try:
             async with AsyncSessionLocal() as db:
