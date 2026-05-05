@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, Query, Request
-from sqlalchemy import func, literal_column, select
+from sqlalchemy import cast, func, literal_column, select
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal, get_db
@@ -277,7 +278,7 @@ async def get_orders(
     from models.auth_models import Brand
     brand_result = await db.execute(
         select(Brand).where(
-            and_(Brand.id == brand_id, Brand.org_id == resolved_org_id)
+            and_(Brand.id == cast(brand_id, PG_UUID(as_uuid=False)), Brand.org_id == cast(resolved_org_id, PG_UUID(as_uuid=False)))
         )
     )
     brand = brand_result.scalar_one_or_none()
@@ -2691,7 +2692,7 @@ async def sync_orders_leaflink(
         # ------------------------------------------------------------------ #
         brand_result = await db.execute(
             select(Brand).where(
-                and_(Brand.id == brand_id, Brand.org_id == org_id)
+                and_(Brand.id == cast(brand_id, PG_UUID(as_uuid=False)), Brand.org_id == cast(org_id, PG_UUID(as_uuid=False)))
             )
         )
         brand_obj = brand_result.scalar_one_or_none()
