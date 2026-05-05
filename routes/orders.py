@@ -2697,6 +2697,8 @@ async def sync_orders_leaflink(
         { "ok": false, "stage": "...", "brand_id": "...", "org_id": "...",
           "sync_run_id": N, "error": "...", "error_count": 1, "errors": [...] }
     """
+    logger.error("[ROUTE DEBUG] /orders/sync/leaflink HIT brand_id=%s org=%s", body.get("brand_id") if isinstance(body, dict) else None, x_opsyn_org)
+
     import time as _time
     from services.leaflink_client import LeafLinkClient
     from services.leaflink_sync import sync_leaflink_orders
@@ -2884,6 +2886,7 @@ async def sync_orders_leaflink(
         # ------------------------------------------------------------------ #
         # Stage 3: Build LeafLink client (credential validation)              #
         # ------------------------------------------------------------------ #
+        logger.error("[ROUTE DEBUG] about to call LeafLink client")
         try:
             client = LeafLinkClient(
                 api_key=cred.api_key,
