@@ -189,6 +189,7 @@ class LeafLinkClient:
             return {"Authorization": auth_header}
         elif self.auth_scheme == "Token":
             auth_header = f"Token {self.api_key}"
+            logger.error("[LEAFLINK_ACTUAL] building_token_auth api_key_len=%s", len(self.api_key))
             logger.info("[LeafLinkAuth] building_header scheme=Token api_key_present=true")
             return {"Authorization": auth_header}
         elif self.auth_scheme == "Raw":
@@ -258,6 +259,7 @@ class LeafLinkClient:
         last_exc: Optional[Exception] = None
         for attempt in range(1, _MAX_RETRY_ATTEMPTS + 1):
             try:
+                logger.error("[LEAFLINK_ACTUAL] about_to_request url=%s", url)
                 resp = self.session.get(
                     url,
                     params=params,
@@ -457,11 +459,11 @@ class LeafLinkClient:
         status: Optional[str] = None,
     ) -> Any:
         logger.error("[CLIENT DEBUG] list_orders() called limit=%s offset=%s", limit, offset)
-        # Correct endpoint: /orders-received/ (no company_id in path).
-        # company_id is stored in DB for metadata only — NOT used in the API path.
-        # Auth: Authorization: Token <api_key> (auth_scheme from DB credential).
+        # HOTFIX: Use the exact working endpoint
+        # Manual curl proves this works:
+        # GET https://www.leaflink.com/api/v2/orders-received/?limit=1
+        # Authorization: Token <key>
         _orders_path = "orders-received/"
-
         params: Dict[str, Any] = {
             "limit": limit,
             "offset": offset,
@@ -471,15 +473,12 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
+        # Build final URL
         _param_str = "&".join(f"{k}={v}" for k, v in params.items())
-        final_url = f"{self.base_url}/{_orders_path}?{_param_str}"
+        url = f"{self.base_url.rstrip('/')}/orders-received/?{_param_str}"
 
-        logger.error(
-            "[LeafLink DEBUG] FINAL_URL=%s",
-            final_url,
-        )
-        logger.info("[LeafLink] final_url=%s", final_url)
-        logger.info("[LeafLink] auth_scheme=%s", self.auth_scheme)
+        logger.error("[LEAFLINK_ACTUAL] url=%s", url)
+        logger.error("[LEAFLINK_ACTUAL] auth_scheme=%s key_len=%s", self.auth_scheme, len(self.api_key or ""))
 
         try:
             resp = self._get_raw(_orders_path, params=params)
@@ -491,6 +490,7 @@ class LeafLinkClient:
             )
             raise
 
+        logger.error("[LEAFLINK_ACTUAL] response_status=%s response_body=%s", resp.status_code, resp.text[:500])
         logger.info("[LeafLink] response_status=%s", resp.status_code)
 
         content_type = resp.headers.get("Content-Type", "")

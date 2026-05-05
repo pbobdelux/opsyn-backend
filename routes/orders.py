@@ -2697,6 +2697,7 @@ async def sync_orders_leaflink(
         { "ok": false, "stage": "...", "brand_id": "...", "org_id": "...",
           "sync_run_id": N, "error": "...", "error_count": 1, "errors": [...] }
     """
+    logger.error("[ROUTE_ACTUAL] /orders/sync/leaflink hit brand_id=%s org=%s", body.get("brand_id") if isinstance(body, dict) else None, x_opsyn_org)
     logger.error("[ROUTE DEBUG] /orders/sync/leaflink HIT brand_id=%s org=%s", body.get("brand_id") if isinstance(body, dict) else None, x_opsyn_org)
 
     import time as _time

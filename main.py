@@ -206,6 +206,7 @@ async def _resume_interrupted_syncs() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.error("[BOOT_ACTUAL] LeafLink sync hotfix loaded commit=%s", os.environ.get("RAILWAY_GIT_COMMIT_SHA", "unknown")[:7])
     logger.info("[Boot] opsyn-backend deploy_sha=%s pr=228", DEPLOY_SHA)
 
     # Validate DATABASE_URL at startup
