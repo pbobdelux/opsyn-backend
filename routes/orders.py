@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Header, Query, Request
 from sqlalchemy import func, literal_column, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -213,7 +213,8 @@ LEAFLINK_PAGE_SIZE = 100        # Orders per LeafLink page
 
 @router.get("")
 async def get_orders(
-    brand: str = Query(..., description="Brand slug/ID"),
+    x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
     limit: int = Query(100, ge=1, le=1000, description="Orders per page (default 100, max 1000)"),
     offset: int = Query(0, ge=0, description="Offset for pagination (default 0)"),
     cursor: Optional[str] = Query(None, description="Opaque cursor for cursor-based pagination"),
@@ -223,26 +224,70 @@ async def get_orders(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Fetch paginated orders for a brand.
+    Fetch paginated orders for a brand from AWS/RDS database.
 
-    By default returns order headers only (lightweight list mode).
-    Use include_line_items=true to get full line_items (detail mode).
+    Does NOT require LeafLink credentials - reads existing orders from database.
+    LeafLink credentials only needed for /sync endpoints to import new orders.
+
+    Requires:
+    - X-OPSYN-ORG header: Organization ID (UUID or org_code like "noble")
+    - brand_id query param: Brand ID (UUID)
 
     Supports two pagination modes:
     1. Limit/Offset: Use limit and offset parameters
     2. Cursor-based: Use cursor parameter (more efficient for large datasets)
 
-    Response includes next_cursor / prev_cursor for navigating pages.
+    Response includes routing fields:
+    - order id, customer name, address, city, state, zip
+    - status, payment_status, total, item_count, unit_count
+    - delivery_date if available
     """
     from leaflink.orders import serialize_order
+    from services.organization_service import lookup_organization
+    from sqlalchemy import and_
+
+    # Validate required headers/params
+    if not x_opsyn_org:
+        logger.warning("[OrdersAPI] missing_org_id")
+        return {"ok": False, "error": "X-OPSYN-ORG header is required"}
+
+    if not brand_id:
+        logger.warning("[OrdersAPI] missing_brand_id")
+        return {"ok": False, "error": "brand_id query parameter is required"}
 
     logger.info(
-        "[OrdersAPI] request brand=%s limit=%s offset=%s include_line_items=%s",
-        brand,
+        "[OrdersAPI] request org_id=%s brand_id=%s limit=%s offset=%s include_line_items=%s",
+        x_opsyn_org,
+        brand_id,
         limit,
         offset,
         include_line_items,
     )
+
+    # Resolve org_id (supports UUID or org_code)
+    org_lookup = await lookup_organization(db, x_opsyn_org)
+    if not org_lookup.get("ok"):
+        logger.warning("[OrdersAPI] org_lookup_failed error=%s", org_lookup.get("error"))
+        return {"ok": False, "error": org_lookup.get("error")}
+
+    resolved_org = org_lookup.get("organization")
+    resolved_org_id = str(resolved_org.id)
+
+    # Validate brand exists and belongs to org
+    from models.auth_models import Brand
+    brand_result = await db.execute(
+        select(Brand).where(
+            and_(Brand.id == brand_id, Brand.org_id == resolved_org_id)
+        )
+    )
+    brand = brand_result.scalar_one_or_none()
+
+    if not brand:
+        logger.warning("[OrdersAPI] brand_not_found brand_id=%s org_id=%s", brand_id, resolved_org_id)
+        return {"ok": False, "error": "Brand not found or does not belong to organization"}
+
+    logger.info("[OrdersAPI] org_and_brand_validated org_id=%s brand_id=%s", resolved_org_id, brand_id)
+    logger.info("[OrdersAPI] leaflink_credential_check skipped reason=read_endpoint")
 
     # ------------------------------------------------------------------ #
     # Decode cursor → (cursor_id, cursor_updated_at)                      #
@@ -273,14 +318,18 @@ async def get_orders(
         sort_col = Order.updated_at
 
     # ------------------------------------------------------------------ #
-    # Build base query                                                     #
+    # Build base query - SCOPED BY ORG_ID AND BRAND_ID                    #
     # ------------------------------------------------------------------ #
     from sqlalchemy.orm import selectinload as _selectinload
 
     query = (
         select(Order)
         .options(_selectinload(Order.lines))
-        .where(Order.brand_id == brand)
+        .where(
+            and_(
+                Order.brand_id == brand_id,
+            )
+        )
     )
 
     if sort_order == "asc":
@@ -313,7 +362,7 @@ async def get_orders(
         result = await db.execute(query.limit(limit + 1))
         orders = list(result.scalars().all())
     except Exception as exc:
-        logger.error("[OrdersAPI] db_query_failed brand=%s error=%s", brand, exc, exc_info=True)
+        logger.error("[OrdersAPI] db_query_failed org_id=%s brand_id=%s error=%s", resolved_org_id, brand_id, exc, exc_info=True)
         return {"ok": False, "error": "Database query failed"}
 
     has_more = len(orders) > limit
@@ -321,9 +370,16 @@ async def get_orders(
         orders = orders[:limit]
 
     # ------------------------------------------------------------------ #
-    # Total count for the brand (shared helper)                            #
+    # Total count for the brand (scoped by brand_id)                      #
     # ------------------------------------------------------------------ #
-    total_in_database = await _get_brand_order_count(db, brand)
+    try:
+        count_result = await db.execute(
+            select(func.count(Order.id)).where(Order.brand_id == brand_id)
+        )
+        total_in_database = count_result.scalar_one() or 0
+    except Exception as exc:
+        logger.error("[OrdersAPI] order_count_error org_id=%s brand_id=%s error=%s", resolved_org_id, brand_id, exc)
+        total_in_database = 0
 
     # ------------------------------------------------------------------ #
     # Build next / prev cursors                                            #
@@ -353,7 +409,7 @@ async def get_orders(
         # Detail mode: full serialization with line_items
         serialized_orders = [serialize_order(o) for o in orders]
     else:
-        # List mode: headers only, no line_items (lightweight)
+        # List mode: headers only with routing fields, no line_items
         serialized_orders = [
             {
                 "id": o.id,
@@ -377,23 +433,18 @@ async def get_orders(
         ]
 
     logger.info(
-        "[OrdersAPI] returned brand=%s count=%s total_in_db=%s latest_order_date=%s",
-        brand,
+        "[OrdersAPI] returned org_id=%s brand_id=%s count=%s total_in_db=%s latest_order_date=%s",
+        resolved_org_id,
+        brand_id,
         len(serialized_orders),
         total_in_database,
         serialized_orders[0]["updated_at"] if serialized_orders else None,
     )
 
-    if serialized_orders:
-        logger.info(
-            "[OrdersAPI] latest_updated_at=%s oldest_updated_at=%s",
-            serialized_orders[0]["updated_at"],
-            serialized_orders[-1]["updated_at"] if len(serialized_orders) > 1 else serialized_orders[0]["updated_at"],
-        )
-
     logger.info(
-        "[OrdersAPI] pagination brand=%s limit=%s offset=%s returned=%s total=%s has_more=%s include_line_items=%s",
-        brand,
+        "[OrdersAPI] pagination org_id=%s brand_id=%s limit=%s offset=%s returned=%s total=%s has_more=%s include_line_items=%s",
+        resolved_org_id,
+        brand_id,
         limit,
         offset,
         len(serialized_orders),
@@ -404,7 +455,8 @@ async def get_orders(
 
     return make_json_safe({
         "ok": True,
-        "brand_id": brand,
+        "org_id": resolved_org_id,
+        "brand_id": brand_id,
         "orders": serialized_orders,
         "returned_count": len(serialized_orders),
         "total_in_database": total_in_database,
