@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Optional
 
+import requests
+
 from fastapi import APIRouter, Depends, Header, Query, Request
 from sqlalchemy import cast, func, literal_column, select
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
@@ -3183,3 +3185,75 @@ async def sync_orders_by_brand_id(
     """
     logger.info("[Sync] sync_by_brand_id_alias brand_id=%s", brand_id)
     return await sync_orders_leaflink({"brand_id": brand_id}, db)
+
+
+@router.get("/leaflink/test-paths")
+async def test_leaflink_paths(
+    brand_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Test multiple LeafLink endpoint paths to find the working one."""
+
+    # Load credential
+    cred = await resolve_leaflink_credential(db, brand_id, allow_env_fallback=False)
+    if not cred:
+        return {"ok": False, "error": "Credential not found"}
+
+    api_key = cred.api_key
+    company_id = cred.company_id
+
+    # Test URLs
+    test_urls = [
+        f"https://www.leaflink.com/api/v2/orders/",
+        f"https://www.leaflink.com/api/v2/orders-received/",
+        f"https://www.leaflink.com/api/v2/brands/{company_id}/orders/",
+        f"https://www.leaflink.com/api/v2/companies/{company_id}/orders/",
+        f"https://www.leaflink.com/api/v2/orders-received/?company={company_id}",
+        f"https://www.leaflink.com/api/v2/orders/?company={company_id}",
+    ]
+
+    results = []
+
+    for url in test_urls:
+        try:
+            headers = {
+                "Authorization": f"Api-Key {api_key}",
+                "Accept": "application/json",
+            }
+
+            resp = requests.get(url, headers=headers, timeout=10, params={"limit": 1})
+
+            results.append({
+                "url": url,
+                "status": resp.status_code,
+                "content_type": resp.headers.get("Content-Type", ""),
+                "body_preview": resp.text[:200],
+                "ok": resp.status_code == 200,
+            })
+
+            logger.error(
+                "[LEAFLINK_TEST] url=%s status=%s content_type=%s",
+                url,
+                resp.status_code,
+                resp.headers.get("Content-Type", ""),
+            )
+
+        except Exception as exc:
+            results.append({
+                "url": url,
+                "status": None,
+                "error": str(exc),
+                "ok": False,
+            })
+            logger.error("[LEAFLINK_TEST] url=%s error=%s", url, exc)
+
+    # Find working endpoint
+    working = [r for r in results if r.get("ok")]
+
+    return {
+        "ok": len(working) > 0,
+        "brand_id": brand_id,
+        "company_id": company_id,
+        "results": results,
+        "working_endpoint": working[0]["url"] if working else None,
+    }
