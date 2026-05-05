@@ -232,7 +232,7 @@ async def passcode_login(
         }
     """
     try:
-        logger.info("[Auth] passcode_login_attempt app_id=%s", app_id)
+        logger.info("[Auth] passcode_login_attempt app_id=%s org_id=%s", app_id, org_id)
 
         # Find all active passcodes
         logger.info("[Auth] querying_active_passcodes")
@@ -291,11 +291,28 @@ async def passcode_login(
             )
             return {"ok": False, "error": "Employee is inactive"}
 
+        # VALIDATE EMPLOYEE NAME IS NOT EMPTY OR PLACEHOLDER
+        employee_first_name = (employee.first_name or "").strip()
+        employee_last_name = (employee.last_name or "").strip()
+
+        if not employee_first_name or not employee_last_name:
+            logger.warning(
+                "[Auth] employee_missing_name employee_id=%s first_name=%s last_name=%s email=%s",
+                employee.id,
+                employee_first_name or "MISSING",
+                employee_last_name or "MISSING",
+                employee.email,
+            )
+            # Use email as fallback if name is missing
+            employee_name = employee.email
+        else:
+            employee_name = f"{employee_first_name} {employee_last_name}"
+
         logger.info(
-            "[Auth] employee_verified employee_id=%s name=%s %s",
+            "[Auth] employee_verified employee_id=%s name=%s email=%s",
             employee.id,
-            employee.first_name,
-            employee.last_name,
+            employee_name,
+            employee.email,
         )
 
         # Get organization — support both UUID and org_code
@@ -319,6 +336,7 @@ async def passcode_login(
                 return {"ok": False, "error": "Employee does not belong to this organization"}
 
             org = provided_org
+            logger.info("[Auth] org_resolved_from_identifier org_id=%s org_code=%s", org.id, org.org_code)
         else:
             # No org_id supplied — derive from the employee record
             org_lookup_result = await lookup_organization(db, str(employee.org_id))
@@ -327,6 +345,7 @@ async def passcode_login(
                 return {"ok": False, "error": org_lookup_result.get("error")}
 
             org = org_lookup_result.get("organization")
+            logger.info("[Auth] org_resolved_from_employee org_id=%s org_code=%s", org.id, org.org_code)
 
         if not org.is_active:
             logger.warning("[Auth] org_inactive org_id=%s", org.id)
@@ -374,6 +393,7 @@ async def passcode_login(
         brand_access = result.scalar_one_or_none()
 
         brand = None
+        brand_id = None
         if brand_access:
             brand_id_str = str(brand_access.brand_id)
             logger.info("[Auth] querying_brand brand_id=%s", brand_id_str)
@@ -395,19 +415,36 @@ async def passcode_login(
             brand = result.scalar_one_or_none()
 
             if brand:
+                brand_id = str(brand.id)
                 logger.info("[Auth] brand_verified brand_id=%s slug=%s", brand.id, brand.slug)
+            else:
+                logger.warning("[Auth] brand_not_found brand_id=%s", brand_id_str)
+        else:
+            logger.info("[Auth] no_brand_access employee_id=%s", employee.id)
+
+        # BUILD TENANT CONTEXT
+        tenant_context = {
+            "org_id": str(org.id),
+            "brand_id": brand_id,
+            "app_id": app_access.app_id,
+            "role": app_access.role,
+        }
 
         logger.info(
-            "[Auth] passcode_login_success employee_id=%s app_id=%s",
+            "[Auth] passcode_login_success employee_id=%s employee_name=%s app_id=%s org_id=%s brand_id=%s role=%s",
             employee.id,
-            app_id,
+            employee_name,
+            app_access.app_id,
+            org.id,
+            brand_id,
+            app_access.role,
         )
 
         return {
             "ok": True,
             "employee": {
                 "id": str(employee.id),
-                "name": f"{employee.first_name} {employee.last_name}",
+                "name": employee_name,  # DYNAMIC FROM DATABASE
                 "email": employee.email,
             },
             "organization": {
@@ -417,7 +454,7 @@ async def passcode_login(
                 "name": org.name,
             },
             "brand": {
-                "id": str(brand.id) if brand else None,
+                "id": brand_id,
                 "slug": brand.slug if brand else None,
                 "name": brand.name if brand else None,
             } if brand else None,
@@ -425,12 +462,7 @@ async def passcode_login(
                 "app_id": app_access.app_id,
                 "role": app_access.role,
             },
-            "tenant_context": {
-                "org_id": str(org.id),
-                "brand_id": str(brand.id) if brand else None,
-                "app_id": app_access.app_id,
-                "role": app_access.role,
-            },
+            "tenant_context": tenant_context,
         }
 
     except Exception as e:
