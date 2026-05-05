@@ -2583,89 +2583,127 @@ async def sync_orders_leaflink(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Sync orders from LeafLink for a specific brand.
+    Production-grade LeafLink order sync for a specific brand.
+
+    Architecture:
+    1. Validate brand_id and load credentials (no DB transaction)
+    2. Create SyncRun record (own transaction, committed immediately)
+    3. Fetch all orders from LeafLink API (no DB transaction)
+    4. Open ONE transaction for upsert phase
+    5. Update SyncRun on completion or failure
+    6. Return structured JSON for all outcomes — never 502
 
     Request body:
-    {
-        "brand_id": "380e963d-36fc-4928-a4f4-e569cd535f9e"
-    }
+        { "brand_id": "..." }
 
-    Response:
-    {
-        "ok": true,
-        "brand_id": "...",
-        "synced_count": 42,
-        "created_count": 10,
-        "updated_count": 5,
-        "error_count": 0,
-        "errors": []
-    }
+    Success response:
+        { "ok": true, "brand_id": "...", "sync_run_id": N,
+          "fetched_count": 120, "created_count": 10, "updated_count": 110,
+          "skipped_count": 0, "error_count": 0, "duration_seconds": 12.4 }
 
-    Or on error:
-    {
-        "ok": false,
-        "error": "clear reason here",
-        "brand_id": "..."
-    }
+    Failure response:
+        { "ok": false, "stage": "...", "brand_id": "...",
+          "sync_run_id": N, "error": "...", "error_count": 1, "errors": [...] }
     """
-    brand_id = body.get("brand_id")
+    import time as _time
+    from services.leaflink_client import LeafLinkClient
+    from services.leaflink_sync import sync_leaflink_orders
+    from services.sync_run_manager import create_sync_run, mark_completed, mark_failed
 
-    if not brand_id:
-        logger.warning("[OrdersSync] missing_brand_id")
-        return {"ok": False, "error": "brand_id is required"}
-
-    logger.info("[OrdersSync] sync_start brand_id=%s", brand_id)
+    sync_wall_start = _time.monotonic()
+    brand_id: Optional[str] = None
+    sync_run_id: Optional[int] = None
 
     try:
-        # Load LeafLink credentials from database
+        # ------------------------------------------------------------------ #
+        # Stage 0: Validate request body                                      #
+        # ------------------------------------------------------------------ #
+        brand_id = (body.get("brand_id") or "").strip() if isinstance(body, dict) else ""
+        if not brand_id:
+            logger.warning("[Sync] missing_brand_id")
+            return make_json_safe({
+                "ok": False,
+                "stage": "validation",
+                "error": "brand_id is required in request body",
+                "brand_id": None,
+                "sync_run_id": None,
+            })
+
+        logger.info("[Sync] start brand_id=%s", brand_id)
+
+        # ------------------------------------------------------------------ #
+        # Stage 1: Load credentials (no DB transaction)                       #
+        # ------------------------------------------------------------------ #
         try:
             cred = await resolve_leaflink_credential(db, brand_id=brand_id, allow_env_fallback=False)
-        except Exception as cred_exc:
-            logger.error("[OrdersSync] credential_resolution_failed brand_id=%s error=%s", brand_id, str(cred_exc)[:500], exc_info=True)
-            return {
+        except ValueError as val_exc:
+            logger.error("[Sync] credential_validation_error brand_id=%s error=%s", brand_id, val_exc)
+            return make_json_safe({
                 "ok": False,
-                "error": f"Failed to resolve credentials: {str(cred_exc)[:200]}",
+                "stage": "credential_lookup",
                 "brand_id": brand_id,
-            }
+                "sync_run_id": None,
+                "error": str(val_exc)[:300],
+                "error_count": 1,
+                "errors": [str(val_exc)[:300]],
+            })
+        except Exception as cred_exc:
+            logger.error("[Sync] credential_lookup_error brand_id=%s error=%s", brand_id, cred_exc, exc_info=True)
+            return make_json_safe({
+                "ok": False,
+                "stage": "credential_lookup",
+                "brand_id": brand_id,
+                "sync_run_id": None,
+                "error": f"Credential lookup failed: {str(cred_exc)[:200]}",
+                "error_count": 1,
+                "errors": [str(cred_exc)[:200]],
+            })
 
         if not cred:
-            logger.warning("[OrdersSync] no_credentials brand_id=%s", brand_id)
-            return {
+            logger.warning("[Sync] no_credentials brand_id=%s", brand_id)
+            return make_json_safe({
                 "ok": False,
-                "error": f"No LeafLink credentials found for brand {brand_id}",
+                "stage": "credential_lookup",
                 "brand_id": brand_id,
-            }
+                "sync_run_id": None,
+                "error": f"No active LeafLink credentials found for brand {brand_id}",
+                "error_count": 1,
+                "errors": [f"No active LeafLink credentials found for brand {brand_id}"],
+            })
 
+        # Log safe credential metadata — never log the actual api_key
+        _api_key_val = (cred.api_key or "").strip()
+        _auth_scheme = (cred.auth_scheme or "Token").strip()
+        _base_url = (cred.base_url or "").strip() or "default"
         logger.info(
-            "[OrdersSync] credentials_found brand_id=%s credential_id=%s auth_scheme=%s base_url=%s",
-            brand_id,
-            cred.id,
-            cred.auth_scheme or "default",
-            cred.base_url or "default",
+            "[Sync] credentials_loaded source=db auth_scheme=%s api_key_present=%s api_key_len=%s base_url=%s",
+            _auth_scheme,
+            bool(_api_key_val),
+            len(_api_key_val),
+            _base_url,
         )
 
-        # Import LeafLink client
+        # ------------------------------------------------------------------ #
+        # Stage 2: Create SyncRun (own transaction, committed immediately)    #
+        # ------------------------------------------------------------------ #
         try:
-            from services.leaflink_client import LeafLinkClient
-            from services.leaflink_sync import sync_leaflink_orders
-        except ImportError as import_exc:
-            logger.error("[OrdersSync] import_failed error=%s", str(import_exc)[:500], exc_info=True)
-            return {
-                "ok": False,
-                "error": f"Failed to import LeafLink services: {str(import_exc)[:200]}",
-                "brand_id": brand_id,
-            }
+            async with AsyncSessionLocal() as _run_db:
+                async with _run_db.begin():
+                    _run = await create_sync_run(_run_db, brand_id, mode="full")
+                    sync_run_id = _run.id
+            logger.info("[Sync] sync_run_created run_id=%s brand_id=%s", sync_run_id, brand_id)
+        except ValueError as dup_exc:
+            # Active run already exists — not a fatal error, proceed without a new run
+            logger.warning("[Sync] sync_run_already_active brand_id=%s detail=%s", brand_id, dup_exc)
+            sync_run_id = None
+        except Exception as run_exc:
+            logger.error("[Sync] sync_run_create_error brand_id=%s error=%s", brand_id, run_exc, exc_info=True)
+            sync_run_id = None  # Non-fatal — continue without tracking
 
-        # Create LeafLink client
+        # ------------------------------------------------------------------ #
+        # Stage 3: Build LeafLink client (credential validation)              #
+        # ------------------------------------------------------------------ #
         try:
-            logger.info(
-                "[LeafLinkAuth] client_init brand_id=%s auth_scheme=%s api_key_present=%s base_url=%s",
-                brand_id,
-                cred.auth_scheme or "default",
-                bool(cred.api_key),
-                cred.base_url or "default",
-            )
-
             client = LeafLinkClient(
                 api_key=cred.api_key,
                 company_id=cred.company_id,
@@ -2673,133 +2711,241 @@ async def sync_orders_leaflink(
                 base_url=cred.base_url,
                 auth_scheme=cred.auth_scheme,
             )
-            logger.info("[OrdersSync] client_created brand_id=%s", brand_id)
         except ValueError as val_exc:
-            logger.error("[OrdersSync] client_creation_failed brand_id=%s error=%s", brand_id, str(val_exc)[:500], exc_info=True)
-            return {
+            err_msg = str(val_exc)[:300]
+            logger.error("[Sync] client_init_validation_error brand_id=%s error=%s", brand_id, err_msg)
+            if sync_run_id:
+                try:
+                    async with AsyncSessionLocal() as _fail_db:
+                        async with _fail_db.begin():
+                            await mark_failed(_fail_db, sync_run_id, err_msg)
+                except Exception:
+                    pass
+            return make_json_safe({
                 "ok": False,
-                "error": f"Invalid LeafLink credentials: {str(val_exc)[:200]}",
+                "stage": "validation",
                 "brand_id": brand_id,
-            }
+                "sync_run_id": sync_run_id,
+                "error": f"Invalid LeafLink credentials: {err_msg}",
+                "error_count": 1,
+                "errors": [err_msg],
+            })
         except Exception as client_exc:
-            logger.error("[OrdersSync] client_creation_error brand_id=%s error=%s", brand_id, str(client_exc)[:500], exc_info=True)
-            return {
+            err_msg = str(client_exc)[:300]
+            logger.error("[Sync] client_init_error brand_id=%s error=%s", brand_id, err_msg, exc_info=True)
+            if sync_run_id:
+                try:
+                    async with AsyncSessionLocal() as _fail_db:
+                        async with _fail_db.begin():
+                            await mark_failed(_fail_db, sync_run_id, err_msg)
+                except Exception:
+                    pass
+            return make_json_safe({
                 "ok": False,
-                "error": f"Failed to create LeafLink client: {str(client_exc)[:200]}",
+                "stage": "validation",
                 "brand_id": brand_id,
-            }
+                "sync_run_id": sync_run_id,
+                "error": f"Failed to initialize LeafLink client: {err_msg}",
+                "error_count": 1,
+                "errors": [err_msg],
+            })
 
-        # Fetch orders from LeafLink
+        # ------------------------------------------------------------------ #
+        # Stage 4: Fetch orders from LeafLink (NO DB transaction open)        #
+        # ------------------------------------------------------------------ #
+        from services.leaflink_client import DEFAULT_LEAFLINK_BASE_URL
+        _fetch_url = f"{DEFAULT_LEAFLINK_BASE_URL}/orders-received/"
+        logger.info("[Sync] leaflink_fetch_start url=%s brand_id=%s", _fetch_url, brand_id)
+
         try:
-            logger.info("[OrdersSync] fetching_from_leaflink brand_id=%s", brand_id)
-
             loop = asyncio.get_event_loop()
             fetch_result = await asyncio.wait_for(
                 loop.run_in_executor(
                     _leaflink_executor,
                     lambda: client.fetch_recent_orders(normalize=True, brand=brand_id),
                 ),
-                timeout=300,  # 5 minute timeout
+                timeout=300,  # 5-minute overall fetch timeout
             )
-
             orders = fetch_result.get("orders", [])
             pages_fetched = fetch_result.get("pages_fetched", 0)
-
             logger.info(
-                "[OrdersSync] fetched_from_leaflink brand_id=%s orders=%s pages=%s",
-                brand_id,
-                len(orders),
-                pages_fetched,
+                "[Sync] leaflink_fetch_complete fetched_count=%s pages=%s brand_id=%s",
+                len(orders), pages_fetched, brand_id,
             )
         except asyncio.TimeoutError:
-            logger.error("[OrdersSync] leaflink_fetch_timeout brand_id=%s", brand_id)
-            return {
+            err_msg = "LeafLink API fetch timed out after 5 minutes"
+            logger.error("[Sync] leaflink_fetch_timeout brand_id=%s", brand_id)
+            if sync_run_id:
+                try:
+                    async with AsyncSessionLocal() as _fail_db:
+                        async with _fail_db.begin():
+                            await mark_failed(_fail_db, sync_run_id, err_msg)
+                except Exception:
+                    pass
+            return make_json_safe({
                 "ok": False,
-                "error": "LeafLink API request timed out (5 minutes)",
+                "stage": "leaflink_fetch",
                 "brand_id": brand_id,
-            }
-        except RuntimeError as runtime_exc:
-            # LeafLink API errors are wrapped in RuntimeError
-            logger.error("[OrdersSync] leaflink_api_error brand_id=%s error=%s", brand_id, str(runtime_exc)[:500], exc_info=True)
-            return {
-                "ok": False,
-                "error": f"LeafLink API error: {str(runtime_exc)[:200]}",
-                "brand_id": brand_id,
-            }
+                "sync_run_id": sync_run_id,
+                "error": err_msg,
+                "error_count": 1,
+                "errors": [err_msg],
+            })
         except Exception as fetch_exc:
-            logger.error("[OrdersSync] leaflink_fetch_failed brand_id=%s error=%s", brand_id, str(fetch_exc)[:500], exc_info=True)
-            return {
+            err_msg = str(fetch_exc)[:300]
+            logger.error("[Sync] leaflink_fetch_error brand_id=%s error=%s", brand_id, err_msg, exc_info=True)
+            if sync_run_id:
+                try:
+                    async with AsyncSessionLocal() as _fail_db:
+                        async with _fail_db.begin():
+                            await mark_failed(_fail_db, sync_run_id, err_msg)
+                except Exception:
+                    pass
+            return make_json_safe({
                 "ok": False,
-                "error": f"Failed to fetch orders from LeafLink: {str(fetch_exc)[:200]}",
+                "stage": "leaflink_fetch",
                 "brand_id": brand_id,
-            }
+                "sync_run_id": sync_run_id,
+                "error": f"LeafLink API error: {err_msg}",
+                "error_count": 1,
+                "errors": [err_msg],
+            })
 
-        # Upsert orders into database
+        # ------------------------------------------------------------------ #
+        # Stage 5: Open ONE transaction for upsert phase                      #
+        # ------------------------------------------------------------------ #
+        logger.info("[Sync] db_transaction_start brand_id=%s order_count=%s", brand_id, len(orders))
+
         try:
-            logger.info("[OrdersSync] upserting_to_database brand_id=%s order_count=%s", brand_id, len(orders))
-            logger.info("[DB] transaction_start")
-
-            # Do NOT wrap in `async with db.begin()` — the session provided by
-            # get_db() uses SQLAlchemy's autobegin, so a transaction is already
-            # active by the time we reach this point.  Calling db.begin() again
-            # raises "connection already initialized a Transaction()".
-            # sync_leaflink_orders() is designed to work inside the caller's
-            # existing transaction; it must not open its own.
-            sync_result = await sync_leaflink_orders(db, brand_id, orders, pages_fetched=pages_fetched)
-
-            logger.info("[DB] transaction_end")
-            await db.commit()
-
-            if not sync_result.get("ok"):
-                logger.error("[OrdersSync] sync_failed brand_id=%s error=%s", brand_id, sync_result.get("error"))
-                return {
-                    "ok": False,
-                    "error": sync_result.get("error", "Unknown sync error"),
-                    "brand_id": brand_id,
-                }
-
+            async with AsyncSessionLocal() as _upsert_db:
+                async with _upsert_db.begin():
+                    sync_result = await sync_leaflink_orders(
+                        _upsert_db, brand_id, orders, pages_fetched=pages_fetched
+                    )
+            # Transaction committed automatically on context manager exit
             logger.info(
-                "[OrdersSync] sync_complete brand_id=%s created=%s updated=%s skipped=%s",
-                brand_id,
+                "[Sync] upsert_complete created=%s updated=%s skipped=%s errors=%s brand_id=%s",
                 sync_result.get("created", 0),
                 sync_result.get("updated", 0),
                 sync_result.get("skipped", 0),
+                sync_result.get("error_count", 0),
+                brand_id,
             )
+            logger.info("[Sync] db_transaction_commit brand_id=%s", brand_id)
+        except Exception as upsert_exc:
+            err_msg = str(upsert_exc)[:300]
+            logger.error("[Sync] db_upsert_error brand_id=%s error=%s", brand_id, err_msg, exc_info=True)
+            if sync_run_id:
+                try:
+                    async with AsyncSessionLocal() as _fail_db:
+                        async with _fail_db.begin():
+                            await mark_failed(_fail_db, sync_run_id, err_msg)
+                except Exception:
+                    pass
+            return make_json_safe({
+                "ok": False,
+                "stage": "db_upsert",
+                "brand_id": brand_id,
+                "sync_run_id": sync_run_id,
+                "error": f"Database upsert failed: {err_msg}",
+                "error_count": 1,
+                "errors": [err_msg],
+            })
 
-            return {
+        # ------------------------------------------------------------------ #
+        # Stage 6: Update SyncRun to completed                                #
+        # ------------------------------------------------------------------ #
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _done_db:
+                    async with _done_db.begin():
+                        await mark_completed(_done_db, sync_run_id)
+            except Exception as done_exc:
+                logger.error("[Sync] sync_run_complete_error run_id=%s error=%s", sync_run_id, done_exc)
+
+        # ------------------------------------------------------------------ #
+        # Stage 7: Build and return structured success response               #
+        # ------------------------------------------------------------------ #
+        duration = round(_time.monotonic() - sync_wall_start, 2)
+        created_count = sync_result.get("created", 0)
+        updated_count = sync_result.get("updated", 0)
+        skipped_count = sync_result.get("skipped", 0)
+        error_count = sync_result.get("error_count", 0)
+        result_errors = sync_result.get("errors", [])
+        fetched_count = len(orders)
+        ok = sync_result.get("ok", True)
+
+        logger.info(
+            "[Sync] complete brand_id=%s run_id=%s fetched=%s created=%s updated=%s skipped=%s errors=%s duration_seconds=%s",
+            brand_id, sync_run_id, fetched_count, created_count, updated_count,
+            skipped_count, error_count, duration,
+        )
+
+        if ok:
+            return make_json_safe({
                 "ok": True,
                 "brand_id": brand_id,
-                "synced_count": len(orders),
-                "created_count": sync_result.get("created", 0),
-                "updated_count": sync_result.get("updated", 0),
-                "error_count": sync_result.get("error_count", 0),
-                "errors": sync_result.get("errors", []),
-            }
-
-        except asyncio.TimeoutError:
-            logger.error("[OrdersSync] database_sync_timeout brand_id=%s", brand_id)
-            await db.rollback()
-            return {
+                "sync_run_id": sync_run_id,
+                "fetched_count": fetched_count,
+                "created_count": created_count,
+                "updated_count": updated_count,
+                "skipped_count": skipped_count,
+                "error_count": error_count,
+                "errors": result_errors[:5],
+                "duration_seconds": duration,
+            })
+        else:
+            # Partial failure: some orders succeeded, some failed
+            if sync_run_id:
+                try:
+                    async with AsyncSessionLocal() as _fail_db:
+                        async with _fail_db.begin():
+                            await mark_failed(
+                                _fail_db, sync_run_id,
+                                f"partial_failure: {error_count} orders failed"
+                            )
+                except Exception:
+                    pass
+            return make_json_safe({
                 "ok": False,
-                "error": "Database sync timed out",
+                "stage": "db_upsert",
                 "brand_id": brand_id,
-            }
-        except Exception as sync_exc:
-            logger.error("[OrdersSync] database_sync_failed brand_id=%s error=%s", brand_id, str(sync_exc)[:500], exc_info=True)
-            await db.rollback()
-            return {
-                "ok": False,
-                "error": f"Failed to sync orders to database: {str(sync_exc)[:200]}",
-                "brand_id": brand_id,
-            }
+                "sync_run_id": sync_run_id,
+                "fetched_count": fetched_count,
+                "created_count": created_count,
+                "updated_count": updated_count,
+                "skipped_count": skipped_count,
+                "error_count": error_count,
+                "error": f"All {fetched_count} orders failed to upsert",
+                "errors": result_errors[:5],
+                "duration_seconds": duration,
+            })
 
     except Exception as outer_exc:
-        logger.error("[OrdersSync] unexpected_error brand_id=%s error=%s", brand_id, str(outer_exc)[:500], exc_info=True)
-        return {
+        # Absolute last-resort catch — must never return 502
+        duration = round(_time.monotonic() - sync_wall_start, 2)
+        err_msg = str(outer_exc)[:300]
+        logger.error(
+            "[Sync] unexpected_error brand_id=%s run_id=%s error=%s duration=%s",
+            brand_id, sync_run_id, err_msg, duration, exc_info=True,
+        )
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _fail_db:
+                    async with _fail_db.begin():
+                        await mark_failed(_fail_db, sync_run_id, err_msg)
+            except Exception:
+                pass
+        return make_json_safe({
             "ok": False,
-            "error": f"Unexpected error: {str(outer_exc)[:200]}",
+            "stage": "unknown",
             "brand_id": brand_id,
-        }
+            "sync_run_id": sync_run_id,
+            "error": f"Unexpected error: {err_msg}",
+            "error_count": 1,
+            "errors": [err_msg],
+            "duration_seconds": duration,
+        })
 
 
 @router.post("/sync/{brand_id}")
@@ -2809,23 +2955,12 @@ async def sync_orders_by_brand_id(
 ):
     """
     Alias endpoint for POST /orders/sync/leaflink.
-    Sync orders from LeafLink for a specific brand.
+    Sync orders from LeafLink for a specific brand via path parameter.
 
     Path parameter:
-    - brand_id: Brand UUID
+    - brand_id: Brand UUID or slug
 
-    Response:
-    {
-        "ok": true,
-        "brand_id": "...",
-        "synced_count": 42,
-        "created_count": 10,
-        "updated_count": 5,
-        "error_count": 0,
-        "errors": []
-    }
+    Delegates to POST /orders/sync/leaflink with brand_id in body.
     """
-    logger.info("[OrdersSync] sync_by_brand_id_start brand_id=%s", brand_id)
-
-    # Delegate to the main sync endpoint
+    logger.info("[Sync] sync_by_brand_id_alias brand_id=%s", brand_id)
     return await sync_orders_leaflink({"brand_id": brand_id}, db)

@@ -200,14 +200,17 @@ async def sync_leaflink_orders(
     # ------------------------------------------------------------------
     # Upsert orders and write line items using the caller's session.
     # No begin() here — the route handler owns the transaction lifecycle.
+    # Per-order error handling: log, skip, continue — never crash the loop.
     # ------------------------------------------------------------------
-    try:
-        for o in orders:
+    for o in orders:
+        order_external_id_for_log = "unknown"
+        try:
             if not isinstance(o, dict):
                 skipped += 1
                 continue
 
             external_id = safe_str(o.get("external_id"))
+            order_external_id_for_log = external_id or "missing"
             if not external_id:
                 skipped += 1
                 continue
@@ -215,7 +218,6 @@ async def sync_leaflink_orders(
             customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
             status = (safe_str(o.get("status")) or "submitted").lower()
             order_number = safe_str(o.get("order_number"))
-
 
             # Try multiple field names with fallbacks.
             # total_amount is the primary key set by the normalized LeafLink client;
@@ -340,45 +342,44 @@ async def sync_leaflink_orders(
 
             total_lines_written += len(normalized_line_items)
 
-        sync_duration = round(time.monotonic() - sync_start, 2)
+        except Exception as order_exc:
+            # Per-order failure: log, record error, skip this order, continue
+            err_msg = f"order={order_external_id_for_log} error={str(order_exc)[:300]}"
+            logger.error(
+                "leaflink: upsert_order_failed brand_id=%s %s",
+                brand_id,
+                err_msg,
+                exc_info=True,
+            )
+            if len(errors) < 5:
+                errors.append(err_msg)
+            skipped += 1
+            continue
 
-        return {
-            "ok": True,
-            "orders_fetched": len(orders),
-            "created": created,
-            "updated": updated,
-            "skipped": skipped,
-            "line_items_written": total_lines_written,
-            "newest_order_date": newest_order_date,
-            "pages_fetched": pages_fetched,
-            "sync_duration_seconds": sync_duration,
-            "errors": errors,
-            "mock_data": using_mock,
-            "message": f"Synced {len(orders)} orders and wrote {total_lines_written} line items",
-        }
+    sync_duration = round(time.monotonic() - sync_start, 2)
+    error_count = len(errors)
+    all_failed = (created == 0 and updated == 0 and error_count > 0 and len(orders) > 0)
 
-    except Exception as e:
-        sync_duration = round(time.monotonic() - sync_start, 2)
-        logger.error(
-            "leaflink: sync_failed brand_id=%s error=%s duration_seconds=%s",
-            brand_id,
-            e,
-            sync_duration,
-            exc_info=True,
-        )
-        return {
-            "ok": False,
-            "error": str(e),
-            "orders_fetched": len(orders),
-            "created": created,
-            "updated": updated,
-            "skipped": skipped,
-            "line_items_written": total_lines_written,
-            "newest_order_date": newest_order_date,
-            "pages_fetched": pages_fetched,
-            "sync_duration_seconds": sync_duration,
-            "errors": [str(e)],
-        }
+    logger.info(
+        "leaflink: upsert_complete brand_id=%s created=%s updated=%s skipped=%s errors=%s duration=%ss",
+        brand_id, created, updated, skipped, error_count, sync_duration,
+    )
+
+    return {
+        "ok": not all_failed,
+        "orders_fetched": len(orders),
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "error_count": error_count,
+        "line_items_written": total_lines_written,
+        "newest_order_date": newest_order_date,
+        "pages_fetched": pages_fetched,
+        "sync_duration_seconds": sync_duration,
+        "errors": errors,
+        "mock_data": using_mock,
+        "message": f"Synced {len(orders)} orders: {created} created, {updated} updated, {skipped} skipped, {error_count} errors",
+    }
 
 
 async def sync_leaflink_orders_headers_only(
