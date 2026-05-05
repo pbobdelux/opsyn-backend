@@ -723,8 +723,23 @@ async def sync_leaflink_orders_headers_only(
                             else o
                         )
 
-                        external_created_at = normalize_datetime(o.get("created_at"))
-                        external_updated_at = normalize_datetime(o.get("updated_at"))
+                        # Map external timestamps from LeafLink payload.
+                        # LeafLink uses "created" and "modified" fields; fall back
+                        # to common alternatives so the mapping is robust.
+                        created_raw = o.get("created") or o.get("created_at") or o.get("external_created_at")
+                        modified_raw = o.get("modified") or o.get("updated") or o.get("updated_at") or o.get("external_updated_at")
+
+                        external_created_at = normalize_datetime(created_raw)
+                        external_updated_at = normalize_datetime(modified_raw)
+
+                        logger.error(
+                            "[EXTERNAL_TS_MAP] external_id=%s created_raw=%s modified_raw=%s external_created_at=%s external_updated_at=%s",
+                            external_id,
+                            created_raw,
+                            modified_raw,
+                            external_created_at,
+                            external_updated_at,
+                        )
 
                         for ts_dt in (external_updated_at, external_created_at):
                             if ts_dt:
