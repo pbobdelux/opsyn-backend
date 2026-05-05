@@ -178,10 +178,15 @@ class LeafLinkClient:
             return {"Authorization": ""}  # Fallback to empty (will fail, but won't crash)
 
         if self.auth_scheme == "Bearer":
-            return {"Authorization": f"Bearer {self.api_key}"}
+            auth_header = f"Bearer {self.api_key}"
+            logger.info("[LeafLinkAuth] building_header scheme=Bearer api_key_present=true")
+            return {"Authorization": auth_header}
         elif self.auth_scheme == "Token":
-            return {"Authorization": f"Token {self.api_key}"}
+            auth_header = f"Token {self.api_key}"
+            logger.info("[LeafLinkAuth] building_header scheme=Token api_key_present=true")
+            return {"Authorization": auth_header}
         elif self.auth_scheme == "Raw":
+            logger.info("[LeafLinkAuth] building_header scheme=Raw api_key_present=true")
             return {"Authorization": self.api_key}
         else:
             # Fallback to Bearer
@@ -189,7 +194,8 @@ class LeafLinkClient:
                 "[LeafLinkAuth] unknown_scheme=%s falling_back_to_Bearer",
                 self.auth_scheme,
             )
-            return {"Authorization": f"Bearer {self.api_key}"}
+            auth_header = f"Bearer {self.api_key}"
+            return {"Authorization": auth_header}
 
     def _validate_request_headers(self, headers: dict) -> bool:
         """Validate that Authorization header is present and non-empty."""

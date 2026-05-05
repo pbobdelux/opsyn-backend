@@ -2634,10 +2634,20 @@ async def sync_orders_leaflink(
         # Fetch orders from LeafLink
         logger.info("[OrdersSync] fetching_from_leaflink brand_id=%s", brand_id)
 
+        logger.info(
+            "[LeafLinkAuth] client_init brand_id=%s auth_scheme=%s api_key_present=%s base_url=%s",
+            brand_id,
+            cred.auth_scheme or "default",
+            bool(cred.api_key),
+            cred.base_url or "default",
+        )
+
         client = LeafLinkClient(
             api_key=cred.api_key,
             company_id=cred.company_id,
             brand_id=brand_id,
+            base_url=cred.base_url,
+            auth_scheme=cred.auth_scheme,
         )
 
         # Run fetch in thread pool to avoid blocking
