@@ -8,7 +8,7 @@ AuthScheme = Literal["Bearer", "Token", "Raw"]
 
 logger = logging.getLogger("leaflink_client")
 
-DEFAULT_LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://www.leaflink.com/api/v2").strip().rstrip("/")
+DEFAULT_LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://api.leaflink.com/api/v1").strip().rstrip("/")
 DEFAULT_LEAFLINK_COMPANY_ID = os.getenv("LEAFLINK_COMPANY_ID", "").strip()
 LEAFLINK_API_VERSION = os.getenv("LEAFLINK_API_VERSION", "").strip()
 LEAFLINK_USER_AGENT = os.getenv("LEAFLINK_USER_AGENT", "opsyn-backend").strip()
@@ -232,8 +232,8 @@ class LeafLinkClient:
                 raise ValueError("Invalid Authorization header")
 
             logger.info(
-                "[LeafLinkAuth] request_start path=%s scheme=%s api_key_len=%s",
-                path,
+                "[LeafLinkAuth] request_start full_url=%s scheme=%s api_key_len=%s",
+                url,
                 self.auth_scheme,
                 len(self.api_key),
             )
@@ -247,8 +247,8 @@ class LeafLinkClient:
                 )
             except Exception as exc:
                 logger.error(
-                    "[LeafLinkAuth] request_error path=%s error=%s",
-                    path,
+                    "[LeafLinkAuth] request_error full_url=%s error=%s",
+                    url,
                     exc,
                 )
                 raise
@@ -256,24 +256,31 @@ class LeafLinkClient:
         resp = _do_request()
 
         logger.info(
-            "[LeafLinkSync] page_response status=%s path=%s",
+            "[LeafLinkSync] page_response status=%s full_url=%s",
             resp.status_code,
-            path,
+            url,
         )
 
         content_type = resp.headers.get("Content-Type", "")
         if "application/json" not in content_type.lower():
             logger.warning(
-                "leaflink: API response is not JSON url=%s status=%s content_type=%s body_preview=%s",
+                "leaflink: API response is not JSON full_url=%s status=%s content_type=%s body_preview=%s",
                 url,
                 resp.status_code,
                 content_type,
                 resp.text[:200],
             )
         if not resp.ok:
-            if resp.status_code == 403:
+            if resp.status_code == 404:
                 logger.error(
-                    "[LeafLinkAuth] 403_invalid_token endpoint=%s scheme=%s api_key_prefix=%s api_key_len=%s brand=%s",
+                    "[LeafLinkAuth] 404_not_found full_url=%s scheme=%s brand=%s",
+                    url,
+                    self.auth_scheme,
+                    self.brand_id,
+                )
+            elif resp.status_code == 403:
+                logger.error(
+                    "[LeafLinkAuth] 403_invalid_token full_url=%s scheme=%s api_key_prefix=%s api_key_len=%s brand=%s",
                     url,
                     self.auth_scheme,
                     self.api_key[:6] if self.api_key else "MISSING",
@@ -282,7 +289,7 @@ class LeafLinkClient:
                 )
             if resp.status_code in (401, 403):
                 logger.error(
-                    "[LeafLinkAuth] auth_failed brand=%s status=%s reason=%s url=%s",
+                    "[LeafLinkAuth] auth_failed brand=%s status=%s reason=%s full_url=%s",
                     self.brand_id,
                     resp.status_code,
                     resp.text[:200],
@@ -290,7 +297,7 @@ class LeafLinkClient:
                 )
             else:
                 logger.error(
-                    "leaflink: API HTTP error brand=%s url=%s status=%s body=%s",
+                    "leaflink: API HTTP error brand=%s full_url=%s status=%s body=%s",
                     self.brand_id,
                     url,
                     resp.status_code,
@@ -307,8 +314,10 @@ class LeafLinkClient:
         }
 
         if not self._validate_request_headers(headers):
-            logger.error("[LeafLinkAuth] invalid_headers aborting_request url=%s", url)
+            logger.error("[LeafLinkAuth] invalid_headers aborting_request full_url=%s", url)
             raise ValueError("Invalid Authorization header")
+
+        logger.info("[LeafLinkAuth] pagination_request_start full_url=%s scheme=%s", url, self.auth_scheme)
 
         try:
             resp = self.session.get(
@@ -319,15 +328,21 @@ class LeafLinkClient:
             )
         except Exception as exc:
             logger.error(
-                "[LeafLinkAuth] request_error url=%s error=%s",
+                "[LeafLinkAuth] request_error full_url=%s error=%s",
                 url,
                 exc,
             )
             raise
 
-        if resp.status_code == 403:
+        if resp.status_code == 404:
             logger.error(
-                "[LeafLinkAuth] 403_invalid_token url=%s scheme=%s prefix=%s len=%s",
+                "[LeafLinkAuth] 404_not_found full_url=%s scheme=%s",
+                url,
+                self.auth_scheme,
+            )
+        elif resp.status_code == 403:
+            logger.error(
+                "[LeafLinkAuth] 403_invalid_token full_url=%s scheme=%s prefix=%s len=%s",
                 url,
                 self.auth_scheme,
                 self.api_key[:6] if self.api_key else "MISSING",
@@ -336,7 +351,7 @@ class LeafLinkClient:
 
         if resp.status_code in (401, 403):
             logger.error(
-                "[LeafLinkAuth] pagination_auth_failed status=%s body=%s url=%s",
+                "[LeafLinkAuth] pagination_auth_failed status=%s body=%s full_url=%s",
                 resp.status_code,
                 resp.text[:200],
                 url,
@@ -354,9 +369,10 @@ class LeafLinkClient:
         url = f"{self.base_url}/{path.lstrip('/')}"
         safe_params = {k: v for k, v in (params or {}).items() if k not in ("api_key", "token", "secret")}
 
-        logger.debug(
-            "[LeafLinkAuth] request_start method=POST path=%s",
-            path,
+        logger.info(
+            "[LeafLinkAuth] request_start method=POST full_url=%s scheme=%s",
+            url,
+            self.auth_scheme,
         )
 
         # Build headers with explicit Authorization
@@ -366,14 +382,8 @@ class LeafLinkClient:
         }
 
         if not self._validate_request_headers(headers):
-            logger.error("[LeafLinkAuth] invalid_headers aborting_request method=POST path=%s", path)
+            logger.error("[LeafLinkAuth] invalid_headers aborting_request method=POST full_url=%s", url)
             raise ValueError("Invalid Authorization header")
-
-        logger.debug(
-            "[LeafLinkAuth] sending_request method=POST url=%s has_auth_header=true scheme=%s",
-            url,
-            self.auth_scheme,
-        )
 
         try:
             return self.session.post(
@@ -385,8 +395,8 @@ class LeafLinkClient:
             )
         except Exception as exc:
             logger.error(
-                "[LeafLinkAuth] request_error method=POST path=%s error=%s",
-                path,
+                "[LeafLinkAuth] request_error method=POST full_url=%s error=%s",
+                url,
                 exc,
             )
             raise
