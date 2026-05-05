@@ -20,6 +20,9 @@ async def resolve_brand_credential(
     - LOWER case
     - is_active = true
 
+    Does NOT filter by org_id — org_id validation must be done separately
+    through the brands table before calling this function.
+
     Returns tuple: (id, brand_id, integration_name, company_id, api_key, is_active, sync_status, last_synced_page, base_url, auth_scheme)
     or None if not found.
     """
@@ -31,6 +34,11 @@ async def resolve_brand_credential(
     normalized_brand = brand_id.strip().lower()
     normalized_integration = integration_name.strip().lower()
 
+    logger.info(
+        "[CredentialResolver] lookup_start brand_id=%s integration_name=%s allow_env_fallback=false",
+        brand_id,
+        integration_name,
+    )
     logger.info(
         "[RESOLVER] resolving_credential normalized_brand=%s normalized_integration=%s",
         normalized_brand,
@@ -66,6 +74,19 @@ async def resolve_brand_credential(
         row = result.fetchone()
 
         if row:
+            # row indices: 0=id, 1=brand_id, 2=integration_name, 3=company_id,
+            #              4=api_key, 5=is_active, 6=sync_status, 7=last_synced_page,
+            #              8=base_url, 9=auth_scheme
+            logger.info(
+                "[CredentialResolver] lookup_result brand_id=%s integration_name=%s"
+                " row_count=1 is_active=%s api_key_present=%s base_url=%s auth_scheme=%s",
+                brand_id,
+                integration_name,
+                row[5],
+                bool(row[4]),
+                row[8],
+                row[9],
+            )
             logger.info(
                 "[RESOLVER] credential_found id=%s brand=%s integration=%s company_id=%s",
                 row[0],
@@ -75,6 +96,16 @@ async def resolve_brand_credential(
             )
             return row
         else:
+            logger.info(
+                "[CredentialResolver] lookup_result brand_id=%s integration_name=%s row_count=0",
+                brand_id,
+                integration_name,
+            )
+            logger.error(
+                "[CredentialResolver] lookup_failed brand_id=%s integration_name=%s reason=no_rows_found",
+                brand_id,
+                integration_name,
+            )
             logger.warning(
                 "[RESOLVER] credential_not_found normalized_brand=%s normalized_integration=%s",
                 normalized_brand,
