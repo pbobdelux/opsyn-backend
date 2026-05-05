@@ -241,6 +241,13 @@ class LeafLinkClient:
             len(self.api_key),
         )
 
+        logger.info(
+            "[LeafLink] final_url=%s auth_scheme=%s key_len=%s",
+            url,
+            self.auth_scheme,
+            len(self.api_key) if self.api_key else 0,
+        )
+
         last_exc: Optional[Exception] = None
         for attempt in range(1, _MAX_RETRY_ATTEMPTS + 1):
             try:

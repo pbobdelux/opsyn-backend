@@ -45,6 +45,7 @@ _leaflink_executor = ThreadPoolExecutor(max_workers=4)
 
 APP_NAME = "Opsyn Backend"
 APP_ENV = os.getenv("ENVIRONMENT", "production")
+DEPLOY_SHA = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "unknown")[:7]
 
 DRIVERS = {}
 
@@ -205,6 +206,8 @@ async def _resume_interrupted_syncs() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("[Boot] opsyn-backend deploy_sha=%s pr=228", DEPLOY_SHA)
+
     # Validate DATABASE_URL at startup
     database_url = os.getenv("DATABASE_URL", "")
 
