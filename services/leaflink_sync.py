@@ -953,10 +953,11 @@ async def sync_leaflink_line_items(
         try:
             async with AsyncSessionLocal() as db:
                 async with db.begin():
+                    leaflink_order_id = safe_str(external_id)
                     result = await db.execute(
                         select(Order).where(
                             Order.brand_id == brand_id_value,
-                            Order.external_order_id == external_id,
+                            Order.external_order_id == leaflink_order_id,
                         )
                     )
                     order_row = result.scalar_one_or_none()
@@ -964,11 +965,21 @@ async def sync_leaflink_line_items(
                     if order_row is None:
                         # Order was not committed — skip to avoid FK violation.
                         logger.warning(
+                            "[LINE_ITEM_ORDER_LOOKUP_FAIL] leaflink_order_id=%s",
+                            leaflink_order_id,
+                        )
+                        logger.warning(
                             "[LINE_ITEM_SKIP] reason=order_not_found external_id=%s brand=%s",
-                            external_id,
+                            leaflink_order_id,
                             brand_id_value,
                         )
                         continue
+
+                    logger.info(
+                        "[LINE_ITEM_ORDER_LOOKUP] leaflink_order_id=%s matched_order_id=%s",
+                        leaflink_order_id,
+                        order_row.id,
+                    )
 
                     # Read line items from the DB row (written during Phase 1)
                     # rather than from the raw in-memory dict, so we use the
