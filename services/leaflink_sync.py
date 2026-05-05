@@ -313,7 +313,8 @@ async def sync_leaflink_orders(
                 unit_count = sum(item.get("quantity", 0) or 0 for item in normalized_line_items)
 
             review_status = derive_review_status(normalized_line_items)
-            now = utc_now()
+            # Normalize now() to guarantee a timezone-aware UTC datetime
+            now = normalize_datetime(utc_now())
 
             raw_payload = o.get("raw_payload") if isinstance(o.get("raw_payload"), dict) else o
 
@@ -340,6 +341,36 @@ async def sync_leaflink_orders(
                         newest_order_date = ts_dt
                     break
 
+            # Build a dict of all datetime fields for validation and logging
+            order_dt_fields = {
+                "synced_at": now,
+                "last_synced_at": now,
+                "external_created_at": external_created_at,
+                "external_updated_at": external_updated_at,
+            }
+
+            # Log normalized datetimes for the first 3 orders processed
+            order_count = created + updated
+            if order_count < 3:
+                for field, value in order_dt_fields.items():
+                    if isinstance(value, datetime):
+                        logger.info(
+                            "[DT_NORMALIZED] field=%s tzinfo=%s",
+                            field,
+                            value.tzinfo,
+                        )
+
+            # Validate all datetime fields are timezone-aware before DB write
+            for field_name, value in order_dt_fields.items():
+                if isinstance(value, datetime):
+                    if value.tzinfo is None:
+                        logger.error(
+                            "[DT_VALIDATION_FAILED] field=%s value=%s tzinfo=None",
+                            field_name,
+                            value,
+                        )
+                        raise ValueError(f"Naive datetime in {field_name}: {value}")
+
             if existing:
                 existing.customer_name = customer_name
                 existing.status = status
@@ -352,10 +383,10 @@ async def sync_leaflink_orders(
                 existing.raw_payload = make_json_safe(raw_payload)
                 existing.review_status = review_status
                 existing.sync_status = "ok"
-                existing.synced_at = now
-                existing.last_synced_at = now
-                existing.external_created_at = external_created_at
-                existing.external_updated_at = external_updated_at
+                existing.synced_at = normalize_datetime(now)
+                existing.last_synced_at = normalize_datetime(now)
+                existing.external_created_at = normalize_datetime(external_created_at)
+                existing.external_updated_at = normalize_datetime(external_updated_at)
                 # Always stamp org_id so existing rows get backfilled on re-sync
                 if org_id:
                     existing.org_id = org_id
@@ -378,10 +409,10 @@ async def sync_leaflink_orders(
                     source="leaflink",
                     review_status=review_status,
                     sync_status="ok",
-                    synced_at=now,
-                    last_synced_at=now,
-                    external_created_at=external_created_at,
-                    external_updated_at=external_updated_at,
+                    synced_at=normalize_datetime(now),
+                    last_synced_at=normalize_datetime(now),
+                    external_created_at=normalize_datetime(external_created_at),
+                    external_updated_at=normalize_datetime(external_updated_at),
                 )
                 db.add(order_row)
                 # Flush to get the auto-generated order_row.id before writing lines.
@@ -393,7 +424,17 @@ async def sync_leaflink_orders(
                 delete(OrderLine).where(OrderLine.order_id == order_row.id)
             )
 
+            line_now = normalize_datetime(utc_now())
             for item in normalized_line_items:
+                # Validate line item datetime fields before insert
+                for field_name, value in [("created_at", line_now), ("updated_at", line_now)]:
+                    if isinstance(value, datetime) and value.tzinfo is None:
+                        logger.error(
+                            "[DT_VALIDATION_FAILED] field=%s value=%s tzinfo=None",
+                            field_name,
+                            value,
+                        )
+                        raise ValueError(f"Naive datetime in OrderLine {field_name}: {value}")
                 db.add(
                     OrderLine(
                         order_id=order_row.id,
@@ -408,6 +449,8 @@ async def sync_leaflink_orders(
                         mapping_status=item.get("mapping_status"),
                         mapping_issue=item.get("mapping_issue"),
                         raw_payload=make_json_safe(item.get("raw_payload")),
+                        created_at=line_now,
+                        updated_at=line_now,
                     )
                 )
 
@@ -649,6 +692,28 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 "external_updated_at": normalize_datetime(external_updated_at),
                                 "updated_at": normalize_datetime(now),
                             }
+
+                            # Log normalized datetimes for first 3 orders per batch
+                            if batch_created + batch_updated < 3:
+                                for field, value in update_params.items():
+                                    if isinstance(value, datetime):
+                                        logger.info(
+                                            "[DT_NORMALIZED] field=%s tzinfo=%s",
+                                            field,
+                                            value.tzinfo,
+                                        )
+
+                            # Validate all datetime params are timezone-aware
+                            for field_name, value in update_params.items():
+                                if isinstance(value, datetime):
+                                    if value.tzinfo is None:
+                                        logger.error(
+                                            "[DT_VALIDATION_FAILED] field=%s value=%s tzinfo=None",
+                                            field_name,
+                                            value,
+                                        )
+                                        raise ValueError(f"Naive datetime in {field_name}: {value}")
+
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -702,6 +767,28 @@ INSERT INTO orders (
                                 "created_at": normalize_datetime(now),
                                 "updated_at": normalize_datetime(now),
                             }
+
+                            # Log normalized datetimes for first 3 orders per batch
+                            if batch_created + batch_updated < 3:
+                                for field, value in insert_params.items():
+                                    if isinstance(value, datetime):
+                                        logger.info(
+                                            "[DT_NORMALIZED] field=%s tzinfo=%s",
+                                            field,
+                                            value.tzinfo,
+                                        )
+
+                            # Validate all datetime params are timezone-aware
+                            for field_name, value in insert_params.items():
+                                if isinstance(value, datetime):
+                                    if value.tzinfo is None:
+                                        logger.error(
+                                            "[DT_VALIDATION_FAILED] field=%s value=%s tzinfo=None",
+                                            field_name,
+                                            value,
+                                        )
+                                        raise ValueError(f"Naive datetime in {field_name}: {value}")
+
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
@@ -996,6 +1083,27 @@ async def sync_leaflink_line_items(
                             }
                             if _packed_qty_exists:
                                 insert_params["packed_qty"] = 0
+
+                            # Log normalized datetimes for first 3 line items
+                            if line_number <= 3:
+                                for field, value in insert_params.items():
+                                    if isinstance(value, datetime):
+                                        logger.info(
+                                            "[DT_NORMALIZED] field=%s tzinfo=%s",
+                                            field,
+                                            value.tzinfo,
+                                        )
+
+                            # Validate all datetime params are timezone-aware
+                            for field_name, value in insert_params.items():
+                                if isinstance(value, datetime):
+                                    if value.tzinfo is None:
+                                        logger.error(
+                                            "[DT_VALIDATION_FAILED] field=%s value=%s tzinfo=None",
+                                            field_name,
+                                            value,
+                                        )
+                                        raise ValueError(f"Naive datetime in {field_name}: {value}")
 
                             await db.execute(text(line_insert_stmt), insert_params)
                             inserted_count += 1
