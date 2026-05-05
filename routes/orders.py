@@ -2600,6 +2600,13 @@ async def sync_orders_leaflink(
         "error_count": 0,
         "errors": []
     }
+
+    Or on error:
+    {
+        "ok": false,
+        "error": "clear reason here",
+        "brand_id": "..."
+    }
     """
     brand_id = body.get("brand_id")
 
@@ -2611,7 +2618,15 @@ async def sync_orders_leaflink(
 
     try:
         # Load LeafLink credentials from database
-        cred = await resolve_leaflink_credential(db, brand_id=brand_id, allow_env_fallback=False)
+        try:
+            cred = await resolve_leaflink_credential(db, brand_id=brand_id, allow_env_fallback=False)
+        except Exception as cred_exc:
+            logger.error("[OrdersSync] credential_resolution_failed brand_id=%s error=%s", brand_id, str(cred_exc)[:500], exc_info=True)
+            return {
+                "ok": False,
+                "error": f"Failed to resolve credentials: {str(cred_exc)[:200]}",
+                "brand_id": brand_id,
+            }
 
         if not cred:
             logger.warning("[OrdersSync] no_credentials brand_id=%s", brand_id)
@@ -2622,91 +2637,157 @@ async def sync_orders_leaflink(
             }
 
         logger.info(
-            "[OrdersSync] credentials_found brand_id=%s credential_id=%s",
+            "[OrdersSync] credentials_found brand_id=%s credential_id=%s auth_scheme=%s base_url=%s",
             brand_id,
             cred.id,
-        )
-
-        # Import LeafLink client
-        from services.leaflink_client import LeafLinkClient
-        from services.leaflink_sync import sync_leaflink_orders
-
-        # Fetch orders from LeafLink
-        logger.info("[OrdersSync] fetching_from_leaflink brand_id=%s", brand_id)
-
-        logger.info(
-            "[LeafLinkAuth] client_init brand_id=%s auth_scheme=%s api_key_present=%s base_url=%s",
-            brand_id,
             cred.auth_scheme or "default",
-            bool(cred.api_key),
             cred.base_url or "default",
         )
 
-        client = LeafLinkClient(
-            api_key=cred.api_key,
-            company_id=cred.company_id,
-            brand_id=brand_id,
-            base_url=cred.base_url,
-            auth_scheme=cred.auth_scheme,
-        )
-
-        # Run fetch in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        fetch_result = await asyncio.wait_for(
-            loop.run_in_executor(
-                _leaflink_executor,
-                lambda: client.fetch_recent_orders(normalize=True, brand=brand_id),
-            ),
-            timeout=300,
-        )
-
-        orders = fetch_result.get("orders", [])
-        pages_fetched = fetch_result.get("pages_fetched", 0)
-
-        logger.info(
-            "[OrdersSync] fetched_from_leaflink brand_id=%s orders=%s pages=%s",
-            brand_id,
-            len(orders),
-            pages_fetched,
-        )
-
-        # Upsert orders into database
-        logger.info("[OrdersSync] upserting_to_database brand_id=%s", brand_id)
-
-        async with db.begin():
-            sync_result = await sync_leaflink_orders(db, brand_id, orders, pages_fetched=pages_fetched)
-
-        if not sync_result.get("ok"):
-            logger.error("[OrdersSync] sync_failed brand_id=%s error=%s", brand_id, sync_result.get("error"))
+        # Import LeafLink client
+        try:
+            from services.leaflink_client import LeafLinkClient
+            from services.leaflink_sync import sync_leaflink_orders
+        except ImportError as import_exc:
+            logger.error("[OrdersSync] import_failed error=%s", str(import_exc)[:500], exc_info=True)
             return {
                 "ok": False,
-                "error": sync_result.get("error"),
+                "error": f"Failed to import LeafLink services: {str(import_exc)[:200]}",
                 "brand_id": brand_id,
             }
 
-        logger.info(
-            "[OrdersSync] sync_complete brand_id=%s created=%s updated=%s skipped=%s",
-            brand_id,
-            sync_result.get("created", 0),
-            sync_result.get("updated", 0),
-            sync_result.get("skipped", 0),
-        )
+        # Create LeafLink client
+        try:
+            logger.info(
+                "[LeafLinkAuth] client_init brand_id=%s auth_scheme=%s api_key_present=%s base_url=%s",
+                brand_id,
+                cred.auth_scheme or "default",
+                bool(cred.api_key),
+                cred.base_url or "default",
+            )
 
-        return {
-            "ok": True,
-            "brand_id": brand_id,
-            "synced_count": len(orders),
-            "created_count": sync_result.get("created", 0),
-            "updated_count": sync_result.get("updated", 0),
-            "error_count": sync_result.get("error_count", 0),
-            "errors": sync_result.get("errors", []),
-        }
+            client = LeafLinkClient(
+                api_key=cred.api_key,
+                company_id=cred.company_id,
+                brand_id=brand_id,
+                base_url=cred.base_url,
+                auth_scheme=cred.auth_scheme,
+            )
+            logger.info("[OrdersSync] client_created brand_id=%s", brand_id)
+        except ValueError as val_exc:
+            logger.error("[OrdersSync] client_creation_failed brand_id=%s error=%s", brand_id, str(val_exc)[:500], exc_info=True)
+            return {
+                "ok": False,
+                "error": f"Invalid LeafLink credentials: {str(val_exc)[:200]}",
+                "brand_id": brand_id,
+            }
+        except Exception as client_exc:
+            logger.error("[OrdersSync] client_creation_error brand_id=%s error=%s", brand_id, str(client_exc)[:500], exc_info=True)
+            return {
+                "ok": False,
+                "error": f"Failed to create LeafLink client: {str(client_exc)[:200]}",
+                "brand_id": brand_id,
+            }
 
-    except Exception as e:
-        logger.error("[OrdersSync] sync_failed brand_id=%s error=%s", brand_id, str(e)[:500], exc_info=True)
+        # Fetch orders from LeafLink
+        try:
+            logger.info("[OrdersSync] fetching_from_leaflink brand_id=%s", brand_id)
+
+            loop = asyncio.get_event_loop()
+            fetch_result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    _leaflink_executor,
+                    lambda: client.fetch_recent_orders(normalize=True, brand=brand_id),
+                ),
+                timeout=300,  # 5 minute timeout
+            )
+
+            orders = fetch_result.get("orders", [])
+            pages_fetched = fetch_result.get("pages_fetched", 0)
+
+            logger.info(
+                "[OrdersSync] fetched_from_leaflink brand_id=%s orders=%s pages=%s",
+                brand_id,
+                len(orders),
+                pages_fetched,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[OrdersSync] leaflink_fetch_timeout brand_id=%s", brand_id)
+            return {
+                "ok": False,
+                "error": "LeafLink API request timed out (5 minutes)",
+                "brand_id": brand_id,
+            }
+        except RuntimeError as runtime_exc:
+            # LeafLink API errors are wrapped in RuntimeError
+            logger.error("[OrdersSync] leaflink_api_error brand_id=%s error=%s", brand_id, str(runtime_exc)[:500], exc_info=True)
+            return {
+                "ok": False,
+                "error": f"LeafLink API error: {str(runtime_exc)[:200]}",
+                "brand_id": brand_id,
+            }
+        except Exception as fetch_exc:
+            logger.error("[OrdersSync] leaflink_fetch_failed brand_id=%s error=%s", brand_id, str(fetch_exc)[:500], exc_info=True)
+            return {
+                "ok": False,
+                "error": f"Failed to fetch orders from LeafLink: {str(fetch_exc)[:200]}",
+                "brand_id": brand_id,
+            }
+
+        # Upsert orders into database
+        try:
+            logger.info("[OrdersSync] upserting_to_database brand_id=%s order_count=%s", brand_id, len(orders))
+
+            async with db.begin():
+                sync_result = await sync_leaflink_orders(db, brand_id, orders, pages_fetched=pages_fetched)
+
+            if not sync_result.get("ok"):
+                logger.error("[OrdersSync] sync_failed brand_id=%s error=%s", brand_id, sync_result.get("error"))
+                return {
+                    "ok": False,
+                    "error": sync_result.get("error", "Unknown sync error"),
+                    "brand_id": brand_id,
+                }
+
+            logger.info(
+                "[OrdersSync] sync_complete brand_id=%s created=%s updated=%s skipped=%s",
+                brand_id,
+                sync_result.get("created", 0),
+                sync_result.get("updated", 0),
+                sync_result.get("skipped", 0),
+            )
+
+            return {
+                "ok": True,
+                "brand_id": brand_id,
+                "synced_count": len(orders),
+                "created_count": sync_result.get("created", 0),
+                "updated_count": sync_result.get("updated", 0),
+                "error_count": sync_result.get("error_count", 0),
+                "errors": sync_result.get("errors", []),
+            }
+
+        except asyncio.TimeoutError:
+            logger.error("[OrdersSync] database_sync_timeout brand_id=%s", brand_id)
+            return {
+                "ok": False,
+                "error": "Database sync timed out",
+                "brand_id": brand_id,
+            }
+        except Exception as sync_exc:
+            logger.error("[OrdersSync] database_sync_failed brand_id=%s error=%s", brand_id, str(sync_exc)[:500], exc_info=True)
+            await db.rollback()
+            return {
+                "ok": False,
+                "error": f"Failed to sync orders to database: {str(sync_exc)[:200]}",
+                "brand_id": brand_id,
+            }
+
+    except Exception as outer_exc:
+        logger.error("[OrdersSync] unexpected_error brand_id=%s error=%s", brand_id, str(outer_exc)[:500], exc_info=True)
         return {
             "ok": False,
-            "error": str(e)[:500],
+            "error": f"Unexpected error: {str(outer_exc)[:200]}",
             "brand_id": brand_id,
         }
 
