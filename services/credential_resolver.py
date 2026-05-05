@@ -20,7 +20,7 @@ async def resolve_brand_credential(
     - LOWER case
     - is_active = true
 
-    Returns tuple: (id, brand_id, integration_name, company_id, api_key, is_active, sync_status, last_synced_page)
+    Returns tuple: (id, brand_id, integration_name, company_id, api_key, is_active, sync_status, last_synced_page, base_url, auth_scheme)
     or None if not found.
     """
 
@@ -48,7 +48,9 @@ async def resolve_brand_credential(
                     api_key,
                     is_active,
                     sync_status,
-                    last_synced_page
+                    last_synced_page,
+                    base_url,
+                    auth_scheme
                 FROM brand_api_credentials
                 WHERE TRIM(LOWER(brand_id)) = :normalized_brand
                 AND TRIM(LOWER(integration_name)) = :normalized_integration

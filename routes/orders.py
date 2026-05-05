@@ -1084,8 +1084,9 @@ async def orders_sync(
             self.is_active = row_data[5]
             self.sync_status = row_data[6]
             self.last_synced_page = row_data[7]
-            # Default auth_scheme to "Token" (verified by /leaflink/auth-test)
-            self.auth_scheme = "Token"
+            # base_url and auth_scheme from DB (indices 8 and 9)
+            self.base_url = row_data[8] if len(row_data) > 8 else None
+            self.auth_scheme = row_data[9] if len(row_data) > 9 and row_data[9] else "Token"
             # Nullable fields
             self.total_pages_available = None
             self.total_orders_available = None
@@ -1189,22 +1190,14 @@ async def orders_sync(
             )
 
             try:
-                from services.leaflink_client import LeafLinkClient, DEFAULT_LEAFLINK_BASE_URL
+                from services.leaflink_client import LeafLinkClient
                 from services.leaflink_sync import (
                     sync_leaflink_orders,
                     sync_leaflink_orders_headers_only,
                     sync_leaflink_line_items,
                 )
 
-                _api_url = f"{DEFAULT_LEAFLINK_BASE_URL}/orders-received/"
-                logger.info(
-                    "[OrdersSync] phase=1_fetch_init brand=%s company_id=%s api_url=%s",
-                    _resolved_brand_id,
-                    _resolved_company_id,
-                    _api_url,
-                )
-
-                # Use stored auth scheme if available, otherwise default to Bearer
+                # Use stored auth scheme if available, otherwise default to Token
                 if _active_cred and _active_cred.auth_scheme:
                     _auth_scheme = _active_cred.auth_scheme
                     logger.info(
@@ -1213,9 +1206,9 @@ async def orders_sync(
                         _resolved_brand_id,
                     )
                 else:
-                    _auth_scheme = "Bearer"
+                    _auth_scheme = "Token"
                     logger.info(
-                        "[LeafLinkAuth] using_default_scheme scheme=Bearer brand=%s",
+                        "[LeafLinkAuth] using_default_scheme scheme=Token brand=%s",
                         _resolved_brand_id,
                     )
 
@@ -1224,6 +1217,7 @@ async def orders_sync(
                         api_key=api_key,
                         company_id=company_id,
                         brand_id=_resolved_brand_id,
+                        base_url=cred.base_url,
                         auth_scheme=_auth_scheme,
                     )
                 except Exception as client_init_exc:
@@ -1241,9 +1235,16 @@ async def orders_sync(
                         "failing_step": "phase_1_client_init",
                         "brand_id": _resolved_brand_id,
                         "company_id": _resolved_company_id,
-                        "api_url": _api_url,
                         "traceback": traceback.format_exc(),
                     })
+
+                _api_url = f"{client.base_url}/orders-received/"
+                logger.info(
+                    "[OrdersSync] phase=1_fetch_init brand=%s company_id=%s api_url=%s",
+                    _resolved_brand_id,
+                    _resolved_company_id,
+                    _api_url,
+                )
 
                 loop = asyncio.get_event_loop()
 
@@ -2753,8 +2754,7 @@ async def sync_orders_leaflink(
         # ------------------------------------------------------------------ #
         # Stage 4: Fetch orders from LeafLink (NO DB transaction open)        #
         # ------------------------------------------------------------------ #
-        from services.leaflink_client import DEFAULT_LEAFLINK_BASE_URL
-        _fetch_url = f"{DEFAULT_LEAFLINK_BASE_URL}/orders-received/"
+        _fetch_url = f"{client.base_url}/orders-received/"
         logger.info("[Sync] leaflink_fetch_start url=%s brand_id=%s", _fetch_url, brand_id)
 
         try:
