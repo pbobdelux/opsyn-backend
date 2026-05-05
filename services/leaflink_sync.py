@@ -119,6 +119,34 @@ def force_utc(dt: Any) -> datetime | None:
     return None
 
 
+def serialize_datetimes_for_sql(params: dict[str, Any]) -> dict[str, Any]:
+    """Convert all datetime values to ISO strings for SQL execution.
+
+    This bypasses SQLAlchemy/asyncpg datetime handling by converting
+    all datetimes to ISO strings before binding. PostgreSQL will parse
+    the ISO strings and handle timezone conversion automatically.
+
+    Args:
+        params: Parameter dict for SQL execution
+
+    Returns:
+        New dict with all datetimes converted to ISO strings
+    """
+    fixed = {}
+    for k, v in params.items():
+        if isinstance(v, datetime):
+            # Ensure UTC
+            if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
+                v = v.replace(tzinfo=timezone.utc)
+            else:
+                v = v.astimezone(timezone.utc)
+            # Convert to ISO string
+            fixed[k] = v.isoformat()
+        else:
+            fixed[k] = v
+    return fixed
+
+
 def enforce_all_datetimes_utc(params: dict[str, Any]) -> dict[str, Any]:
     """Force all datetime values to naive UTC.
 
@@ -767,7 +795,7 @@ WHERE brand_id = CAST(:brand_id AS uuid) AND external_order_id = :external_order
                             }
                             log_datetime_check(update_params, "UPDATE")
                             validate_datetime_params(update_params, "UPDATE")
-                            update_params = enforce_all_datetimes_utc(update_params)
+                            update_params = serialize_datetimes_for_sql(update_params)
                             log_final_datetime_params(update_params, "UPDATE")
                             await db.execute(
                                 text(update_stmt),
@@ -824,7 +852,7 @@ INSERT INTO orders (
                             }
                             log_datetime_check(insert_params, "INSERT")
                             validate_datetime_params(insert_params, "INSERT")
-                            insert_params = enforce_all_datetimes_utc(insert_params)
+                            insert_params = serialize_datetimes_for_sql(insert_params)
                             log_final_datetime_params(insert_params, "INSERT")
                             await db.execute(
                                 text(insert_stmt),
