@@ -1,10 +1,23 @@
 import logging
+import os
 from typing import Optional, Tuple
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
+
+
+def extract_db_host(database_url: str) -> str:
+    """Extract hostname from DATABASE_URL for logging (no credentials exposed)."""
+    try:
+        if "@" in database_url:
+            host_part = database_url.split("@")[1]
+            host = host_part.split(":")[0]
+            return host
+        return "unknown"
+    except Exception:
+        return "unknown"
 
 
 async def resolve_brand_credential(
@@ -34,6 +47,14 @@ async def resolve_brand_credential(
     normalized_brand = brand_id.strip().lower()
     normalized_integration = integration_name.strip().lower()
 
+    _db_host = extract_db_host(os.getenv("DATABASE_URL", ""))
+
+    logger.info(
+        "[CredentialLookup] db_host=%s brand_id=%s integration_name=%s is_active=true",
+        _db_host,
+        brand_id,
+        integration_name,
+    )
     logger.info(
         "[CredentialResolver] lookup_start brand_id=%s integration_name=%s allow_env_fallback=false",
         brand_id,
@@ -77,6 +98,17 @@ async def resolve_brand_credential(
             # row indices: 0=id, 1=brand_id, 2=integration_name, 3=company_id,
             #              4=api_key, 5=is_active, 6=sync_status, 7=last_synced_page,
             #              8=base_url, 9=auth_scheme
+            _api_key_raw = row[4] or ""
+            _api_key_len = len(_api_key_raw.strip())
+            logger.info(
+                "[CredentialLookup] row_count=1 is_active=%s api_key_present=%s"
+                " api_key_len=%s base_url=%s auth_scheme=%s",
+                row[5],
+                bool(_api_key_raw.strip()),
+                _api_key_len,
+                row[8],
+                row[9],
+            )
             logger.info(
                 "[CredentialResolver] lookup_result brand_id=%s integration_name=%s"
                 " row_count=1 is_active=%s api_key_present=%s base_url=%s auth_scheme=%s",
@@ -96,6 +128,11 @@ async def resolve_brand_credential(
             )
             return row
         else:
+            logger.info(
+                "[CredentialLookup] row_count=0 reason=no_rows_found brand_id=%s integration_name=%s",
+                brand_id,
+                integration_name,
+            )
             logger.info(
                 "[CredentialResolver] lookup_result brand_id=%s integration_name=%s row_count=0",
                 brand_id,

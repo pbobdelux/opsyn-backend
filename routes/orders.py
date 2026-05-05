@@ -76,16 +76,27 @@ async def resolve_leaflink_credential(
     - ENV fallback only if allow_env_fallback=true AND brand_id is empty
     - Never use another tenant's credential
     - Never override tenant credential with ENV
+    - Query uses TRIM(LOWER()) normalization on brand_id and integration_name
+      to avoid case/whitespace mismatches
 
     Args:
         db: AsyncSession
-        brand_id: Tenant brand ID (e.g., 'noble-nectar'). If provided, DB-only.
+        brand_id: Tenant brand ID (UUID). If provided, DB-only.
         allow_env_fallback: Allow ENV fallback only if brand_id is empty.
 
     Returns:
         BrandAPICredential or None
     """
+    from services.credential_resolver import extract_db_host
+    from sqlalchemy import text as _text
 
+    _db_host = extract_db_host(os.getenv("DATABASE_URL", ""))
+
+    logger.info(
+        "[CredentialLookup] db_host=%s brand_id=%s integration_name=leaflink is_active=true",
+        _db_host,
+        brand_id,
+    )
     logger.info(
         "[CredentialResolver] lookup_start brand_id=%s integration_name=leaflink allow_env_fallback=%s",
         brand_id,
@@ -96,45 +107,95 @@ async def resolve_leaflink_credential(
     if brand_id:
         logger.info("[CredentialResolver] env_checked=false reason=brand_scoped_tenant_request")
 
+        normalized_brand = brand_id.strip().lower()
+
         try:
+            # Use TRIM(LOWER()) normalization to avoid case/whitespace mismatches
             result = await db.execute(
-                select(BrandAPICredential).where(
-                    BrandAPICredential.brand_id == brand_id,
-                    BrandAPICredential.integration_name == "leaflink",
-                    BrandAPICredential.is_active == True,
-                ).order_by(BrandAPICredential.updated_at.desc().nullslast()).limit(1)
+                _text("""
+                    SELECT
+                        id,
+                        brand_id,
+                        integration_name,
+                        company_id,
+                        api_key,
+                        is_active,
+                        base_url,
+                        auth_scheme,
+                        updated_at
+                    FROM brand_api_credentials
+                    WHERE TRIM(LOWER(brand_id::text)) = :normalized_brand
+                    AND TRIM(LOWER(integration_name)) = 'leaflink'
+                    AND is_active = true
+                    ORDER BY updated_at DESC NULLS LAST
+                    LIMIT 1
+                """),
+                {"normalized_brand": normalized_brand},
             )
-            cred = result.scalar_one_or_none()
+            row = result.fetchone()
 
-            if cred:
-                api_key = (cred.api_key or "").strip()
+            if row:
+                # row indices: 0=id, 1=brand_id, 2=integration_name, 3=company_id,
+                #              4=api_key, 5=is_active, 6=base_url, 7=auth_scheme, 8=updated_at
+                api_key = (row[4] or "").strip()
+                _api_key_len = len(api_key)
 
+                logger.info(
+                    "[CredentialLookup] row_count=1 is_active=%s api_key_present=%s"
+                    " api_key_len=%s base_url=%s auth_scheme=%s",
+                    row[5],
+                    bool(api_key),
+                    _api_key_len,
+                    row[6],
+                    row[7],
+                )
                 logger.info(
                     "[CredentialResolver] lookup_result brand_id=%s integration_name=leaflink"
                     " row_count=1 is_active=%s api_key_present=%s base_url=%s auth_scheme=%s",
                     brand_id,
-                    cred.is_active,
+                    row[5],
                     bool(api_key),
-                    cred.base_url,
-                    cred.auth_scheme,
+                    row[6],
+                    row[7],
                 )
 
                 # Validate key length
-                if len(api_key) > 50 or len(api_key) < 20:
+                logger.info(
+                    "[CredentialLookup] api_key_validation_start api_key_len=%s",
+                    _api_key_len,
+                )
+                if _api_key_len > 200 or _api_key_len < 10:
+                    logger.error(
+                        "[CredentialLookup] api_key_validation_failed reason=key_length_out_of_range api_key_len=%s",
+                        _api_key_len,
+                    )
                     logger.error(
                         "[CredentialResolver] tenant_key_invalid_length len=%s — REJECTING",
-                        len(api_key),
+                        _api_key_len,
                     )
-                    raise ValueError(f"Invalid LeafLink API key length: {len(api_key)}")
+                    raise ValueError(f"Invalid LeafLink API key length: {_api_key_len}")
 
-                # Strip whitespace
+                logger.info("[CredentialLookup] api_key_validation_passed")
+
+                # Build a BrandAPICredential-like object from the raw row
+                cred = BrandAPICredential()
+                cred.id = row[0]
+                cred.brand_id = row[1]
+                cred.integration_name = row[2]
+                cred.company_id = (row[3] or "").strip()
                 cred.api_key = api_key
-                cred.company_id = (cred.company_id or "").strip()
+                cred.is_active = row[5]
+                cred.base_url = row[6]
+                cred.auth_scheme = row[7]
 
                 logger.info("[CredentialResolver] final_source=db tenant_isolated=true")
 
                 return cred
             else:
+                logger.info(
+                    "[CredentialLookup] row_count=0 reason=no_rows_found brand_id=%s integration_name=leaflink",
+                    brand_id,
+                )
                 logger.info(
                     "[CredentialResolver] lookup_result brand_id=%s integration_name=leaflink row_count=0",
                     brand_id,
