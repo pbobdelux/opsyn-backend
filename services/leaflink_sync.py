@@ -86,6 +86,64 @@ def normalize_datetime(dt: Any) -> datetime | None:
     return None
 
 
+def force_utc(dt: Any) -> datetime | None:
+    """Force any datetime to timezone-aware UTC.
+
+    Handles:
+    - None → None
+    - ISO strings → parse and convert to UTC
+    - Naive datetimes → assume UTC and make aware
+    - Aware datetimes → convert to UTC
+    - Invalid tzinfo → replace with UTC
+
+    ALWAYS returns either UTC-aware datetime or None.
+    """
+    if dt is None:
+        return None
+
+    # Handle strings
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+
+    # Handle datetime objects
+    if isinstance(dt, datetime):
+        # If naive or invalid tzinfo, assume UTC
+        if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+            return dt.replace(tzinfo=timezone.utc)
+        # If aware, convert to UTC
+        return dt.astimezone(timezone.utc)
+
+    return None
+
+
+def log_final_datetime_params(params: dict[str, Any], op: str) -> None:
+    """Log all datetime parameters immediately before SQL execution.
+
+    This is the final check to confirm all datetimes are UTC-aware.
+    """
+    datetime_fields = [
+        "synced_at", "last_synced_at", "created_at", "updated_at",
+        "external_created_at", "external_updated_at"
+    ]
+
+    for field_name in datetime_fields:
+        value = params.get(field_name)
+        if value is not None:
+            tzinfo = getattr(value, "tzinfo", None)
+            offset = value.utcoffset() if isinstance(value, datetime) and value.tzinfo else None
+            logger.error(
+                "[FINAL_DT_PARAM] op=%s field=%s value=%s tzinfo=%s offset=%s",
+                op,
+                field_name,
+                value,
+                tzinfo,
+                offset,
+            )
+
+
 def safe_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -663,6 +721,8 @@ WHERE brand_id = CAST(:brand_id AS uuid) AND external_order_id = :external_order
                             line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
                             raw_payload_str = json.dumps(make_json_safe(raw_payload)) if raw_payload else None
 
+                            now = datetime.now(timezone.utc)
+
                             update_params = {
                                 "org_id": org_id_value,
                                 "brand_id": brand_id_value,
@@ -678,14 +738,15 @@ WHERE brand_id = CAST(:brand_id AS uuid) AND external_order_id = :external_order
                                 "raw_payload": raw_payload_str,
                                 "review_status": review_status,
                                 "sync_status": "ok",
-                                "synced_at": normalize_datetime(now),
-                                "last_synced_at": normalize_datetime(now),
-                                "external_created_at": normalize_datetime(external_created_at),
-                                "external_updated_at": normalize_datetime(external_updated_at),
-                                "updated_at": normalize_datetime(now),
+                                "synced_at": force_utc(now),
+                                "last_synced_at": force_utc(now),
+                                "external_created_at": force_utc(external_created_at),
+                                "external_updated_at": force_utc(external_updated_at),
+                                "updated_at": force_utc(now),
                             }
                             log_datetime_check(update_params, "UPDATE")
                             validate_datetime_params(update_params, "UPDATE")
+                            log_final_datetime_params(update_params, "UPDATE")
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -714,6 +775,8 @@ INSERT INTO orders (
                             line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
                             raw_payload_str = json.dumps(make_json_safe(raw_payload)) if raw_payload else None
 
+                            now = datetime.now(timezone.utc)
+
                             insert_params = {
                                 "org_id": org_id_value,
                                 "brand_id": brand_id_value,
@@ -730,15 +793,16 @@ INSERT INTO orders (
                                 "source": "leaflink",
                                 "review_status": review_status,
                                 "sync_status": "ok",
-                                "synced_at": normalize_datetime(now),
-                                "last_synced_at": normalize_datetime(now),
-                                "external_created_at": normalize_datetime(external_created_at),
-                                "external_updated_at": normalize_datetime(external_updated_at),
-                                "created_at": normalize_datetime(now),
-                                "updated_at": normalize_datetime(now),
+                                "synced_at": force_utc(now),
+                                "last_synced_at": force_utc(now),
+                                "external_created_at": force_utc(external_created_at),
+                                "external_updated_at": force_utc(external_updated_at),
+                                "created_at": force_utc(now),
+                                "updated_at": force_utc(now),
                             }
                             log_datetime_check(insert_params, "INSERT")
                             validate_datetime_params(insert_params, "INSERT")
+                            log_final_datetime_params(insert_params, "INSERT")
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
