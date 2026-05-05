@@ -31,6 +31,7 @@ from routes.admin import router as admin_router
 from routes.debug import router as debug_router
 from routes.auth import router as auth_router
 from routes.webhooks import router as webhooks_router
+from routes.sync import router as sync_router
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("opsyn-backend")
@@ -66,6 +67,7 @@ async def _create_assistant_tables() -> None:
         # Import models so SQLAlchemy registers them with Base.metadata
         import models.assistant_models  # noqa: F401
         import models.auth_models  # noqa: F401
+        import models.sync_health  # noqa: F401
 
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -454,6 +456,7 @@ app.include_router(debug_router)
 app.include_router(admin_router)
 app.include_router(auth_router)
 app.include_router(webhooks_router)
+app.include_router(sync_router)
 logger.info("[Routes] registered debug routes")
 
 logger.error("[STARTUP DEBUG] Registered routes:")

@@ -415,3 +415,8 @@ from models.assistant_models import (  # noqa: F401, E402
     AssistantSession,
 )
 
+# ---------------------------------------------------------------------------
+# Sync health models
+# ---------------------------------------------------------------------------
+from models.sync_health import DeadLetterLineItem, SyncHealth  # noqa: F401, E402
+
