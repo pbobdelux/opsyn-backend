@@ -86,6 +86,24 @@ def normalize_datetime(dt: Any) -> datetime | None:
     return None
 
 
+def ensure_utc_aware(dt: Any, field_name: str) -> "datetime | None":
+    """Normalize datetime and log only if it was naive (validation failure)."""
+    normalized = normalize_datetime(dt)
+
+    if normalized is None:
+        return None
+
+    if normalized.tzinfo is None:
+        logger.error(
+            "[DT_VALIDATION_FAILED] field=%s value=%s tzinfo=None — fixing to UTC",
+            field_name,
+            normalized,
+        )
+        normalized = normalized.replace(tzinfo=timezone.utc)
+
+    return normalized
+
+
 def safe_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -208,6 +226,121 @@ def derive_review_status(line_items: list[dict[str, Any]]) -> str:
     return "ready"
 
 
+async def _insert_line_items_standalone(
+    db: AsyncSession,
+    order_id: int,
+    normalized_line_items: list[dict],
+) -> tuple[int, int, int]:
+    """Module-level helper to insert OrderLine rows for a given order_id.
+
+    Uses savepoints so a single bad line item never poisons the whole
+    batch transaction.  Deletes stale rows before inserting fresh ones.
+
+    Returns:
+        (inserted_count, skipped_count, failed_count)
+
+    Intended for use by external scripts (e.g. scripts/retry_line_items.py)
+    that need to re-insert line items without going through the full sync flow.
+    """
+    optional_columns = ["packed_qty", "unit_price_cents", "total_price_cents"]
+    enabled_columns: dict[str, bool] = {
+        col: has_column("order_lines", col) for col in optional_columns
+    }
+
+    insert_columns = [
+        "order_id", "sku", "product_name", "quantity",
+        "unit_price", "total_price", "mapped_product_id",
+        "mapping_status", "mapping_issue", "raw_payload",
+        "created_at", "updated_at",
+    ]
+    for col in optional_columns:
+        if enabled_columns.get(col, False):
+            insert_columns.append(col)
+
+    columns_str = ", ".join(insert_columns)
+    placeholders = ", ".join([f":{col}" for col in insert_columns])
+    line_insert_stmt = f"""
+        INSERT INTO public.order_lines ({columns_str})
+        VALUES ({placeholders})
+    """
+
+    # Delete stale line items before inserting fresh ones
+    await db.execute(delete(OrderLine).where(OrderLine.order_id == order_id))
+
+    inserted = 0
+    skipped = 0
+    failed = 0
+
+    for line_number, item in enumerate(normalized_line_items, 1):
+        sku = item.get("sku")
+
+        if not order_id or not sku:
+            logger.error(
+                "[LINE_ITEM_SKIP] order_id=%s line_number=%s sku=%s — missing required field",
+                order_id,
+                line_number,
+                sku,
+            )
+            skipped += 1
+            continue
+
+        savepoint_name = f"line_item_{line_number}"
+        try:
+            await db.execute(text(f"SAVEPOINT {savepoint_name}"))
+
+            raw_payload_val = item.get("raw_payload")
+            raw_payload_str = (
+                json.dumps(make_json_safe(raw_payload_val))
+                if raw_payload_val is not None
+                else None
+            )
+
+            created_at_val = ensure_utc_aware(utc_now(), "created_at")
+            updated_at_val = ensure_utc_aware(utc_now(), "updated_at")
+
+            insert_params: dict[str, Any] = {
+                "order_id": order_id,
+                "sku": sku,
+                "product_name": item.get("product_name"),
+                "quantity": item.get("quantity"),
+                "unit_price": item.get("unit_price"),
+                "total_price": item.get("total_price"),
+                "mapped_product_id": item.get("mapped_product_id"),
+                "mapping_status": item.get("mapping_status"),
+                "mapping_issue": item.get("mapping_issue"),
+                "raw_payload": raw_payload_str,
+                "created_at": created_at_val,
+                "updated_at": updated_at_val,
+            }
+
+            if enabled_columns.get("packed_qty", False):
+                insert_params["packed_qty"] = 0
+            if enabled_columns.get("unit_price_cents", False):
+                insert_params["unit_price_cents"] = item.get("unit_price_cents")
+            if enabled_columns.get("total_price_cents", False):
+                insert_params["total_price_cents"] = item.get("total_price_cents")
+
+            await db.execute(text(line_insert_stmt), insert_params)
+            inserted += 1
+
+            await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
+
+        except Exception as line_error:
+            try:
+                await db.execute(text(f"ROLLBACK TO SAVEPOINT {savepoint_name}"))
+            except Exception:
+                pass
+
+            logger.error(
+                "[LINE_ITEM_INSERT_FAILED] order_id=%s line_number=%s error=%s",
+                order_id,
+                line_number,
+                str(line_error)[:200],
+            )
+            failed += 1
+            continue
+
+    return inserted, skipped, failed
 
 
 
@@ -341,35 +474,11 @@ async def sync_leaflink_orders(
                         newest_order_date = ts_dt
                     break
 
-            # Build a dict of all datetime fields for validation and logging
-            order_dt_fields = {
-                "synced_at": now,
-                "last_synced_at": now,
-                "external_created_at": external_created_at,
-                "external_updated_at": external_updated_at,
-            }
-
-            # Log normalized datetimes for the first 3 orders processed
-            order_count = created + updated
-            if order_count < 3:
-                for field, value in order_dt_fields.items():
-                    if isinstance(value, datetime):
-                        logger.info(
-                            "[DT_NORMALIZED] field=%s tzinfo=%s",
-                            field,
-                            value.tzinfo,
-                        )
-
-            # Validate all datetime fields are timezone-aware before DB write
-            for field_name, value in order_dt_fields.items():
-                if isinstance(value, datetime):
-                    if value.tzinfo is None:
-                        logger.error(
-                            "[DT_VALIDATION_FAILED] field=%s value=%s tzinfo=None",
-                            field_name,
-                            value,
-                        )
-                        raise ValueError(f"Naive datetime in {field_name}: {value}")
+            # Defensively normalize all datetime fields — ensure_utc_aware logs
+            # only on validation failure (naive datetime), keeping logs quiet.
+            now = ensure_utc_aware(now, "synced_at")
+            external_created_at = ensure_utc_aware(external_created_at, "external_created_at")
+            external_updated_at = ensure_utc_aware(external_updated_at, "external_updated_at")
 
             if existing:
                 existing.customer_name = customer_name
@@ -424,17 +533,8 @@ async def sync_leaflink_orders(
                 delete(OrderLine).where(OrderLine.order_id == order_row.id)
             )
 
-            line_now = normalize_datetime(utc_now())
+            line_now = ensure_utc_aware(utc_now(), "line_now")
             for item in normalized_line_items:
-                # Validate line item datetime fields before insert
-                for field_name, value in [("created_at", line_now), ("updated_at", line_now)]:
-                    if isinstance(value, datetime) and value.tzinfo is None:
-                        logger.error(
-                            "[DT_VALIDATION_FAILED] field=%s value=%s tzinfo=None",
-                            field_name,
-                            value,
-                        )
-                        raise ValueError(f"Naive datetime in OrderLine {field_name}: {value}")
                 db.add(
                     OrderLine(
                         order_id=order_row.id,
@@ -671,6 +771,12 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
 
                             now = datetime.now(timezone.utc)
 
+                            # Defensively normalize all datetime fields
+                            synced_at_val = ensure_utc_aware(now, "synced_at")
+                            updated_at_val = ensure_utc_aware(now, "updated_at")
+                            ext_created_val = ensure_utc_aware(external_created_at, "external_created_at")
+                            ext_updated_val = ensure_utc_aware(external_updated_at, "external_updated_at")
+
                             update_params = {
                                 "org_id": org_id_value,
                                 "brand_id": brand_id_value,
@@ -686,33 +792,12 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 "raw_payload": raw_payload_str,
                                 "review_status": review_status,
                                 "sync_status": "ok",
-                                "synced_at": normalize_datetime(now),
-                                "last_synced_at": normalize_datetime(now),
-                                "external_created_at": normalize_datetime(external_created_at),
-                                "external_updated_at": normalize_datetime(external_updated_at),
-                                "updated_at": normalize_datetime(now),
+                                "synced_at": synced_at_val,
+                                "last_synced_at": synced_at_val,
+                                "external_created_at": ext_created_val,
+                                "external_updated_at": ext_updated_val,
+                                "updated_at": updated_at_val,
                             }
-
-                            # Log normalized datetimes for first 3 orders per batch
-                            if batch_created + batch_updated < 3:
-                                for field, value in update_params.items():
-                                    if isinstance(value, datetime):
-                                        logger.info(
-                                            "[DT_NORMALIZED] field=%s tzinfo=%s",
-                                            field,
-                                            value.tzinfo,
-                                        )
-
-                            # Validate all datetime params are timezone-aware
-                            for field_name, value in update_params.items():
-                                if isinstance(value, datetime):
-                                    if value.tzinfo is None:
-                                        logger.error(
-                                            "[DT_VALIDATION_FAILED] field=%s value=%s tzinfo=None",
-                                            field_name,
-                                            value,
-                                        )
-                                        raise ValueError(f"Naive datetime in {field_name}: {value}")
 
                             await db.execute(
                                 text(update_stmt),
@@ -744,6 +829,12 @@ INSERT INTO orders (
 
                             now = datetime.now(timezone.utc)
 
+                            # Defensively normalize all datetime fields
+                            created_at_val = ensure_utc_aware(now, "created_at")
+                            synced_at_val = ensure_utc_aware(now, "synced_at")
+                            ext_created_val = ensure_utc_aware(external_created_at, "external_created_at")
+                            ext_updated_val = ensure_utc_aware(external_updated_at, "external_updated_at")
+
                             insert_params = {
                                 "org_id": org_id_value,
                                 "brand_id": brand_id_value,
@@ -760,34 +851,13 @@ INSERT INTO orders (
                                 "source": "leaflink",
                                 "review_status": review_status,
                                 "sync_status": "ok",
-                                "synced_at": normalize_datetime(now),
-                                "last_synced_at": normalize_datetime(now),
-                                "external_created_at": normalize_datetime(external_created_at),
-                                "external_updated_at": normalize_datetime(external_updated_at),
-                                "created_at": normalize_datetime(now),
-                                "updated_at": normalize_datetime(now),
+                                "synced_at": synced_at_val,
+                                "last_synced_at": synced_at_val,
+                                "external_created_at": ext_created_val,
+                                "external_updated_at": ext_updated_val,
+                                "created_at": created_at_val,
+                                "updated_at": created_at_val,
                             }
-
-                            # Log normalized datetimes for first 3 orders per batch
-                            if batch_created + batch_updated < 3:
-                                for field, value in insert_params.items():
-                                    if isinstance(value, datetime):
-                                        logger.info(
-                                            "[DT_NORMALIZED] field=%s tzinfo=%s",
-                                            field,
-                                            value.tzinfo,
-                                        )
-
-                            # Validate all datetime params are timezone-aware
-                            for field_name, value in insert_params.items():
-                                if isinstance(value, datetime):
-                                    if value.tzinfo is None:
-                                        logger.error(
-                                            "[DT_VALIDATION_FAILED] field=%s value=%s tzinfo=None",
-                                            field_name,
-                                            value,
-                                        )
-                                        raise ValueError(f"Naive datetime in {field_name}: {value}")
 
                             await db.execute(
                                 text(insert_stmt),
@@ -950,6 +1020,152 @@ async def sync_leaflink_line_items(
             "duration_seconds": 0,
         }
 
+    # ------------------------------------------------------------------
+    # Helper: build the INSERT statement and enabled_columns map once,
+    # reused for both the first pass and the retry pass.
+    # ------------------------------------------------------------------
+    optional_columns = [
+        "packed_qty",
+        "unit_price_cents",
+        "total_price_cents",
+    ]
+    enabled_columns: dict[str, bool] = {
+        col: has_column("order_lines", col) for col in optional_columns
+    }
+
+    insert_columns = [
+        "order_id",
+        "sku",
+        "product_name",
+        "quantity",
+        "unit_price",
+        "total_price",
+        "mapped_product_id",
+        "mapping_status",
+        "mapping_issue",
+        "raw_payload",
+        "created_at",
+        "updated_at",
+    ]
+    for col in optional_columns:
+        if enabled_columns.get(col, False):
+            insert_columns.append(col)
+
+    columns_str = ", ".join(insert_columns)
+    placeholders = ", ".join([f":{col}" for col in insert_columns])
+    line_insert_stmt = f"""
+        INSERT INTO public.order_lines ({columns_str})
+        VALUES ({placeholders})
+    """
+
+    # ------------------------------------------------------------------
+    # Inner helper: insert all line items for one order using savepoints
+    # so a single bad item never poisons the whole batch transaction.
+    # Returns (inserted_count, skipped_count, failed_count).
+    # ------------------------------------------------------------------
+    async def _insert_line_items(
+        db: AsyncSession,
+        order_row: Any,
+        normalized_line_items: list[dict],
+    ) -> tuple[int, int, int]:
+        order_id_value = order_row.id
+        inserted = 0
+        skipped = 0
+        failed = 0
+
+        # Delete stale line items before inserting fresh ones
+        await db.execute(
+            delete(OrderLine).where(OrderLine.order_id == order_id_value)
+        )
+
+        for line_number, item in enumerate(normalized_line_items, 1):
+            sku = item.get("sku")
+
+            if not order_id_value or not sku:
+                logger.error(
+                    "[LINE_ITEM_SKIP] order_id=%s line_number=%s sku=%s — missing required field",
+                    order_id_value,
+                    line_number,
+                    sku,
+                )
+                skipped += 1
+                continue
+
+            savepoint_name = f"line_item_{line_number}"
+            try:
+                await db.execute(text(f"SAVEPOINT {savepoint_name}"))
+
+                raw_payload_val = item.get("raw_payload")
+                raw_payload_str = (
+                    json.dumps(make_json_safe(raw_payload_val))
+                    if raw_payload_val is not None
+                    else None
+                )
+
+                # Defensively normalize datetime fields
+                created_at_val = ensure_utc_aware(utc_now(), "created_at")
+                updated_at_val = ensure_utc_aware(utc_now(), "updated_at")
+
+                insert_params: dict[str, Any] = {
+                    "order_id": order_id_value,
+                    "sku": sku,
+                    "product_name": item.get("product_name"),
+                    "quantity": item.get("quantity"),
+                    "unit_price": item.get("unit_price"),
+                    "total_price": item.get("total_price"),
+                    "mapped_product_id": item.get("mapped_product_id"),
+                    "mapping_status": item.get("mapping_status"),
+                    "mapping_issue": item.get("mapping_issue"),
+                    "raw_payload": raw_payload_str,
+                    "created_at": created_at_val,
+                    "updated_at": updated_at_val,
+                }
+
+                if enabled_columns.get("packed_qty", False):
+                    insert_params["packed_qty"] = 0
+                if enabled_columns.get("unit_price_cents", False):
+                    insert_params["unit_price_cents"] = item.get("unit_price_cents")
+                if enabled_columns.get("total_price_cents", False):
+                    insert_params["total_price_cents"] = item.get("total_price_cents")
+
+                await db.execute(text(line_insert_stmt), insert_params)
+                inserted += 1
+
+                await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
+
+            except Exception as line_error:
+                # Roll back only this line item — the rest of the batch is safe
+                try:
+                    await db.execute(text(f"ROLLBACK TO SAVEPOINT {savepoint_name}"))
+                except Exception:
+                    pass
+
+                logger.error(
+                    "[LINE_ITEM_INSERT_FAILED] order_id=%s line_number=%s error=%s",
+                    order_id_value,
+                    line_number,
+                    str(line_error)[:200],
+                )
+                failed += 1
+                continue
+
+        return inserted, skipped, failed
+
+    # ------------------------------------------------------------------
+    # Aggregate counters across all orders
+    # ------------------------------------------------------------------
+    total_inserted = 0
+    total_skipped = 0
+    total_failed = 0
+    total_retried = 0
+    total_orders = 0
+
+    # ------------------------------------------------------------------
+    # First pass: try to insert line items for orders that exist in DB.
+    # Collect orders whose parent row was not found for a retry pass.
+    # ------------------------------------------------------------------
+    retry_items: list[tuple[str, dict]] = []  # (leaflink_order_id, raw_order_dict)
+
     for o in orders:
         if not isinstance(o, dict):
             continue
@@ -960,10 +1176,11 @@ async def sync_leaflink_line_items(
         if not external_id:
             continue
 
+        leaflink_order_id = safe_str(external_id)
+
         try:
             async with AsyncSessionLocal() as db:
                 async with db.begin():
-                    leaflink_order_id = safe_str(external_id)
                     result = await db.execute(
                         select(Order).where(
                             Order.brand_id == brand_id_value,
@@ -973,16 +1190,11 @@ async def sync_leaflink_line_items(
                     order_row = result.scalar_one_or_none()
 
                     if order_row is None:
-                        # Order was not committed — skip to avoid FK violation.
                         logger.warning(
                             "[LINE_ITEM_ORDER_LOOKUP_FAIL] leaflink_order_id=%s",
                             leaflink_order_id,
                         )
-                        logger.warning(
-                            "[LINE_ITEM_SKIP] reason=order_not_found external_id=%s brand=%s",
-                            leaflink_order_id,
-                            brand_id_value,
-                        )
+                        retry_items.append((leaflink_order_id, o))
                         continue
 
                     logger.info(
@@ -992,152 +1204,39 @@ async def sync_leaflink_line_items(
                     )
 
                     # Read line items from the DB row (written during Phase 1)
-                    # rather than from the raw in-memory dict, so we use the
-                    # already-normalised, JSON-safe representation.
                     db_line_items = order_row.line_items_json
                     if isinstance(db_line_items, list):
                         normalized_line_items = db_line_items
                     else:
-                        # Fallback: normalise from the raw order dict
                         raw_line_items = o.get("line_items", [])
                         normalized_line_items = normalize_line_items(raw_line_items)
 
                     if not normalized_line_items:
                         continue
 
-                    # Columns that may not exist in all environments
-                    optional_columns = [
-                        "packed_qty",
-                        "unit_price_cents",
-                        "total_price_cents",
-                    ]
-
-                    # Check which optional columns exist in the database schema
-                    enabled_columns = {}
-                    for col in optional_columns:
-                        enabled_columns[col] = has_column("order_lines", col)
+                    order_id_value = order_row.id
+                    inserted_count, skipped_count, failed_count = await _insert_line_items(
+                        db, order_row, normalized_line_items
+                    )
 
                     logger.info(
-                        "[LINE_ITEM_COLUMNS_ENABLED] packed_qty=%s unit_price_cents=%s total_price_cents=%s",
-                        str(enabled_columns.get("packed_qty", False)).lower(),
-                        str(enabled_columns.get("unit_price_cents", False)).lower(),
-                        str(enabled_columns.get("total_price_cents", False)).lower(),
+                        "[LINE_ITEM_SAVE_COMMIT] brand_id=%s created=%s updated=0",
+                        brand_id_value,
+                        inserted_count,
+                    )
+                    logger.info(
+                        "[LINE_ITEM_BATCH_RESULT] order_id=%s total=%s inserted=%s skipped=%s failed=%s retried=0",
+                        order_id_value,
+                        len(normalized_line_items),
+                        inserted_count,
+                        skipped_count,
+                        failed_count,
                     )
 
-                    # Base columns (always present in order_lines)
-                    insert_columns = [
-                        "order_id",
-                        "sku",
-                        "product_name",
-                        "quantity",
-                        "unit_price",
-                        "total_price",
-                        "mapped_product_id",
-                        "mapping_status",
-                        "mapping_issue",
-                        "raw_payload",
-                        "created_at",
-                        "updated_at",
-                    ]
-
-                    # Add optional columns only if they exist in the schema
-                    for col in optional_columns:
-                        if enabled_columns.get(col, False):
-                            insert_columns.append(col)
-
-                    columns_str = ", ".join(insert_columns)
-                    placeholders = ", ".join([f":{col}" for col in insert_columns])
-                    line_insert_stmt = f"""
-                        INSERT INTO public.order_lines ({columns_str})
-                        VALUES ({placeholders})
-                    """
-
-                    # Replace stale line items with the current set
-                    await db.execute(
-                        delete(OrderLine).where(OrderLine.order_id == order_row.id)
-                    )
-
-                    inserted_count = 0
-                    for line_number, item in enumerate(normalized_line_items, 1):
-                        order_id_value = order_row.id
-                        sku = item.get("sku")
-
-                        # Pre-insert validation: skip items missing required fields
-                        if not order_id_value or not sku:
-                            logger.error(
-                                "[LINE_ITEM_SKIP] order_id=%s line_number=%s sku=%s — missing required field",
-                                order_id_value,
-                                line_number,
-                                sku,
-                            )
-                            continue
-
-                        # Fail-safe: one bad line item must not crash the entire batch
-                        try:
-                            raw_payload_val = item.get("raw_payload")
-                            raw_payload_str = json.dumps(make_json_safe(raw_payload_val)) if raw_payload_val is not None else None
-
-                            # Base params (always present)
-                            insert_params: dict[str, Any] = {
-                                "order_id": order_id_value,
-                                "sku": sku,
-                                "product_name": item.get("product_name"),
-                                "quantity": item.get("quantity"),
-                                "unit_price": item.get("unit_price"),
-                                "total_price": item.get("total_price"),
-                                "mapped_product_id": item.get("mapped_product_id"),
-                                "mapping_status": item.get("mapping_status"),
-                                "mapping_issue": item.get("mapping_issue"),
-                                "raw_payload": raw_payload_str,
-                                "created_at": normalize_datetime(utc_now()),
-                                "updated_at": normalize_datetime(utc_now()),
-                            }
-
-                            # Add optional params only if columns exist
-                            if enabled_columns.get("packed_qty", False):
-                                insert_params["packed_qty"] = 0
-                            if enabled_columns.get("unit_price_cents", False):
-                                insert_params["unit_price_cents"] = item.get("unit_price_cents")
-                            if enabled_columns.get("total_price_cents", False):
-                                insert_params["total_price_cents"] = item.get("total_price_cents")
-
-                            # Log normalized datetimes for first 3 line items
-                            if line_number <= 3:
-                                for field, value in insert_params.items():
-                                    if isinstance(value, datetime):
-                                        logger.info(
-                                            "[DT_NORMALIZED] field=%s tzinfo=%s",
-                                            field,
-                                            value.tzinfo,
-                                        )
-
-                            # Validate all datetime params are timezone-aware
-                            for field_name, value in insert_params.items():
-                                if isinstance(value, datetime):
-                                    if value.tzinfo is None:
-                                        logger.error(
-                                            "[DT_VALIDATION_FAILED] field=%s value=%s tzinfo=None",
-                                            field_name,
-                                            value,
-                                        )
-                                        raise ValueError(f"Naive datetime in {field_name}: {value}")
-
-                            await db.execute(text(line_insert_stmt), insert_params)
-                            inserted_count += 1
-                        except Exception as line_error:
-                            logger.error(
-                                "[LINE_ITEM_ERROR] order_id=%s line_number=%s sku=%s error=%s",
-                                order_id_value,
-                                line_number,
-                                sku,
-                                str(line_error),
-                                exc_info=True,
-                            )
-                            # Continue to next line item instead of crashing batch
-                            continue
-
-                    logger.info("[LINE_ITEM_SAVE] inserted=%s external_id=%s", inserted_count, external_id)
-                    logger.info("[LINE_ITEM_SAVE_COMMIT] brand_id=%s created=%s updated=0", brand_id_value, inserted_count)
+                    total_inserted += inserted_count
+                    total_skipped += skipped_count
+                    total_failed += failed_count
+                    total_orders += 1
 
         except Exception as line_exc:
             err_msg = str(line_exc)
@@ -1150,18 +1249,106 @@ async def sync_leaflink_line_items(
             )
             errors.append(err_msg)
 
+    # ------------------------------------------------------------------
+    # Retry pass: attempt once more for orders whose parent row was not
+    # found during the first pass (they may have been committed by now).
+    # ------------------------------------------------------------------
+    for leaflink_order_id, o in retry_items:
+        logger.info("[LINE_ITEM_RETRY] leaflink_order_id=%s", leaflink_order_id)
+
+        try:
+            async with AsyncSessionLocal() as db:
+                async with db.begin():
+                    result = await db.execute(
+                        select(Order).where(
+                            Order.brand_id == brand_id_value,
+                            Order.external_order_id == leaflink_order_id,
+                        )
+                    )
+                    order_row = result.scalar_one_or_none()
+
+                    if order_row is None:
+                        logger.warning(
+                            "[LINE_ITEM_RETRY_GIVEUP] leaflink_order_id=%s",
+                            leaflink_order_id,
+                        )
+                        continue
+
+                    logger.info(
+                        "[LINE_ITEM_RETRY_SUCCESS] leaflink_order_id=%s matched_order_id=%s",
+                        leaflink_order_id,
+                        order_row.id,
+                    )
+
+                    db_line_items = order_row.line_items_json
+                    if isinstance(db_line_items, list):
+                        normalized_line_items = db_line_items
+                    else:
+                        raw_line_items = o.get("line_items", [])
+                        normalized_line_items = normalize_line_items(raw_line_items)
+
+                    if not normalized_line_items:
+                        continue
+
+                    order_id_value = order_row.id
+                    inserted_count, skipped_count, failed_count = await _insert_line_items(
+                        db, order_row, normalized_line_items
+                    )
+
+                    logger.info(
+                        "[LINE_ITEM_SAVE_COMMIT] brand_id=%s created=%s updated=0",
+                        brand_id_value,
+                        inserted_count,
+                    )
+                    logger.info(
+                        "[LINE_ITEM_BATCH_RESULT] order_id=%s total=%s inserted=%s skipped=%s failed=%s retried=1",
+                        order_id_value,
+                        len(normalized_line_items),
+                        inserted_count,
+                        skipped_count,
+                        failed_count,
+                    )
+
+                    total_inserted += inserted_count
+                    total_skipped += skipped_count
+                    total_failed += failed_count
+                    total_retried += 1
+                    total_orders += 1
+
+        except Exception as retry_exc:
+            err_msg = str(retry_exc)
+            logger.error(
+                "[OrdersSync] line_items_retry_error brand=%s external_id=%s error=%s",
+                brand_id_value,
+                leaflink_order_id,
+                err_msg,
+                exc_info=True,
+            )
+            errors.append(err_msg)
+
     bg_duration = round(time.monotonic() - bg_start, 2)
+
+    logger.info(
+        "[SYNC_COMPLETE] brand_id=%s orders_processed=%s line_items_total=%s inserted=%s skipped=%s failed=%s retried=%s",
+        brand_id_value,
+        total_orders,
+        total_inserted + total_skipped + total_failed,
+        total_inserted,
+        total_skipped,
+        total_failed,
+        total_retried,
+    )
     logger.info(
         "[OrdersSync] line_items_complete brand=%s lines_written=%s duration=%ss errors=%s",
         brand_id_value,
-        total_lines_written,
+        total_inserted,
         bg_duration,
         len(errors),
     )
 
     return {
         "ok": len(errors) == 0,
-        "lines_written": total_lines_written,
+        "lines_written": total_inserted,
         "errors": errors,
         "duration_seconds": bg_duration,
     }
