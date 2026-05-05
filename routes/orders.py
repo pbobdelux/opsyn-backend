@@ -2672,6 +2672,7 @@ async def sync_orders_leaflink(
         # Stage 0b: Validate brand_id from request body                      #
         # ------------------------------------------------------------------ #
         brand_id = (body.get("brand_id") or "").strip() if isinstance(body, dict) else ""
+        logger.info("[Sync] request_parsed brand_id=%s", brand_id)
         if not brand_id:
             logger.warning("[Sync] missing_brand_id org_id=%s", org_id)
             return make_json_safe({
