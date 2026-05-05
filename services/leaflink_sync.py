@@ -918,6 +918,41 @@ async def sync_leaflink_line_items(
                     if not normalized_line_items:
                         continue
 
+                    # Check once per order whether packed_qty exists in the DB
+                    # schema.  The result drives both the SQL column list and the
+                    # params dict so the INSERT never references a missing column.
+                    _packed_qty_exists = has_column("order_lines", "packed_qty")
+                    logger.info("[LINE_ITEM_PACKED_QTY_ENABLED] %s", str(_packed_qty_exists).lower())
+
+                    # Build the INSERT statement dynamically so that packed_qty
+                    # is only referenced when the column actually exists in the
+                    # live database schema.
+                    insert_columns = [
+                        "order_id",
+                        "sku",
+                        "product_name",
+                        "quantity",
+                        "unit_price",
+                        "total_price",
+                        "unit_price_cents",
+                        "total_price_cents",
+                        "mapped_product_id",
+                        "mapping_status",
+                        "mapping_issue",
+                        "raw_payload",
+                        "created_at",
+                        "updated_at",
+                    ]
+                    if _packed_qty_exists:
+                        insert_columns.append("packed_qty")
+
+                    columns_str = ", ".join(insert_columns)
+                    placeholders = ", ".join([f":{col}" for col in insert_columns])
+                    line_insert_stmt = f"""
+                        INSERT INTO public.order_lines ({columns_str})
+                        VALUES ({placeholders})
+                    """
+
                     # Replace stale line items with the current set
                     await db.execute(
                         delete(OrderLine).where(OrderLine.order_id == order_row.id)
@@ -940,16 +975,10 @@ async def sync_leaflink_line_items(
 
                         # Fail-safe: one bad line item must not crash the entire batch
                         try:
-                            # Check whether packed_qty column exists in the DB schema
-                            # (populated at startup by inspect_schema_at_startup).
-                            _packed_qty_exists = has_column("order_lines", "packed_qty")
+                            raw_payload_val = item.get("raw_payload")
+                            raw_payload_str = json.dumps(make_json_safe(raw_payload_val)) if raw_payload_val is not None else None
 
-                            if not _packed_qty_exists:
-                                logger.info(
-                                    "[LINE_ITEM_COLUMN_SKIPPED] field=packed_qty reason=column_not_found"
-                                )
-
-                            _line_kwargs: dict[str, Any] = {
+                            insert_params: dict[str, Any] = {
                                 "order_id": order_id_value,
                                 "sku": sku,
                                 "product_name": item.get("product_name"),
@@ -961,12 +990,14 @@ async def sync_leaflink_line_items(
                                 "mapped_product_id": item.get("mapped_product_id"),
                                 "mapping_status": item.get("mapping_status"),
                                 "mapping_issue": item.get("mapping_issue"),
-                                "raw_payload": make_json_safe(item.get("raw_payload")),
+                                "raw_payload": raw_payload_str,
+                                "created_at": normalize_datetime(utc_now()),
+                                "updated_at": normalize_datetime(utc_now()),
                             }
                             if _packed_qty_exists:
-                                _line_kwargs["packed_qty"] = 0
+                                insert_params["packed_qty"] = 0
 
-                            db.add(OrderLine(**_line_kwargs))
+                            await db.execute(text(line_insert_stmt), insert_params)
                             inserted_count += 1
                         except Exception as line_error:
                             logger.error(
@@ -980,7 +1011,6 @@ async def sync_leaflink_line_items(
                             # Continue to next line item instead of crashing batch
                             continue
 
-                    total_lines_written += inserted_count
                     logger.info("[LINE_ITEM_SAVE] inserted=%s external_id=%s", inserted_count, external_id)
                     logger.info("[LINE_ITEM_SAVE_COMMIT] brand_id=%s created=%s updated=0", brand_id_value, inserted_count)
 
