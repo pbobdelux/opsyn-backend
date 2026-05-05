@@ -173,14 +173,15 @@ class LeafLinkClient:
             logger.error("[LeafLinkAuth] MISSING company_id brand=%s", self.brand_id)
 
     def _get_auth_header(self) -> dict:
-        """Build Authorization header using Api-Key format (LeafLink requirement)."""
+        """Build Authorization header using auth_scheme from DB (default: Token)."""
         if not self.api_key:
             logger.error("[LeafLinkAuth] MISSING api_key in _get_auth_header")
             return {"Authorization": ""}
 
-        # LeafLink requires: Authorization: Api-Key <api_key>
-        auth_header = f"Api-Key {self.api_key}"
-        logger.error("[LeafLinkAuth] building_header scheme=Api-Key api_key_len=%s", len(self.api_key))
+        # Use auth_scheme from DB, default to Token
+        scheme = self.auth_scheme or "Token"
+        auth_header = f"{scheme} {self.api_key}"
+        logger.info("[LeafLinkAuth] building_header scheme=%s api_key_len=%s", scheme, len(self.api_key))
         return {"Authorization": auth_header}
 
     def _validate_request_headers(self, headers: dict) -> bool:
@@ -243,6 +244,13 @@ class LeafLinkClient:
         last_exc: Optional[Exception] = None
         for attempt in range(1, _MAX_RETRY_ATTEMPTS + 1):
             try:
+                logger.info(
+                    "[LEAFLINK_FINAL] url=%s auth_scheme=%s key_len=%s key_prefix=%s",
+                    url,
+                    self.auth_scheme or "Token",
+                    len(self.api_key or ""),
+                    (self.api_key[:8] if self.api_key and len(self.api_key) >= 8 else "SHORT"),
+                )
                 logger.error("[LEAFLINK_ACTUAL] about_to_request url=%s", url)
                 resp = self.session.get(
                     url,
@@ -443,9 +451,10 @@ class LeafLinkClient:
         status: Optional[str] = None,
     ) -> Any:
         logger.error("[CLIENT DEBUG] list_orders() called limit=%s offset=%s", limit, offset)
-        # TEST: Trying /orders/ endpoint instead of /orders-received/ to diagnose 403
-        # Original endpoint was "orders-received/" — switching to "orders/" to test API key scope
-        _orders_path = "orders/"
+        # FIXED: Use exact working endpoint
+        # https://www.leaflink.com/api/v2/orders-received/
+        # Trailing slash on /orders-received/ is REQUIRED
+        _orders_path = "orders-received/"
         params: Dict[str, Any] = {
             "limit": limit,
             "offset": offset,
@@ -455,13 +464,14 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
+        # Build URL with exactly one slash between base_url and endpoint
         _param_str = "&".join(f"{k}={v}" for k, v in params.items())
-        url = f"{self.base_url.rstrip('/')}/{_orders_path}?{_param_str}"
+        final_url = f"{self.base_url.rstrip('/')}/{_orders_path}?{_param_str}"
 
         logger.error("[LEAFLINK_TEST] endpoint=%s", _orders_path)
-        logger.error("[LEAFLINK_TEST] final_url=%s", url)
-        logger.error("[LEAFLINK_ACTUAL] url=%s", url)
-        logger.error("[LEAFLINK_ACTUAL] auth_header_format=Api-Key key_len=%s", len(self.api_key or ""))
+        logger.error("[LEAFLINK_TEST] final_url=%s", final_url)
+        logger.error("[LEAFLINK_ACTUAL] url=%s", final_url)
+        logger.error("[LEAFLINK_ACTUAL] auth_scheme=%s key_len=%s", self.auth_scheme or "Token", len(self.api_key or ""))
 
         try:
             resp = self._get_raw(_orders_path, params=params)
