@@ -215,6 +215,7 @@ async def poll_and_execute() -> None:
             api_key: str = cred.api_key or ""
             company_id: str = cred.company_id or ""
             auth_scheme: str = cred.auth_scheme or "Token"
+            base_url: str = cred.base_url or ""
 
             # Validate api_key
             if not api_key or not api_key.strip():
@@ -295,6 +296,7 @@ async def poll_and_execute() -> None:
             manager=None,  # No in-memory manager needed — DB-only progress tracking
             sync_run_id=sync_run_id,  # Pass SyncRun ID for direct DB updates
             total_orders_available=total_orders_available,
+            base_url=base_url,
         )
 
         logger.info("[SyncWorker] sync_complete id=%s brand=%s", sync_run_id, brand_id)

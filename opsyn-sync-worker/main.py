@@ -142,6 +142,7 @@ async def process_sync_requests() -> None:
 
                 api_key: str = cred.api_key or ""
                 company_id: str = cred.company_id or ""
+                base_url: str = cred.base_url or ""
 
                 if not api_key.strip() or not company_id.strip():
                     logger.error(
@@ -183,6 +184,7 @@ async def process_sync_requests() -> None:
                     total_pages=total_pages or 1,
                     manager=None,  # Worker uses DB-only progress tracking
                     total_orders_available=total_orders_available,
+                    base_url=base_url,
                 )
 
                 # Mark complete

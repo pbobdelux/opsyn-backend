@@ -319,6 +319,7 @@ async def get_orders(
 
     # ------------------------------------------------------------------ #
     # Build base query - SCOPED BY ORG_ID AND BRAND_ID                    #
+    # Both filters are required for multi-tenant isolation.               #
     # ------------------------------------------------------------------ #
     from sqlalchemy.orm import selectinload as _selectinload
 
@@ -327,6 +328,7 @@ async def get_orders(
         .options(_selectinload(Order.lines))
         .where(
             and_(
+                Order.org_id == resolved_org_id,
                 Order.brand_id == brand_id,
             )
         )
@@ -370,11 +372,13 @@ async def get_orders(
         orders = orders[:limit]
 
     # ------------------------------------------------------------------ #
-    # Total count for the brand (scoped by brand_id)                      #
+    # Total count scoped by org_id AND brand_id                           #
     # ------------------------------------------------------------------ #
     try:
         count_result = await db.execute(
-            select(func.count(Order.id)).where(Order.brand_id == brand_id)
+            select(func.count(Order.id)).where(
+                and_(Order.org_id == resolved_org_id, Order.brand_id == brand_id)
+            )
         )
         total_in_database = count_result.scalar_one() or 0
     except Exception as exc:
@@ -2580,80 +2584,153 @@ def _cursor_hash_safe(cursor: Optional[str]) -> Optional[str]:
 
 @router.post("/sync/leaflink")
 async def sync_orders_leaflink(
+    request: Request,
     body: dict,
+    x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Production-grade LeafLink order sync for a specific brand.
 
+    Multi-tenant isolation enforced:
+    - X-OPSYN-ORG header required (org UUID or org_code)
+    - brand_id must belong to the org from X-OPSYN-ORG
+    - Credentials loaded from DB by brand_id only (no env var fallback)
+    - credential.brand_id validated against request brand_id
+    - final_url constructed from credential.base_url + credential.company_id
+    - Orders written with org_id + brand_id
+
     Architecture:
-    1. Validate brand_id and load credentials (no DB transaction)
-    2. Create SyncRun record (own transaction, committed immediately)
-    3. Fetch all orders from LeafLink API (no DB transaction)
-    4. Open ONE transaction for upsert phase
-    5. Update SyncRun on completion or failure
-    6. Return structured JSON for all outcomes — never 502
+    1. Validate org_id (X-OPSYN-ORG header) and brand_id
+    2. Validate brand belongs to org
+    3. Load credentials from DB by brand_id (no env vars)
+    4. Validate credential.brand_id matches request brand_id
+    5. Create SyncRun record (own transaction, committed immediately)
+    6. Fetch all orders from LeafLink API (no DB transaction)
+    7. Open ONE transaction for upsert phase (writes org_id + brand_id)
+    8. Update SyncRun on completion or failure
+    9. Return structured JSON for all outcomes — never 502
 
     Request body:
         { "brand_id": "..." }
 
     Success response:
-        { "ok": true, "brand_id": "...", "sync_run_id": N,
+        { "ok": true, "brand_id": "...", "org_id": "...", "sync_run_id": N,
           "fetched_count": 120, "created_count": 10, "updated_count": 110,
           "skipped_count": 0, "error_count": 0, "duration_seconds": 12.4 }
 
     Failure response:
-        { "ok": false, "stage": "...", "brand_id": "...",
+        { "ok": false, "stage": "...", "brand_id": "...", "org_id": "...",
           "sync_run_id": N, "error": "...", "error_count": 1, "errors": [...] }
     """
     import time as _time
     from services.leaflink_client import LeafLinkClient
     from services.leaflink_sync import sync_leaflink_orders
+    from services.organization_service import lookup_organization
     from services.sync_run_manager import create_sync_run, mark_completed, mark_failed
+    from models.auth_models import Brand
+    from sqlalchemy import and_
 
     sync_wall_start = _time.monotonic()
     brand_id: Optional[str] = None
+    org_id: Optional[str] = None
     sync_run_id: Optional[int] = None
 
     try:
         # ------------------------------------------------------------------ #
-        # Stage 0: Validate request body                                      #
+        # Stage 0: Validate org_id from X-OPSYN-ORG header                   #
+        # ------------------------------------------------------------------ #
+        _raw_org = x_opsyn_org or request.headers.get("x-opsyn-org") or request.headers.get("x-org-id")
+        if not _raw_org:
+            logger.warning("[Sync] missing_org_id")
+            return make_json_safe({
+                "ok": False,
+                "stage": "validation",
+                "error": "X-OPSYN-ORG header is required",
+                "brand_id": None,
+                "org_id": None,
+                "sync_run_id": None,
+            })
+
+        # Resolve org (supports UUID or org_code)
+        org_lookup = await lookup_organization(db, _raw_org)
+        if not org_lookup.get("ok"):
+            logger.warning("[Sync] org_lookup_failed org=%s error=%s", _raw_org, org_lookup.get("error"))
+            return make_json_safe({
+                "ok": False,
+                "stage": "validation",
+                "error": org_lookup.get("error"),
+                "brand_id": None,
+                "org_id": _raw_org,
+                "sync_run_id": None,
+            })
+
+        resolved_org = org_lookup.get("organization")
+        org_id = str(resolved_org.id)
+
+        # ------------------------------------------------------------------ #
+        # Stage 0b: Validate brand_id from request body                      #
         # ------------------------------------------------------------------ #
         brand_id = (body.get("brand_id") or "").strip() if isinstance(body, dict) else ""
         if not brand_id:
-            logger.warning("[Sync] missing_brand_id")
+            logger.warning("[Sync] missing_brand_id org_id=%s", org_id)
             return make_json_safe({
                 "ok": False,
                 "stage": "validation",
                 "error": "brand_id is required in request body",
                 "brand_id": None,
+                "org_id": org_id,
                 "sync_run_id": None,
             })
 
-        logger.info("[Sync] start brand_id=%s", brand_id)
+        logger.info("[Sync] start org_id=%s brand_id=%s credential_source=db", org_id, brand_id)
 
         # ------------------------------------------------------------------ #
-        # Stage 1: Load credentials (no DB transaction)                       #
+        # Stage 0c: Validate brand belongs to org                            #
+        # ------------------------------------------------------------------ #
+        brand_result = await db.execute(
+            select(Brand).where(
+                and_(Brand.id == brand_id, Brand.org_id == org_id)
+            )
+        )
+        brand_obj = brand_result.scalar_one_or_none()
+        if not brand_obj:
+            logger.warning("[Sync] brand_not_found_or_wrong_org brand_id=%s org_id=%s", brand_id, org_id)
+            return make_json_safe({
+                "ok": False,
+                "stage": "validation",
+                "error": "Brand not found or does not belong to organization",
+                "brand_id": brand_id,
+                "org_id": org_id,
+                "sync_run_id": None,
+            })
+
+        logger.info("[Sync] brand_validated org_id=%s brand_id=%s", org_id, brand_id)
+
+        # ------------------------------------------------------------------ #
+        # Stage 1: Load credentials from DB by brand_id (no env vars)        #
         # ------------------------------------------------------------------ #
         try:
             cred = await resolve_leaflink_credential(db, brand_id=brand_id, allow_env_fallback=False)
         except ValueError as val_exc:
-            logger.error("[Sync] credential_validation_error brand_id=%s error=%s", brand_id, val_exc)
+            logger.error("[Sync] credential_validation_error brand_id=%s org_id=%s error=%s", brand_id, org_id, val_exc)
             return make_json_safe({
                 "ok": False,
                 "stage": "credential_lookup",
                 "brand_id": brand_id,
+                "org_id": org_id,
                 "sync_run_id": None,
                 "error": str(val_exc)[:300],
                 "error_count": 1,
                 "errors": [str(val_exc)[:300]],
             })
         except Exception as cred_exc:
-            logger.error("[Sync] credential_lookup_error brand_id=%s error=%s", brand_id, cred_exc, exc_info=True)
+            logger.error("[Sync] credential_lookup_error brand_id=%s org_id=%s error=%s", brand_id, org_id, cred_exc, exc_info=True)
             return make_json_safe({
                 "ok": False,
                 "stage": "credential_lookup",
                 "brand_id": brand_id,
+                "org_id": org_id,
                 "sync_run_id": None,
                 "error": f"Credential lookup failed: {str(cred_exc)[:200]}",
                 "error_count": 1,
@@ -2661,28 +2738,56 @@ async def sync_orders_leaflink(
             })
 
         if not cred:
-            logger.warning("[Sync] no_credentials brand_id=%s", brand_id)
+            logger.warning("[Sync] no_credentials brand_id=%s org_id=%s", brand_id, org_id)
             return make_json_safe({
                 "ok": False,
                 "stage": "credential_lookup",
                 "brand_id": brand_id,
+                "org_id": org_id,
                 "sync_run_id": None,
-                "error": f"No active LeafLink credentials found for brand {brand_id}",
+                "error": "LeafLink credentials missing for this brand",
                 "error_count": 1,
-                "errors": [f"No active LeafLink credentials found for brand {brand_id}"],
+                "errors": ["LeafLink credentials missing for this brand"],
             })
 
-        # Log safe credential metadata — never log the actual api_key
+        # ------------------------------------------------------------------ #
+        # Stage 1b: Validate credential.brand_id matches request brand_id    #
+        # (prevents cross-tenant credential access)                           #
+        # ------------------------------------------------------------------ #
+        _cred_brand_id = (cred.brand_id or "").strip()
+        if _cred_brand_id.lower() != brand_id.lower():
+            logger.error(
+                "[Sync] credential_brand_mismatch requested_brand=%s credential_brand=%s org_id=%s",
+                brand_id, _cred_brand_id, org_id,
+            )
+            return make_json_safe({
+                "ok": False,
+                "stage": "credential_lookup",
+                "brand_id": brand_id,
+                "org_id": org_id,
+                "sync_run_id": None,
+                "error": "Credential brand_id does not match requested brand_id",
+                "error_count": 1,
+                "errors": ["Credential brand_id does not match requested brand_id"],
+            })
+
+        # Log safe credential metadata — NEVER log the actual api_key value
         _api_key_val = (cred.api_key or "").strip()
         _auth_scheme = (cred.auth_scheme or "Token").strip()
-        _base_url = (cred.base_url or "").strip() or "default"
+        _base_url = (cred.base_url or "").strip()
+        _company_id = (cred.company_id or "").strip()
+        _final_url = f"{_base_url}/companies/{_company_id}/orders-received/" if _base_url and _company_id else "unknown"
         logger.info(
-            "[Sync] credentials_loaded source=db auth_scheme=%s api_key_present=%s api_key_len=%s base_url=%s",
+            "[Sync] credentials_loaded source=db org_id=%s brand_id=%s company_id=%s "
+            "base_url=%s auth_scheme=%s api_key_present=%s",
+            org_id,
+            brand_id,
+            _company_id,
+            _base_url,
             _auth_scheme,
             bool(_api_key_val),
-            len(_api_key_val),
-            _base_url,
         )
+        logger.info("[Sync] leaflink_fetch_start final_url=%s", _final_url)
 
         # ------------------------------------------------------------------ #
         # Stage 2: Create SyncRun (own transaction, committed immediately)    #
@@ -2692,13 +2797,13 @@ async def sync_orders_leaflink(
                 async with _run_db.begin():
                     _run = await create_sync_run(_run_db, brand_id, mode="full")
                     sync_run_id = _run.id
-            logger.info("[Sync] sync_run_created run_id=%s brand_id=%s", sync_run_id, brand_id)
+            logger.info("[Sync] sync_run_created run_id=%s brand_id=%s org_id=%s", sync_run_id, brand_id, org_id)
         except ValueError as dup_exc:
             # Active run already exists — not a fatal error, proceed without a new run
-            logger.warning("[Sync] sync_run_already_active brand_id=%s detail=%s", brand_id, dup_exc)
+            logger.warning("[Sync] sync_run_already_active brand_id=%s org_id=%s detail=%s", brand_id, org_id, dup_exc)
             sync_run_id = None
         except Exception as run_exc:
-            logger.error("[Sync] sync_run_create_error brand_id=%s error=%s", brand_id, run_exc, exc_info=True)
+            logger.error("[Sync] sync_run_create_error brand_id=%s org_id=%s error=%s", brand_id, org_id, run_exc, exc_info=True)
             sync_run_id = None  # Non-fatal — continue without tracking
 
         # ------------------------------------------------------------------ #
@@ -2714,7 +2819,7 @@ async def sync_orders_leaflink(
             )
         except ValueError as val_exc:
             err_msg = str(val_exc)[:300]
-            logger.error("[Sync] client_init_validation_error brand_id=%s error=%s", brand_id, err_msg)
+            logger.error("[Sync] client_init_validation_error brand_id=%s org_id=%s error=%s", brand_id, org_id, err_msg)
             if sync_run_id:
                 try:
                     async with AsyncSessionLocal() as _fail_db:
@@ -2726,6 +2831,7 @@ async def sync_orders_leaflink(
                 "ok": False,
                 "stage": "validation",
                 "brand_id": brand_id,
+                "org_id": org_id,
                 "sync_run_id": sync_run_id,
                 "error": f"Invalid LeafLink credentials: {err_msg}",
                 "error_count": 1,
@@ -2733,7 +2839,7 @@ async def sync_orders_leaflink(
             })
         except Exception as client_exc:
             err_msg = str(client_exc)[:300]
-            logger.error("[Sync] client_init_error brand_id=%s error=%s", brand_id, err_msg, exc_info=True)
+            logger.error("[Sync] client_init_error brand_id=%s org_id=%s error=%s", brand_id, org_id, err_msg, exc_info=True)
             if sync_run_id:
                 try:
                     async with AsyncSessionLocal() as _fail_db:
@@ -2745,6 +2851,7 @@ async def sync_orders_leaflink(
                 "ok": False,
                 "stage": "validation",
                 "brand_id": brand_id,
+                "org_id": org_id,
                 "sync_run_id": sync_run_id,
                 "error": f"Failed to initialize LeafLink client: {err_msg}",
                 "error_count": 1,
@@ -2754,8 +2861,8 @@ async def sync_orders_leaflink(
         # ------------------------------------------------------------------ #
         # Stage 4: Fetch orders from LeafLink (NO DB transaction open)        #
         # ------------------------------------------------------------------ #
-        _fetch_url = f"{client.base_url}/orders-received/"
-        logger.info("[Sync] leaflink_fetch_start url=%s brand_id=%s", _fetch_url, brand_id)
+        _fetch_url = f"{client.base_url}/companies/{client.company_id}/orders-received/"
+        logger.info("[Sync] leaflink_fetch_start url=%s brand_id=%s org_id=%s", _fetch_url, brand_id, org_id)
 
         try:
             loop = asyncio.get_event_loop()
@@ -2813,28 +2920,30 @@ async def sync_orders_leaflink(
 
         # ------------------------------------------------------------------ #
         # Stage 5: Open ONE transaction for upsert phase                      #
+        # Orders are written with org_id + brand_id for tenant isolation.     #
         # ------------------------------------------------------------------ #
-        logger.info("[Sync] db_transaction_start brand_id=%s order_count=%s", brand_id, len(orders))
+        logger.info("[Sync] db_transaction_start brand_id=%s org_id=%s order_count=%s", brand_id, org_id, len(orders))
 
         try:
             async with AsyncSessionLocal() as _upsert_db:
                 async with _upsert_db.begin():
                     sync_result = await sync_leaflink_orders(
-                        _upsert_db, brand_id, orders, pages_fetched=pages_fetched
+                        _upsert_db, brand_id, orders, pages_fetched=pages_fetched, org_id=org_id
                     )
             # Transaction committed automatically on context manager exit
             logger.info(
-                "[Sync] upsert_complete created=%s updated=%s skipped=%s errors=%s brand_id=%s",
+                "[Sync] upsert_complete created=%s updated=%s skipped=%s errors=%s brand_id=%s org_id=%s",
                 sync_result.get("created", 0),
                 sync_result.get("updated", 0),
                 sync_result.get("skipped", 0),
                 sync_result.get("error_count", 0),
                 brand_id,
+                org_id,
             )
-            logger.info("[Sync] db_transaction_commit brand_id=%s", brand_id)
+            logger.info("[Sync] db_transaction_commit brand_id=%s org_id=%s", brand_id, org_id)
         except Exception as upsert_exc:
             err_msg = str(upsert_exc)[:300]
-            logger.error("[Sync] db_upsert_error brand_id=%s error=%s", brand_id, err_msg, exc_info=True)
+            logger.error("[Sync] db_upsert_error brand_id=%s org_id=%s error=%s", brand_id, org_id, err_msg, exc_info=True)
             if sync_run_id:
                 try:
                     async with AsyncSessionLocal() as _fail_db:
@@ -2846,6 +2955,7 @@ async def sync_orders_leaflink(
                 "ok": False,
                 "stage": "db_upsert",
                 "brand_id": brand_id,
+                "org_id": org_id,
                 "sync_run_id": sync_run_id,
                 "error": f"Database upsert failed: {err_msg}",
                 "error_count": 1,
@@ -2876,14 +2986,15 @@ async def sync_orders_leaflink(
         ok = sync_result.get("ok", True)
 
         logger.info(
-            "[Sync] complete brand_id=%s run_id=%s fetched=%s created=%s updated=%s skipped=%s errors=%s duration_seconds=%s",
-            brand_id, sync_run_id, fetched_count, created_count, updated_count,
+            "[Sync] complete org_id=%s brand_id=%s run_id=%s fetched=%s created=%s updated=%s skipped=%s errors=%s duration_seconds=%s",
+            org_id, brand_id, sync_run_id, fetched_count, created_count, updated_count,
             skipped_count, error_count, duration,
         )
 
         if ok:
             return make_json_safe({
                 "ok": True,
+                "org_id": org_id,
                 "brand_id": brand_id,
                 "sync_run_id": sync_run_id,
                 "fetched_count": fetched_count,
@@ -2909,6 +3020,7 @@ async def sync_orders_leaflink(
             return make_json_safe({
                 "ok": False,
                 "stage": "db_upsert",
+                "org_id": org_id,
                 "brand_id": brand_id,
                 "sync_run_id": sync_run_id,
                 "fetched_count": fetched_count,
@@ -2926,8 +3038,8 @@ async def sync_orders_leaflink(
         duration = round(_time.monotonic() - sync_wall_start, 2)
         err_msg = str(outer_exc)[:300]
         logger.error(
-            "[Sync] unexpected_error brand_id=%s run_id=%s error=%s duration=%s",
-            brand_id, sync_run_id, err_msg, duration, exc_info=True,
+            "[Sync] unexpected_error org_id=%s brand_id=%s run_id=%s error=%s duration=%s",
+            org_id, brand_id, sync_run_id, err_msg, duration, exc_info=True,
         )
         if sync_run_id:
             try:
@@ -2939,6 +3051,7 @@ async def sync_orders_leaflink(
         return make_json_safe({
             "ok": False,
             "stage": "unknown",
+            "org_id": org_id,
             "brand_id": brand_id,
             "sync_run_id": sync_run_id,
             "error": f"Unexpected error: {err_msg}",

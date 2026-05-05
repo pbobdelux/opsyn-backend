@@ -74,9 +74,11 @@ class Order(Base):
         UniqueConstraint("brand_id", "external_order_id", name="uq_brand_external_order"),
         Index("ix_orders_brand_id", "brand_id"),
         Index("ix_orders_order_number", "order_number"),
+        Index("ix_orders_org_id", "org_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    org_id: Mapped[str | None] = mapped_column(String(120), index=True, nullable=True)
     brand_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
     external_order_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
 
