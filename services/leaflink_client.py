@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 import requests
 
-AuthScheme = Literal["Bearer", "Token", "Raw"]
+AuthScheme = Literal["Bearer", "Token", "App", "Raw"]
 
 logger = logging.getLogger("leaflink_client")
 
@@ -137,24 +137,27 @@ class LeafLinkClient:
 
         # Determine auth scheme
         if auth_scheme:
-            self.auth_scheme: str = auth_scheme
+            if auth_scheme.lower() in ("bearer", "token", "app", "raw"):
+                self.auth_scheme: str = auth_scheme.capitalize() if auth_scheme.lower() != "raw" else "Raw"
+            else:
+                raise ValueError(f"Invalid auth_scheme: {auth_scheme}")
             logger.info(
                 "[LeafLinkAuth] using_explicit_scheme scheme=%s",
-                auth_scheme,
+                self.auth_scheme,
             )
         else:
-            env_scheme = os.getenv("LEAFLINK_AUTH_SCHEME", "auto").lower()
-            if env_scheme in ("bearer", "token", "raw"):
+            env_scheme = os.getenv("LEAFLINK_AUTH_SCHEME", "token").lower()
+            if env_scheme in ("bearer", "token", "app", "raw"):
                 self.auth_scheme = env_scheme.capitalize() if env_scheme != "raw" else "Raw"
                 logger.info(
                     "[LeafLinkAuth] using_env_scheme scheme=%s",
                     self.auth_scheme,
                 )
             else:
-                # Default to Bearer (most common for modern APIs)
-                self.auth_scheme = "Bearer"
+                # Default to Token
+                self.auth_scheme = "Token"
                 logger.info(
-                    "[LeafLinkAuth] using_default_scheme scheme=Bearer",
+                    "[LeafLinkAuth] using_default_scheme scheme=Token",
                 )
 
         self.session = requests.Session()
@@ -176,6 +179,12 @@ class LeafLinkClient:
     def _get_auth_header(self) -> dict:
         """Build Authorization header based on configured scheme.
 
+        Supported schemes:
+        - Bearer: Authorization: Bearer <api_key>
+        - Token: Authorization: Token <api_key>
+        - App: Authorization: App <api_key> (LeafLink v2)
+        - Raw: Authorization: <api_key>
+
         Always returns a valid dict with Authorization key.
         """
         if not self.api_key:
@@ -189,6 +198,10 @@ class LeafLinkClient:
         elif self.auth_scheme == "Token":
             auth_header = f"Token {self.api_key}"
             logger.info("[LeafLinkAuth] building_header scheme=Token api_key_present=true")
+            return {"Authorization": auth_header}
+        elif self.auth_scheme == "App":
+            auth_header = f"App {self.api_key}"
+            logger.info("[LeafLinkAuth] building_header scheme=App api_key_present=true")
             return {"Authorization": auth_header}
         elif self.auth_scheme == "Raw":
             logger.info("[LeafLinkAuth] building_header scheme=Raw api_key_present=true")
