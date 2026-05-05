@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Optional
+from uuid import UUID
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,6 +56,21 @@ def safe_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text if text else None
+
+
+def safe_uuid(value: str | None) -> str | None:
+    """Cast string to UUID and back to ensure DB compatibility.
+
+    Validates that the value is a well-formed UUID and returns it in canonical
+    lowercase hyphenated form.  If the value is not a valid UUID it is returned
+    as-is so that non-UUID brand/org identifiers still work.
+    """
+    if not value:
+        return None
+    try:
+        return str(UUID(value))
+    except (ValueError, TypeError):
+        return value  # Return as-is if not a valid UUID
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -416,6 +432,11 @@ async def sync_leaflink_orders_headers_only(
     """
     sync_start = time.monotonic()
 
+    # Cast brand_id and org_id to canonical UUID form so that PostgreSQL UUID
+    # columns never receive a plain character-varying expression.
+    brand_id_value = safe_uuid(brand_id)
+    org_id_value = safe_uuid(org_id) if org_id else None
+
     total_created = 0
     total_updated = 0
     total_skipped = 0
@@ -429,9 +450,10 @@ async def sync_leaflink_orders_headers_only(
         for i in range(0, len(orders), batch_size)
     ]
 
+    logger.info("[ORDER_SAVE_START] fetched=%s brand=%s", len(orders), brand_id_value)
     logger.info(
         "[OrdersSync] sync_start brand=%s total_orders=%s batch_size=%s total_batches=%s",
-        brand_id,
+        brand_id_value,
         len(orders),
         batch_size,
         len(batches),
@@ -518,7 +540,7 @@ async def sync_leaflink_orders_headers_only(
 
                         existing_result = await db.execute(
                             select(Order).where(
-                                Order.brand_id == brand_id,
+                                Order.brand_id == brand_id_value,
                                 Order.external_order_id == external_id,
                             )
                         )
@@ -541,14 +563,14 @@ async def sync_leaflink_orders_headers_only(
                             existing.external_created_at = external_created_at
                             existing.external_updated_at = external_updated_at
                             # Backfill org_id on existing rows when available
-                            if org_id:
-                                existing.org_id = org_id
+                            if org_id_value:
+                                existing.org_id = org_id_value
                             batch_updated += 1
                         else:
                             db.add(
                                 Order(
-                                    org_id=org_id,
-                                    brand_id=brand_id,
+                                    org_id=org_id_value,
+                                    brand_id=brand_id_value,
                                     external_order_id=external_id,
                                     order_number=order_number,
                                     customer_name=customer_name,
@@ -573,17 +595,29 @@ async def sync_leaflink_orders_headers_only(
             # Batch committed successfully (async with db.begin() exited cleanly)
             batch_duration = round(time.monotonic() - batch_start, 2)
             logger.info(
+                "[ORDER_NORMALIZED] normalized=%s batch=%s/%s",
+                batch_created + batch_updated,
+                batch_num,
+                len(batches),
+            )
+            logger.info(
+                "[ORDER_SAVE_RESULT] inserted=%s updated=%s batch=%s/%s",
+                batch_created,
+                batch_updated,
+                batch_num,
+                len(batches),
+            )
+            logger.info("[ORDER_SAVE_COMMIT] true batch=%s/%s", batch_num, len(batches))
+            logger.info(
                 "[OrdersSync] batch_committed batch=%s/%s brand=%s created=%s updated=%s skipped=%s duration=%ss",
                 batch_num,
                 len(batches),
-                brand_id,
+                brand_id_value,
                 batch_created,
                 batch_updated,
                 batch_skipped,
                 batch_duration,
             )
-            logger.info("[ORDER_SAVE] inserted=%s", batch_created)
-            logger.info("[ORDER_SAVE] updated=%s", batch_updated)
             total_created += batch_created
             total_updated += batch_updated
             total_skipped += batch_skipped
@@ -595,7 +629,7 @@ async def sync_leaflink_orders_headers_only(
                 "[OrdersSync] batch_failed batch=%s/%s brand=%s batch_size=%s error=%s duration=%ss",
                 batch_num,
                 len(batches),
-                brand_id,
+                brand_id_value,
                 current_batch_size,
                 err_msg,
                 batch_duration,
@@ -609,11 +643,15 @@ async def sync_leaflink_orders_headers_only(
 
     # Emit critical alert if we fetched orders but saved none at all
     if fetched_count > 0 and total_created == 0 and total_updated == 0:
-        logger.critical("[CRITICAL] orders_not_saved brand=%s fetched=%s", brand_id, fetched_count)
+        logger.critical(
+            "[CRITICAL] orders_not_saved fetched=%s brand=%s",
+            fetched_count,
+            brand_id_value,
+        )
 
     logger.info(
         "[OrdersSync] all_batches_complete brand=%s total_batches=%s total_created=%s total_updated=%s total_skipped=%s sync_duration=%ss",
-        brand_id,
+        brand_id_value,
         len(batches),
         total_created,
         total_updated,
@@ -628,7 +666,7 @@ async def sync_leaflink_orders_headers_only(
     # it by (brand_id, external_order_id).
     # ------------------------------------------------------------------
     async def _background_line_items() -> None:
-        await sync_leaflink_line_items(brand_id, orders, org_id=org_id)
+        await sync_leaflink_line_items(brand_id_value, orders, org_id=org_id_value)
 
     asyncio.create_task(_background_line_items())
 
@@ -658,18 +696,68 @@ async def sync_leaflink_line_items(
     For each order this function:
       1. Resolves the external_id using the same priority as the header sync
          (order["id"] → "external_id" → "external_order_id").
-      2. Looks up the committed Order row in the DB by (brand_id, external_order_id).
-      3. If the row is NOT found, logs [LINE_ITEM_SKIP] and skips — the order
+      2. Checks that at least one committed Order row exists for this brand
+         before processing any line items (safety guard).
+      3. Looks up the committed Order row in the DB by (brand_id, external_order_id).
+      4. If the row is NOT found, logs [LINE_ITEM_SKIP] and skips — the order
          was never committed, so inserting line items would violate the FK.
-      4. If found, reads line_items_json from the DB row (authoritative source),
+      5. If found, reads line_items_json from the DB row (authoritative source),
          deletes stale OrderLine rows, and inserts fresh ones.
-      5. Logs [LINE_ITEM_SAVE] with the count of inserted rows.
+      6. Logs [LINE_ITEM_SAVE] with the count of inserted rows.
 
     Runs in its own session per order so a single failure never aborts the rest.
     """
+    from sqlalchemy import func
+
     bg_start = time.monotonic()
     total_lines_written = 0
     errors: list[str] = []
+
+    # Cast brand_id to canonical UUID form to match what was written in Phase 1.
+    brand_id_value = safe_uuid(brand_id)
+    org_id_value = safe_uuid(org_id) if org_id else None
+
+    # ------------------------------------------------------------------
+    # Safety guard: verify that parent Order rows exist before processing
+    # any line items.  If Phase 1 failed to commit orders (e.g. due to a
+    # UUID type error) we must not attempt FK-dependent inserts.
+    # ------------------------------------------------------------------
+    logger.info("[LINE_ITEM_SAFETY_CHECK] brand=%s checking_parent_orders", brand_id_value)
+    try:
+        async with AsyncSessionLocal() as _check_db:
+            async with _check_db.begin():
+                count_result = await _check_db.execute(
+                    select(func.count()).select_from(Order).where(
+                        Order.brand_id == brand_id_value,
+                        Order.source == "leaflink",
+                    )
+                )
+                order_count = count_result.scalar_one()
+    except Exception as check_exc:
+        logger.error(
+            "[LINE_ITEM_SAFETY_CHECK] count_error brand=%s error=%s",
+            brand_id_value,
+            check_exc,
+            exc_info=True,
+        )
+        order_count = 0
+
+    logger.info(
+        "[LINE_ITEM_SAFETY_CHECK_RESULT] count=%s brand=%s",
+        order_count,
+        brand_id_value,
+    )
+    if order_count == 0:
+        logger.warning(
+            "[LINE_ITEM_BLOCKED] reason=no_parent_orders brand=%s",
+            brand_id_value,
+        )
+        return {
+            "ok": True,
+            "lines_written": 0,
+            "errors": [],
+            "duration_seconds": round(time.monotonic() - bg_start, 2),
+        }
 
     for o in orders:
         if not isinstance(o, dict):
@@ -686,7 +774,7 @@ async def sync_leaflink_line_items(
                 async with db.begin():
                     result = await db.execute(
                         select(Order).where(
-                            Order.brand_id == brand_id,
+                            Order.brand_id == brand_id_value,
                             Order.external_order_id == external_id,
                         )
                     )
@@ -697,7 +785,7 @@ async def sync_leaflink_line_items(
                         logger.warning(
                             "[LINE_ITEM_SKIP] reason=order_not_found external_id=%s brand=%s",
                             external_id,
-                            brand_id,
+                            brand_id_value,
                         )
                         continue
 
@@ -746,7 +834,7 @@ async def sync_leaflink_line_items(
             err_msg = str(line_exc)
             logger.error(
                 "[OrdersSync] line_items_error brand=%s external_id=%s error=%s",
-                brand_id,
+                brand_id_value,
                 external_id,
                 err_msg,
                 exc_info=True,
@@ -756,7 +844,7 @@ async def sync_leaflink_line_items(
     bg_duration = round(time.monotonic() - bg_start, 2)
     logger.info(
         "[OrdersSync] line_items_complete brand=%s lines_written=%s duration=%ss errors=%s",
-        brand_id,
+        brand_id_value,
         total_lines_written,
         bg_duration,
         len(errors),
