@@ -105,14 +105,14 @@ class LeafLinkClient:
             )
             self.api_key = self.api_key[6:].strip()
 
+        # company_id is stored in DB for metadata/tenant resolution only.
+        # It is NOT used in the API path — the correct endpoint is /orders-received/
+        # without any company scoping in the URL.
         self.company_id = str(company_id or "").strip()
 
         if not self.api_key:
             logger.warning("leaflink: client_init brand=%s missing api_key", self.brand_id)
             raise ValueError("Missing api_key — LeafLink credentials must be provided per brand (not from env vars)")
-        if not self.company_id:
-            logger.warning("leaflink: client_init brand=%s missing company_id", self.brand_id)
-            raise ValueError("Missing LEAFLINK_COMPANY_ID")
 
         # CRITICAL: Validate API key length
         if len(self.api_key) > 50:
@@ -431,29 +431,30 @@ class LeafLinkClient:
 
     def list_orders(
         self,
-        page: int = 1,
-        page_size: int = 100,
+        limit: int = 100,
+        offset: int = 0,
+        modified__gte: Optional[str] = None,
         status: Optional[str] = None,
     ) -> Any:
+        # Correct endpoint: /orders-received/ (no company_id in path).
+        # company_id is stored in DB for metadata only — NOT used in the API path.
+        # Auth: Authorization: Token <api_key> (auth_scheme from DB credential).
+        _orders_path = "orders-received/"
+
         params: Dict[str, Any] = {
-            "page": page,
-            "page_size": page_size,
-            "include_children": "line_items,customer,sales_reps",
+            "limit": limit,
+            "offset": offset,
         }
+        if modified__gte:
+            params["modified__gte"] = modified__gte
         if status:
             params["status"] = status
 
-        # Build URL using /companies/{company_id}/orders-received/ for tenant isolation.
-        # All credentials come from DB — no env var fallback.
-        _orders_path = f"companies/{self.company_id}/orders-received/"
         _param_str = "&".join(f"{k}={v}" for k, v in params.items())
-        _final_url = f"{self.base_url}/{_orders_path}?{_param_str}"
-        logger.info(
-            "[LeafLink] final_url=%s company_id=%s brand=%s",
-            _final_url,
-            self.company_id,
-            self.brand_id,
-        )
+        final_url = f"{self.base_url}/{_orders_path}?{_param_str}"
+
+        logger.info("[LeafLink] final_url=%s", final_url)
+        logger.info("[LeafLink] auth_scheme=%s", self.auth_scheme)
 
         try:
             resp = self._get_raw(_orders_path, params=params)
@@ -465,10 +466,17 @@ class LeafLinkClient:
             )
             raise
 
+        logger.info("[LeafLink] response_status=%s", resp.status_code)
+
         content_type = resp.headers.get("Content-Type", "")
 
         if resp.ok and "application/json" in content_type.lower():
             data = resp.json()
+            count = data.get("count") if isinstance(data, dict) else None
+            results = data.get("results") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            results_count = len(results) if isinstance(results, list) else 0
+            logger.info("[LeafLink] count=%s", count)
+            logger.info("[LeafLink] results_count=%s", results_count)
             return data
 
         if resp.status_code in (401, 403):
@@ -746,7 +754,10 @@ class LeafLinkClient:
                         )
                     payload = resp.json()
                 else:
-                    payload = self.list_orders(page=current_page, page_size=page_size)
+                    # Use limit/offset pagination — offset is derived from the logical
+                    # page number so that resume_url and fresh-start paths are consistent.
+                    _offset = (current_page - 1) * page_size
+                    payload = self.list_orders(limit=page_size, offset=_offset)
 
                 if isinstance(payload, list):
                     results = payload
@@ -827,8 +838,14 @@ class LeafLinkClient:
         max_pages: Optional[int] = None,
         normalize: bool = False,
         brand: str = "unknown",
+        limit: int = 100,
+        modified__gte: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Fetch all orders from LeafLink, paginating until no ``next`` URL is returned.
+        """Fetch all orders from LeafLink using limit/offset pagination.
+
+        Uses the correct endpoint: /orders-received/ (no company_id in path).
+        Paginates via limit/offset until no ``next`` URL is returned by the API
+        or ``max_pages`` is reached.
 
         Args:
             max_pages: Maximum number of pages to fetch. ``None`` (default) means
@@ -836,6 +853,9 @@ class LeafLinkClient:
                 Pass an integer to cap the number of pages (e.g. for testing).
             normalize: When ``True``, run each raw order through ``_normalize_order``.
             brand: Brand slug used only for structured log messages.
+            limit: Number of orders per page (default 100).
+            modified__gte: Optional ISO datetime string to filter orders modified
+                after this timestamp (e.g. for incremental sync).
 
         Returns:
             A dict with keys:
@@ -848,22 +868,22 @@ class LeafLinkClient:
         pages_fetched = 0
 
         try:
-            page = 1
+            offset = 0
             next_url: Optional[str] = None
 
-            while page <= effective_max:
-                pages_fetched += 1
-
+            while pages_fetched < effective_max:
                 if next_url:
-                    # Use the full ``next`` URL returned by LeafLink directly.
+                    # Follow the ``next`` URL returned by LeafLink directly.
                     # _get_raw_url() explicitly attaches the Authorization header so
                     # that pagination requests are authenticated the same way as page 1.
                     logger.info("[LeafLink] final_url=%s", next_url)
+                    logger.info("[LeafLink] auth_scheme=%s", self.auth_scheme)
                     resp = self._get_raw_url(next_url)
+                    logger.info("[LeafLink] response_status=%s", resp.status_code)
                     if resp.status_code in (401, 403):
                         logger.error(
-                            "[LeafLinkAuth] pagination_auth_failed page=%s status=%s body=%s",
-                            page,
+                            "[LeafLinkAuth] pagination_auth_failed offset=%s status=%s body=%s",
+                            offset,
                             resp.status_code,
                             resp.text[:200],
                         )
@@ -872,8 +892,8 @@ class LeafLinkClient:
                         )
                     if not resp.ok:
                         logger.error(
-                            "[LeafLinkSync] page=%s http_error status=%s body=%s",
-                            page,
+                            "[LeafLinkSync] offset=%s http_error status=%s body=%s",
+                            offset,
                             resp.status_code,
                             resp.text[:500],
                         )
@@ -882,7 +902,12 @@ class LeafLinkClient:
                         )
                     payload = resp.json()
                 else:
-                    payload = self.list_orders(page=page, page_size=100)
+                    # First page or explicit offset-based fetch
+                    payload = self.list_orders(
+                        limit=limit,
+                        offset=offset,
+                        modified__gte=modified__gte,
+                    )
 
                 if isinstance(payload, list):
                     results = payload
@@ -895,6 +920,8 @@ class LeafLinkClient:
                         or []
                     )
                     next_url = payload.get("next")
+                    count = payload.get("count")
+                    logger.info("[LeafLink] count=%s", count)
                 else:
                     raise RuntimeError(f"Unexpected LeafLink response type: {type(payload).__name__}")
 
@@ -902,11 +929,13 @@ class LeafLinkClient:
                     raise RuntimeError(f"Unexpected LeafLink results type: {type(results).__name__}")
 
                 logger.info(
-                    "[LeafLink] page_response status=200 orders_count=%s page=%s brand=%s",
+                    "[LeafLink] results_count=%s offset=%s brand=%s",
                     len(results),
-                    page,
+                    offset,
                     brand,
                 )
+
+                pages_fetched += 1
 
                 if not results:
                     break
@@ -923,7 +952,7 @@ class LeafLinkClient:
                 if not next_url:
                     break
 
-                page += 1
+                offset += limit
 
         except Exception as exc:
             logger.error(
