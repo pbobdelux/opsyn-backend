@@ -399,6 +399,7 @@ async def sync_leaflink_orders_headers_only(
     orders: list[dict],
     pages_fetched: int = 0,
     batch_size: int = HEADER_BATCH_SIZE,
+    org_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Upsert ONLY order headers (Order table) for Phase 1 — no line items.
 
@@ -407,8 +408,9 @@ async def sync_leaflink_orders_headers_only(
     Line item data is preserved in ``line_items_json`` on the Order row so the
     background worker can read it back without re-fetching from LeafLink.
 
-    After all header batches are committed a fire-and-forget asyncio task is
-    spawned to write the corresponding OrderLine rows in the background.
+    All header batches are committed BEFORE spawning the fire-and-forget asyncio
+    task that writes OrderLine rows, guaranteeing the parent Order rows exist in
+    the database when the background worker queries for them.
 
     Returns a summary dict compatible with the existing sync_result contract.
     """
@@ -419,6 +421,7 @@ async def sync_leaflink_orders_headers_only(
     total_skipped = 0
     errors: list[str] = []
     newest_order_date: datetime | None = None
+    fetched_count = len(orders)
 
     # Split orders into batches of batch_size
     batches = [
@@ -434,6 +437,12 @@ async def sync_leaflink_orders_headers_only(
         len(batches),
     )
 
+    # ------------------------------------------------------------------
+    # Phase 1: Upsert all order headers and commit each batch before
+    # spawning the line-item background task.  This guarantees that every
+    # Order row is visible to subsequent DB sessions when the background
+    # worker looks them up by (brand_id, external_order_id).
+    # ------------------------------------------------------------------
     for batch_num, batch in enumerate(batches, 1):
         batch_start = time.monotonic()
         current_batch_size = len(batch)
@@ -450,6 +459,7 @@ async def sync_leaflink_orders_headers_only(
                             continue
 
                         # Map external_order_id: use order["id"] as primary source
+                        # (LeafLink raw payloads carry the order PK in "id").
                         external_id = safe_str(o.get("id") or o.get("external_id") or o.get("external_order_id"))
                         if not external_id:
                             logger.error(
@@ -530,10 +540,14 @@ async def sync_leaflink_orders_headers_only(
                             existing.last_synced_at = now
                             existing.external_created_at = external_created_at
                             existing.external_updated_at = external_updated_at
+                            # Backfill org_id on existing rows when available
+                            if org_id:
+                                existing.org_id = org_id
                             batch_updated += 1
                         else:
                             db.add(
                                 Order(
+                                    org_id=org_id,
                                     brand_id=brand_id,
                                     external_order_id=external_id,
                                     order_number=order_number,
@@ -556,7 +570,7 @@ async def sync_leaflink_orders_headers_only(
                             )
                             batch_created += 1
 
-            # Batch committed successfully — log and accumulate totals
+            # Batch committed successfully (async with db.begin() exited cleanly)
             batch_duration = round(time.monotonic() - batch_start, 2)
             logger.info(
                 "[OrdersSync] batch_committed batch=%s/%s brand=%s created=%s updated=%s skipped=%s duration=%ss",
@@ -568,6 +582,8 @@ async def sync_leaflink_orders_headers_only(
                 batch_skipped,
                 batch_duration,
             )
+            logger.info("[ORDER_SAVE] inserted=%s", batch_created)
+            logger.info("[ORDER_SAVE] updated=%s", batch_updated)
             total_created += batch_created
             total_updated += batch_updated
             total_skipped += batch_skipped
@@ -590,6 +606,11 @@ async def sync_leaflink_orders_headers_only(
             continue
 
     sync_duration = round(time.monotonic() - sync_start, 2)
+
+    # Emit critical alert if we fetched orders but saved none at all
+    if fetched_count > 0 and total_created == 0 and total_updated == 0:
+        logger.critical("[CRITICAL] orders_not_saved brand=%s fetched=%s", brand_id, fetched_count)
+
     logger.info(
         "[OrdersSync] all_batches_complete brand=%s total_batches=%s total_created=%s total_updated=%s total_skipped=%s sync_duration=%ss",
         brand_id,
@@ -600,16 +621,20 @@ async def sync_leaflink_orders_headers_only(
         sync_duration,
     )
 
-    # Spawn a fire-and-forget background task to write OrderLine rows so the
-    # caller is not blocked waiting for line-item DB writes.
+    # ------------------------------------------------------------------
+    # Phase 2: All order header batches are now committed to the DB.
+    # Spawn the line-item background task AFTER the commit loop so that
+    # every Order row is guaranteed to exist when the worker queries for
+    # it by (brand_id, external_order_id).
+    # ------------------------------------------------------------------
     async def _background_line_items() -> None:
-        await sync_leaflink_line_items(brand_id, orders)
+        await sync_leaflink_line_items(brand_id, orders, org_id=org_id)
 
     asyncio.create_task(_background_line_items())
 
     return {
         "ok": len(errors) == 0,
-        "orders_fetched": len(orders),
+        "orders_fetched": fetched_count,
         "created": total_created,
         "updated": total_updated,
         "skipped": total_skipped,
@@ -626,12 +651,21 @@ async def sync_leaflink_orders_headers_only(
 async def sync_leaflink_line_items(
     brand_id: str,
     orders: list[dict],
+    org_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Write OrderLine rows for a list of pre-fetched orders (background Phase 2).
 
-    Reads the order IDs from the DB (by brand_id + external_order_id), then
-    deletes stale OrderLine rows and inserts fresh ones.  Runs in its own
-    session so it never blocks the HTTP response.
+    For each order this function:
+      1. Resolves the external_id using the same priority as the header sync
+         (order["id"] → "external_id" → "external_order_id").
+      2. Looks up the committed Order row in the DB by (brand_id, external_order_id).
+      3. If the row is NOT found, logs [LINE_ITEM_SKIP] and skips — the order
+         was never committed, so inserting line items would violate the FK.
+      4. If found, reads line_items_json from the DB row (authoritative source),
+         deletes stale OrderLine rows, and inserts fresh ones.
+      5. Logs [LINE_ITEM_SAVE] with the count of inserted rows.
+
+    Runs in its own session per order so a single failure never aborts the rest.
     """
     bg_start = time.monotonic()
     total_lines_written = 0
@@ -641,14 +675,10 @@ async def sync_leaflink_line_items(
         if not isinstance(o, dict):
             continue
 
-        external_id = safe_str(o.get("external_id"))
+        # Use the same external_id resolution as sync_leaflink_orders_headers_only
+        # so the DB lookup always matches the key that was written during Phase 1.
+        external_id = safe_str(o.get("id") or o.get("external_id") or o.get("external_order_id"))
         if not external_id:
-            continue
-
-        raw_line_items = o.get("line_items", [])
-        normalized_line_items = normalize_line_items(raw_line_items)
-
-        if not normalized_line_items:
             continue
 
         try:
@@ -661,14 +691,31 @@ async def sync_leaflink_line_items(
                         )
                     )
                     order_row = result.scalar_one_or_none()
+
                     if order_row is None:
+                        # Order was not committed — skip to avoid FK violation.
                         logger.warning(
-                            "[OrdersSync] line_items_order_not_found brand=%s external_id=%s",
-                            brand_id,
+                            "[LINE_ITEM_SKIP] reason=order_not_found external_id=%s brand=%s",
                             external_id,
+                            brand_id,
                         )
                         continue
 
+                    # Read line items from the DB row (written during Phase 1)
+                    # rather than from the raw in-memory dict, so we use the
+                    # already-normalised, JSON-safe representation.
+                    db_line_items = order_row.line_items_json
+                    if isinstance(db_line_items, list):
+                        normalized_line_items = db_line_items
+                    else:
+                        # Fallback: normalise from the raw order dict
+                        raw_line_items = o.get("line_items", [])
+                        normalized_line_items = normalize_line_items(raw_line_items)
+
+                    if not normalized_line_items:
+                        continue
+
+                    # Replace stale line items with the current set
                     await db.execute(
                         delete(OrderLine).where(OrderLine.order_id == order_row.id)
                     )
@@ -691,7 +738,9 @@ async def sync_leaflink_line_items(
                             )
                         )
 
-                    total_lines_written += len(normalized_line_items)
+                    inserted_count = len(normalized_line_items)
+                    total_lines_written += inserted_count
+                    logger.info("[LINE_ITEM_SAVE] inserted=%s external_id=%s", inserted_count, external_id)
 
         except Exception as line_exc:
             err_msg = str(line_exc)
