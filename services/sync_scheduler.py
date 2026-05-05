@@ -391,7 +391,7 @@ async def run_scheduler() -> None:
         logger.info("[SyncWorker] validating database connection")
         sys.stdout.flush()
 
-        from sqlalchemy import select
+        from sqlalchemy import select, func
         from database import AsyncSessionLocal
 
         async with AsyncSessionLocal() as test_db:
@@ -408,6 +408,37 @@ async def run_scheduler() -> None:
         )
         sys.stdout.flush()
         raise
+
+    # Log database identity for verification
+    try:
+        from sqlalchemy import select, func
+        from database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as identity_db:
+            result = await identity_db.execute(
+                select(
+                    func.current_database(),
+                    func.current_user(),
+                    func.inet_server_addr(),
+                    func.inet_server_port(),
+                )
+            )
+            row = result.tuple()
+            if row:
+                db_name, db_user, server_addr, server_port = row
+                logger.info(
+                    "[DB_IDENTITY] database=%s user=%s host=%s port=%s",
+                    db_name,
+                    db_user,
+                    server_addr,
+                    server_port,
+                )
+    except Exception as identity_exc:
+        logger.error(
+            "[DB_IDENTITY] failed to query database identity: %s",
+            identity_exc,
+            exc_info=True,
+        )
 
     # Main polling loop
     while True:
