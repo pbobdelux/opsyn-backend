@@ -776,3 +776,167 @@ async def leaflink_auth_test(
             "attempts": attempts,
             "error": "All auth schemes failed",
         }
+
+
+
+
+# ---------------------------------------------------------------------------
+# /leaflink/test-paths — probe multiple LeafLink API paths to find which works
+# ---------------------------------------------------------------------------
+
+_TEST_PATHS = [
+    "/api/v2/orders-received/",
+    "/api/v2/orders/",
+    "/api/v1/orders/",
+    "/api/v1/purchase-orders/",
+    "/api/v1/sales-orders/",
+]
+
+_LEAFLINK_HOST = "https://api.leaflink.com"
+
+
+@router.get("/test-paths")
+async def test_leaflink_paths(
+    brand: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Test multiple LeafLink endpoint paths with Token auth and return status
+    codes for each.  Use this to identify which path returns 200 for the
+    active API key so the sync endpoint can be updated accordingly.
+
+    GET /leaflink/test-paths
+    GET /leaflink/test-paths?brand=<brand_id>
+    """
+    logger.info("[LeafLinkTestPaths] request brand=%s", brand)
+
+    # ── Load credential (same logic as sync endpoint) ────────────────────────
+    try:
+        if brand:
+            query = (
+                select(BrandAPICredential)
+                .where(
+                    BrandAPICredential.integration_name == "leaflink",
+                    BrandAPICredential.is_active == True,
+                    BrandAPICredential.brand_id == brand,
+                )
+                .order_by(BrandAPICredential.last_sync_at.desc().nullslast())
+                .limit(1)
+            )
+        else:
+            query = (
+                select(BrandAPICredential)
+                .where(
+                    BrandAPICredential.integration_name == "leaflink",
+                    BrandAPICredential.is_active == True,
+                )
+                .order_by(BrandAPICredential.last_sync_at.desc().nullslast())
+                .limit(1)
+            )
+
+        cred_result = await db.execute(query)
+        cred = cred_result.scalar_one_or_none()
+    except Exception as cred_exc:
+        logger.error("[LeafLinkTestPaths] cred_lookup_failed error=%s", cred_exc)
+        return {"ok": False, "error": f"DB credential lookup failed: {cred_exc}"}
+
+    if cred is None:
+        logger.warning("[LeafLinkTestPaths] no_active_credentials brand=%s", brand)
+        return {
+            "ok": False,
+            "error": (
+                "No active LeafLink credentials found in database. "
+                "Use POST /integrations/leaflink/connect to add credentials."
+            ),
+        }
+
+    # Clean the API key (strip whitespace, remove any accidental "Token " prefix)
+    raw_api_key = cred.api_key or ""
+    api_key = raw_api_key.strip()
+    if api_key.startswith("Token "):
+        api_key = api_key[6:].strip()
+
+    brand_id = cred.brand_id
+    api_key_len = len(api_key)
+
+    logger.info(
+        "[LeafLinkTestPaths] credential_loaded brand_id=%s api_key_len=%s",
+        brand_id,
+        api_key_len,
+    )
+
+    # ── Probe each path ──────────────────────────────────────────────────────
+    headers = {
+        "Authorization": f"Token {api_key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "opsyn-backend",
+    }
+    params = {"page": 1, "page_size": 1}
+
+    results = []
+    working_path: Optional[str] = None
+
+    for path in _TEST_PATHS:
+        full_url = f"{_LEAFLINK_HOST}{path}"
+        logger.info("[LeafLinkTestPaths] probing path=%s", path)
+
+        try:
+            resp = requests.get(full_url, headers=headers, params=params, timeout=10)
+            status = resp.status_code
+            content_type = resp.headers.get("Content-Type", "")
+            body_preview = resp.text[:200]
+            is_working = status == 200
+
+            logger.info(
+                "[LeafLinkTestPaths] result path=%s status=%s content_type=%s working=%s",
+                path,
+                status,
+                content_type,
+                is_working,
+            )
+
+            results.append(
+                {
+                    "path": path,
+                    "full_url": f"{full_url}?page=1&page_size=1",
+                    "status": status,
+                    "content_type": content_type,
+                    "body_preview": body_preview,
+                    "working": is_working,
+                }
+            )
+
+            if is_working and working_path is None:
+                working_path = path
+
+        except Exception as req_exc:
+            logger.error(
+                "[LeafLinkTestPaths] request_failed path=%s error=%s", path, req_exc
+            )
+            results.append(
+                {
+                    "path": path,
+                    "full_url": f"{full_url}?page=1&page_size=1",
+                    "status": None,
+                    "content_type": None,
+                    "body_preview": None,
+                    "working": False,
+                    "error": str(req_exc),
+                }
+            )
+
+    logger.info(
+        "[LeafLinkTestPaths] complete brand_id=%s working_path=%s",
+        brand_id,
+        working_path,
+    )
+
+    return {
+        "ok": True,
+        "brand_id": brand_id,
+        "api_key_len": api_key_len,
+        "auth_scheme": "Token",
+        "results": results,
+        "working_path": working_path,
+    }
