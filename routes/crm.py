@@ -3,17 +3,62 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, Header, Query
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import Order, OrderLine, BrandAPICredential
+from models.auth_models import Brand, Organization
+from services.organization_service import lookup_organization
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("crm")
 
 router = APIRouter(prefix="/crm", tags=["crm"])
+
+
+async def validate_crm_access(
+    db: AsyncSession,
+    org_id: str,
+    brand_id: str,
+) -> dict:
+    """
+    Validate that org_id and brand_id exist and that brand belongs to org.
+
+    Returns:
+        {ok: bool, org_id: str, brand_id: str, error: str or None}
+    """
+    if not org_id:
+        return {"ok": False, "error": "org_id is required (parameter or X-OPSYN-ORG header)"}
+
+    if not brand_id:
+        return {"ok": False, "error": "brand_id is required"}
+
+    # Validate org exists (supports UUID or org_code via lookup_organization)
+    org_lookup = await lookup_organization(db, org_id)
+    if not org_lookup.get("ok"):
+        logger.warning("[CRM] org_not_found org_id=%s", org_id)
+        return {"ok": False, "error": org_lookup.get("error")}
+
+    resolved_org = org_lookup.get("organization")
+    resolved_org_id = str(resolved_org.id)
+
+    # Validate brand exists and belongs to org
+    brand_result = await db.execute(
+        select(Brand).where(
+            and_(Brand.id == brand_id, Brand.org_id == resolved_org_id)
+        )
+    )
+    brand = brand_result.scalar_one_or_none()
+
+    if not brand:
+        logger.warning("[CRM] brand_not_found brand_id=%s org_id=%s", brand_id, resolved_org_id)
+        return {"ok": False, "error": "Brand not found or does not belong to organization"}
+
+    logger.info("[CRM] access_validated org_id=%s brand_id=%s", resolved_org_id, brand_id)
+
+    return {"ok": True, "org_id": resolved_org_id, "brand_id": brand_id, "error": None}
 
 
 @router.get("/diagnostic")
@@ -169,12 +214,24 @@ async def crm_health():
 
 
 @router.get("/dashboard")
-async def crm_dashboard(db: AsyncSession = Depends(get_db)):
+async def crm_dashboard(
+    org_id: str = Query(..., description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    x_opsyn_org: str | None = Header(None, description="Optional org_id from header"),
+    db: AsyncSession = Depends(get_db),
+):
     """
-    Fast CRM dashboard with key metrics and recent data.
+    CRM dashboard scoped to org_id and brand_id.
+
+    Requires:
+    - org_id: Organization ID (UUID or org_code like "noble")
+    - brand_id: Brand ID (UUID)
+
+    Optional:
+    - X-OPSYN-ORG header: Alternative way to pass org_id
 
     Returns:
-    - total_orders: Total orders in system
+    - total_orders: Total orders for brand
     - total_revenue: Total revenue (dollars)
     - unique_customers: Count of unique customers
     - top_customers: Top 10 customers by spend
@@ -184,16 +241,30 @@ async def crm_dashboard(db: AsyncSession = Depends(get_db)):
     Performance: <500ms
     """
     try:
-        logger.info("[CRM] dashboard_requested")
+        resolved_identifier = x_opsyn_org or org_id
+        logger.info("[CRM] dashboard_requested org_id=%s brand_id=%s", resolved_identifier, brand_id)
 
-        # 1. Get aggregate stats (single query)
+        # Validate org and brand access
+        access_result = await validate_crm_access(db, resolved_identifier, brand_id)
+        if not access_result.get("ok"):
+            logger.warning("[CRM] dashboard_access_denied error=%s", access_result.get("error"))
+            return {"ok": False, "error": access_result.get("error")}
+
+        resolved_org_id = access_result["org_id"]
+
+        # 1. Get aggregate stats filtered by brand_id
         stats_result = await db.execute(
             select(
                 func.count(func.distinct(Order.customer_name)).label("unique_customers"),
                 func.count(Order.id).label("total_orders"),
                 func.sum(Order.amount).label("total_revenue_cents"),
             )
-            .where(Order.customer_name != None)
+            .where(
+                and_(
+                    Order.customer_name != None,
+                    Order.brand_id == brand_id,
+                )
+            )
         )
         stats_row = stats_result.fetchone()
 
@@ -201,7 +272,7 @@ async def crm_dashboard(db: AsyncSession = Depends(get_db)):
         total_orders = stats_row.total_orders or 0
         total_revenue = float(stats_row.total_revenue_cents or 0) / 100.0
 
-        # 2. Get top 10 customers by spend
+        # 2. Get top 10 customers by spend filtered by brand_id
         top_customers_result = await db.execute(
             select(
                 Order.customer_name,
@@ -209,31 +280,37 @@ async def crm_dashboard(db: AsyncSession = Depends(get_db)):
                 func.sum(Order.amount).label("total_spend_cents"),
                 func.max(Order.external_updated_at).label("last_order_at"),
             )
-            .where(Order.customer_name != None)
+            .where(
+                and_(
+                    Order.customer_name != None,
+                    Order.brand_id == brand_id,
+                )
+            )
             .group_by(Order.customer_name)
             .order_by(func.sum(Order.amount).desc())
             .limit(10)
         )
 
-        top_customers = []
-        for row in top_customers_result:
-            top_customers.append({
+        top_customers = [
+            {
                 "name": row.customer_name,
                 "order_count": row.order_count or 0,
                 "total_spend": float(row.total_spend_cents or 0) / 100.0,
                 "last_order_at": row.last_order_at.isoformat() if row.last_order_at else None,
-            })
+            }
+            for row in top_customers_result
+        ]
 
-        # 3. Get recent 50 orders
+        # 3. Get recent 50 orders filtered by brand_id
         recent_orders_result = await db.execute(
             select(Order)
+            .where(Order.brand_id == brand_id)
             .order_by(Order.external_updated_at.desc())
             .limit(50)
         )
 
-        recent_orders = []
-        for order in recent_orders_result.scalars().all():
-            recent_orders.append({
+        recent_orders = [
+            {
                 "id": order.id,
                 "external_id": order.external_order_id,
                 "customer_name": order.customer_name,
@@ -242,12 +319,16 @@ async def crm_dashboard(db: AsyncSession = Depends(get_db)):
                 "amount": float(order.amount or 0) / 100.0,
                 "created_at": order.external_created_at.isoformat() if order.external_created_at else None,
                 "updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
-            })
+            }
+            for order in recent_orders_result.scalars().all()
+        ]
 
         synced_at = datetime.now(timezone.utc).isoformat()
 
         logger.info(
-            "[CRM] dashboard_complete customers=%s orders=%s revenue=%s",
+            "[CRM] dashboard_complete org_id=%s brand_id=%s customers=%s orders=%s revenue=%s",
+            resolved_org_id,
+            brand_id,
             unique_customers,
             total_orders,
             total_revenue,
@@ -255,6 +336,8 @@ async def crm_dashboard(db: AsyncSession = Depends(get_db)):
 
         return make_json_safe({
             "ok": True,
+            "org_id": resolved_org_id,
+            "brand_id": brand_id,
             "stats": {
                 "total_orders": total_orders,
                 "total_revenue": total_revenue,
@@ -283,6 +366,9 @@ async def crm_dashboard(db: AsyncSession = Depends(get_db)):
 
 @router.get("/orders")
 async def crm_orders(
+    org_id: str = Query(..., description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    x_opsyn_org: str | None = Header(None, description="Optional org_id from header"),
     limit: int = Query(50, ge=10, le=500, description="Records per page (default 50, max 500)"),
     cursor: Optional[str] = Query(None, description="Pagination cursor from previous response"),
     customer_name: Optional[str] = Query(None, description="Filter by customer name"),
@@ -292,7 +378,11 @@ async def crm_orders(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get paginated orders with optional filtering.
+    Get paginated orders scoped to org_id and brand_id.
+
+    Requires:
+    - org_id: Organization ID (UUID or org_code)
+    - brand_id: Brand ID (UUID)
 
     Supports:
     - Cursor-based pagination
@@ -303,15 +393,26 @@ async def crm_orders(
     Returns: orders array + next_cursor (if more results)
     """
     try:
+        resolved_identifier = x_opsyn_org or org_id
         logger.info(
-            "[CRM] orders_requested limit=%s customer=%s status=%s",
+            "[CRM] orders_requested org_id=%s brand_id=%s limit=%s customer=%s status=%s",
+            resolved_identifier,
+            brand_id,
             limit,
             customer_name,
             status,
         )
 
-        # Build query with filters
-        query = select(Order)
+        # Validate org and brand access
+        access_result = await validate_crm_access(db, resolved_identifier, brand_id)
+        if not access_result.get("ok"):
+            logger.warning("[CRM] orders_access_denied error=%s", access_result.get("error"))
+            return {"ok": False, "error": access_result.get("error")}
+
+        resolved_org_id = access_result["org_id"]
+
+        # Build query with filters scoped to brand_id
+        query = select(Order).where(Order.brand_id == brand_id)
 
         if customer_name:
             query = query.where(Order.customer_name.ilike(f"%{customer_name}%"))
@@ -369,10 +470,18 @@ async def crm_orders(
         if has_more and orders:
             next_cursor = base64.b64encode(str(orders[-1]["id"]).encode()).decode()
 
-        logger.info("[CRM] orders_returned count=%s has_more=%s", len(orders), has_more)
+        logger.info(
+            "[CRM] orders_returned org_id=%s brand_id=%s count=%s has_more=%s",
+            resolved_org_id,
+            brand_id,
+            len(orders),
+            has_more,
+        )
 
         return make_json_safe({
             "ok": True,
+            "org_id": resolved_org_id,
+            "brand_id": brand_id,
             "orders": orders,
             "count": len(orders),
             "has_more": has_more,
@@ -457,6 +566,9 @@ async def crm_full_data(
 
 @router.get("/customers")
 async def crm_customers(
+    org_id: str = Query(..., description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    x_opsyn_org: str | None = Header(None, description="Optional org_id from header"),
     limit: int = Query(50, ge=10, le=500, description="Records per page (default 50, max 500)"),
     cursor: Optional[str] = Query(None, description="Pagination cursor"),
     search: Optional[str] = Query(None, description="Search customer name"),
@@ -464,7 +576,11 @@ async def crm_customers(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get paginated customers with aggregated stats.
+    Get paginated customers with aggregated stats, scoped to org_id and brand_id.
+
+    Requires:
+    - org_id: Organization ID (UUID or org_code)
+    - brand_id: Brand ID (UUID)
 
     Returns per-customer:
     - name
@@ -478,15 +594,33 @@ async def crm_customers(
     - Sort by spend, order count, or recency
     """
     try:
-        logger.info("[CRM] customers_requested limit=%s search=%s sort=%s", limit, search, sort_by)
+        resolved_identifier = x_opsyn_org or org_id
+        logger.info(
+            "[CRM] customers_requested org_id=%s brand_id=%s limit=%s search=%s sort=%s",
+            resolved_identifier,
+            brand_id,
+            limit,
+            search,
+            sort_by,
+        )
 
-        # Build query
+        # Validate org and brand access
+        access_result = await validate_crm_access(db, resolved_identifier, brand_id)
+        if not access_result.get("ok"):
+            logger.warning("[CRM] customers_access_denied error=%s", access_result.get("error"))
+            return {"ok": False, "error": access_result.get("error")}
+
+        resolved_org_id = access_result["org_id"]
+
+        # Build query scoped to brand_id
         query = select(
             Order.customer_name,
             func.count(Order.id).label("order_count"),
             func.sum(Order.amount).label("total_spend_cents"),
             func.max(Order.external_updated_at).label("last_order_at"),
-        ).where(Order.customer_name != None).group_by(Order.customer_name)
+        ).where(
+            and_(Order.customer_name != None, Order.brand_id == brand_id)
+        ).group_by(Order.customer_name)
 
         if search:
             query = query.where(Order.customer_name.ilike(f"%{search}%"))
@@ -529,10 +663,18 @@ async def crm_customers(
         if has_more and customers:
             next_cursor = base64.b64encode(customers[-1]["name"].encode()).decode()
 
-        logger.info("[CRM] customers_returned count=%s has_more=%s", len(customers), has_more)
+        logger.info(
+            "[CRM] customers_returned org_id=%s brand_id=%s count=%s has_more=%s",
+            resolved_org_id,
+            brand_id,
+            len(customers),
+            has_more,
+        )
 
         return make_json_safe({
             "ok": True,
+            "org_id": resolved_org_id,
+            "brand_id": brand_id,
             "customers": customers,
             "count": len(customers),
             "has_more": has_more,
@@ -556,25 +698,57 @@ async def crm_customers(
 @router.get("/customers/{customer_id}")
 async def crm_customer_detail(
     customer_id: str,
+    org_id: str = Query(..., description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    x_opsyn_org: str | None = Header(None, description="Optional org_id from header"),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get detailed customer information.
+    Get detailed customer information scoped to org_id and brand_id.
+
+    Requires:
+    - org_id: Organization ID (UUID or org_code)
+    - brand_id: Brand ID (UUID)
+
     Returns: name, order_count, total_spend, last_order_at, contact info.
     """
     try:
-        logger.info("crm: customer_detail_requested customer_id=%s", customer_id)
+        resolved_identifier = x_opsyn_org or org_id
+        logger.info(
+            "[CRM] customer_detail_requested customer_id=%s org_id=%s brand_id=%s",
+            customer_id,
+            resolved_identifier,
+            brand_id,
+        )
 
-        # Get customer orders
+        # Validate org and brand access
+        access_result = await validate_crm_access(db, resolved_identifier, brand_id)
+        if not access_result.get("ok"):
+            logger.warning("[CRM] customer_detail_access_denied error=%s", access_result.get("error"))
+            return {"ok": False, "error": access_result.get("error")}
+
+        resolved_org_id = access_result["org_id"]
+
+        # Get customer orders scoped to brand_id
         orders_result = await db.execute(
             select(Order)
-            .where(Order.customer_name == customer_id)
+            .where(
+                and_(
+                    Order.customer_name == customer_id,
+                    Order.brand_id == brand_id,
+                )
+            )
             .order_by(Order.external_updated_at.desc())
         )
         orders = orders_result.scalars().all()
 
         if not orders:
-            logger.warning("crm: customer_not_found customer_id=%s", customer_id)
+            logger.warning(
+                "[CRM] customer_not_found customer_id=%s org_id=%s brand_id=%s",
+                customer_id,
+                resolved_org_id,
+                brand_id,
+            )
             return {
                 "ok": False,
                 "error": "Customer not found",
@@ -589,8 +763,10 @@ async def crm_customer_detail(
         last_order_at = max((o.external_updated_at for o in orders if o.external_updated_at), default=None)
 
         logger.info(
-            "crm: customer_detail_complete customer_id=%s orders=%s total_spend=%s",
+            "[CRM] customer_detail_complete customer_id=%s org_id=%s brand_id=%s orders=%s total_spend=%s",
             customer_id,
+            resolved_org_id,
+            brand_id,
             order_count,
             total_spend,
         )
@@ -599,6 +775,8 @@ async def crm_customer_detail(
 
         return make_json_safe({
             "ok": True,
+            "org_id": resolved_org_id,
+            "brand_id": brand_id,
             "source": "live",
             "data_source": "live",
             "synced_at": synced_at,
@@ -614,10 +792,10 @@ async def crm_customer_detail(
         })
 
     except Exception as e:
-        logger.error("crm: customer_detail_failed customer_id=%s error=%s", customer_id, e)
+        logger.error("[CRM] customer_detail_failed customer_id=%s error=%s", customer_id, str(e)[:500], exc_info=True)
         return {
             "ok": False,
-            "error": str(e),
+            "error": str(e)[:500],
             "source": "error",
             "data_source": "error",
             "synced_at": datetime.now(timezone.utc).isoformat(),
@@ -627,26 +805,50 @@ async def crm_customer_detail(
 @router.get("/customers/{customer_id}/orders")
 async def crm_customer_orders(
     customer_id: str,
-    limit: int = 50,
-    offset: int = 0,
+    org_id: str = Query(..., description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    x_opsyn_org: str | None = Header(None, description="Optional org_id from header"),
+    limit: int = Query(50, ge=1, le=500, description="Records per page (default 50, max 500)"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get orders for a specific customer.
+    Get orders for a specific customer scoped to org_id and brand_id.
+
+    Requires:
+    - org_id: Organization ID (UUID or org_code)
+    - brand_id: Brand ID (UUID)
+
     Returns: order_id, order_number, status, amount, item_count, created_at.
     """
     try:
+        resolved_identifier = x_opsyn_org or org_id
         logger.info(
-            "crm: customer_orders_requested customer_id=%s limit=%s offset=%s",
+            "[CRM] customer_orders_requested customer_id=%s org_id=%s brand_id=%s limit=%s offset=%s",
             customer_id,
+            resolved_identifier,
+            brand_id,
             limit,
             offset,
         )
 
-        # Get customer orders
+        # Validate org and brand access
+        access_result = await validate_crm_access(db, resolved_identifier, brand_id)
+        if not access_result.get("ok"):
+            logger.warning("[CRM] customer_orders_access_denied error=%s", access_result.get("error"))
+            return {"ok": False, "error": access_result.get("error")}
+
+        resolved_org_id = access_result["org_id"]
+
+        # Get customer orders scoped to brand_id
         orders_result = await db.execute(
             select(Order)
-            .where(Order.customer_name == customer_id)
+            .where(
+                and_(
+                    Order.customer_name == customer_id,
+                    Order.brand_id == brand_id,
+                )
+            )
             .order_by(Order.external_updated_at.desc())
             .limit(limit)
             .offset(offset)
@@ -671,10 +873,18 @@ async def crm_customer_orders(
         synced_at = datetime.now(timezone.utc).isoformat()
         source = "live" if orders_data else "empty"
 
-        logger.info("[CRM] orders_query count=%s customer_id=%s", len(orders_data), customer_id)
+        logger.info(
+            "[CRM] customer_orders_returned customer_id=%s org_id=%s brand_id=%s count=%s",
+            customer_id,
+            resolved_org_id,
+            brand_id,
+            len(orders_data),
+        )
 
         return make_json_safe({
             "ok": True,
+            "org_id": resolved_org_id,
+            "brand_id": brand_id,
             "source": source,
             "data_source": source,
             "synced_at": synced_at,
@@ -684,11 +894,11 @@ async def crm_customer_orders(
         })
 
     except Exception as e:
-        logger.error("crm: customer_orders_failed customer_id=%s error=%s", customer_id, e)
+        logger.error("[CRM] customer_orders_failed customer_id=%s error=%s", customer_id, str(e)[:500], exc_info=True)
         # Never return empty array on error
         return {
             "ok": False,
-            "error": str(e),
+            "error": str(e)[:500],
             "source": "error",
             "data_source": "error",
             "synced_at": datetime.now(timezone.utc).isoformat(),

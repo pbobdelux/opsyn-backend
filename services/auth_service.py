@@ -234,6 +234,14 @@ async def passcode_login(
     try:
         logger.info("[Auth] passcode_login_attempt app_id=%s org_id=%s", app_id, org_id)
 
+        # Validate app_id is supported
+        SUPPORTED_APPS = ["brand_app", "driver_app", "crm_app"]
+        if app_id not in SUPPORTED_APPS:
+            logger.warning("[Auth] unsupported_app_id app_id=%s", app_id)
+            return {"ok": False, "error": f"Unsupported app_id: {app_id}. Supported: {', '.join(SUPPORTED_APPS)}"}
+
+        logger.info("[Auth] app_id_supported app_id=%s", app_id)
+
         # Find all active passcodes
         logger.info("[Auth] querying_active_passcodes")
 
