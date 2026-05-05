@@ -120,26 +120,29 @@ def force_utc(dt: Any) -> datetime | None:
 
 
 def enforce_all_datetimes_utc(params: dict[str, Any]) -> dict[str, Any]:
-    """Enforce all datetime values in params dict to be UTC-aware.
+    """Force all datetime values to naive UTC.
 
-    This is the final boundary check before SQL execution.
-    Scans every parameter and converts any datetime to UTC-aware.
+    The orders table uses 'timestamp without time zone' columns,
+    which expect naive UTC datetimes, not timezone-aware.
+
+    This sanitizer converts all datetimes to naive UTC before SQL execution.
 
     Args:
         params: Parameter dict for SQL execution
 
     Returns:
-        New dict with all datetimes converted to UTC-aware
+        New dict with all datetimes converted to naive UTC
     """
     fixed = {}
     for k, v in params.items():
         if isinstance(v, datetime):
-            # If naive or invalid tzinfo, assume UTC
-            if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
-                v = v.replace(tzinfo=timezone.utc)
+            # FORCE NAIVE UTC (critical for timestamp without time zone columns)
+            if v.tzinfo is None:
+                # Already naive, ensure it's UTC
+                v = v.replace(tzinfo=timezone.utc).replace(tzinfo=None)
             else:
-                # If aware, convert to UTC
-                v = v.astimezone(timezone.utc)
+                # Aware datetime, convert to UTC then strip tzinfo
+                v = v.astimezone(timezone.utc).replace(tzinfo=None)
         fixed[k] = v
     return fixed
 
