@@ -443,10 +443,9 @@ class LeafLinkClient:
         status: Optional[str] = None,
     ) -> Any:
         logger.error("[CLIENT DEBUG] list_orders() called limit=%s offset=%s", limit, offset)
-        # HOTFIX: Use correct LeafLink endpoint
-        # https://marketplace.leaflink.com/api/v2/orders-received/
-        # Authorization: Api-Key <key>
-        _orders_path = "orders-received/"
+        # TEST: Trying /orders/ endpoint instead of /orders-received/ to diagnose 403
+        # Original endpoint was "orders-received/" — switching to "orders/" to test API key scope
+        _orders_path = "orders/"
         params: Dict[str, Any] = {
             "limit": limit,
             "offset": offset,
@@ -457,8 +456,10 @@ class LeafLinkClient:
             params["status"] = status
 
         _param_str = "&".join(f"{k}={v}" for k, v in params.items())
-        url = f"{self.base_url.rstrip('/')}/orders-received/?{_param_str}"
+        url = f"{self.base_url.rstrip('/')}/{_orders_path}?{_param_str}"
 
+        logger.error("[LEAFLINK_TEST] endpoint=%s", _orders_path)
+        logger.error("[LEAFLINK_TEST] final_url=%s", url)
         logger.error("[LEAFLINK_ACTUAL] url=%s", url)
         logger.error("[LEAFLINK_ACTUAL] auth_header_format=Api-Key key_len=%s", len(self.api_key or ""))
 
@@ -472,6 +473,8 @@ class LeafLinkClient:
             )
             raise
 
+        logger.error("[LEAFLINK_TEST] response_status=%s", resp.status_code)
+        logger.error("[LEAFLINK_TEST] response_body=%s", resp.text[:500])
         logger.error("[LEAFLINK_ACTUAL] response_status=%s response_body=%s", resp.status_code, resp.text[:500])
         logger.info("[LeafLink] response_status=%s", resp.status_code)
 
