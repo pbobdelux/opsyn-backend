@@ -53,41 +53,48 @@ def parse_dt(val: Any) -> datetime | None:
 
 
 def normalize_datetime(value: Any) -> datetime | None:
-    """Convert any datetime value to timezone-aware UTC.
+    """Ensure datetime is timezone-aware UTC, handling all input types.
 
-    Handles:
+    Safely handles:
     - None → None
-    - Naive datetime → attach timezone.utc
-    - Aware datetime → convert to UTC
-    - ISO string → parse and attach timezone.utc
-    - Other types → return None
+    - Empty strings → None
+    - ISO datetime strings → parsed and converted to UTC-aware
+    - Naive datetimes → assumed UTC and made aware
+    - Aware datetimes → converted to UTC if needed
+    - Already UTC-aware → returned as-is
+
+    Always returns either a timezone-aware UTC datetime or None.
     """
-    if value is None:
+    # Handle None and empty strings
+    if value is None or value == "":
         return None
 
-    # Already a datetime object
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            # Naive datetime — attach UTC
-            return value.replace(tzinfo=timezone.utc)
-        else:
-            # Aware datetime — convert to UTC
-            return value.astimezone(timezone.utc)
-
-    # String (ISO format from LeafLink API)
+    # Handle ISO datetime strings
     if isinstance(value, str):
         try:
-            # Parse ISO string
+            # Parse ISO string (handles both with and without timezone)
             dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            # Ensure it's UTC-aware
             if dt.tzinfo is None:
-                # Parsed as naive — attach UTC
                 return dt.replace(tzinfo=timezone.utc)
-            else:
-                # Parsed as aware — convert to UTC
+            if dt.tzinfo != timezone.utc:
                 return dt.astimezone(timezone.utc)
+            return dt
         except (ValueError, TypeError):
             return None
 
+    # Handle datetime objects
+    if isinstance(value, datetime):
+        # If naive, assume UTC and make aware
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        # If aware but not UTC, convert to UTC
+        if value.tzinfo != timezone.utc:
+            return value.astimezone(timezone.utc)
+        # Already UTC-aware
+        return value
+
+    # Unsupported type
     return None
 
 
@@ -213,6 +220,32 @@ def derive_review_status(line_items: list[dict[str, Any]]) -> str:
     return "ready"
 
 
+def validate_datetime_params(params: dict[str, Any], stmt_type: str) -> None:
+    """Scan params dict and raise if any datetime field is naive.
+
+    This is a safety guard to catch any remaining timezone-naive datetimes
+    before they reach asyncpg, which will reject them with a DataError.
+    """
+    datetime_fields = {
+        "external_created_at", "external_updated_at",
+        "synced_at", "last_synced_at", "created_at", "updated_at"
+    }
+
+    for field_name in datetime_fields:
+        value = params.get(field_name)
+        if value is not None and isinstance(value, datetime):
+            if value.tzinfo is None:
+                logger.error(
+                    "[BAD_DATETIME] field=%s value=%s tzinfo=None — aborting %s",
+                    field_name,
+                    value,
+                    stmt_type,
+                )
+                raise ValueError(
+                    f"Naive datetime in {field_name}: {value} — must be UTC-aware"
+                )
+
+
 async def sync_leaflink_orders(
     db: AsyncSession,
     brand_id: str,
@@ -327,8 +360,8 @@ async def sync_leaflink_orders(
             )
             existing = existing_result.scalar_one_or_none()
 
-            external_created_at = parse_dt(o.get("created_at"))
-            external_updated_at = parse_dt(o.get("updated_at"))
+            external_created_at = normalize_datetime(o.get("created_at"))
+            external_updated_at = normalize_datetime(o.get("updated_at"))
 
             # Track the newest order date for the response.
             for ts_dt in (external_updated_at, external_created_at):
@@ -570,8 +603,8 @@ async def sync_leaflink_orders_headers_only(
                             else o
                         )
 
-                        external_created_at = normalize_datetime(parse_dt(o.get("created_at")))
-                        external_updated_at = normalize_datetime(parse_dt(o.get("updated_at")))
+                        external_created_at = normalize_datetime(o.get("created_at"))
+                        external_updated_at = normalize_datetime(o.get("updated_at"))
 
                         for ts_dt in (external_updated_at, external_created_at):
                             if ts_dt:
@@ -617,29 +650,31 @@ WHERE brand_id = CAST(:brand_id AS uuid) AND external_order_id = :external_order
                             line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
                             raw_payload_str = json.dumps(make_json_safe(raw_payload)) if raw_payload else None
 
+                            update_params = {
+                                "org_id": org_id_value,
+                                "brand_id": brand_id_value,
+                                "external_order_id": external_id,
+                                "customer_name": customer_name,
+                                "status": status,
+                                "order_number": order_number,
+                                "total_cents": total_cents,
+                                "amount": amount_decimal,
+                                "item_count": item_count,
+                                "unit_count": unit_count,
+                                "line_items_json": line_items_json_str,
+                                "raw_payload": raw_payload_str,
+                                "review_status": review_status,
+                                "sync_status": "ok",
+                                "synced_at": normalize_datetime(now),
+                                "last_synced_at": normalize_datetime(now),
+                                "external_created_at": normalize_datetime(external_created_at),
+                                "external_updated_at": normalize_datetime(external_updated_at),
+                                "updated_at": normalize_datetime(now),
+                            }
+                            validate_datetime_params(update_params, "UPDATE")
                             await db.execute(
                                 text(update_stmt),
-                                {
-                                    "org_id": org_id_value,
-                                    "brand_id": brand_id_value,
-                                    "external_order_id": external_id,
-                                    "customer_name": customer_name,
-                                    "status": status,
-                                    "order_number": order_number,
-                                    "total_cents": total_cents,
-                                    "amount": amount_decimal,
-                                    "item_count": item_count,
-                                    "unit_count": unit_count,
-                                    "line_items_json": line_items_json_str,
-                                    "raw_payload": raw_payload_str,
-                                    "review_status": review_status,
-                                    "sync_status": "ok",
-                                    "synced_at": normalize_datetime(now),
-                                    "last_synced_at": normalize_datetime(now),
-                                    "external_created_at": normalize_datetime(external_created_at),
-                                    "external_updated_at": normalize_datetime(external_updated_at),
-                                    "updated_at": normalize_datetime(now),
-                                }
+                                update_params,
                             )
                             batch_updated += 1
                         else:
@@ -665,31 +700,33 @@ INSERT INTO orders (
                             line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
                             raw_payload_str = json.dumps(make_json_safe(raw_payload)) if raw_payload else None
 
+                            insert_params = {
+                                "org_id": org_id_value,
+                                "brand_id": brand_id_value,
+                                "external_order_id": external_id,
+                                "order_number": order_number,
+                                "customer_name": customer_name,
+                                "status": status,
+                                "total_cents": total_cents,
+                                "amount": amount_decimal,
+                                "item_count": item_count,
+                                "unit_count": unit_count,
+                                "line_items_json": line_items_json_str,
+                                "raw_payload": raw_payload_str,
+                                "source": "leaflink",
+                                "review_status": review_status,
+                                "sync_status": "ok",
+                                "synced_at": normalize_datetime(now),
+                                "last_synced_at": normalize_datetime(now),
+                                "external_created_at": normalize_datetime(external_created_at),
+                                "external_updated_at": normalize_datetime(external_updated_at),
+                                "created_at": normalize_datetime(now),
+                                "updated_at": normalize_datetime(now),
+                            }
+                            validate_datetime_params(insert_params, "INSERT")
                             await db.execute(
                                 text(insert_stmt),
-                                {
-                                    "org_id": org_id_value,
-                                    "brand_id": brand_id_value,
-                                    "external_order_id": external_id,
-                                    "order_number": order_number,
-                                    "customer_name": customer_name,
-                                    "status": status,
-                                    "total_cents": total_cents,
-                                    "amount": amount_decimal,
-                                    "item_count": item_count,
-                                    "unit_count": unit_count,
-                                    "line_items_json": line_items_json_str,
-                                    "raw_payload": raw_payload_str,
-                                    "source": "leaflink",
-                                    "review_status": review_status,
-                                    "sync_status": "ok",
-                                    "synced_at": normalize_datetime(now),
-                                    "last_synced_at": normalize_datetime(now),
-                                    "external_created_at": normalize_datetime(external_created_at),
-                                    "external_updated_at": normalize_datetime(external_updated_at),
-                                    "created_at": normalize_datetime(now),
-                                    "updated_at": normalize_datetime(now),
-                                }
+                                insert_params,
                             )
                             batch_created += 1
 
