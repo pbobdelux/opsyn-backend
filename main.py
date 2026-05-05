@@ -30,6 +30,7 @@ from routes.voice_brain import router as voice_brain_router
 from routes.admin import router as admin_router
 from routes.debug import router as debug_router
 from routes.auth import router as auth_router
+from routes.webhooks import router as webhooks_router
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("opsyn-backend")
@@ -442,6 +443,7 @@ app.include_router(voice_brain_router)
 app.include_router(debug_router)
 app.include_router(admin_router)
 app.include_router(auth_router)
+app.include_router(webhooks_router)
 logger.info("[Routes] registered debug routes")
 
 

@@ -2910,15 +2910,42 @@ async def sync_orders_leaflink(
                             await mark_failed(_fail_db, sync_run_id, err_msg)
                 except Exception:
                     pass
+
+            # Detect auth/authorization failures and return a structured message
+            _err_lower = err_msg.lower()
+            _is_auth_error = any(
+                kw in _err_lower
+                for kw in ("401", "403", "unauthorized", "forbidden", "authentication", "api access")
+            )
+            if _is_auth_error:
+                logger.warning(
+                    "[Sync] leaflink_auth_failure brand_id=%s org_id=%s error=%s",
+                    brand_id,
+                    org_id,
+                    err_msg,
+                )
+                return make_json_safe({
+                    "ok": False,
+                    "stage": "leaflink_fetch",
+                    "error": "LeafLink API unauthorized. API access may not be enabled for this key.",
+                    "brand_id": brand_id,
+                    "org_id": org_id,
+                    "sync_run_id": sync_run_id,
+                    "error_count": 1,
+                    "errors": [err_msg],
+                })
+
             return make_json_safe({
                 "ok": False,
                 "stage": "leaflink_fetch",
                 "brand_id": brand_id,
+                "org_id": org_id,
                 "sync_run_id": sync_run_id,
                 "error": f"LeafLink API error: {err_msg}",
                 "error_count": 1,
                 "errors": [err_msg],
             })
+
 
         # ------------------------------------------------------------------ #
         # Stage 5: Open ONE transaction for upsert phase                      #
