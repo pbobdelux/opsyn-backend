@@ -237,6 +237,24 @@ def get_schema_column_types() -> dict[str, dict[str, str]]:
     return _schema_column_types
 
 
+def has_column(table_name: str, column_name: str) -> bool:
+    """Check whether a column exists in the cached schema for the given table.
+
+    Returns True if the column was found in the ``public`` schema during
+    startup inspection, False otherwise.  Logs a one-time diagnostic line
+    for ``packed_qty`` so the result is always visible in the startup logs.
+    """
+    exists = column_name in _schema_column_types.get(table_name, {})
+    if column_name == "packed_qty":
+        logger.info(
+            "[SCHEMA_HAS_COLUMN] table=%s column=%s exists=%s",
+            table_name,
+            column_name,
+            str(exists).lower(),
+        )
+    return exists
+
+
 async def dispose_and_recreate_engine() -> None:
     """Dispose the engine to flush asyncpg prepared-statement cache, then recreate it.
 

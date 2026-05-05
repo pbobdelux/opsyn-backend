@@ -13,7 +13,7 @@ from uuid import UUID
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import AsyncSessionLocal, get_schema_column_types
+from database import AsyncSessionLocal, get_schema_column_types, has_column
 from models import Order, OrderLine
 from utils.json_utils import make_json_safe
 
@@ -84,42 +84,6 @@ def normalize_datetime(dt: Any) -> datetime | None:
 
     # Unsupported type
     return None
-
-
-def force_utc(dt: Any) -> datetime | None:
-    """Force any datetime to timezone-aware UTC.
-
-    Handles:
-    - None → None
-    - ISO strings → parse and convert to UTC
-    - Naive datetimes → assume UTC and make aware
-    - Aware datetimes → convert to UTC
-    - Invalid tzinfo → replace with UTC
-
-    ALWAYS returns either UTC-aware datetime or None.
-    """
-    if dt is None:
-        return None
-
-    # Handle strings
-    if isinstance(dt, str):
-        try:
-            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            return None
-
-    # Handle datetime objects
-    if isinstance(dt, datetime):
-        # If naive or invalid tzinfo, assume UTC
-        if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
-            return dt.replace(tzinfo=timezone.utc)
-        # If aware, convert to UTC
-        return dt.astimezone(timezone.utc)
-
-    return None
-
-
-
 
 
 def safe_str(value: Any) -> str | None:
@@ -368,16 +332,6 @@ async def sync_leaflink_orders(
 
             external_created_at = normalize_datetime(created_raw)
             external_updated_at = normalize_datetime(modified_raw)
-
-            logger.error(
-                "[EXTERNAL_TS_MAP] external_id=%s keys=%s created_raw=%s modified_raw=%s external_created_at=%s external_updated_at=%s",
-                external_id,
-                list(o.keys()),
-                created_raw,
-                modified_raw,
-                external_created_at,
-                external_updated_at,
-            )
 
             # Track the newest order date for the response.
             for ts_dt in (external_updated_at, external_created_at):
@@ -628,27 +582,12 @@ async def sync_leaflink_orders_headers_only(
                         external_created_at = normalize_datetime(created_raw)
                         external_updated_at = normalize_datetime(modified_raw)
 
-                        logger.error(
-                            "[EXTERNAL_TS_MAP] external_id=%s created_raw=%s modified_raw=%s external_created_at=%s external_updated_at=%s",
-                            external_id,
-                            created_raw,
-                            modified_raw,
-                            external_created_at,
-                            external_updated_at,
-                        )
-
                         for ts_dt in (external_updated_at, external_created_at):
                             if ts_dt:
                                 if newest_order_date is None or ts_dt > newest_order_date:
                                     newest_order_date = ts_dt
                                 break
 
-                        logger.error(
-                            "[UUID_CAST] query=%s org_id=%s brand_id=%s",
-                            "order_existence_check",
-                            org_id_value,
-                            brand_id_value,
-                        )
                         existing_result = await db.execute(
                             select(Order).where(
                                 Order.brand_id == brand_id_value,
@@ -704,20 +643,12 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 "raw_payload": raw_payload_str,
                                 "review_status": review_status,
                                 "sync_status": "ok",
-                                "synced_at": force_utc(now),
-                                "last_synced_at": force_utc(now),
-                                "external_created_at": force_utc(external_created_at),
-                                "external_updated_at": force_utc(external_updated_at),
-                                "updated_at": force_utc(now),
+                                "synced_at": normalize_datetime(now),
+                                "last_synced_at": normalize_datetime(now),
+                                "external_created_at": normalize_datetime(external_created_at),
+                                "external_updated_at": normalize_datetime(external_updated_at),
+                                "updated_at": normalize_datetime(now),
                             }
-                            for _field, _val in update_params.items():
-                                if isinstance(_val, datetime):
-                                    logger.info(
-                                        "[DB_PARAM_TYPE] field=%s type=datetime tzinfo=%s offset=%s",
-                                        _field,
-                                        _val.tzinfo,
-                                        _val.utcoffset() if _val.tzinfo else None,
-                                    )
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -764,21 +695,13 @@ INSERT INTO orders (
                                 "source": "leaflink",
                                 "review_status": review_status,
                                 "sync_status": "ok",
-                                "synced_at": force_utc(now),
-                                "last_synced_at": force_utc(now),
-                                "external_created_at": force_utc(external_created_at),
-                                "external_updated_at": force_utc(external_updated_at),
-                                "created_at": force_utc(now),
-                                "updated_at": force_utc(now),
+                                "synced_at": normalize_datetime(now),
+                                "last_synced_at": normalize_datetime(now),
+                                "external_created_at": normalize_datetime(external_created_at),
+                                "external_updated_at": normalize_datetime(external_updated_at),
+                                "created_at": normalize_datetime(now),
+                                "updated_at": normalize_datetime(now),
                             }
-                            for _field, _val in insert_params.items():
-                                if isinstance(_val, datetime):
-                                    logger.info(
-                                        "[DB_PARAM_TYPE] field=%s type=datetime tzinfo=%s offset=%s",
-                                        _field,
-                                        _val.tzinfo,
-                                        _val.utcoffset() if _val.tzinfo else None,
-                                    )
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
@@ -1015,29 +938,11 @@ async def sync_leaflink_line_items(
                             )
                             continue
 
-                        # Log the fields being inserted for visibility
-                        insert_fields = {
-                            "order_id": order_id_value,
-                            "line_number": line_number,
-                            "sku": sku,
-                            "product_name": item.get("product_name"),
-                            "quantity": item.get("quantity"),
-                            "unit_price": item.get("unit_price"),
-                            "total_price": item.get("total_price"),
-                        }
-                        logger.error(
-                            "[ORDER_LINES_FIELDS] order_id=%s line_number=%s keys=%s",
-                            order_id_value,
-                            line_number,
-                            list(insert_fields.keys()),
-                        )
-
                         # Fail-safe: one bad line item must not crash the entire batch
                         try:
                             # Check whether packed_qty column exists in the DB schema
                             # (populated at startup by inspect_schema_at_startup).
-                            _order_lines_cols = get_schema_column_types().get("order_lines", {})
-                            _packed_qty_exists = "packed_qty" in _order_lines_cols
+                            _packed_qty_exists = has_column("order_lines", "packed_qty")
 
                             if not _packed_qty_exists:
                                 logger.info(
