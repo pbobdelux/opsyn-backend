@@ -1079,25 +1079,69 @@ async def sync_leaflink_line_items(
                         delete(OrderLine).where(OrderLine.order_id == order_row.id)
                     )
 
-                    for item in normalized_line_items:
-                        db.add(
-                            OrderLine(
-                                order_id=order_row.id,
-                                sku=item.get("sku"),
-                                product_name=item.get("product_name"),
-                                quantity=item.get("quantity"),
-                                unit_price=item.get("unit_price"),
-                                total_price=item.get("total_price"),
-                                unit_price_cents=item.get("unit_price_cents"),
-                                total_price_cents=item.get("total_price_cents"),
-                                mapped_product_id=item.get("mapped_product_id"),
-                                mapping_status=item.get("mapping_status"),
-                                mapping_issue=item.get("mapping_issue"),
-                                raw_payload=make_json_safe(item.get("raw_payload")),
+                    inserted_count = 0
+                    for line_number, item in enumerate(normalized_line_items, 1):
+                        order_id_value = order_row.id
+                        sku = item.get("sku")
+
+                        # Pre-insert validation: skip items missing required fields
+                        if not order_id_value or not sku:
+                            logger.error(
+                                "[LINE_ITEM_SKIP] order_id=%s line_number=%s sku=%s — missing required field",
+                                order_id_value,
+                                line_number,
+                                sku,
                             )
+                            continue
+
+                        # Log the fields being inserted for visibility
+                        insert_fields = {
+                            "order_id": order_id_value,
+                            "line_number": line_number,
+                            "sku": sku,
+                            "product_name": item.get("product_name"),
+                            "quantity": item.get("quantity"),
+                            "unit_price": item.get("unit_price"),
+                            "total_price": item.get("total_price"),
+                        }
+                        logger.error(
+                            "[ORDER_LINES_FIELDS] order_id=%s line_number=%s keys=%s",
+                            order_id_value,
+                            line_number,
+                            list(insert_fields.keys()),
                         )
 
-                    inserted_count = len(normalized_line_items)
+                        # Fail-safe: one bad line item must not crash the entire batch
+                        try:
+                            db.add(
+                                OrderLine(
+                                    order_id=order_id_value,
+                                    sku=sku,
+                                    product_name=item.get("product_name"),
+                                    quantity=item.get("quantity"),
+                                    unit_price=item.get("unit_price"),
+                                    total_price=item.get("total_price"),
+                                    unit_price_cents=item.get("unit_price_cents"),
+                                    total_price_cents=item.get("total_price_cents"),
+                                    mapped_product_id=item.get("mapped_product_id"),
+                                    mapping_status=item.get("mapping_status"),
+                                    mapping_issue=item.get("mapping_issue"),
+                                    raw_payload=make_json_safe(item.get("raw_payload")),
+                                )
+                            )
+                            inserted_count += 1
+                        except Exception as line_error:
+                            logger.error(
+                                "[LINE_ITEM_ERROR] order_id=%s line_number=%s sku=%s error=%s",
+                                order_id_value,
+                                line_number,
+                                sku,
+                                str(line_error),
+                                exc_info=True,
+                            )
+                            # Continue to next line item instead of crashing batch
+                            continue
+
                     total_lines_written += inserted_count
                     logger.info("[LINE_ITEM_SAVE] inserted=%s external_id=%s", inserted_count, external_id)
 
