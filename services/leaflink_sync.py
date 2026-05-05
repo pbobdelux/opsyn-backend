@@ -37,6 +37,7 @@ HEADER_BATCH_SIZE = 25
 
 
 def utc_now() -> datetime:
+    """Return current time as timezone-aware UTC datetime."""
     return datetime.now(timezone.utc)
 
 
