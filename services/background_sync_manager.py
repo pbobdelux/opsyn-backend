@@ -92,6 +92,7 @@ class BackgroundSyncManager:
         total_pages: int,
         start_page: int,
         total_orders_available: Optional[int] = None,
+        base_url: Optional[str] = None,
     ) -> asyncio.Task:
         """
         Spawn a background asyncio task that calls
@@ -134,6 +135,7 @@ class BackgroundSyncManager:
                     total_pages=total_pages,
                     manager=self,
                     total_orders_available=total_orders_available,
+                    base_url=base_url,
                 )
             except asyncio.CancelledError:
                 logger.info(

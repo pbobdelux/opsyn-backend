@@ -16,11 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models import BrandAPICredential, Order
 from services.leaflink_client import (
-    DEFAULT_LEAFLINK_BASE_URL,
-    DEFAULT_LEAFLINK_COMPANY_ID,
     MOCK_MODE,
     LeafLinkClient,
 )
+
+# These constants were removed from leaflink_client — read env vars directly for debug purposes only.
+# Tenant sync NEVER uses env vars; these are only for the debug endpoint diagnostics.
+_DEBUG_LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "").strip().rstrip("/")
+_DEBUG_LEAFLINK_COMPANY_ID = os.getenv("LEAFLINK_COMPANY_ID", "").strip()
 
 # DEFAULT_LEAFLINK_API_KEY was removed — credentials are now loaded from DB per brand
 
@@ -229,7 +232,7 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
 
     # Resolve brand_id from the active credential used for the API check
     _debug_brand_id = db_cred_for_api.brand_id if db_cred_for_api else None
-    _debug_company_id = db_cred_for_api.company_id if db_cred_for_api else (DEFAULT_LEAFLINK_COMPANY_ID or company_id_raw or None)
+    _debug_company_id = db_cred_for_api.company_id if db_cred_for_api else (_DEBUG_LEAFLINK_COMPANY_ID or company_id_raw or None)
 
     result = {
         "ok": True,
@@ -238,7 +241,7 @@ async def debug_leaflink(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
         "credentials_valid": credentials_valid,
         "credentials_source": credentials_source,
         "brand_id": _debug_brand_id,
-        "base_url": DEFAULT_LEAFLINK_BASE_URL or base_url_raw or None,
+        "base_url": _DEBUG_LEAFLINK_BASE_URL or base_url_raw or None,
         "company_id": _debug_company_id,
         "orders_in_db": orders_in_db,
         "orders_with_line_items": orders_with_line_items,
@@ -334,7 +337,7 @@ async def debug_leaflink_auth(
         )
 
         # Test multiple order endpoint paths with Token auth to find which one works
-        base_url = DEFAULT_LEAFLINK_BASE_URL
+        base_url = _DEBUG_LEAFLINK_BASE_URL
 
         headers = {
             "Authorization": f"Token {clean_api_key}",

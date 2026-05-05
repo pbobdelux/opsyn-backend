@@ -9,8 +9,6 @@ AuthScheme = Literal["Bearer", "Token", "Raw"]
 
 logger = logging.getLogger("leaflink_client")
 
-DEFAULT_LEAFLINK_BASE_URL = os.getenv("LEAFLINK_BASE_URL", "https://api.leaflink.com/api/v1").strip().rstrip("/")
-DEFAULT_LEAFLINK_COMPANY_ID = os.getenv("LEAFLINK_COMPANY_ID", "").strip()
 LEAFLINK_API_VERSION = os.getenv("LEAFLINK_API_VERSION", "").strip()
 LEAFLINK_USER_AGENT = os.getenv("LEAFLINK_USER_AGENT", "opsyn-backend").strip()
 MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
@@ -90,7 +88,10 @@ class LeafLinkClient:
         auth_scheme: Optional[AuthScheme] = None,
     ) -> None:
         self.brand_id = brand_id or "unknown"
-        self.base_url = (base_url or DEFAULT_LEAFLINK_BASE_URL).strip().rstrip("/")
+        if not base_url:
+            logger.warning("leaflink: client_init brand=%s missing base_url — no env var fallback", self.brand_id)
+            raise ValueError("Missing base_url — LeafLink base_url must be provided per brand (not from env vars)")
+        self.base_url = base_url.strip().rstrip("/")
 
         # Clean the API key: strip whitespace and remove "Token " prefix if present
         # api_key is required — no env var fallback (multi-tenant: each brand has its own key)
@@ -104,11 +105,8 @@ class LeafLinkClient:
             )
             self.api_key = self.api_key[6:].strip()
 
-        self.company_id = str(company_id or DEFAULT_LEAFLINK_COMPANY_ID).strip()
+        self.company_id = str(company_id or "").strip()
 
-        if not self.base_url:
-            logger.warning("leaflink: client_init brand=%s missing base_url", self.brand_id)
-            raise ValueError("Missing LEAFLINK_BASE_URL")
         if not self.api_key:
             logger.warning("leaflink: client_init brand=%s missing api_key", self.brand_id)
             raise ValueError("Missing api_key — LeafLink credentials must be provided per brand (not from env vars)")
@@ -445,13 +443,20 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
-        # Build and log the exact URL that will be called so 404s are easy to diagnose
+        # Build URL using /companies/{company_id}/orders-received/ for tenant isolation.
+        # All credentials come from DB — no env var fallback.
+        _orders_path = f"companies/{self.company_id}/orders-received/"
         _param_str = "&".join(f"{k}={v}" for k, v in params.items())
-        _final_url = f"{self.base_url}/orders-received/?{_param_str}"
-        logger.info("[LeafLink] final_url=%s", _final_url)
+        _final_url = f"{self.base_url}/{_orders_path}?{_param_str}"
+        logger.info(
+            "[LeafLink] final_url=%s company_id=%s brand=%s",
+            _final_url,
+            self.company_id,
+            self.brand_id,
+        )
 
         try:
-            resp = self._get_raw("orders-received/", params=params)
+            resp = self._get_raw(_orders_path, params=params)
         except Exception as exc:
             logger.error(
                 "leaflink: list_orders_request_failed brand=%s error=%s",

@@ -162,6 +162,7 @@ async def sync_leaflink_orders(
     brand_id: str,
     orders: list[dict],
     pages_fetched: int = 0,
+    org_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Upsert *pre-fetched* LeafLink orders and their line items.
 
@@ -175,13 +176,20 @@ async def sync_leaflink_orders(
 
     Args:
         db: Active async database session.
-        brand_id: Brand slug / ID used to scope orders.
+        brand_id: Brand UUID used to scope orders.
         orders: Pre-fetched, normalised order dicts from LeafLink.
         pages_fetched: Number of API pages retrieved (for metadata).
+        org_id: Organization UUID for multi-tenant isolation. Written to every
+                order row so GET /orders can filter by org_id AND brand_id.
     """
     sync_start = time.monotonic()
 
-    logger.info("[DB] upserting_orders count=%s brand_id=%s", len(orders), brand_id)
+    logger.info(
+        "[DB] upserting_orders count=%s brand_id=%s org_id=%s",
+        len(orders),
+        brand_id,
+        org_id,
+    )
 
     using_mock = any(isinstance(o, dict) and o.get("mock_data") for o in orders)
     if using_mock:
@@ -289,10 +297,14 @@ async def sync_leaflink_orders(
                 existing.last_synced_at = now
                 existing.external_created_at = external_created_at
                 existing.external_updated_at = external_updated_at
+                # Always stamp org_id so existing rows get backfilled on re-sync
+                if org_id:
+                    existing.org_id = org_id
                 order_row = existing
                 updated += 1
             else:
                 order_row = Order(
+                    org_id=org_id,
                     brand_id=brand_id,
                     external_order_id=external_id,
                     order_number=order_number,
@@ -361,8 +373,8 @@ async def sync_leaflink_orders(
     all_failed = (created == 0 and updated == 0 and error_count > 0 and len(orders) > 0)
 
     logger.info(
-        "leaflink: upsert_complete brand_id=%s created=%s updated=%s skipped=%s errors=%s duration=%ss",
-        brand_id, created, updated, skipped, error_count, sync_duration,
+        "leaflink: upsert_complete org_id=%s brand_id=%s created=%s updated=%s skipped=%s errors=%s duration=%ss",
+        org_id, brand_id, created, updated, skipped, error_count, sync_duration,
     )
 
     return {
@@ -745,6 +757,7 @@ async def sync_leaflink_background_continuous(
     total_orders_available: Optional[int] = None,
     sync_run_id: Optional[int] = None,
     auth_scheme: str = "Token",
+    base_url: Optional[str] = None,
 ) -> None:
     """
     Fetch all remaining LeafLink pages in adaptive batches and upsert to DB.
@@ -762,14 +775,15 @@ async def sync_leaflink_background_continuous(
     run is marked stalled with reason=cursor_loop_detected.
 
     Args:
-        brand_id:               Brand slug / ID.
-        api_key:                LeafLink API key.
-        company_id:             LeafLink company ID.
+        brand_id:               Brand UUID.
+        api_key:                LeafLink API key (from DB credential).
+        company_id:             LeafLink company ID (from DB credential).
         start_page:             First page to fetch (Phase 1 already fetched pages before this).
         total_pages:            Total pages reported by LeafLink API, or None for cursor-based pagination.
         manager:                Optional BackgroundSyncManager instance for in-memory tracking.
         total_orders_available: Total orders reported by LeafLink (for progress display).
         sync_run_id:            Optional SyncRun.id to persist progress against.
+        base_url:               LeafLink base URL (from DB credential, required).
     """
     from services.leaflink_client import LeafLinkClient
     from services.sync_run_manager import (
@@ -822,6 +836,7 @@ async def sync_leaflink_background_continuous(
                 company_id=company_id,
                 brand_id=brand_id,
                 auth_scheme=auth_scheme,
+                base_url=base_url,
             )
         except Exception as client_exc:
             logger.error(
