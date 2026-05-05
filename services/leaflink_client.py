@@ -445,6 +445,11 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
+        # Build and log the exact URL that will be called so 404s are easy to diagnose
+        _param_str = "&".join(f"{k}={v}" for k, v in params.items())
+        _final_url = f"{self.base_url}/orders-received/?{_param_str}"
+        logger.info("[LeafLink] final_url=%s", _final_url)
+
         try:
             resp = self._get_raw("orders-received/", params=params)
         except Exception as exc:
@@ -848,6 +853,7 @@ class LeafLinkClient:
                     # Use the full ``next`` URL returned by LeafLink directly.
                     # _get_raw_url() explicitly attaches the Authorization header so
                     # that pagination requests are authenticated the same way as page 1.
+                    logger.info("[LeafLink] final_url=%s", next_url)
                     resp = self._get_raw_url(next_url)
                     if resp.status_code in (401, 403):
                         logger.error(
@@ -890,6 +896,13 @@ class LeafLinkClient:
                 if not isinstance(results, list):
                     raise RuntimeError(f"Unexpected LeafLink results type: {type(results).__name__}")
 
+                logger.info(
+                    "[LeafLink] page_response status=200 orders_count=%s page=%s brand=%s",
+                    len(results),
+                    page,
+                    brand,
+                )
+
                 if not results:
                     break
 
@@ -924,4 +937,10 @@ class LeafLinkClient:
             logger.info("[LeafLinkSync] returning_mock=false")
             raise
 
+        logger.info(
+            "[LeafLink] pagination_complete total_orders=%s pages_fetched=%s brand=%s",
+            len(all_orders),
+            pages_fetched,
+            brand,
+        )
         return {"orders": all_orders, "pages_fetched": pages_fetched}
