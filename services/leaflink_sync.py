@@ -747,6 +747,12 @@ async def sync_leaflink_orders_headers_only(
                                     newest_order_date = ts_dt
                                 break
 
+                        logger.error(
+                            "[UUID_CAST] query=%s org_id=%s brand_id=%s",
+                            "order_existence_check",
+                            org_id_value,
+                            brand_id_value,
+                        )
                         existing_result = await db.execute(
                             select(Order).where(
                                 Order.brand_id == brand_id_value,
@@ -778,7 +784,7 @@ UPDATE orders SET
     external_created_at = :external_created_at,
     external_updated_at = :external_updated_at,
     updated_at = :updated_at
-WHERE brand_id = CAST(:brand_id AS uuid) AND external_order_id = :external_order_id
+WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :external_order_id
 """
                             # Serialize JSON fields for raw SQL binding — asyncpg
                             # cannot encode Python list/dict directly; it needs strings.

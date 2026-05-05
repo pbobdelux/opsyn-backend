@@ -90,6 +90,59 @@ sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
+# Schema validation
+# ---------------------------------------------------------------------------
+
+
+async def validate_schema() -> None:
+    """Validate that required columns exist in database schema.
+
+    Checks the orders and order_lines tables for required columns and
+    raises ValueError if any are missing or if invalid columns (like
+    pulled_qty) are present.
+    """
+    from database import AsyncSessionLocal
+    from sqlalchemy import text
+
+    try:
+        async with AsyncSessionLocal() as db:
+            # Check orders table
+            result = await db.execute(
+                text("SELECT column_name FROM information_schema.columns WHERE table_name='orders'")
+            )
+            orders_columns = {row[0] for row in result.fetchall()}
+
+            required_orders_cols = {
+                'id', 'org_id', 'brand_id', 'external_order_id',
+                'external_created_at', 'external_updated_at'
+            }
+            missing_orders = required_orders_cols - orders_columns
+            if missing_orders:
+                raise ValueError(f"Missing orders columns: {missing_orders}")
+
+            # Check order_lines table
+            result = await db.execute(
+                text("SELECT column_name FROM information_schema.columns WHERE table_name='order_lines'")
+            )
+            lines_columns = {row[0] for row in result.fetchall()}
+
+            required_lines_cols = {'id', 'order_id', 'sku', 'quantity'}
+            missing_lines = required_lines_cols - lines_columns
+            if missing_lines:
+                raise ValueError(f"Missing order_lines columns: {missing_lines}")
+
+            # Check for invalid columns that should have been removed
+            invalid_cols = {'pulled_qty'} & lines_columns
+            if invalid_cols:
+                raise ValueError(f"Invalid columns in order_lines (should be removed): {invalid_cols}")
+
+            logger.info("[SCHEMA_VALIDATION] orders and order_lines tables are valid")
+    except Exception as e:
+        logger.error("[SCHEMA_VALIDATION] FAILED: %s", e, exc_info=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Core poll-and-execute function
 # ---------------------------------------------------------------------------
 
@@ -439,6 +492,18 @@ async def run_scheduler() -> None:
             identity_exc,
             exc_info=True,
         )
+
+    # Validate database schema at startup
+    try:
+        await validate_schema()
+    except Exception as schema_exc:
+        logger.error(
+            "[SyncWorker] FATAL: schema validation failed: %s",
+            str(schema_exc)[:500],
+            exc_info=True,
+        )
+        sys.stdout.flush()
+        raise
 
     # Main polling loop
     while True:
