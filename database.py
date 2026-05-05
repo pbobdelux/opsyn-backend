@@ -3,6 +3,7 @@ import os
 from typing import AsyncGenerator
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -286,6 +287,53 @@ async def dispose_and_recreate_engine() -> None:
     logger.info("[DB_STARTUP] engine_recreated_after_dispose")
 
 
+async def confirm_database_identity() -> None:
+    """Query and log the database identity at startup.
+
+    Confirms:
+    - Database name (current_database())
+    - Connected user (current_user)
+    - Server host (inet_server_addr())
+    - Server port (inet_server_port())
+
+    Logs as [DB_IDENTITY_CONFIRM] for easy grepping.
+    """
+    if engine is None:
+        logger.warning("[DB_IDENTITY_CONFIRM] engine not available — skipping identity check")
+        return
+
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text("""
+                    SELECT
+                        current_database() as database,
+                        current_user as user,
+                        inet_server_addr() as host,
+                        inet_server_port() as port
+                """)
+            )
+            row = result.fetchone()
+
+            if row:
+                database, user, host, port = row
+                logger.info(
+                    "[DB_IDENTITY_CONFIRM] database=%s user=%s host=%s port=%s",
+                    database,
+                    user,
+                    host or "localhost",
+                    port or "5432",
+                )
+            else:
+                logger.warning("[DB_IDENTITY_CONFIRM] query returned no results")
+    except Exception as exc:
+        logger.error(
+            "[DB_IDENTITY_CONFIRM] failed to query database identity: %s",
+            exc,
+            exc_info=True,
+        )
+
+
 async def inspect_schema_at_startup() -> None:
     """Query information_schema to log and cache actual PostgreSQL column types.
 
@@ -306,11 +354,9 @@ async def inspect_schema_at_startup() -> None:
 
     try:
         async with engine.connect() as conn:
-            from sqlalchemy import text as _text
-
             for table_name in ("orders", "order_lines"):
                 result = await conn.execute(
-                    _text(
+                    text(
                         """
                         SELECT column_name, data_type
                         FROM information_schema.columns
