@@ -2737,6 +2737,7 @@ async def sync_orders_leaflink(
         # Upsert orders into database
         try:
             logger.info("[OrdersSync] upserting_to_database brand_id=%s order_count=%s", brand_id, len(orders))
+            logger.info("[DB] transaction_start")
 
             # Do NOT wrap in `async with db.begin()` — the session provided by
             # get_db() uses SQLAlchemy's autobegin, so a transaction is already
@@ -2745,6 +2746,9 @@ async def sync_orders_leaflink(
             # sync_leaflink_orders() is designed to work inside the caller's
             # existing transaction; it must not open its own.
             sync_result = await sync_leaflink_orders(db, brand_id, orders, pages_fetched=pages_fetched)
+
+            logger.info("[DB] transaction_end")
+            await db.commit()
 
             if not sync_result.get("ok"):
                 logger.error("[OrdersSync] sync_failed brand_id=%s error=%s", brand_id, sync_result.get("error"))
@@ -2774,6 +2778,7 @@ async def sync_orders_leaflink(
 
         except asyncio.TimeoutError:
             logger.error("[OrdersSync] database_sync_timeout brand_id=%s", brand_id)
+            await db.rollback()
             return {
                 "ok": False,
                 "error": "Database sync timed out",
