@@ -142,7 +142,6 @@ class OrderLine(Base):
     product_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    pulled_qty: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     packed_qty: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     unit_price_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
