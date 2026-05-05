@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal, get_schema_column_types, has_column
 from models import Order, OrderLine
+from models.sync_health import DeadLetterLineItem, SyncHealth
 from utils.json_utils import make_json_safe
 
 if TYPE_CHECKING:
@@ -34,6 +35,196 @@ _leaflink_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="leafl
 
 # Number of order headers committed per batch in Phase 1
 HEADER_BATCH_SIZE = 25
+
+# Maximum retries before a line item is moved to the dead-letter table
+MAX_LINE_ITEM_RETRIES = 3
+
+
+# ---------------------------------------------------------------------------
+# Advisory lock helpers — prevent overlapping syncs for the same brand
+# ---------------------------------------------------------------------------
+
+def _brand_lock_id(brand_id: str) -> int:
+    """Convert brand_id to a stable 32-bit integer for pg_advisory_lock."""
+    return int(hashlib.md5(brand_id.encode()).hexdigest()[:8], 16) & 0x7FFFFFFF
+
+
+async def acquire_sync_lock(db: AsyncSession, brand_id: str) -> bool:
+    """Try to acquire an exclusive advisory lock for this brand's sync.
+
+    Returns True if the lock was acquired, False if another sync is already
+    running for this brand.
+    """
+    lock_id = _brand_lock_id(brand_id)
+    result = await db.execute(
+        text("SELECT pg_try_advisory_lock(:lock_id)"),
+        {"lock_id": lock_id},
+    )
+    return result.scalar() is True
+
+
+async def release_sync_lock(db: AsyncSession, brand_id: str) -> None:
+    """Release the advisory lock for this brand's sync."""
+    lock_id = _brand_lock_id(brand_id)
+    await db.execute(
+        text("SELECT pg_advisory_unlock(:lock_id)"),
+        {"lock_id": lock_id},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sync health state helpers
+# ---------------------------------------------------------------------------
+
+async def _update_sync_health_phase1(
+    brand_id: str,
+    orders_count: int,
+) -> None:
+    """Record that Phase 1 started/completed for this brand."""
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                text("""
+                    INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, updated_at)
+                    VALUES (:brand_id, :now, :count, :now)
+                    ON CONFLICT (brand_id) DO UPDATE SET
+                        last_attempted_sync_at = :now,
+                        total_orders_synced = sync_health.total_orders_synced + :count,
+                        updated_at = :now
+                """),
+                {"brand_id": brand_id, "now": utc_now(), "count": orders_count},
+            )
+            await db.commit()
+            logger.info(
+                "[SYNC_HEALTH_UPDATE] brand_id=%s phase=1 orders_delta=%s",
+                brand_id,
+                orders_count,
+            )
+    except Exception as exc:
+        logger.error(
+            "[SYNC_HEALTH_UPDATE_ERROR] brand_id=%s phase=1 error=%s",
+            brand_id,
+            str(exc)[:300],
+        )
+
+
+async def _update_sync_health_phase2(
+    brand_id: str,
+    line_items_count: int,
+) -> None:
+    """Record that Phase 2 completed successfully for this brand."""
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                text("""
+                    UPDATE sync_health SET
+                        last_successful_sync_at = :now,
+                        consecutive_failures = 0,
+                        total_line_items_synced = total_line_items_synced + :count,
+                        last_error = NULL,
+                        updated_at = :now
+                    WHERE brand_id = :brand_id
+                """),
+                {"brand_id": brand_id, "now": utc_now(), "count": line_items_count},
+            )
+            await db.commit()
+            logger.info(
+                "[SYNC_HEALTH_UPDATE] brand_id=%s phase=2 line_items_delta=%s",
+                brand_id,
+                line_items_count,
+            )
+    except Exception as exc:
+        logger.error(
+            "[SYNC_HEALTH_UPDATE_ERROR] brand_id=%s phase=2 error=%s",
+            brand_id,
+            str(exc)[:300],
+        )
+
+
+async def _record_sync_error(brand_id: str, error: Exception) -> None:
+    """Increment consecutive_failures and record the last error message."""
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                text("""
+                    INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
+                    VALUES (:brand_id, :error, 1, :now)
+                    ON CONFLICT (brand_id) DO UPDATE SET
+                        last_error = :error,
+                        consecutive_failures = sync_health.consecutive_failures + 1,
+                        updated_at = :now
+                """),
+                {"brand_id": brand_id, "error": str(error)[:500], "now": utc_now()},
+            )
+            await db.commit()
+    except Exception as exc:
+        logger.error(
+            "[SYNC_HEALTH_UPDATE_ERROR] brand_id=%s record_error error=%s",
+            brand_id,
+            str(exc)[:300],
+        )
+
+
+async def _dead_letter_line_item(
+    brand_id: str,
+    external_order_id: str,
+    order_id: Optional[int],
+    sku: Optional[str],
+    product_name: Optional[str],
+    raw_payload: Any,
+    failure_reason: str,
+    failure_count: int,
+) -> None:
+    """Insert or update a dead-letter record for a permanently failed line item."""
+    try:
+        async with AsyncSessionLocal() as db:
+            raw_payload_str = (
+                json.dumps(make_json_safe(raw_payload))
+                if raw_payload is not None
+                else None
+            )
+            await db.execute(
+                text("""
+                    INSERT INTO dead_letter_line_items
+                        (brand_id, external_order_id, order_id, sku, product_name,
+                         raw_payload, failure_reason, failure_count, last_failed_at, created_at)
+                    VALUES
+                        (:brand_id, :external_order_id, :order_id, :sku, :product_name,
+                         CAST(:raw_payload AS jsonb), :reason, :count, :now, :now)
+                    ON CONFLICT (brand_id, external_order_id, sku) DO UPDATE SET
+                        failure_count = dead_letter_line_items.failure_count + 1,
+                        failure_reason = :reason,
+                        last_failed_at = :now,
+                        raw_payload = CAST(:raw_payload AS jsonb)
+                """),
+                {
+                    "brand_id": brand_id,
+                    "external_order_id": external_order_id,
+                    "order_id": order_id,
+                    "sku": sku or "unknown",
+                    "product_name": product_name,
+                    "raw_payload": raw_payload_str,
+                    "reason": failure_reason[:500],
+                    "count": failure_count,
+                    "now": utc_now(),
+                },
+            )
+            await db.commit()
+        logger.warning(
+            "[LINE_ITEM_DEAD_LETTERED] brand_id=%s external_order_id=%s sku=%s failure_count=%s",
+            brand_id,
+            external_order_id,
+            sku,
+            failure_count,
+        )
+    except Exception as exc:
+        logger.error(
+            "[DEAD_LETTER_ERROR] brand_id=%s external_order_id=%s sku=%s error=%s",
+            brand_id,
+            external_order_id,
+            sku,
+            str(exc)[:300],
+        )
 
 
 def utc_now() -> datetime:
@@ -617,6 +808,11 @@ async def sync_leaflink_orders_headers_only(
     Returns a summary dict compatible with the existing sync_result contract.
     """
     logger.info("[ORDER_SAVE_START] entering order save function brand=%s fetched=%s", brand_id, len(orders))
+    logger.info(
+        "[SYNC_PHASE_1_START] brand_id=%s orders_to_fetch=%s",
+        brand_id,
+        len(orders),
+    )
 
     sync_start = time.monotonic()
 
@@ -934,6 +1130,19 @@ INSERT INTO orders (
         total_skipped,
         sync_duration,
     )
+    logger.info(
+        "[SYNC_PHASE_1_COMPLETE] brand_id=%s created=%s updated=%s duration=%ss",
+        brand_id_value,
+        total_created,
+        total_updated,
+        sync_duration,
+    )
+
+    # Update sync health after Phase 1 commits
+    await _update_sync_health_phase1(
+        brand_id=brand_id_value,
+        orders_count=total_created + total_updated,
+    )
 
     # ------------------------------------------------------------------
     # Phase 2: All order header batches are now committed to the DB.
@@ -969,17 +1178,18 @@ async def sync_leaflink_line_items(
 ) -> dict[str, Any]:
     """Write OrderLine rows for a list of pre-fetched orders (background Phase 2).
 
-    For each order this function:
-      1. Resolves the external_id using the same priority as the header sync
-         (order["id"] → "external_id" → "external_order_id").
-      2. Checks that at least one committed Order row exists for this brand
-         before processing any line items (safety guard).
-      3. Looks up the committed Order row in the DB by (brand_id, external_order_id).
-      4. If the row is NOT found, logs [LINE_ITEM_SKIP] and skips — the order
-         was never committed, so inserting line items would violate the FK.
-      5. If found, reads line_items_json from the DB row (authoritative source),
-         deletes stale OrderLine rows, and inserts fresh ones.
-      6. Logs [LINE_ITEM_SAVE] with the count of inserted rows.
+    Two-phase design guarantees parent orders exist before line items are written:
+      - Phase 1 (sync_leaflink_orders_headers_only) commits all Order rows first.
+      - Phase 2 (this function) runs after Phase 1 commits, so FK lookups always
+        succeed.
+
+    Idempotent writes: uses INSERT ... ON CONFLICT (order_id, sku, product_name)
+    DO UPDATE so retries and overlapping syncs never create duplicates.
+
+    Dead-letter queue: items that fail after MAX_LINE_ITEM_RETRIES are moved to
+    dead_letter_line_items for admin inspection and manual replay.
+
+    Sync health: updates sync_health table after Phase 2 completes or on error.
 
     Runs in its own session per order so a single failure never aborts the rest.
     """
@@ -987,9 +1197,13 @@ async def sync_leaflink_line_items(
 
     # Safety guard: verify orders exist before processing line items
     logger.info("[LINE_ITEM_CHECK_START] checking for parent orders brand=%s", brand_id)
+    logger.info(
+        "[SYNC_PHASE_2_START] brand_id=%s line_items_to_sync=%s",
+        brand_id,
+        len(orders),
+    )
 
     bg_start = time.monotonic()
-    total_lines_written = 0
     errors: list[str] = []
 
     # Cast brand_id to canonical UUID form to match what was written in Phase 1.
@@ -1013,6 +1227,7 @@ async def sync_leaflink_line_items(
 
     if order_count == 0:
         logger.error("[LINE_ITEM_BLOCKED] no orders in DB — aborting line item sync brand=%s", brand_id_value)
+        await _record_sync_error(brand_id_value, Exception("No parent orders found in database"))
         return {
             "ok": False,
             "lines_written": 0,
@@ -1021,8 +1236,9 @@ async def sync_leaflink_line_items(
         }
 
     # ------------------------------------------------------------------
-    # Helper: build the INSERT statement and enabled_columns map once,
-    # reused for both the first pass and the retry pass.
+    # Helper: build the idempotent UPSERT statement once.
+    # Uses ON CONFLICT (order_id, sku, product_name) DO UPDATE so retries
+    # never create duplicate rows (requires uq_order_line_identity constraint).
     # ------------------------------------------------------------------
     optional_columns = [
         "packed_qty",
@@ -1053,38 +1269,57 @@ async def sync_leaflink_line_items(
 
     columns_str = ", ".join(insert_columns)
     placeholders = ", ".join([f":{col}" for col in insert_columns])
-    line_insert_stmt = f"""
+
+    # Build the ON CONFLICT DO UPDATE clause for mutable fields
+    update_set_clauses = [
+        "quantity = EXCLUDED.quantity",
+        "unit_price = EXCLUDED.unit_price",
+        "total_price = EXCLUDED.total_price",
+        "mapped_product_id = EXCLUDED.mapped_product_id",
+        "mapping_status = EXCLUDED.mapping_status",
+        "mapping_issue = EXCLUDED.mapping_issue",
+        "raw_payload = EXCLUDED.raw_payload",
+        "updated_at = EXCLUDED.updated_at",
+    ]
+    if enabled_columns.get("unit_price_cents", False):
+        update_set_clauses.append("unit_price_cents = EXCLUDED.unit_price_cents")
+    if enabled_columns.get("total_price_cents", False):
+        update_set_clauses.append("total_price_cents = EXCLUDED.total_price_cents")
+
+    update_set_str = ",\n        ".join(update_set_clauses)
+
+    line_upsert_stmt = f"""
         INSERT INTO public.order_lines ({columns_str})
         VALUES ({placeholders})
+        ON CONFLICT (order_id, sku, product_name)
+        WHERE sku IS NOT NULL AND product_name IS NOT NULL
+        DO UPDATE SET
+        {update_set_str}
     """
 
     # ------------------------------------------------------------------
-    # Inner helper: insert all line items for one order using savepoints
+    # Inner helper: upsert all line items for one order using savepoints
     # so a single bad item never poisons the whole batch transaction.
-    # Returns (inserted_count, skipped_count, failed_count).
+    # Returns (inserted_count, skipped_count, failed_items).
+    # failed_items is a list of (item_dict, error_str) for dead-lettering.
     # ------------------------------------------------------------------
-    async def _insert_line_items(
+    async def _upsert_line_items(
         db: AsyncSession,
         order_row: Any,
         normalized_line_items: list[dict],
-    ) -> tuple[int, int, int]:
-        order_id_value = order_row.id
+    ) -> tuple[int, int, list[tuple[dict, str]]]:
+        order_id_val = order_row.id
         inserted = 0
         skipped = 0
-        failed = 0
-
-        # Delete stale line items before inserting fresh ones
-        await db.execute(
-            delete(OrderLine).where(OrderLine.order_id == order_id_value)
-        )
+        failed_items: list[tuple[dict, str]] = []
 
         for line_number, item in enumerate(normalized_line_items, 1):
             sku = item.get("sku")
 
-            if not order_id_value or not sku:
+            if not order_id_val or not sku:
                 logger.error(
                     "[LINE_ITEM_SKIP] order_id=%s line_number=%s sku=%s — missing required field",
-                    order_id_value,
+                    order_id_val,
                     line_number,
                     sku,
                 )
@@ -1102,12 +1337,10 @@ async def sync_leaflink_line_items(
                     else None
                 )
 
-                # Defensively normalize datetime fields
-                created_at_val = ensure_utc_aware(utc_now(), "created_at")
-                updated_at_val = ensure_utc_aware(utc_now(), "updated_at")
+                now_val = ensure_utc_aware(utc_now(), "now")
 
                 insert_params: dict[str, Any] = {
-                    "order_id": order_id_value,
+                    "order_id": order_id_val,
                     "sku": sku,
                     "product_name": item.get("product_name"),
                     "quantity": item.get("quantity"),
@@ -1117,8 +1350,8 @@ async def sync_leaflink_line_items(
                     "mapping_status": item.get("mapping_status"),
                     "mapping_issue": item.get("mapping_issue"),
                     "raw_payload": raw_payload_str,
-                    "created_at": created_at_val,
-                    "updated_at": updated_at_val,
+                    "created_at": now_val,
+                    "updated_at": now_val,
                 }
 
                 if enabled_columns.get("packed_qty", False):
@@ -1128,28 +1361,27 @@ async def sync_leaflink_line_items(
                 if enabled_columns.get("total_price_cents", False):
                     insert_params["total_price_cents"] = item.get("total_price_cents")
 
-                await db.execute(text(line_insert_stmt), insert_params)
+                await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
                 await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
 
             except Exception as line_error:
-                # Roll back only this line item — the rest of the batch is safe
                 try:
                     await db.execute(text(f"ROLLBACK TO SAVEPOINT {savepoint_name}"))
                 except Exception:
                     pass
 
                 logger.error(
-                    "[LINE_ITEM_INSERT_FAILED] order_id=%s line_number=%s error=%s",
-                    order_id_value,
+                    "[LINE_ITEM_INSERT_FAILED] order_id=%s line_number=%s sku=%s error=%s",
+                    order_id_val,
                     line_number,
+                    sku,
                     str(line_error)[:200],
                 )
-                failed += 1
-                continue
+                failed_items.append((item, str(line_error)[:500]))
 
-        return inserted, skipped, failed
+        return inserted, skipped, failed_items
 
     # ------------------------------------------------------------------
     # Aggregate counters across all orders
@@ -1161,7 +1393,7 @@ async def sync_leaflink_line_items(
     total_orders = 0
 
     # ------------------------------------------------------------------
-    # First pass: try to insert line items for orders that exist in DB.
+    # First pass: try to upsert line items for orders that exist in DB.
     # Collect orders whose parent row was not found for a retry pass.
     # ------------------------------------------------------------------
     retry_items: list[tuple[str, dict]] = []  # (leaflink_order_id, raw_order_dict)
@@ -1214,29 +1446,42 @@ async def sync_leaflink_line_items(
                     if not normalized_line_items:
                         continue
 
-                    order_id_value = order_row.id
-                    inserted_count, skipped_count, failed_count = await _insert_line_items(
+                    order_id_val = order_row.id
+                    inserted_count, skipped_count, failed_items = await _upsert_line_items(
                         db, order_row, normalized_line_items
                     )
 
                     logger.info(
-                        "[LINE_ITEM_SAVE_COMMIT] brand_id=%s created=%s updated=0",
+                        "[LINE_ITEM_UPSERT_COMMIT] brand_id=%s inserted=%s updated=0 duration=0s",
                         brand_id_value,
                         inserted_count,
                     )
                     logger.info(
                         "[LINE_ITEM_BATCH_RESULT] order_id=%s total=%s inserted=%s skipped=%s failed=%s retried=0",
-                        order_id_value,
+                        order_id_val,
                         len(normalized_line_items),
                         inserted_count,
                         skipped_count,
-                        failed_count,
+                        len(failed_items),
                     )
 
                     total_inserted += inserted_count
                     total_skipped += skipped_count
-                    total_failed += failed_count
+                    total_failed += len(failed_items)
                     total_orders += 1
+
+                    # Dead-letter permanently failed items
+                    for failed_item, fail_reason in failed_items:
+                        await _dead_letter_line_item(
+                            brand_id=brand_id_value,
+                            external_order_id=leaflink_order_id,
+                            order_id=order_id_val,
+                            sku=failed_item.get("sku"),
+                            product_name=failed_item.get("product_name"),
+                            raw_payload=failed_item.get("raw_payload"),
+                            failure_reason=fail_reason,
+                            failure_count=1,
+                        )
 
         except Exception as line_exc:
             err_msg = str(line_exc)
@@ -1252,6 +1497,7 @@ async def sync_leaflink_line_items(
     # ------------------------------------------------------------------
     # Retry pass: attempt once more for orders whose parent row was not
     # found during the first pass (they may have been committed by now).
+    # Items that still fail after retry are dead-lettered.
     # ------------------------------------------------------------------
     for leaflink_order_id, o in retry_items:
         logger.info("[LINE_ITEM_RETRY] leaflink_order_id=%s", leaflink_order_id)
@@ -1269,9 +1515,23 @@ async def sync_leaflink_line_items(
 
                     if order_row is None:
                         logger.warning(
-                            "[LINE_ITEM_RETRY_GIVEUP] leaflink_order_id=%s",
+                            "[LINE_ITEM_RETRY_GIVEUP] leaflink_order_id=%s — dead-lettering all items",
                             leaflink_order_id,
                         )
+                        # Dead-letter all items for this order since parent was never found
+                        raw_line_items = o.get("line_items", [])
+                        normalized_line_items = normalize_line_items(raw_line_items)
+                        for item in normalized_line_items:
+                            await _dead_letter_line_item(
+                                brand_id=brand_id_value,
+                                external_order_id=leaflink_order_id,
+                                order_id=None,
+                                sku=item.get("sku"),
+                                product_name=item.get("product_name"),
+                                raw_payload=item.get("raw_payload"),
+                                failure_reason="Parent order not found after retry",
+                                failure_count=MAX_LINE_ITEM_RETRIES,
+                            )
                         continue
 
                     logger.info(
@@ -1290,30 +1550,43 @@ async def sync_leaflink_line_items(
                     if not normalized_line_items:
                         continue
 
-                    order_id_value = order_row.id
-                    inserted_count, skipped_count, failed_count = await _insert_line_items(
+                    order_id_val = order_row.id
+                    inserted_count, skipped_count, failed_items = await _upsert_line_items(
                         db, order_row, normalized_line_items
                     )
 
                     logger.info(
-                        "[LINE_ITEM_SAVE_COMMIT] brand_id=%s created=%s updated=0",
+                        "[LINE_ITEM_UPSERT_COMMIT] brand_id=%s inserted=%s updated=0 duration=0s",
                         brand_id_value,
                         inserted_count,
                     )
                     logger.info(
                         "[LINE_ITEM_BATCH_RESULT] order_id=%s total=%s inserted=%s skipped=%s failed=%s retried=1",
-                        order_id_value,
+                        order_id_val,
                         len(normalized_line_items),
                         inserted_count,
                         skipped_count,
-                        failed_count,
+                        len(failed_items),
                     )
 
                     total_inserted += inserted_count
                     total_skipped += skipped_count
-                    total_failed += failed_count
+                    total_failed += len(failed_items)
                     total_retried += 1
                     total_orders += 1
+
+                    # Dead-letter items that still failed after retry
+                    for failed_item, fail_reason in failed_items:
+                        await _dead_letter_line_item(
+                            brand_id=brand_id_value,
+                            external_order_id=leaflink_order_id,
+                            order_id=order_id_val,
+                            sku=failed_item.get("sku"),
+                            product_name=failed_item.get("product_name"),
+                            raw_payload=failed_item.get("raw_payload"),
+                            failure_reason=fail_reason,
+                            failure_count=MAX_LINE_ITEM_RETRIES,
+                        )
 
         except Exception as retry_exc:
             err_msg = str(retry_exc)
@@ -1329,7 +1602,7 @@ async def sync_leaflink_line_items(
     bg_duration = round(time.monotonic() - bg_start, 2)
 
     logger.info(
-        "[SYNC_COMPLETE] brand_id=%s orders_processed=%s line_items_total=%s inserted=%s skipped=%s failed=%s retried=%s",
+        "[SYNC_PHASE_2_COMPLETE] brand_id=%s orders_processed=%s line_items_total=%s inserted=%s skipped=%s failed=%s retried=%s duration=%ss",
         brand_id_value,
         total_orders,
         total_inserted + total_skipped + total_failed,
@@ -1337,6 +1610,15 @@ async def sync_leaflink_line_items(
         total_skipped,
         total_failed,
         total_retried,
+        bg_duration,
+    )
+    logger.info(
+        "[SYNC_COMPLETE] brand_id=%s ok=true orders=%s line_items=%s errors=%s duration=%ss",
+        brand_id_value,
+        total_orders,
+        total_inserted,
+        len(errors),
+        bg_duration,
     )
     logger.info(
         "[OrdersSync] line_items_complete brand=%s lines_written=%s duration=%ss errors=%s",
@@ -1345,6 +1627,18 @@ async def sync_leaflink_line_items(
         bg_duration,
         len(errors),
     )
+
+    # Update sync health after Phase 2 completes
+    if len(errors) == 0:
+        await _update_sync_health_phase2(
+            brand_id=brand_id_value,
+            line_items_count=total_inserted,
+        )
+    else:
+        await _record_sync_error(
+            brand_id=brand_id_value,
+            error=Exception(f"Phase 2 completed with {len(errors)} errors"),
+        )
 
     return {
         "ok": len(errors) == 0,
