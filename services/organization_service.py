@@ -1,6 +1,7 @@
 import logging
 from uuid import UUID
-from sqlalchemy import select
+from sqlalchemy import cast, select
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from models.auth_models import Organization
 
@@ -34,9 +35,12 @@ async def lookup_organization(db: AsyncSession, org_identifier: str) -> dict:
             org_uuid = UUID(org_identifier)
             logger.info("[Org] identifier_is_uuid uuid=%s", org_uuid)
 
-            # Query by UUID
+            # Query by UUID — cast the string literal to uuid to avoid
+            # "operator does not exist: uuid = character varying" errors
             result = await db.execute(
-                select(Organization).where(Organization.id == str(org_uuid))
+                select(Organization).where(
+                    Organization.id == cast(str(org_uuid), PG_UUID(as_uuid=False))
+                )
             )
             org = result.scalar_one_or_none()
 
@@ -45,7 +49,7 @@ async def lookup_organization(db: AsyncSession, org_identifier: str) -> dict:
                 return {"ok": True, "organization": org, "error": None}
             else:
                 logger.warning("[Org] not_found_by_uuid uuid=%s", org_uuid)
-                return {"ok": False, "organization": None, "error": f"Organization not found: {org_identifier}"}
+                return {"ok": False, "organization": None, "error": "Organization not found"}
 
         except (ValueError, TypeError):
             # Not a UUID — try org_code (case-insensitive)
@@ -63,7 +67,7 @@ async def lookup_organization(db: AsyncSession, org_identifier: str) -> dict:
                 return {"ok": True, "organization": org, "error": None}
             else:
                 logger.warning("[Org] not_found_by_org_code code=%s", org_code_lower)
-                return {"ok": False, "organization": None, "error": f"Organization not found: {org_identifier}"}
+                return {"ok": False, "organization": None, "error": "Organization not found"}
 
     except Exception as e:
         logger.error("[Org] lookup_organization_failed error=%s", str(e)[:500], exc_info=True)
