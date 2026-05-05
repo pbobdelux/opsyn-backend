@@ -119,28 +119,46 @@ def force_utc(dt: Any) -> datetime | None:
     return None
 
 
+def enforce_all_datetimes_utc(params: dict[str, Any]) -> dict[str, Any]:
+    """Enforce all datetime values in params dict to be UTC-aware.
+
+    This is the final boundary check before SQL execution.
+    Scans every parameter and converts any datetime to UTC-aware.
+
+    Args:
+        params: Parameter dict for SQL execution
+
+    Returns:
+        New dict with all datetimes converted to UTC-aware
+    """
+    fixed = {}
+    for k, v in params.items():
+        if isinstance(v, datetime):
+            # If naive or invalid tzinfo, assume UTC
+            if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
+                v = v.replace(tzinfo=timezone.utc)
+            else:
+                # If aware, convert to UTC
+                v = v.astimezone(timezone.utc)
+        fixed[k] = v
+    return fixed
+
+
 def log_final_datetime_params(params: dict[str, Any], op: str) -> None:
     """Log all datetime parameters immediately before SQL execution.
 
-    This is the final check to confirm all datetimes are UTC-aware.
+    Scans every parameter and logs all datetime fields.
+    This is the final audit trail before asyncpg execution.
     """
-    datetime_fields = [
-        "synced_at", "last_synced_at", "created_at", "updated_at",
-        "external_created_at", "external_updated_at"
-    ]
-
-    for field_name in datetime_fields:
-        value = params.get(field_name)
-        if value is not None:
-            tzinfo = getattr(value, "tzinfo", None)
-            offset = value.utcoffset() if isinstance(value, datetime) and value.tzinfo else None
+    for field_name, value in params.items():
+        if isinstance(value, datetime):
             logger.error(
                 "[FINAL_DT_PARAM] op=%s field=%s value=%s tzinfo=%s offset=%s",
                 op,
                 field_name,
                 value,
-                tzinfo,
-                offset,
+                value.tzinfo,
+                value.utcoffset() if value.tzinfo else None,
             )
 
 
@@ -746,6 +764,7 @@ WHERE brand_id = CAST(:brand_id AS uuid) AND external_order_id = :external_order
                             }
                             log_datetime_check(update_params, "UPDATE")
                             validate_datetime_params(update_params, "UPDATE")
+                            update_params = enforce_all_datetimes_utc(update_params)
                             log_final_datetime_params(update_params, "UPDATE")
                             await db.execute(
                                 text(update_stmt),
@@ -802,6 +821,7 @@ INSERT INTO orders (
                             }
                             log_datetime_check(insert_params, "INSERT")
                             validate_datetime_params(insert_params, "INSERT")
+                            insert_params = enforce_all_datetimes_utc(insert_params)
                             log_final_datetime_params(insert_params, "INSERT")
                             await db.execute(
                                 text(insert_stmt),
