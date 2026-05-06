@@ -284,10 +284,13 @@ async def lifespan(app: FastAPI):
 
     logger.info(f"Starting {APP_NAME} in {APP_ENV}")
 
-    await _create_assistant_tables()
+    # Run migrations FIRST, before any other database operations, to ensure
+    # schema is up-to-date before tables are created or queries are executed.
     from services.migration_runner import run_migrations
     applied = await run_migrations()
     logger.info("[Startup] migrations_complete count=%s", len(applied))
+
+    await _create_assistant_tables()
 
     # Refresh connection pool after migrations so new connections see updated schema
     if applied:
