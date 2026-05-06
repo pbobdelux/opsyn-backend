@@ -85,14 +85,14 @@ async def _update_sync_health_phase1(
         async with AsyncSessionLocal() as db:
             await db.execute(
                 text("""
-                    INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, updated_at)
-                    VALUES (:brand_id, :now, :count, :now)
+                    INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, updated_at)
+                    VALUES (:brand_id, :now, :count, 0, 0, :now)
                     ON CONFLICT (brand_id) DO UPDATE SET
                         last_attempted_sync_at = :now,
                         total_orders_synced = sync_health.total_orders_synced + :count,
                         updated_at = :now
                 """),
-                {"brand_id": brand_id, "now": utc_now(), "count": orders_count},
+                {"brand_id": brand_id, "now": utc_now(), "count": (orders_count or 0)},
             )
             await db.commit()
             logger.info(
@@ -275,6 +275,32 @@ def normalize_datetime(dt: Any) -> datetime | None:
 
     # Unsupported type
     return None
+
+
+def ensure_utc(dt: Any) -> "datetime | None":
+    """Ensure a datetime is timezone-aware UTC.
+
+    Handles:
+    - None → None
+    - Naive datetime → assume UTC and make aware
+    - Aware datetime → convert to UTC
+    - Invalid input → None
+
+    ALWAYS returns either UTC-aware datetime or None.
+    Never returns naive datetimes.
+    """
+    if dt is None:
+        return None
+
+    if not isinstance(dt, datetime):
+        return None
+
+    # If naive, assume UTC and make aware
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+
+    # If aware, convert to UTC
+    return dt.astimezone(timezone.utc)
 
 
 def ensure_utc_aware(dt: Any, field_name: str) -> "datetime | None":
@@ -655,14 +681,17 @@ async def sync_leaflink_orders(
             created_raw = o.get("created") or o.get("created_at") or o.get("external_created_at")
             modified_raw = o.get("modified") or o.get("updated") or o.get("updated_at") or o.get("external_updated_at")
 
-            external_created_at = normalize_datetime(created_raw)
-            external_updated_at = normalize_datetime(modified_raw)
+            # NORMALIZE to UTC-aware
+            external_created_at = ensure_utc(normalize_datetime(created_raw))
+            external_updated_at = ensure_utc(normalize_datetime(modified_raw))
 
             # Track the newest order date for the response.
             for ts_dt in (external_updated_at, external_created_at):
                 if ts_dt:
-                    if newest_order_date is None or ts_dt > newest_order_date:
-                        newest_order_date = ts_dt
+                    order_date_utc = ensure_utc(ts_dt)
+                    newest_order_date_utc = ensure_utc(newest_order_date)
+                    if order_date_utc and (newest_order_date_utc is None or order_date_utc > newest_order_date_utc):
+                        newest_order_date = order_date_utc
                     break
 
             # Defensively normalize all datetime fields — ensure_utc_aware logs
@@ -918,13 +947,16 @@ async def sync_leaflink_orders_headers_only(
                         created_raw = o.get("created") or o.get("created_at") or o.get("external_created_at")
                         modified_raw = o.get("modified") or o.get("updated") or o.get("updated_at") or o.get("external_updated_at")
 
-                        external_created_at = normalize_datetime(created_raw)
-                        external_updated_at = normalize_datetime(modified_raw)
+                        # NORMALIZE to UTC-aware
+                        external_created_at = ensure_utc(normalize_datetime(created_raw))
+                        external_updated_at = ensure_utc(normalize_datetime(modified_raw))
 
                         for ts_dt in (external_updated_at, external_created_at):
                             if ts_dt:
-                                if newest_order_date is None or ts_dt > newest_order_date:
-                                    newest_order_date = ts_dt
+                                order_date_utc = ensure_utc(ts_dt)
+                                newest_order_date_utc = ensure_utc(newest_order_date)
+                                if order_date_utc and (newest_order_date_utc is None or order_date_utc > newest_order_date_utc):
+                                    newest_order_date = order_date_utc
                                 break
 
                         existing_result = await db.execute(
@@ -1141,7 +1173,7 @@ INSERT INTO orders (
     # Update sync health after Phase 1 commits
     await _update_sync_health_phase1(
         brand_id=brand_id_value,
-        orders_count=total_created + total_updated,
+        orders_count=(total_created or 0) + (total_updated or 0),
     )
 
     # ------------------------------------------------------------------
@@ -1339,13 +1371,18 @@ async def sync_leaflink_line_items(
 
                 now_val = ensure_utc_aware(utc_now(), "now")
 
+                # Defensive null checks — ensure required numeric fields have defaults
+                quantity = item.get("quantity") or 0
+                unit_price = item.get("unit_price") or 0
+                total_price = item.get("total_price") or 0
+
                 insert_params: dict[str, Any] = {
                     "order_id": order_id_val,
                     "sku": sku,
                     "product_name": item.get("product_name"),
-                    "quantity": item.get("quantity"),
-                    "unit_price": item.get("unit_price"),
-                    "total_price": item.get("total_price"),
+                    "quantity": quantity,
+                    "unit_price": unit_price,
+                    "total_price": total_price,
                     "mapped_product_id": item.get("mapped_product_id"),
                     "mapping_status": item.get("mapping_status"),
                     "mapping_issue": item.get("mapping_issue"),
@@ -1378,6 +1415,25 @@ async def sync_leaflink_line_items(
                     line_number,
                     sku,
                     str(line_error)[:200],
+                )
+                logger.error(
+                    "[LINE_ITEM_INSERT_FAILED_DEBUG] order_id=%s line_number=%s payload=%s",
+                    order_id_val,
+                    line_number,
+                    json.dumps({
+                        "sku": sku,
+                        "product_name": item.get("product_name"),
+                        "quantity": item.get("quantity"),
+                        "unit_price": item.get("unit_price"),
+                        "total_price": item.get("total_price"),
+                        "unit_price_cents": item.get("unit_price_cents"),
+                        "total_price_cents": item.get("total_price_cents"),
+                        "mapped_product_id": item.get("mapped_product_id"),
+                        "mapping_status": item.get("mapping_status"),
+                        "mapping_issue": item.get("mapping_issue"),
+                        "created_at": str(now_val) if now_val else None,
+                        "updated_at": str(now_val) if now_val else None,
+                    }, default=str)[:1000],
                 )
                 failed_items.append((item, str(line_error)[:500]))
 
@@ -1632,7 +1688,7 @@ async def sync_leaflink_line_items(
     if len(errors) == 0:
         await _update_sync_health_phase2(
             brand_id=brand_id_value,
-            line_items_count=total_inserted,
+            line_items_count=(total_inserted or 0),
         )
     else:
         await _record_sync_error(
