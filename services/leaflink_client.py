@@ -1,9 +1,12 @@
 import logging
 import os
+import random
 import time
 from typing import Any, Dict, List, Literal, Optional
 
 import requests
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
 
 AuthScheme = Literal["Bearer", "Token", "Raw", "Api-Key"]
 
@@ -13,11 +16,14 @@ LEAFLINK_API_VERSION = os.getenv("LEAFLINK_API_VERSION", "").strip()
 LEAFLINK_USER_AGENT = os.getenv("LEAFLINK_USER_AGENT", "opsyn-backend").strip()
 MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
 
-# Retry configuration for transient HTTP errors
+# Retry configuration for transient HTTP errors and network failures
 _RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 _MAX_RETRY_ATTEMPTS = 3
 _RETRY_BACKOFF_BASE = 1.0   # seconds (doubles each attempt: 1s, 2s, 4s)
 _REQUEST_TIMEOUT = 30       # seconds per HTTP request
+
+# Network-level errors that are always retryable (DNS, connection reset, timeout)
+_RETRYABLE_NETWORK_EXCEPTIONS = (RequestsConnectionError, RequestsTimeout, OSError)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -251,32 +257,37 @@ class LeafLinkClient:
                     len(self.api_key or ""),
                     (self.api_key[:8] if self.api_key and len(self.api_key) >= 8 else "SHORT"),
                 )
-                logger.error("[LEAFLINK_ACTUAL] about_to_request url=%s", url)
                 resp = self.session.get(
                     url,
                     params=params,
                     timeout=_REQUEST_TIMEOUT,
                     headers=headers,
                 )
-            except Exception as exc:
-                logger.error(
-                    "[LeafLinkAuth] request_error full_url=%s attempt=%s/%s error=%s",
-                    url, attempt, _MAX_RETRY_ATTEMPTS, exc,
-                )
+            except _RETRYABLE_NETWORK_EXCEPTIONS as exc:
+                # DNS failures (NameResolutionError), connection resets, timeouts
                 last_exc = exc
                 if attempt < _MAX_RETRY_ATTEMPTS:
                     backoff = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                    jitter = random.uniform(0, backoff * 0.1)
+                    backoff_total = round(backoff + jitter, 2)
                     logger.warning(
-                        "[LeafLinkClient] retry_after_error attempt=%s/%s backoff=%.1fs url=%s",
-                        attempt, _MAX_RETRY_ATTEMPTS, backoff, url,
+                        "[LEAFLINK_REQUEST_RETRY] method=GET endpoint=%s error=%s attempt=%s backoff=%ss",
+                        path, type(exc).__name__, attempt, backoff_total,
                     )
-                    time.sleep(backoff)
+                    time.sleep(backoff_total)
+                else:
+                    logger.error(
+                        "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s error=%s max_retries_exceeded",
+                        path, type(exc).__name__,
+                    )
                 continue
-
-            logger.info(
-                "[LeafLinkSync] page_response status=%s full_url=%s attempt=%s",
-                resp.status_code, url, attempt,
-            )
+            except Exception as exc:
+                logger.error(
+                    "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s error=%s",
+                    path, type(exc).__name__,
+                )
+                last_exc = exc
+                continue
 
             content_type = resp.headers.get("Content-Type", "")
             if "application/json" not in content_type.lower():
@@ -298,24 +309,31 @@ class LeafLinkClient:
                     )
                 if resp.status_code in (401, 403):
                     logger.error(
-                        "[LeafLinkAuth] auth_failed brand=%s status=%s reason=%s full_url=%s",
-                        self.brand_id, resp.status_code, resp.text[:200], url,
+                        "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s status=%s",
+                        path, resp.status_code,
                     )
                     # Do NOT retry auth failures
                     return resp
                 elif resp.status_code in _RETRY_STATUS_CODES and attempt < _MAX_RETRY_ATTEMPTS:
                     backoff = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                    jitter = random.uniform(0, backoff * 0.1)
+                    backoff_total = round(backoff + jitter, 2)
                     logger.warning(
-                        "[LeafLinkClient] retry_transient_error status=%s attempt=%s/%s backoff=%.1fs url=%s",
-                        resp.status_code, attempt, _MAX_RETRY_ATTEMPTS, backoff, url,
+                        "[LEAFLINK_REQUEST_RETRY] method=GET endpoint=%s status=%s attempt=%s backoff=%ss",
+                        path, resp.status_code, attempt, backoff_total,
                     )
-                    time.sleep(backoff)
+                    time.sleep(backoff_total)
                     continue
                 else:
                     logger.error(
-                        "leaflink: API HTTP error brand=%s full_url=%s status=%s body=%s",
-                        self.brand_id, url, resp.status_code, resp.text[:500],
+                        "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s status=%s",
+                        path, resp.status_code,
                     )
+            else:
+                logger.info(
+                    "[LEAFLINK_REQUEST_SUCCESS] method=GET endpoint=%s status=%s",
+                    path, resp.status_code,
+                )
 
             return resp
 
@@ -341,31 +359,36 @@ class LeafLinkClient:
         last_exc: Optional[Exception] = None
         for attempt in range(1, _MAX_RETRY_ATTEMPTS + 1):
             try:
-                logger.info(
-                    "[LeafLink] final_url=%s auth_scheme=%s key_len=%s",
-                    url,
-                    self.auth_scheme,
-                    len(self.api_key) if self.api_key else 0,
-                )
                 resp = self.session.get(
                     url,
                     params=None,
                     timeout=_REQUEST_TIMEOUT,
                     headers=headers,
                 )
-            except Exception as exc:
-                logger.error(
-                    "[LeafLinkAuth] request_error full_url=%s attempt=%s/%s error=%s",
-                    url, attempt, _MAX_RETRY_ATTEMPTS, exc,
-                )
+            except _RETRYABLE_NETWORK_EXCEPTIONS as exc:
+                # DNS failures (NameResolutionError), connection resets, timeouts
                 last_exc = exc
                 if attempt < _MAX_RETRY_ATTEMPTS:
                     backoff = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                    jitter = random.uniform(0, backoff * 0.1)
+                    backoff_total = round(backoff + jitter, 2)
                     logger.warning(
-                        "[LeafLinkClient] retry_after_error attempt=%s/%s backoff=%.1fs url=%s",
-                        attempt, _MAX_RETRY_ATTEMPTS, backoff, url,
+                        "[LEAFLINK_REQUEST_RETRY] method=GET endpoint=%s error=%s attempt=%s backoff=%ss",
+                        url, type(exc).__name__, attempt, backoff_total,
                     )
-                    time.sleep(backoff)
+                    time.sleep(backoff_total)
+                else:
+                    logger.error(
+                        "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s error=%s max_retries_exceeded",
+                        url, type(exc).__name__,
+                    )
+                continue
+            except Exception as exc:
+                logger.error(
+                    "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s error=%s",
+                    url, type(exc).__name__,
+                )
+                last_exc = exc
                 continue
 
             if resp.status_code == 404:
@@ -381,19 +404,26 @@ class LeafLinkClient:
 
             if resp.status_code in (401, 403):
                 logger.error(
-                    "[LeafLinkAuth] pagination_auth_failed status=%s body=%s full_url=%s",
-                    resp.status_code, resp.text[:200], url,
+                    "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s status=%s",
+                    url, resp.status_code,
                 )
                 # Do NOT retry auth failures
                 return resp
             elif not resp.ok and resp.status_code in _RETRY_STATUS_CODES and attempt < _MAX_RETRY_ATTEMPTS:
                 backoff = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                jitter = random.uniform(0, backoff * 0.1)
+                backoff_total = round(backoff + jitter, 2)
                 logger.warning(
-                    "[LeafLinkClient] retry_transient_error status=%s attempt=%s/%s backoff=%.1fs url=%s",
-                    resp.status_code, attempt, _MAX_RETRY_ATTEMPTS, backoff, url,
+                    "[LEAFLINK_REQUEST_RETRY] method=GET endpoint=%s status=%s attempt=%s backoff=%ss",
+                    url, resp.status_code, attempt, backoff_total,
                 )
-                time.sleep(backoff)
+                time.sleep(backoff_total)
                 continue
+            elif resp.ok:
+                logger.info(
+                    "[LEAFLINK_REQUEST_SUCCESS] method=GET endpoint=%s status=%s",
+                    url, resp.status_code,
+                )
 
             return resp
 

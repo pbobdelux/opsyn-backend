@@ -168,6 +168,29 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
         )
 
 
+async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
+    """Record a retryable (transient) sync error in sync_health without incrementing consecutive_failures."""
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                text("""
+                    INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
+                    VALUES (:brand_id, :error, 0, :now)
+                    ON CONFLICT (brand_id) DO UPDATE SET
+                        last_error = :error,
+                        updated_at = :now
+                """),
+                {"brand_id": brand_id, "error": error_msg[:500], "now": ensure_utc(utc_now())},
+            )
+            await db.commit()
+    except Exception as exc:
+        logger.error(
+            "[SYNC_HEALTH_UPDATE_ERROR] brand_id=%s record_retryable_error error=%s",
+            brand_id,
+            str(exc)[:300],
+        )
+
+
 async def _dead_letter_line_item(
     brand_id: str,
     external_order_id: str,
@@ -463,17 +486,17 @@ async def _insert_line_items_standalone(
     Intended for use by external scripts (e.g. scripts/retry_line_items.py)
     that need to re-insert line items without going through the full sync flow.
     """
-    optional_columns = ["packed_qty", "unit_price_cents", "total_price_cents"]
+    optional_columns = [
+        "packed_qty", "unit_price_cents", "total_price_cents",
+        "mapped_product_id", "mapping_status", "mapping_issue",
+        "raw_payload", "created_at", "updated_at",
+    ]
     enabled_columns: dict[str, bool] = {
         col: has_column("order_lines", col) for col in optional_columns
     }
 
-    insert_columns = [
-        "order_id", "sku", "product_name", "quantity",
-        "unit_price", "total_price", "mapped_product_id",
-        "mapping_status", "mapping_issue", "raw_payload",
-        "created_at", "updated_at",
-    ]
+    # Core columns always present; optional columns appended only if they exist
+    insert_columns = ["order_id", "sku", "product_name", "quantity", "unit_price", "total_price"]
     for col in optional_columns:
         if enabled_columns.get(col, False):
             insert_columns.append(col)
@@ -527,14 +550,20 @@ async def _insert_line_items_standalone(
                 "quantity": item.get("quantity"),
                 "unit_price": item.get("unit_price"),
                 "total_price": item.get("total_price"),
-                "mapped_product_id": item.get("mapped_product_id"),
-                "mapping_status": item.get("mapping_status"),
-                "mapping_issue": item.get("mapping_issue"),
-                "raw_payload": raw_payload_str,
-                "created_at": created_at_val,
-                "updated_at": updated_at_val,
             }
 
+            if enabled_columns.get("mapped_product_id", False):
+                insert_params["mapped_product_id"] = item.get("mapped_product_id")
+            if enabled_columns.get("mapping_status", False):
+                insert_params["mapping_status"] = item.get("mapping_status")
+            if enabled_columns.get("mapping_issue", False):
+                insert_params["mapping_issue"] = item.get("mapping_issue")
+            if enabled_columns.get("raw_payload", False):
+                insert_params["raw_payload"] = raw_payload_str
+            if enabled_columns.get("created_at", False):
+                insert_params["created_at"] = created_at_val
+            if enabled_columns.get("updated_at", False):
+                insert_params["updated_at"] = updated_at_val
             if enabled_columns.get("packed_qty", False):
                 insert_params["packed_qty"] = 0
             if enabled_columns.get("unit_price_cents", False):
@@ -1278,23 +1307,12 @@ async def sync_leaflink_line_items(
     # Helper: build the idempotent UPSERT statement once.
     # Uses ON CONFLICT (order_id, sku, product_name) DO UPDATE so retries
     # never create duplicate rows (requires uq_order_line_identity constraint).
+    # Inspect actual schema so inserts work with any schema variant.
     # ------------------------------------------------------------------
     optional_columns = [
         "packed_qty",
         "unit_price_cents",
         "total_price_cents",
-    ]
-    enabled_columns: dict[str, bool] = {
-        col: has_column("order_lines", col) for col in optional_columns
-    }
-
-    insert_columns = [
-        "order_id",
-        "sku",
-        "product_name",
-        "quantity",
-        "unit_price",
-        "total_price",
         "mapped_product_id",
         "mapping_status",
         "mapping_issue",
@@ -1302,6 +1320,25 @@ async def sync_leaflink_line_items(
         "created_at",
         "updated_at",
     ]
+    enabled_columns: dict[str, bool] = {
+        col: has_column("order_lines", col) for col in optional_columns
+    }
+
+    logger.info(
+        "[LINE_ITEM_COLUMNS_ENABLED] columns=%s",
+        json.dumps({col: enabled for col, enabled in enabled_columns.items()}),
+    )
+
+    # Always-present core columns
+    insert_columns = [
+        "order_id",
+        "sku",
+        "product_name",
+        "quantity",
+        "unit_price",
+        "total_price",
+    ]
+    # Append optional columns only if they exist in the live schema
     for col in optional_columns:
         if enabled_columns.get(col, False):
             insert_columns.append(col)
@@ -1309,17 +1346,22 @@ async def sync_leaflink_line_items(
     columns_str = ", ".join(insert_columns)
     placeholders = ", ".join([f":{col}" for col in insert_columns])
 
-    # Build the ON CONFLICT DO UPDATE clause for mutable fields
+    # Build the ON CONFLICT DO UPDATE clause — only include columns that exist
     update_set_clauses = [
         "quantity = EXCLUDED.quantity",
         "unit_price = EXCLUDED.unit_price",
         "total_price = EXCLUDED.total_price",
-        "mapped_product_id = EXCLUDED.mapped_product_id",
-        "mapping_status = EXCLUDED.mapping_status",
-        "mapping_issue = EXCLUDED.mapping_issue",
-        "raw_payload = EXCLUDED.raw_payload",
-        "updated_at = EXCLUDED.updated_at",
     ]
+    if enabled_columns.get("mapped_product_id", False):
+        update_set_clauses.append("mapped_product_id = EXCLUDED.mapped_product_id")
+    if enabled_columns.get("mapping_status", False):
+        update_set_clauses.append("mapping_status = EXCLUDED.mapping_status")
+    if enabled_columns.get("mapping_issue", False):
+        update_set_clauses.append("mapping_issue = EXCLUDED.mapping_issue")
+    if enabled_columns.get("raw_payload", False):
+        update_set_clauses.append("raw_payload = EXCLUDED.raw_payload")
+    if enabled_columns.get("updated_at", False):
+        update_set_clauses.append("updated_at = EXCLUDED.updated_at")
     if enabled_columns.get("unit_price_cents", False):
         update_set_clauses.append("unit_price_cents = EXCLUDED.unit_price_cents")
     if enabled_columns.get("total_price_cents", False):
@@ -1380,6 +1422,7 @@ async def sync_leaflink_line_items(
                 # Defensive null checks — ensure required numeric fields have defaults
                 quantity = item.get("quantity") or 0
                 unit_price = item.get("unit_price") or 0
+                total_price = item.get("total_price") or 0
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
                 now_val = ensure_utc(utc_now())
 
@@ -1390,14 +1433,20 @@ async def sync_leaflink_line_items(
                     "quantity": quantity,
                     "unit_price": unit_price,
                     "total_price": total_price,
-                    "mapped_product_id": item.get("mapped_product_id"),
-                    "mapping_status": item.get("mapping_status"),
-                    "mapping_issue": item.get("mapping_issue"),
-                    "raw_payload": raw_payload_str,
-                    "created_at": now_val,
-                    "updated_at": now_val,
                 }
 
+                if enabled_columns.get("mapped_product_id", False):
+                    insert_params["mapped_product_id"] = item.get("mapped_product_id")
+                if enabled_columns.get("mapping_status", False):
+                    insert_params["mapping_status"] = item.get("mapping_status")
+                if enabled_columns.get("mapping_issue", False):
+                    insert_params["mapping_issue"] = item.get("mapping_issue")
+                if enabled_columns.get("raw_payload", False):
+                    insert_params["raw_payload"] = raw_payload_str
+                if enabled_columns.get("created_at", False):
+                    insert_params["created_at"] = now_val
+                if enabled_columns.get("updated_at", False):
+                    insert_params["updated_at"] = now_val
                 if enabled_columns.get("packed_qty", False):
                     insert_params["packed_qty"] = 0
                 if enabled_columns.get("unit_price_cents", False):
@@ -1676,11 +1725,11 @@ async def sync_leaflink_line_items(
         bg_duration,
     )
     logger.info(
-        "[SYNC_COMPLETE] brand_id=%s ok=true orders=%s line_items=%s errors=%s duration=%ss",
+        "[SYNC_COMPLETE] brand_id=%s orders_created=0 orders_updated=%s line_items_inserted=%s line_items_failed=%s retryable_errors=0 duration=%ss",
         brand_id_value,
         total_orders,
         total_inserted,
-        len(errors),
+        total_failed,
         bg_duration,
     )
     logger.info(
@@ -1879,35 +1928,36 @@ async def sync_leaflink_background_continuous(
                     last_error = fetch_exc
                     error_code = getattr(fetch_exc, "status_code", None)
 
-                    # Check if error is transient
-                    is_transient = error_code in TRANSIENT_ERROR_CODES
+                    # Network-level errors (DNS, connection reset, timeout) are always retryable
+                    is_network_error = isinstance(fetch_exc, (ConnectionError, OSError, TimeoutError))
+                    # HTTP-level transient errors
+                    is_transient = is_network_error or (error_code in TRANSIENT_ERROR_CODES)
 
                     if not is_transient or attempt >= max_retries:
                         # Not transient or out of retries — give up
                         logger.error(
-                            "[OrdersSync] fetch_failed brand=%s page=%s error_code=%s transient=%s attempt=%s/%s error=%s",
+                            "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=fetch_orders_page_range error=%s max_retries_exceeded",
+                            type(fetch_exc).__name__,
+                        )
+                        logger.error(
+                            "[SYNC_RETRYABLE_ERROR] brand_id=%s error=%s",
                             brand_id,
-                            start_page,
-                            error_code,
-                            is_transient,
-                            attempt + 1,
-                            max_retries + 1,
-                            fetch_exc,
+                            type(fetch_exc).__name__,
                         )
                         raise
 
                     # Transient error — retry with backoff
+                    import random as _random
+                    jitter = _random.uniform(0, backoff_seconds * 0.1)
+                    backoff_total = round(backoff_seconds + jitter, 2)
                     logger.warning(
-                        "[OrdersSync] fetch_transient_error brand=%s page=%s error_code=%s attempt=%s/%s backoff_seconds=%s",
-                        brand_id,
-                        start_page,
-                        error_code,
+                        "[LEAFLINK_REQUEST_RETRY] method=GET endpoint=fetch_orders_page_range error=%s attempt=%s backoff=%ss",
+                        type(fetch_exc).__name__,
                         attempt + 1,
-                        max_retries + 1,
-                        backoff_seconds,
+                        backoff_total,
                     )
 
-                    await asyncio.sleep(backoff_seconds)
+                    await asyncio.sleep(backoff_total)
                     backoff_seconds = min(backoff_seconds * BACKOFF_MULTIPLIER, MAX_BACKOFF_SECONDS)
 
             raise last_error

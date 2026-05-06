@@ -382,6 +382,13 @@ async def inspect_schema_at_startup() -> None:
             str(packed_qty_exists).lower(),
         )
 
+        # Log order_lines schema for production visibility
+        import json as _json
+        logger.info(
+            "[ORDER_LINES_SCHEMA] columns=%s",
+            _json.dumps(_schema_column_types.get("order_lines", {})),
+        )
+
     except Exception as exc:
         logger.error(
             "[SCHEMA_INSPECT] failed to inspect schema: %s",

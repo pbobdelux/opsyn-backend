@@ -299,12 +299,35 @@ async def lifespan(app: FastAPI):
 
     # Dispose and recreate the engine to flush asyncpg prepared-statement cache,
     # then inspect the live schema so sync code can check column existence at runtime.
-    from database import confirm_database_identity, dispose_and_recreate_engine, inspect_schema_at_startup
+    from database import confirm_database_identity, dispose_and_recreate_engine, inspect_schema_at_startup, get_schema_column_types
     await dispose_and_recreate_engine()
     await inspect_schema_at_startup()
 
     # Confirm database identity (logs [DB_IDENTITY_CONFIRM] for easy grepping)
     await confirm_database_identity()
+
+    # Log startup verification: database identity and order_lines schema
+    try:
+        from urllib.parse import urlparse as _urlparse2
+        _parsed2 = _urlparse2(os.getenv("DATABASE_URL", ""))
+        _db_name = _parsed2.path.lstrip("/") or "unknown"
+        _db_user = _parsed2.username or "unknown"
+        _db_host = _parsed2.hostname or "unknown"
+        _db_port = _parsed2.port or 5432
+        logger.info(
+            "[STARTUP_VERIFICATION] database=%s user=%s host=%s port=%s",
+            _db_name, _db_user, _db_host, _db_port,
+        )
+    except Exception as _sv_exc:
+        logger.warning("[STARTUP_VERIFICATION] failed to parse DATABASE_URL: %s", _sv_exc)
+
+    # Log order_lines schema for visibility
+    import json as _json
+    _schema = get_schema_column_types()
+    logger.info(
+        "[ORDER_LINES_SCHEMA] columns=%s",
+        _json.dumps(_schema.get("order_lines", {})),
+    )
 
     # Verify database schema and log connection details
     await _verify_database_schema()

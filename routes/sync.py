@@ -6,6 +6,7 @@ Provides:
   - GET  /orders/sync/leaflink/status   — get sync health state for a brand
   - GET  /orders/sync/leaflink/dead-letter — list dead-lettered line items
   - POST /orders/sync/leaflink/replay-dead-letter — replay a dead-lettered item
+  - POST /orders/sync/recover           — retry failed/retryable sync runs
 """
 
 import logging
@@ -245,6 +246,54 @@ async def replay_dead_letter_item(
             "error": str(exc)[:500],
             "item_id": item_id,
         }
+
+
+@router.post("/recover")
+async def recover_sync(
+    brand_id: str = Query(..., description="Brand ID to recover sync for"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retry failed/retryable sync runs and orphaned line items.
+
+    Looks up the sync health record for the brand. If consecutive_failures > 0,
+    enqueues a new pending SyncRequest so the worker will retry on next poll.
+    Returns immediately — the sync runs in the background.
+    """
+    from models import SyncRequest
+
+    result = await db.execute(
+        select(SyncHealth).where(
+            SyncHealth.brand_id == brand_id,
+            SyncHealth.consecutive_failures > 0,
+        )
+    )
+    health = result.scalar_one_or_none()
+
+    if not health:
+        return {"ok": True, "message": "No retryable syncs found", "brand_id": brand_id}
+
+    sync_req = SyncRequest(
+        brand_id=brand_id,
+        status="pending",
+        start_page=1,
+    )
+    db.add(sync_req)
+    await db.commit()
+
+    logger.info(
+        "[SYNC_RECOVER] brand_id=%s consecutive_failures=%s sync_request_id=%s",
+        brand_id,
+        health.consecutive_failures,
+        sync_req.id,
+    )
+
+    return {
+        "ok": True,
+        "message": f"Recovery sync enqueued for {brand_id}",
+        "sync_request_id": sync_req.id,
+        "brand_id": brand_id,
+        "consecutive_failures_before_recovery": health.consecutive_failures,
+    }
 
 
 @router.post("/leaflink/trigger")

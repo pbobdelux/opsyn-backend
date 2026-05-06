@@ -1,10 +1,10 @@
 -- Migration: Add LeafLink order freshness + reconciliation fields
 
 ALTER TABLE orders
-ADD COLUMN IF NOT EXISTS leaflink_last_synced_at TIMESTAMP,
+ADD COLUMN IF NOT EXISTS leaflink_last_synced_at TIMESTAMP WITH TIME ZONE,
 ADD COLUMN IF NOT EXISTS leaflink_raw JSONB,
-ADD COLUMN IF NOT EXISTS last_status_change_at TIMESTAMP,
-ADD COLUMN IF NOT EXISTS last_payment_sync_at TIMESTAMP,
+ADD COLUMN IF NOT EXISTS last_status_change_at TIMESTAMP WITH TIME ZONE,
+ADD COLUMN IF NOT EXISTS last_payment_sync_at TIMESTAMP WITH TIME ZONE,
 ADD COLUMN IF NOT EXISTS sync_source TEXT DEFAULT 'system',
 ADD COLUMN IF NOT EXISTS needs_reconciliation BOOLEAN DEFAULT FALSE,
 ADD COLUMN IF NOT EXISTS stale BOOLEAN DEFAULT FALSE;
