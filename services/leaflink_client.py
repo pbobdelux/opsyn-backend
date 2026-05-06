@@ -1485,8 +1485,31 @@ class LeafLinkClient:
                 ``total_count``       – total order count reported by LeafLink (first page only)
                 ``total_pages``       – estimated total pages (total_count / page_size, rounded up)
         """
-        if not _check_leaflink_health(self.base_url):
-            logger.warning("[LEAFLINK_SYNC_SKIPPED] health_check_failed brand=%s", self.brand_id)
+        # [SYNC_FETCH_ORDERS_ENTRY] Log entry into fetch_orders_page_range
+        logger.info(
+            "[SYNC_FETCH_ORDERS_ENTRY] fetch_orders_page_range called brand=%s start_page=%s"
+            " num_pages=%s page_size=%s resume_url=%s",
+            self.brand_id,
+            start_page,
+            num_pages,
+            page_size,
+            "present" if resume_url else "none",
+        )
+
+        _health_ok = _check_leaflink_health(self.base_url)
+        logger.info(
+            "[SYNC_HEALTH_CHECK] brand=%s base_url=%s health_ok=%s",
+            self.brand_id,
+            self.base_url,
+            _health_ok,
+        )
+        if not _health_ok:
+            logger.error(
+                "[LEAFLINK_SYNC_SKIPPED] health_check_failed brand=%s base_url=%s"
+                " — returning empty orders list, this may cause fetched_count=0",
+                self.brand_id,
+                self.base_url,
+            )
             return {"orders": [], "pages_fetched": 0, "next_url": None, "next_page": None, "total_count": None, "total_pages": None}
 
         all_orders: List[Dict[str, Any]] = []
@@ -1553,6 +1576,15 @@ class LeafLinkClient:
                     next_url = None
                     break
 
+                # [SYNC_PAGE_FETCHED] Log raw results count before normalization
+                logger.info(
+                    "[SYNC_PAGE_FETCHED] page=%s raw_count=%s normalize=%s brand=%s",
+                    current_page,
+                    len(results),
+                    normalize,
+                    self.brand_id,
+                )
+
                 if normalize:
                     for raw in results:
                         if isinstance(raw, dict):
@@ -1561,6 +1593,15 @@ class LeafLinkClient:
                     for raw in results:
                         if isinstance(raw, dict):
                             all_orders.append(raw)
+
+                # [SYNC_PAGE_FETCHED] Log parsed count after normalization
+                logger.info(
+                    "[SYNC_PAGE_FETCHED] page=%s parsed_count=%s total_so_far=%s brand=%s",
+                    current_page,
+                    len(results),
+                    len(all_orders),
+                    self.brand_id,
+                )
 
                 # [LEAFLINK_ORDER_SAMPLE] Log a sample of orders from this page
                 if results:
@@ -1603,6 +1644,18 @@ class LeafLinkClient:
         total_pages: Optional[int] = None
 
         next_page = start_page + pages_fetched if next_url else None
+
+        # [SYNC_FETCH_ORDERS_RESULT] Log final result of fetch_orders_page_range
+        logger.info(
+            "[SYNC_FETCH_ORDERS_RESULT] brand=%s orders_count=%s pages_fetched=%s"
+            " has_next=%s next_page=%s total_count=%s",
+            self.brand_id,
+            len(all_orders),
+            pages_fetched,
+            "true" if next_url else "false",
+            next_page,
+            total_count,
+        )
 
         return {
             "orders": all_orders,

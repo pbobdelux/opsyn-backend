@@ -1943,6 +1943,16 @@ async def sync_leaflink_background_continuous(
         mark_failed as _srm_mark_failed,
     )
 
+    # [SYNC_ENTRY] Log entry into the background continuous sync function
+    logger.info(
+        "[SYNC_ENTRY] sync_leaflink_background_continuous entered brand_id=%s"
+        " start_page=%s total_pages=%s sync_run_id=%s",
+        brand_id,
+        start_page,
+        total_pages if total_pages is not None else "cursor_based",
+        sync_run_id,
+    )
+
     try:
         bg_start = time.monotonic()
         current_page = start_page
@@ -2092,6 +2102,16 @@ async def sync_leaflink_background_continuous(
 
             raise last_error
 
+        # [SYNC_LOOP_START] Log entry into the main pagination loop
+        logger.info(
+            "[SYNC_LOOP_START] brand_id=%s start_page=%s total_pages=%s batch_size=%s sync_run_id=%s",
+            brand_id,
+            start_page,
+            total_pages if total_pages is not None else "cursor_based",
+            batch_size,
+            sync_run_id,
+        )
+
         # When total_pages is None (cursor-based pagination), loop until the API
         # returns no next_url. When total_pages is known, also enforce the page bound.
         while total_pages is None or current_page <= total_pages:
@@ -2193,9 +2213,44 @@ async def sync_leaflink_background_continuous(
             next_cursor = fetch_result.get("next_url")
             next_page = fetch_result.get("next_page")
 
-            # [LEAFLINK_SYNC_RESPONSE] Log what list_orders returned
+            # [SYNC_PAGE_FETCHED] Log raw and parsed counts for this batch
             _orders_count = len(batch_orders)
             _resp_type = "list" if isinstance(batch_orders, list) else type(batch_orders).__name__
+            logger.info(
+                "[SYNC_PAGE_FETCHED] page=%s raw_count=%s parsed_count=%s pages_in_batch=%s brand_id=%s",
+                current_page,
+                _orders_count,
+                _orders_count,
+                pages_fetched_this_batch,
+                brand_id,
+            )
+
+            # [SYNC_FILTER_DISABLED] All filters are disabled — passing all orders through
+            logger.info(
+                "[SYNC_FILTER_DISABLED] filter_type=status reason=debug_mode brand_id=%s page=%s",
+                brand_id,
+                current_page,
+            )
+            logger.info(
+                "[SYNC_FILTER_DISABLED] filter_type=freshness reason=debug_mode brand_id=%s page=%s",
+                brand_id,
+                current_page,
+            )
+            logger.info(
+                "[SYNC_FILTER_DISABLED] filter_type=date reason=debug_mode brand_id=%s page=%s",
+                brand_id,
+                current_page,
+            )
+
+            # [SYNC_AFTER_FILTERS] No filters applied — all fetched orders pass through
+            logger.info(
+                "[SYNC_AFTER_FILTERS] remaining=%s reason=no_filters_applied page=%s brand_id=%s",
+                _orders_count,
+                current_page,
+                brand_id,
+            )
+
+            # [LEAFLINK_SYNC_RESPONSE] Log what list_orders returned
             logger.info(
                 "[LEAFLINK_SYNC_RESPONSE] brand_id=%s orders_count=%s response_type=%s"
                 " pages_fetched=%s next_cursor=%s",
@@ -2204,6 +2259,15 @@ async def sync_leaflink_background_continuous(
                 _resp_type,
                 pages_fetched_this_batch,
                 "present" if next_cursor else "none",
+            )
+
+            # [SYNC_PAGINATION] Log pagination state for this batch
+            logger.info(
+                "[SYNC_PAGINATION] page=%s has_next=%s next_url=%s brand_id=%s",
+                current_page,
+                "true" if next_cursor else "false",
+                next_cursor[:80] if next_cursor else "none",
+                brand_id,
             )
 
             # [LEAFLINK_SYNC_ZERO_ORDERS] Explicitly flag when API returns zero orders
@@ -2307,7 +2371,19 @@ async def sync_leaflink_background_continuous(
                     )
                     # Line items are deferred inside sync_leaflink_orders_headers_only
                     # via asyncio.create_task — no need to spawn a second task here.
-                    # persist_result captured but logging removed to avoid potential exceptions
+
+                    # [SYNC_TRANSFORM_RESULT] Log transformation results from headers-only upsert
+                    _input_count = len(batch_orders)
+                    _transformed = persist_result.get("created", 0) + persist_result.get("updated", 0) if persist_result else 0
+                    _skipped = persist_result.get("skipped", 0) if persist_result else 0
+                    logger.info(
+                        "[SYNC_TRANSFORM_RESULT] page=%s input_count=%s transformed=%s skipped=%s brand_id=%s",
+                        current_page,
+                        _input_count,
+                        _transformed,
+                        _skipped,
+                        brand_id,
+                    )
 
                 except Exception as upsert_exc:
                     logger.error(
@@ -2319,6 +2395,15 @@ async def sync_leaflink_background_continuous(
                     )
 
             total_orders_synced += len(batch_orders)
+
+            # [SYNC_ACCUMULATOR] Log running total after each batch
+            logger.info(
+                "[SYNC_ACCUMULATOR] total_fetched=%s after_page=%s brand_id=%s",
+                total_orders_synced,
+                current_page,
+                brand_id,
+            )
+
             # When total_pages is None (cursor-based), fall back to current_page
             last_completed_page = (next_page - 1) if next_page else (total_pages or current_page)
 
@@ -2418,6 +2503,18 @@ async def sync_leaflink_background_continuous(
                         sync_run_id,
                         _done_exc,
                     )
+
+        # [SYNC_FINAL_COUNTS] Log final summary for the entire sync run
+        logger.info(
+            "[SYNC_FINAL_COUNTS] fetched=%s created=deferred updated=deferred skipped=deferred errors=0"
+            " final_page=%s total_pages=%s duration=%ss brand_id=%s sync_run_id=%s",
+            total_orders_synced,
+            final_page,
+            total_pages,
+            total_duration,
+            brand_id,
+            sync_run_id,
+        )
 
         logger.info(
             "[OrdersSync] bg_sync_complete brand=%s final_page=%s total_pages=%s "
