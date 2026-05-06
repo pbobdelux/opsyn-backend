@@ -8,7 +8,8 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
-from models import BrandAPICredential
+from models import BrandAPICredential, Order, SyncRun
+from models.sync_health import DeadLetterLineItem, SyncHealth
 
 logger = logging.getLogger("opsyn-backend")
 router = APIRouter(prefix="/debug", tags=["debug"])
@@ -170,4 +171,144 @@ async def debug_brand_api_credentials(
 
     except Exception as exc:
         logger.error("[DEBUG] brand_api_credentials_dump_error error=%s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/orders/brand/{brand_id}")
+async def debug_brand_orders(
+    brand_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Diagnostic endpoint to trace order visibility issues for a brand.
+
+    Returns comprehensive order and credential information without secrets.
+    Use this to diagnose why orders are not appearing in the brand app.
+    """
+    logger.info("[DEBUG] debug_brand_orders_request brand_id=%s", brand_id)
+
+    try:
+        # Get credential (no API key in response)
+        cred_result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.brand_id == brand_id,
+                BrandAPICredential.integration_name == "leaflink",
+            )
+        )
+        cred = cred_result.scalar_one_or_none()
+
+        # Get total order count for brand
+        total_result = await db.execute(
+            select(func.count()).select_from(Order).where(Order.brand_id == brand_id)
+        )
+        total_orders = total_result.scalar() or 0
+
+        # Get latest 10 orders
+        latest_result = await db.execute(
+            select(Order)
+            .where(Order.brand_id == brand_id)
+            .order_by(Order.synced_at.desc())
+            .limit(10)
+        )
+        latest_orders = latest_result.scalars().all()
+
+        # Get null field stats
+        null_stats = {}
+        for field in ["external_order_id", "org_id", "brand_id", "synced_at", "external_created_at"]:
+            null_result = await db.execute(
+                select(func.count()).select_from(Order).where(
+                    Order.brand_id == brand_id,
+                    getattr(Order, field).is_(None),
+                )
+            )
+            null_stats[f"null_{field}"] = null_result.scalar() or 0
+
+        # Get latest sync run
+        sync_run_result = await db.execute(
+            select(SyncRun)
+            .where(SyncRun.brand_id == brand_id)
+            .order_by(SyncRun.started_at.desc())
+            .limit(1)
+        )
+        latest_sync_run = sync_run_result.scalar_one_or_none()
+
+        # Get sync health
+        health_result = await db.execute(
+            select(SyncHealth).where(SyncHealth.brand_id == brand_id)
+        )
+        sync_health = health_result.scalar_one_or_none()
+
+        # Get dead letters
+        dead_letter_result = await db.execute(
+            select(DeadLetterLineItem)
+            .where(DeadLetterLineItem.brand_id == brand_id)
+            .order_by(DeadLetterLineItem.last_failed_at.desc())
+            .limit(5)
+        )
+        dead_letters = dead_letter_result.scalars().all()
+
+        logger.info(
+            "[DEBUG] debug_brand_orders_result brand_id=%s total_orders=%s cred_found=%s",
+            brand_id,
+            total_orders,
+            cred is not None,
+        )
+
+        return {
+            "ok": True,
+            "brand_id": brand_id,
+            "credential": {
+                "brand_id": cred.brand_id if cred else None,
+                "org_id": cred.org_id if cred else None,
+                "company_id": cred.company_id if cred else None,
+                "auth_scheme": cred.auth_scheme if cred else None,
+                "base_url": cred.base_url[:50] if cred and cred.base_url else None,
+                "integration_name": cred.integration_name if cred else None,
+                "is_active": cred.is_active if cred else None,
+            },
+            "order_stats": {
+                "total_orders": total_orders,
+                "null_field_stats": null_stats,
+            },
+            "latest_orders": [
+                {
+                    "id": o.id,
+                    "external_order_id": o.external_order_id,
+                    "brand_id": o.brand_id,
+                    "org_id": o.org_id,
+                    "customer_name": o.customer_name,
+                    "status": o.status,
+                    "synced_at": o.synced_at.isoformat() if o.synced_at else None,
+                    "external_created_at": o.external_created_at.isoformat() if o.external_created_at else None,
+                    "external_updated_at": o.external_updated_at.isoformat() if o.external_updated_at else None,
+                }
+                for o in latest_orders
+            ],
+            "latest_sync_run": {
+                "id": latest_sync_run.id if latest_sync_run else None,
+                "status": latest_sync_run.status if latest_sync_run else None,
+                "started_at": latest_sync_run.started_at.isoformat() if latest_sync_run and latest_sync_run.started_at else None,
+                "completed_at": latest_sync_run.completed_at.isoformat() if latest_sync_run and latest_sync_run.completed_at else None,
+                "last_error": latest_sync_run.last_error if latest_sync_run else None,
+            },
+            "sync_health": {
+                "last_successful_sync_at": sync_health.last_successful_sync_at.isoformat() if sync_health and sync_health.last_successful_sync_at else None,
+                "consecutive_failures": sync_health.consecutive_failures if sync_health else None,
+                "total_orders_synced": sync_health.total_orders_synced if sync_health else None,
+                "last_error": sync_health.last_error if sync_health else None,
+            },
+            "dead_letters": [
+                {
+                    "id": dl.id,
+                    "external_order_id": dl.external_order_id,
+                    "sku": dl.sku,
+                    "failure_reason": dl.failure_reason,
+                    "failure_count": dl.failure_count,
+                    "last_failed_at": dl.last_failed_at.isoformat() if dl.last_failed_at else None,
+                }
+                for dl in dead_letters
+            ],
+        }
+
+    except Exception as exc:
+        logger.error("[DEBUG] debug_brand_orders_error brand_id=%s error=%s", brand_id, exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))

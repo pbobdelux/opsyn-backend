@@ -1122,6 +1122,25 @@ class LeafLinkClient:
                         if isinstance(raw, dict):
                             all_orders.append(raw)
 
+                # [LEAFLINK_ORDER_SAMPLE] Log a sample of orders from this page
+                if results:
+                    _sample_count = min(3, len(results))
+                    _sample_orders = results[:_sample_count]
+                    _order_ids = [o.get("id") or o.get("external_id") or "unknown" for o in _sample_orders]
+                    _customer_names = [o.get("customer_name") or "unknown" for o in _sample_orders]
+                    _created_ats = [o.get("created_at") or o.get("external_created_at") or o.get("created") or "unknown" for o in _sample_orders]
+                    _updated_ats = [o.get("updated_at") or o.get("external_updated_at") or o.get("modified") or "unknown" for o in _sample_orders]
+                    _company_ids = [o.get("company_id") or o.get("source") or "unknown" for o in _sample_orders]
+                    logger.info(
+                        "[LEAFLINK_ORDER_SAMPLE] count=%s order_ids=%s customer_names=%s external_created_at=%s external_updated_at=%s company_ids=%s",
+                        len(results),
+                        _order_ids,
+                        _customer_names,
+                        _created_ats,
+                        _updated_ats,
+                        _company_ids,
+                    )
+
                 pages_fetched += 1
 
                 if not next_url:
@@ -1261,6 +1280,25 @@ class LeafLinkClient:
                     for raw in results:
                         if isinstance(raw, dict):
                             all_orders.append(raw)
+
+                # [LEAFLINK_ORDER_SAMPLE] Log a sample of orders from this page
+                if results:
+                    _sample_count = min(3, len(results))
+                    _sample_orders = results[:_sample_count]
+                    _order_ids = [o.get("id") or o.get("external_id") or "unknown" for o in _sample_orders]
+                    _customer_names = [o.get("customer_name") or "unknown" for o in _sample_orders]
+                    _created_ats = [o.get("created_at") or o.get("external_created_at") or o.get("created") or "unknown" for o in _sample_orders]
+                    _updated_ats = [o.get("updated_at") or o.get("external_updated_at") or o.get("modified") or "unknown" for o in _sample_orders]
+                    _company_ids = [o.get("company_id") or o.get("source") or "unknown" for o in _sample_orders]
+                    logger.info(
+                        "[LEAFLINK_ORDER_SAMPLE] count=%s order_ids=%s customer_names=%s external_created_at=%s external_updated_at=%s company_ids=%s",
+                        len(results),
+                        _order_ids,
+                        _customer_names,
+                        _created_ats,
+                        _updated_ats,
+                        _company_ids,
+                    )
 
                 if not next_url:
                     break

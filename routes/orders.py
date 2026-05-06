@@ -533,6 +533,26 @@ async def get_orders(
         include_line_items,
     )
 
+    # [ORDERS_API_RESULT] Structured audit log for brand app order queries
+    _filters_applied = ["org_id", "brand_id"]
+    if sort_by:
+        _filters_applied.append(f"sort_by={sort_by}")
+    if sort_order:
+        _filters_applied.append(f"sort_order={sort_order}")
+    if cursor:
+        _filters_applied.append("cursor")
+    logger.info(
+        "[ORDERS_API_RESULT] route=%s brand_id=%s org_id=%s filters_applied=%s returned_count=%s total_in_db=%s limit=%s offset=%s",
+        "/orders",
+        brand_id,
+        resolved_org_id,
+        _filters_applied,
+        len(serialized_orders),
+        total_in_database,
+        limit,
+        offset,
+    )
+
     return make_json_safe({
         "ok": True,
         "org_id": resolved_org_id,
@@ -1181,6 +1201,20 @@ async def orders_sync(
 
     # Use resolved brand ID for all subsequent operations
     _effective_brand_id: Optional[str] = _resolved_brand_id
+
+    # [BRAND_CONFIG_AUDIT] Log credential configuration before every sync
+    # so we can verify brand/org/company alignment. Never log API keys.
+    _audit_org_id = getattr(_active_cred, "org_id", None) or request.headers.get("x-opsyn-org") or request.headers.get("x-org-id")
+    logger.info(
+        "[BRAND_CONFIG_AUDIT] brand_id=%s org_id=%s company_id=%s auth_scheme=%s base_url=%s integration_name=%s is_active=%s",
+        _active_cred.brand_id,
+        _audit_org_id,
+        _active_cred.company_id,
+        _active_cred.auth_scheme,
+        (_active_cred.base_url[:50] if _active_cred.base_url else None),
+        _active_cred.integration_name,
+        _active_cred.is_active,
+    )
 
 
 
