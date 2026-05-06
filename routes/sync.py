@@ -2,10 +2,11 @@
 Admin recovery endpoints for LeafLink sync operations.
 
 Provides:
-  - POST /orders/sync/leaflink          — manually trigger a sync for a brand
-  - GET  /orders/sync/leaflink/status   — get sync health state for a brand
-  - GET  /orders/sync/leaflink/dead-letter — list dead-lettered line items
-  - POST /orders/sync/leaflink/replay-dead-letter — replay a dead-lettered item
+  - POST /orders/sync/recover                      — self-healing recovery (retry dead-letter + requeue failed runs)
+  - POST /orders/sync/leaflink                     — manually trigger a sync for a brand
+  - GET  /orders/sync/leaflink/status              — get sync health state for a brand
+  - GET  /orders/sync/leaflink/dead-letter         — list dead-lettered line items
+  - POST /orders/sync/leaflink/replay-dead-letter  — replay a dead-lettered item
 """
 
 import logging
@@ -15,7 +16,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import get_db
+from database import get_db, has_column
+from models import Order, SyncRequest, SyncRun
 from models.sync_health import DeadLetterLineItem, SyncHealth
 from utils.json_utils import make_json_safe
 
@@ -245,6 +247,213 @@ async def replay_dead_letter_item(
             "error": str(exc)[:500],
             "item_id": item_id,
         }
+
+
+@router.post("/recover")
+async def recover_sync(
+    brand_id: str = Query(..., description="Brand ID to recover sync for"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Self-healing sync recovery endpoint.
+
+    Retries failed/retryable sync runs and orphaned dead-letter line items
+    for a brand without requiring manual Python script execution.
+
+    Actions taken:
+    1. Retry dead-lettered line items whose parent order now exists in DB.
+    2. Re-enqueue any failed SyncRun as a new pending SyncRequest.
+
+    Returns a summary of recovered items.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    recovered_line_items = 0
+    failed_line_items = 0
+    sync_runs_requeued = 0
+    errors: list[str] = []
+
+    # ------------------------------------------------------------------
+    # Step 1: Retry dead-lettered line items
+    # ------------------------------------------------------------------
+    try:
+        dead_letter_result = await db.execute(
+            select(DeadLetterLineItem)
+            .where(DeadLetterLineItem.brand_id == brand_id)
+            .order_by(DeadLetterLineItem.last_failed_at.asc())
+            .limit(200)
+        )
+        dead_items = dead_letter_result.scalars().all()
+
+        if dead_items:
+            # Build schema-aware insert statement
+            optional_columns = ["packed_qty", "unit_price_cents", "total_price_cents",
+                                 "mapped_product_id", "mapping_status", "mapping_issue",
+                                 "raw_payload", "created_at", "updated_at"]
+            enabled_columns = {col: has_column("order_lines", col) for col in optional_columns}
+
+            insert_columns = ["order_id", "sku", "product_name", "quantity", "unit_price", "total_price"]
+            for col in optional_columns:
+                if enabled_columns.get(col, False):
+                    insert_columns.append(col)
+
+            columns_str = ", ".join(insert_columns)
+            placeholders = ", ".join([f":{col}" for col in insert_columns])
+
+            update_set_clauses = ["quantity = EXCLUDED.quantity", "unit_price = EXCLUDED.unit_price",
+                                   "total_price = EXCLUDED.total_price"]
+            for col in ["mapped_product_id", "mapping_status", "mapping_issue", "raw_payload", "updated_at",
+                        "unit_price_cents", "total_price_cents"]:
+                if col in insert_columns:
+                    update_set_clauses.append(f"{col} = EXCLUDED.{col}")
+
+            upsert_stmt = f"""
+                INSERT INTO public.order_lines ({columns_str})
+                VALUES ({placeholders})
+                ON CONFLICT (order_id, sku, product_name)
+                WHERE sku IS NOT NULL AND product_name IS NOT NULL
+                DO UPDATE SET {", ".join(update_set_clauses)}
+            """
+
+            now = datetime.now(timezone.utc)
+
+            for item in dead_items:
+                if item.order_id is None:
+                    # Try to find the parent order
+                    order_result = await db.execute(
+                        select(Order).where(
+                            Order.brand_id == brand_id,
+                            Order.external_order_id == item.external_order_id,
+                        )
+                    )
+                    order_row = order_result.scalar_one_or_none()
+                    if order_row is None:
+                        logger.warning(
+                            "[RECOVER] dead_letter_item_id=%s external_order_id=%s — parent order still missing",
+                            item.id, item.external_order_id,
+                        )
+                        failed_line_items += 1
+                        continue
+                    order_id = order_row.id
+                else:
+                    order_id = item.order_id
+
+                raw = item.raw_payload or {}
+                _all_params: dict = {
+                    "order_id": order_id,
+                    "sku": item.sku or "unknown",
+                    "product_name": item.product_name,
+                    "quantity": raw.get("quantity", 0),
+                    "unit_price": raw.get("unit_price", 0),
+                    "total_price": raw.get("total_price", 0),
+                    "mapped_product_id": raw.get("mapped_product_id"),
+                    "mapping_status": raw.get("mapping_status", "unknown"),
+                    "mapping_issue": raw.get("mapping_issue"),
+                    "raw_payload": json.dumps(make_json_safe(raw)) if raw else None,
+                    "created_at": now,
+                    "updated_at": now,
+                    "packed_qty": 0,
+                    "unit_price_cents": raw.get("unit_price_cents"),
+                    "total_price_cents": raw.get("total_price_cents"),
+                }
+                params = {k: v for k, v in _all_params.items() if k in insert_columns}
+
+                try:
+                    await db.execute(text(upsert_stmt), params)
+                    await db.execute(
+                        delete(DeadLetterLineItem).where(DeadLetterLineItem.id == item.id)
+                    )
+                    await db.commit()
+                    recovered_line_items += 1
+                    logger.info(
+                        "[RECOVER] line_item_recovered brand_id=%s external_order_id=%s sku=%s",
+                        brand_id, item.external_order_id, item.sku,
+                    )
+                except Exception as exc:
+                    await db.rollback()
+                    failed_line_items += 1
+                    errors.append(f"line_item={item.id} error={str(exc)[:200]}")
+                    logger.error(
+                        "[RECOVER] line_item_failed brand_id=%s item_id=%s error=%s",
+                        brand_id, item.id, str(exc)[:200],
+                    )
+
+    except Exception as exc:
+        errors.append(f"dead_letter_query error={str(exc)[:200]}")
+        logger.error("[RECOVER] dead_letter_query_failed brand_id=%s error=%s", brand_id, str(exc)[:200])
+
+    # ------------------------------------------------------------------
+    # Step 2: Re-enqueue failed sync runs
+    # ------------------------------------------------------------------
+    try:
+        # Find the most recent failed/stalled sync run
+        failed_run_result = await db.execute(
+            select(SyncRun)
+            .where(
+                SyncRun.brand_id == brand_id,
+                SyncRun.status.in_(["failed", "stalled"]),
+            )
+            .order_by(SyncRun.started_at.desc())
+            .limit(1)
+        )
+        failed_run = failed_run_result.scalar_one_or_none()
+
+        if failed_run:
+            # Check no active run exists
+            active_result = await db.execute(
+                select(SyncRun)
+                .where(
+                    SyncRun.brand_id == brand_id,
+                    SyncRun.status.in_(["queued", "syncing"]),
+                )
+                .limit(1)
+            )
+            active_run = active_result.scalar_one_or_none()
+
+            if active_run is None:
+                resume_page = (failed_run.last_successful_page or 0) + 1
+                sync_req = SyncRequest(
+                    brand_id=brand_id,
+                    status="pending",
+                    start_page=resume_page,
+                    total_pages=failed_run.total_pages,
+                    total_orders_available=failed_run.total_orders_available,
+                )
+                db.add(sync_req)
+                await db.commit()
+                sync_runs_requeued += 1
+                logger.info(
+                    "[RECOVER] sync_run_requeued brand_id=%s from_page=%s",
+                    brand_id, resume_page,
+                )
+            else:
+                logger.info(
+                    "[RECOVER] active_run_exists brand_id=%s run_id=%s — skipping requeue",
+                    brand_id, active_run.id,
+                )
+
+    except Exception as exc:
+        errors.append(f"sync_run_requeue error={str(exc)[:200]}")
+        logger.error("[RECOVER] sync_run_requeue_failed brand_id=%s error=%s", brand_id, str(exc)[:200])
+
+    logger.info(
+        "[RECOVER] complete brand_id=%s recovered_line_items=%s failed_line_items=%s sync_runs_requeued=%s errors=%s",
+        brand_id, recovered_line_items, failed_line_items, sync_runs_requeued, len(errors),
+    )
+
+    return {
+        "ok": len(errors) == 0,
+        "brand_id": brand_id,
+        "recovered_line_items": recovered_line_items,
+        "failed_line_items": failed_line_items,
+        "sync_runs_requeued": sync_runs_requeued,
+        "errors": errors,
+        "message": (
+            f"Recovered {recovered_line_items} line items, "
+            f"requeued {sync_runs_requeued} sync runs, "
+            f"{failed_line_items} items still failed"
+        ),
+    }
 
 
 @router.post("/leaflink/trigger")

@@ -306,6 +306,20 @@ async def lifespan(app: FastAPI):
     # Confirm database identity (logs [DB_IDENTITY_CONFIRM] for easy grepping)
     await confirm_database_identity()
 
+    # Log which order_lines columns are enabled in the live schema
+    try:
+        from database import has_column as _has_column
+        _optional_line_cols = [
+            "packed_qty", "unit_price_cents", "total_price_cents",
+            "mapped_product_id", "mapping_status", "mapping_issue",
+            "raw_payload", "created_at", "updated_at",
+        ]
+        _core_cols = ["order_id", "sku", "product_name", "quantity", "unit_price", "total_price"]
+        _enabled = _core_cols + [c for c in _optional_line_cols if _has_column("order_lines", c)]
+        logger.info("[LINE_ITEM_COLUMNS_ENABLED] columns=%s", _enabled)
+    except Exception as _col_exc:
+        logger.warning("[LINE_ITEM_COLUMNS_ENABLED] failed to inspect columns: %s", _col_exc)
+
     # Verify database schema and log connection details
     await _verify_database_schema()
 
