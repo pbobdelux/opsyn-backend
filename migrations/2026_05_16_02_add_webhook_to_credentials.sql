@@ -5,7 +5,7 @@
 
 ALTER TABLE brand_api_credentials
     ADD COLUMN IF NOT EXISTS webhook_key VARCHAR(255),
-    ADD COLUMN IF NOT EXISTS org_id UUID;
+    ADD COLUMN IF NOT EXISTS org_id VARCHAR(120);
 
 CREATE INDEX IF NOT EXISTS ix_brand_api_credentials_webhook_key
     ON brand_api_credentials(webhook_key);

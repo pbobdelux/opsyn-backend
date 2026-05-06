@@ -3,4 +3,4 @@
 -- auto-detected authentication scheme (Bearer, Token, or Raw).
 
 ALTER TABLE brand_api_credentials
-    ADD COLUMN IF NOT EXISTS auth_scheme VARCHAR(20) DEFAULT 'Token';
+    ADD COLUMN IF NOT EXISTS auth_scheme VARCHAR(20) DEFAULT 'Token'::text;

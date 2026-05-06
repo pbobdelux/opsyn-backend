@@ -66,7 +66,7 @@ CREATE INDEX IF NOT EXISTS ix_dead_letter_brand_external_order
 -- -------------------------------------------------------------------------
 DELETE FROM order_lines
 WHERE id NOT IN (
-    SELECT DISTINCT ON (order_id, sku, product_name) id
+    SELECT DISTINCT ON (order_id, sku, product_name) id::bigint
     FROM order_lines
     ORDER BY order_id, sku, product_name, updated_at DESC NULLS LAST, id DESC
 );
