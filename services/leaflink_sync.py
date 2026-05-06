@@ -926,6 +926,10 @@ async def sync_leaflink_orders_headers_only(
                 async with db.begin():
                     for o in batch:
                         if not isinstance(o, dict):
+                            logger.warning(
+                                "[ORDER_SKIPPED] brand_id=%s external_order_id=unknown reason=invalid_payload details=not_a_dict",
+                                brand_id_value,
+                            )
                             batch_skipped += 1
                             continue
 
@@ -938,8 +942,24 @@ async def sync_leaflink_orders_headers_only(
                                 batch_num,
                                 safe_str(o.get("order_number")),
                             )
+                            logger.warning(
+                                "[ORDER_SKIPPED] brand_id=%s external_order_id=unknown reason=missing_external_order_id",
+                                brand_id_value,
+                            )
                             batch_skipped += 1
                             continue
+
+                        # [COMPANY_ID_MISMATCH] Log payload company_id for alignment tracing.
+                        # Compare against credential_company_id from [BRAND_CONFIG_AUDIT] logs.
+                        # Logged only when the payload carries a company_id or source field.
+                        _payload_company_id = o.get("company_id") or o.get("source")
+                        if _payload_company_id:
+                            logger.info(
+                                "[COMPANY_ID_MISMATCH] brand_id=%s external_order_id=%s payload_company_id=%s note=compare_with_BRAND_CONFIG_AUDIT_for_credential_company_id",
+                                brand_id_value,
+                                external_id,
+                                _payload_company_id,
+                            )
 
                         customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
                         status = (safe_str(o.get("status")) or "submitted").lower()
@@ -1069,6 +1089,19 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 update_params,
                             )
                             batch_updated += 1
+                            # [ORDER_DB_WRITE] Log every successful order update
+                            logger.info(
+                                "[ORDER_DB_WRITE] db_order_id=%s external_order_id=%s brand_id=%s org_id=%s customer_name=%s synced_at=%s external_created_at=%s external_updated_at=%s status=%s",
+                                existing.id,
+                                external_id,
+                                brand_id_value,
+                                org_id_value,
+                                customer_name,
+                                synced_at_val.isoformat() if synced_at_val else None,
+                                ext_created_val.isoformat() if ext_created_val else None,
+                                ext_updated_val.isoformat() if ext_updated_val else None,
+                                "updated",
+                            )
                         else:
                             # Use raw SQL INSERT with CAST so PostgreSQL receives
                             # explicit type coercion for UUID columns instead of
@@ -1129,6 +1162,18 @@ INSERT INTO orders (
                                 insert_params,
                             )
                             batch_created += 1
+                            # [ORDER_DB_WRITE] Log every successful order insert
+                            logger.info(
+                                "[ORDER_DB_WRITE] db_order_id=pending external_order_id=%s brand_id=%s org_id=%s customer_name=%s synced_at=%s external_created_at=%s external_updated_at=%s status=%s",
+                                external_id,
+                                brand_id_value,
+                                org_id_value,
+                                customer_name,
+                                synced_at_val.isoformat() if synced_at_val else None,
+                                ext_created_val.isoformat() if ext_created_val else None,
+                                ext_updated_val.isoformat() if ext_updated_val else None,
+                                "created",
+                            )
                 # Explicit commit guarantee
                 await db.commit()
 
@@ -1205,6 +1250,72 @@ INSERT INTO orders (
         total_updated,
         sync_duration,
     )
+
+    # [ORDER_COUNT_AFTER_SYNC] Query DB to verify orders are present and check for null fields
+    try:
+        from sqlalchemy import func as _func
+        async with AsyncSessionLocal() as _count_db:
+            _total_res = await _count_db.execute(
+                select(_func.count()).select_from(Order).where(Order.brand_id == brand_id_value)
+            )
+            _total = _total_res.scalar() or 0
+
+            _null_ext_id_res = await _count_db.execute(
+                select(_func.count()).select_from(Order).where(
+                    Order.brand_id == brand_id_value,
+                    Order.external_order_id.is_(None),
+                )
+            )
+            _null_ext_id = _null_ext_id_res.scalar() or 0
+
+            _null_org_id_res = await _count_db.execute(
+                select(_func.count()).select_from(Order).where(
+                    Order.brand_id == brand_id_value,
+                    Order.org_id.is_(None),
+                )
+            )
+            _null_org_id = _null_org_id_res.scalar() or 0
+
+            _null_brand_id_res = await _count_db.execute(
+                select(_func.count()).select_from(Order).where(
+                    Order.brand_id == brand_id_value,
+                    Order.brand_id.is_(None),
+                )
+            )
+            _null_brand_id = _null_brand_id_res.scalar() or 0
+
+            _null_synced_at_res = await _count_db.execute(
+                select(_func.count()).select_from(Order).where(
+                    Order.brand_id == brand_id_value,
+                    Order.synced_at.is_(None),
+                )
+            )
+            _null_synced_at = _null_synced_at_res.scalar() or 0
+
+            _null_ext_created_res = await _count_db.execute(
+                select(_func.count()).select_from(Order).where(
+                    Order.brand_id == brand_id_value,
+                    Order.external_created_at.is_(None),
+                )
+            )
+            _null_ext_created = _null_ext_created_res.scalar() or 0
+
+        logger.info(
+            "[ORDER_COUNT_AFTER_SYNC] brand_id=%s total=%s null_external_order_id=%s null_org_id=%s null_brand_id=%s null_synced_at=%s null_external_created_at=%s",
+            brand_id_value,
+            _total,
+            _null_ext_id,
+            _null_org_id,
+            _null_brand_id,
+            _null_synced_at,
+            _null_ext_created,
+        )
+    except Exception as _count_exc:
+        logger.error(
+            "[ORDER_COUNT_AFTER_SYNC] brand_id=%s error=%s",
+            brand_id_value,
+            str(_count_exc)[:200],
+        )
 
     # Update sync health after Phase 1 commits
     await _update_sync_health_phase1(
