@@ -24,8 +24,8 @@ CREATE TABLE IF NOT EXISTS sync_health (
     last_page_synced        INTEGER,
     total_orders_synced     INTEGER NOT NULL DEFAULT 0,
     total_line_items_synced INTEGER NOT NULL DEFAULT 0,
-    created_at              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    updated_at              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    created_at              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()::timestamptz,
+    updated_at              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()::timestamptz,
     CONSTRAINT uq_sync_health_brand_id UNIQUE (brand_id)
 );
 
@@ -44,8 +44,8 @@ CREATE TABLE IF NOT EXISTS dead_letter_line_items (
     raw_payload         JSONB,
     failure_reason      TEXT,
     failure_count       INTEGER NOT NULL DEFAULT 1,
-    last_failed_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    last_failed_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()::timestamptz,
+    created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()::timestamptz,
     CONSTRAINT uq_dead_letter_brand_order_sku UNIQUE (brand_id, external_order_id, sku)
 );
 
@@ -69,7 +69,8 @@ WHERE id NOT IN (
     SELECT DISTINCT ON (order_id, sku, product_name) id
     FROM order_lines
     ORDER BY order_id, sku, product_name, updated_at DESC NULLS LAST, id DESC
-);
+)
+AND id IS NOT NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_order_line_identity
     ON order_lines (order_id, sku, product_name)

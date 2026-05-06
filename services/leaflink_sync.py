@@ -463,17 +463,16 @@ async def _insert_line_items_standalone(
     Intended for use by external scripts (e.g. scripts/retry_line_items.py)
     that need to re-insert line items without going through the full sync flow.
     """
-    optional_columns = ["packed_qty", "unit_price_cents", "total_price_cents"]
+    optional_columns = [
+        "packed_qty", "unit_price_cents", "total_price_cents",
+        "mapped_product_id", "mapping_status", "mapping_issue",
+        "raw_payload", "created_at", "updated_at",
+    ]
     enabled_columns: dict[str, bool] = {
         col: has_column("order_lines", col) for col in optional_columns
     }
 
-    insert_columns = [
-        "order_id", "sku", "product_name", "quantity",
-        "unit_price", "total_price", "mapped_product_id",
-        "mapping_status", "mapping_issue", "raw_payload",
-        "created_at", "updated_at",
-    ]
+    insert_columns = ["order_id", "sku", "product_name", "quantity", "unit_price", "total_price"]
     for col in optional_columns:
         if enabled_columns.get(col, False):
             insert_columns.append(col)
@@ -517,30 +516,28 @@ async def _insert_line_items_standalone(
             )
 
             # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-            created_at_val = ensure_utc(utc_now())
-            updated_at_val = ensure_utc(utc_now())
+            now_val = ensure_utc(utc_now())
 
-            insert_params: dict[str, Any] = {
+            _all_params: dict[str, Any] = {
                 "order_id": order_id,
                 "sku": sku,
                 "product_name": item.get("product_name"),
-                "quantity": item.get("quantity"),
-                "unit_price": item.get("unit_price"),
-                "total_price": item.get("total_price"),
+                "quantity": item.get("quantity") or 0,
+                "unit_price": item.get("unit_price") or 0,
+                "total_price": item.get("total_price") or 0,
                 "mapped_product_id": item.get("mapped_product_id"),
                 "mapping_status": item.get("mapping_status"),
                 "mapping_issue": item.get("mapping_issue"),
                 "raw_payload": raw_payload_str,
-                "created_at": created_at_val,
-                "updated_at": updated_at_val,
+                "created_at": now_val,
+                "updated_at": now_val,
+                "packed_qty": 0,
+                "unit_price_cents": item.get("unit_price_cents"),
+                "total_price_cents": item.get("total_price_cents"),
             }
-
-            if enabled_columns.get("packed_qty", False):
-                insert_params["packed_qty"] = 0
-            if enabled_columns.get("unit_price_cents", False):
-                insert_params["unit_price_cents"] = item.get("unit_price_cents")
-            if enabled_columns.get("total_price_cents", False):
-                insert_params["total_price_cents"] = item.get("total_price_cents")
+            insert_params: dict[str, Any] = {
+                k: v for k, v in _all_params.items() if k in insert_columns
+            }
 
             await db.execute(text(line_insert_stmt), insert_params)
             inserted += 1
@@ -1176,6 +1173,14 @@ INSERT INTO orders (
         total_updated,
         sync_duration,
     )
+    logger.info(
+        "[SYNC_COMPLETE] brand_id=%s orders_created=%s orders_updated=%s line_items_inserted=pending line_items_failed=0 retryable_errors=%s duration=%ss",
+        brand_id_value,
+        total_created,
+        total_updated,
+        len(errors),
+        sync_duration,
+    )
 
     # Update sync health after Phase 1 commits
     await _update_sync_health_phase1(
@@ -1283,6 +1288,12 @@ async def sync_leaflink_line_items(
         "packed_qty",
         "unit_price_cents",
         "total_price_cents",
+        "mapped_product_id",
+        "mapping_status",
+        "mapping_issue",
+        "raw_payload",
+        "created_at",
+        "updated_at",
     ]
     enabled_columns: dict[str, bool] = {
         col: has_column("order_lines", col) for col in optional_columns
@@ -1295,35 +1306,33 @@ async def sync_leaflink_line_items(
         "quantity",
         "unit_price",
         "total_price",
-        "mapped_product_id",
-        "mapping_status",
-        "mapping_issue",
-        "raw_payload",
-        "created_at",
-        "updated_at",
     ]
+    # Add optional columns only if they exist in the live schema
     for col in optional_columns:
         if enabled_columns.get(col, False):
             insert_columns.append(col)
+
+    logger.info(
+        "[LINE_ITEM_COLUMNS_ENABLED] brand_id=%s columns=%s",
+        brand_id_value,
+        insert_columns,
+    )
 
     columns_str = ", ".join(insert_columns)
     placeholders = ", ".join([f":{col}" for col in insert_columns])
 
     # Build the ON CONFLICT DO UPDATE clause for mutable fields
-    update_set_clauses = [
-        "quantity = EXCLUDED.quantity",
-        "unit_price = EXCLUDED.unit_price",
-        "total_price = EXCLUDED.total_price",
-        "mapped_product_id = EXCLUDED.mapped_product_id",
-        "mapping_status = EXCLUDED.mapping_status",
-        "mapping_issue = EXCLUDED.mapping_issue",
-        "raw_payload = EXCLUDED.raw_payload",
-        "updated_at = EXCLUDED.updated_at",
+    # Build ON CONFLICT DO UPDATE only for columns that exist in the live schema
+    _always_update = ["quantity", "unit_price", "total_price"]
+    _optional_update = [
+        "mapped_product_id", "mapping_status", "mapping_issue",
+        "raw_payload", "updated_at",
+        "unit_price_cents", "total_price_cents",
     ]
-    if enabled_columns.get("unit_price_cents", False):
-        update_set_clauses.append("unit_price_cents = EXCLUDED.unit_price_cents")
-    if enabled_columns.get("total_price_cents", False):
-        update_set_clauses.append("total_price_cents = EXCLUDED.total_price_cents")
+    update_set_clauses = [f"{col} = EXCLUDED.{col}" for col in _always_update]
+    for col in _optional_update:
+        if col in insert_columns:
+            update_set_clauses.append(f"{col} = EXCLUDED.{col}")
 
     update_set_str = ",\n        ".join(update_set_clauses)
 
@@ -1380,10 +1389,12 @@ async def sync_leaflink_line_items(
                 # Defensive null checks — ensure required numeric fields have defaults
                 quantity = item.get("quantity") or 0
                 unit_price = item.get("unit_price") or 0
+                total_price = item.get("total_price") or 0
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
                 now_val = ensure_utc(utc_now())
 
-                insert_params: dict[str, Any] = {
+                # Build params only for columns that exist in the live schema
+                _all_possible_params: dict[str, Any] = {
                     "order_id": order_id_val,
                     "sku": sku,
                     "product_name": item.get("product_name"),
@@ -1396,19 +1407,24 @@ async def sync_leaflink_line_items(
                     "raw_payload": raw_payload_str,
                     "created_at": now_val,
                     "updated_at": now_val,
+                    "packed_qty": 0,
+                    "unit_price_cents": item.get("unit_price_cents"),
+                    "total_price_cents": item.get("total_price_cents"),
                 }
-
-                if enabled_columns.get("packed_qty", False):
-                    insert_params["packed_qty"] = 0
-                if enabled_columns.get("unit_price_cents", False):
-                    insert_params["unit_price_cents"] = item.get("unit_price_cents")
-                if enabled_columns.get("total_price_cents", False):
-                    insert_params["total_price_cents"] = item.get("total_price_cents")
+                insert_params: dict[str, Any] = {
+                    k: v for k, v in _all_possible_params.items()
+                    if k in insert_columns
+                }
 
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
                 await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
+                logger.debug(
+                    "[LINE_ITEM_SAVE_COMMIT] order_id=%s sku=%s inserted=1",
+                    order_id_val,
+                    sku,
+                )
 
             except Exception as line_error:
                 try:
@@ -1422,25 +1438,6 @@ async def sync_leaflink_line_items(
                     line_number,
                     sku,
                     str(line_error)[:200],
-                )
-                logger.error(
-                    "[LINE_ITEM_INSERT_FAILED_DEBUG] order_id=%s line_number=%s payload=%s",
-                    order_id_val,
-                    line_number,
-                    json.dumps({
-                        "sku": sku,
-                        "product_name": item.get("product_name"),
-                        "quantity": item.get("quantity"),
-                        "unit_price": item.get("unit_price"),
-                        "total_price": item.get("total_price"),
-                        "unit_price_cents": item.get("unit_price_cents"),
-                        "total_price_cents": item.get("total_price_cents"),
-                        "mapped_product_id": item.get("mapped_product_id"),
-                        "mapping_status": item.get("mapping_status"),
-                        "mapping_issue": item.get("mapping_issue"),
-                        "created_at": str(now_val) if now_val else None,
-                        "updated_at": str(now_val) if now_val else None,
-                    }, default=str)[:1000],
                 )
                 failed_items.append((item, str(line_error)[:500]))
 
@@ -1676,19 +1673,13 @@ async def sync_leaflink_line_items(
         bg_duration,
     )
     logger.info(
-        "[SYNC_COMPLETE] brand_id=%s ok=true orders=%s line_items=%s errors=%s duration=%ss",
+        "[SYNC_COMPLETE] brand_id=%s orders_created=0 orders_updated=%s line_items_inserted=%s line_items_failed=%s retryable_errors=%s duration=%ss",
         brand_id_value,
         total_orders,
         total_inserted,
+        total_failed,
         len(errors),
         bg_duration,
-    )
-    logger.info(
-        "[OrdersSync] line_items_complete brand=%s lines_written=%s duration=%ss errors=%s",
-        brand_id_value,
-        total_inserted,
-        bg_duration,
-        len(errors),
     )
 
     # Update sync health after Phase 2 completes

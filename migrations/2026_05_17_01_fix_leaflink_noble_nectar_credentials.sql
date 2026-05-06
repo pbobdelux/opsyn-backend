@@ -5,7 +5,7 @@
 -- return "API access may not be enabled for this key" / "Invalid token".
 
 UPDATE brand_api_credentials
-SET base_url    = 'https://marketplace.leaflink.com/api/v2',
-    auth_scheme = 'Api-Key'
-WHERE brand_id         = '380e963d-36fc-4928-a4f4-e569cd535f9e'
-  AND integration_name = 'leaflink';
+SET base_url    = 'https://marketplace.leaflink.com/api/v2'::text,
+    auth_scheme = 'Api-Key'::text
+WHERE brand_id         = '380e963d-36fc-4928-a4f4-e569cd535f9e'::text
+  AND integration_name = 'leaflink'::text;

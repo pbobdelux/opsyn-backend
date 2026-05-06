@@ -1,5 +1,7 @@
 import logging
 import os
+import random
+import socket
 import time
 from typing import Any, Dict, List, Literal, Optional
 
@@ -17,7 +19,24 @@ MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
 _RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 _MAX_RETRY_ATTEMPTS = 3
 _RETRY_BACKOFF_BASE = 1.0   # seconds (doubles each attempt: 1s, 2s, 4s)
+_RETRY_JITTER_MAX = 0.5     # seconds of random jitter added to each backoff
 _REQUEST_TIMEOUT = 30       # seconds per HTTP request
+
+
+def _backoff_with_jitter(attempt: int) -> float:
+    """Compute exponential backoff with random jitter.
+
+    backoff = base * (2 ** attempt) + random(0, jitter)
+    """
+    return _RETRY_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, _RETRY_JITTER_MAX)
+
+
+def _is_transient_exception(exc: Exception) -> bool:
+    """Return True for DNS failures, connection errors, and timeouts."""
+    if isinstance(exc, (socket.gaierror, requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout)):
+        return True
+    return False
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -87,7 +106,7 @@ class LeafLinkClient:
         brand_id: Optional[str] = None,
         auth_scheme: Optional[AuthScheme] = None,
     ) -> None:
-        logger.error("[CLIENT DEBUG] LeafLinkClient.__init__ base_url=%s company_id=%s brand_id=%s", base_url, company_id, brand_id)
+        logger.info("[LeafLinkClient] init brand_id=%s", brand_id)
         self.brand_id = brand_id or "unknown"
         if not base_url:
             logger.warning("leaflink: client_init brand=%s missing base_url — no env var fallback", self.brand_id)
@@ -181,7 +200,7 @@ class LeafLinkClient:
         # Use auth_scheme from DB, default to Token
         scheme = self.auth_scheme or "Token"
         auth_header = f"{scheme} {self.api_key}"
-        logger.info("[LeafLinkAuth] building_header scheme=%s api_key_len=%s", scheme, len(self.api_key))
+        logger.debug("[LeafLinkAuth] building_header scheme=%s api_key_len=%s", scheme, len(self.api_key))
         return {"Authorization": auth_header}
 
     def _validate_request_headers(self, headers: dict) -> bool:
@@ -203,14 +222,8 @@ class LeafLinkClient:
         return True
 
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
-        """Make GET request with explicit Authorization header and retry logic."""
-        logger.error("[CLIENT DEBUG] _get_raw() called path=%s", path)
+        """Make GET request with explicit Authorization header and retry/backoff logic."""
         url = f"{self.base_url}/{path.lstrip('/')}"
-        logger.error("[CLIENT DEBUG] FINAL_URL=%s", url)
-        logger.error(
-            "[LeafLink DEBUG] _get_raw_url=%s",
-            url,
-        )
 
         # Build headers with explicit Authorization
         headers = {
@@ -218,40 +231,13 @@ class LeafLinkClient:
             "Content-Type": "application/json",
         }
 
-        logger.error(
-            "[LEAFLINK_ACTUAL] request_headers Authorization=%s",
-            (headers.get("Authorization", "MISSING")[:20] + "..."),
-        )
-
         if not self._validate_request_headers(headers):
             logger.error("[LeafLinkAuth] invalid_headers aborting_request path=%s", path)
             raise ValueError("Invalid Authorization header")
 
-        logger.info(
-            "[LeafLinkAuth] request_start full_url=%s scheme=%s api_key_len=%s",
-            url,
-            self.auth_scheme,
-            len(self.api_key),
-        )
-
-        logger.info(
-            "[LeafLink] final_url=%s auth_scheme=%s key_len=%s",
-            url,
-            self.auth_scheme,
-            len(self.api_key) if self.api_key else 0,
-        )
-
         last_exc: Optional[Exception] = None
         for attempt in range(1, _MAX_RETRY_ATTEMPTS + 1):
             try:
-                logger.info(
-                    "[LEAFLINK_FINAL] url=%s auth_scheme=%s key_len=%s key_prefix=%s",
-                    url,
-                    self.auth_scheme or "Token",
-                    len(self.api_key or ""),
-                    (self.api_key[:8] if self.api_key and len(self.api_key) >= 8 else "SHORT"),
-                )
-                logger.error("[LEAFLINK_ACTUAL] about_to_request url=%s", url)
                 resp = self.session.get(
                     url,
                     params=params,
@@ -259,73 +245,69 @@ class LeafLinkClient:
                     headers=headers,
                 )
             except Exception as exc:
-                logger.error(
-                    "[LeafLinkAuth] request_error full_url=%s attempt=%s/%s error=%s",
-                    url, attempt, _MAX_RETRY_ATTEMPTS, exc,
-                )
                 last_exc = exc
-                if attempt < _MAX_RETRY_ATTEMPTS:
-                    backoff = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                if attempt < _MAX_RETRY_ATTEMPTS and _is_transient_exception(exc):
+                    backoff = _backoff_with_jitter(attempt - 1)
                     logger.warning(
-                        "[LeafLinkClient] retry_after_error attempt=%s/%s backoff=%.1fs url=%s",
-                        attempt, _MAX_RETRY_ATTEMPTS, backoff, url,
-                    )
-                    time.sleep(backoff)
-                continue
-
-            logger.info(
-                "[LeafLinkSync] page_response status=%s full_url=%s attempt=%s",
-                resp.status_code, url, attempt,
-            )
-
-            content_type = resp.headers.get("Content-Type", "")
-            if "application/json" not in content_type.lower():
-                logger.warning(
-                    "leaflink: API response is not JSON full_url=%s status=%s content_type=%s body_preview=%s",
-                    url, resp.status_code, content_type, resp.text[:200],
-                )
-
-            if not resp.ok:
-                if resp.status_code == 404:
-                    logger.error(
-                        "[LeafLinkAuth] 404_not_found full_url=%s scheme=%s brand=%s",
-                        url, self.auth_scheme, self.brand_id,
-                    )
-                elif resp.status_code == 403:
-                    logger.error(
-                        "[LeafLinkAuth] 403_invalid_token full_url=%s scheme=%s api_key_len=%s brand=%s",
-                        url, self.auth_scheme, len(self.api_key), self.brand_id,
-                    )
-                if resp.status_code in (401, 403):
-                    logger.error(
-                        "[LeafLinkAuth] auth_failed brand=%s status=%s reason=%s full_url=%s",
-                        self.brand_id, resp.status_code, resp.text[:200], url,
-                    )
-                    # Do NOT retry auth failures
-                    return resp
-                elif resp.status_code in _RETRY_STATUS_CODES and attempt < _MAX_RETRY_ATTEMPTS:
-                    backoff = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
-                    logger.warning(
-                        "[LeafLinkClient] retry_transient_error status=%s attempt=%s/%s backoff=%.1fs url=%s",
-                        resp.status_code, attempt, _MAX_RETRY_ATTEMPTS, backoff, url,
+                        "[LEAFLINK_REQUEST_RETRY] url=%s attempt=%s/%s backoff=%.1fs error=%s",
+                        url, attempt, _MAX_RETRY_ATTEMPTS, backoff, type(exc).__name__,
                     )
                     time.sleep(backoff)
                     continue
                 else:
                     logger.error(
-                        "leaflink: API HTTP error brand=%s full_url=%s status=%s body=%s",
-                        self.brand_id, url, resp.status_code, resp.text[:500],
+                        "[LEAFLINK_REQUEST_FAILED] url=%s attempt=%s/%s error=%s",
+                        url, attempt, _MAX_RETRY_ATTEMPTS, str(exc)[:200],
                     )
+                continue
+
+            content_type = resp.headers.get("Content-Type", "")
+            if "application/json" not in content_type.lower():
+                logger.warning(
+                    "leaflink: API response is not JSON url=%s status=%s content_type=%s body_preview=%s",
+                    url, resp.status_code, content_type, resp.text[:200],
+                )
+
+            if not resp.ok:
+                if resp.status_code in (401, 403):
+                    logger.error(
+                        "[LeafLinkAuth] auth_failed brand=%s status=%s url=%s",
+                        self.brand_id, resp.status_code, url,
+                    )
+                    # Do NOT retry auth failures
+                    return resp
+                elif resp.status_code in _RETRY_STATUS_CODES and attempt < _MAX_RETRY_ATTEMPTS:
+                    backoff = _backoff_with_jitter(attempt - 1)
+                    logger.warning(
+                        "[LEAFLINK_REQUEST_RETRY] url=%s attempt=%s/%s backoff=%.1fs status=%s",
+                        url, attempt, _MAX_RETRY_ATTEMPTS, backoff, resp.status_code,
+                    )
+                    time.sleep(backoff)
+                    continue
+                else:
+                    logger.error(
+                        "[LEAFLINK_REQUEST_FAILED] url=%s status=%s reason=%s",
+                        url, resp.status_code, resp.text[:200],
+                    )
+            else:
+                logger.info(
+                    "[LEAFLINK_REQUEST_SUCCESS] url=%s status=%s",
+                    url, resp.status_code,
+                )
 
             return resp
 
         # All attempts exhausted via exception path
         if last_exc is not None:
+            logger.error(
+                "[LEAFLINK_REQUEST_FAILED] url=%s all_attempts_exhausted error=%s",
+                url, str(last_exc)[:200],
+            )
             raise last_exc
         raise RuntimeError(f"LeafLink request failed after {_MAX_RETRY_ATTEMPTS} attempts: {url}")
 
     def _get_raw_url(self, url: str) -> requests.Response:
-        """Make GET request to full URL with explicit Authorization header and retry logic."""
+        """Make GET request to full URL with explicit Authorization header and retry/backoff logic."""
         # Build headers with explicit Authorization
         headers = {
             **self._get_auth_header(),
@@ -336,17 +318,9 @@ class LeafLinkClient:
             logger.error("[LeafLinkAuth] invalid_headers aborting_request full_url=%s", url)
             raise ValueError("Invalid Authorization header")
 
-        logger.info("[LeafLinkAuth] pagination_request_start full_url=%s scheme=%s", url, self.auth_scheme)
-
         last_exc: Optional[Exception] = None
         for attempt in range(1, _MAX_RETRY_ATTEMPTS + 1):
             try:
-                logger.info(
-                    "[LeafLink] final_url=%s auth_scheme=%s key_len=%s",
-                    url,
-                    self.auth_scheme,
-                    len(self.api_key) if self.api_key else 0,
-                )
                 resp = self.session.get(
                     url,
                     params=None,
@@ -354,50 +328,56 @@ class LeafLinkClient:
                     headers=headers,
                 )
             except Exception as exc:
-                logger.error(
-                    "[LeafLinkAuth] request_error full_url=%s attempt=%s/%s error=%s",
-                    url, attempt, _MAX_RETRY_ATTEMPTS, exc,
-                )
                 last_exc = exc
-                if attempt < _MAX_RETRY_ATTEMPTS:
-                    backoff = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                if attempt < _MAX_RETRY_ATTEMPTS and _is_transient_exception(exc):
+                    backoff = _backoff_with_jitter(attempt - 1)
                     logger.warning(
-                        "[LeafLinkClient] retry_after_error attempt=%s/%s backoff=%.1fs url=%s",
-                        attempt, _MAX_RETRY_ATTEMPTS, backoff, url,
+                        "[LEAFLINK_REQUEST_RETRY] url=%s attempt=%s/%s backoff=%.1fs error=%s",
+                        url, attempt, _MAX_RETRY_ATTEMPTS, backoff, type(exc).__name__,
                     )
                     time.sleep(backoff)
+                    continue
+                else:
+                    logger.error(
+                        "[LEAFLINK_REQUEST_FAILED] url=%s attempt=%s/%s error=%s",
+                        url, attempt, _MAX_RETRY_ATTEMPTS, str(exc)[:200],
+                    )
                 continue
-
-            if resp.status_code == 404:
-                logger.error(
-                    "[LeafLinkAuth] 404_not_found full_url=%s scheme=%s",
-                    url, self.auth_scheme,
-                )
-            elif resp.status_code == 403:
-                logger.error(
-                    "[LeafLinkAuth] 403_invalid_token full_url=%s scheme=%s api_key_len=%s",
-                    url, self.auth_scheme, len(self.api_key),
-                )
 
             if resp.status_code in (401, 403):
                 logger.error(
-                    "[LeafLinkAuth] pagination_auth_failed status=%s body=%s full_url=%s",
-                    resp.status_code, resp.text[:200], url,
+                    "[LeafLinkAuth] pagination_auth_failed status=%s url=%s",
+                    resp.status_code, url,
                 )
                 # Do NOT retry auth failures
                 return resp
             elif not resp.ok and resp.status_code in _RETRY_STATUS_CODES and attempt < _MAX_RETRY_ATTEMPTS:
-                backoff = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                backoff = _backoff_with_jitter(attempt - 1)
                 logger.warning(
-                    "[LeafLinkClient] retry_transient_error status=%s attempt=%s/%s backoff=%.1fs url=%s",
-                    resp.status_code, attempt, _MAX_RETRY_ATTEMPTS, backoff, url,
+                    "[LEAFLINK_REQUEST_RETRY] url=%s attempt=%s/%s backoff=%.1fs status=%s",
+                    url, attempt, _MAX_RETRY_ATTEMPTS, backoff, resp.status_code,
                 )
                 time.sleep(backoff)
                 continue
+            else:
+                if resp.ok:
+                    logger.info(
+                        "[LEAFLINK_REQUEST_SUCCESS] url=%s status=%s",
+                        url, resp.status_code,
+                    )
+                else:
+                    logger.error(
+                        "[LEAFLINK_REQUEST_FAILED] url=%s status=%s reason=%s",
+                        url, resp.status_code, resp.text[:200],
+                    )
 
             return resp
 
         if last_exc is not None:
+            logger.error(
+                "[LEAFLINK_REQUEST_FAILED] url=%s all_attempts_exhausted error=%s",
+                url, str(last_exc)[:200],
+            )
             raise last_exc
         raise RuntimeError(f"LeafLink pagination request failed after {_MAX_RETRY_ATTEMPTS} attempts: {url}")
 
@@ -407,15 +387,9 @@ class LeafLinkClient:
         json_data: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
     ) -> requests.Response:
-        """Make POST request with explicit Authorization header."""
+        """Make POST request with explicit Authorization header and retry/backoff logic."""
         url = f"{self.base_url}/{path.lstrip('/')}"
         safe_params = {k: v for k, v in (params or {}).items() if k not in ("api_key", "token", "secret")}
-
-        logger.info(
-            "[LeafLinkAuth] request_start method=POST full_url=%s scheme=%s",
-            url,
-            self.auth_scheme,
-        )
 
         # Build headers with explicit Authorization
         headers = {
@@ -424,24 +398,71 @@ class LeafLinkClient:
         }
 
         if not self._validate_request_headers(headers):
-            logger.error("[LeafLinkAuth] invalid_headers aborting_request method=POST full_url=%s", url)
+            logger.error("[LeafLinkAuth] invalid_headers aborting_request method=POST url=%s", url)
             raise ValueError("Invalid Authorization header")
 
-        try:
-            return self.session.post(
-                url,
-                params=safe_params,
-                json=json_data,
-                timeout=_REQUEST_TIMEOUT,
-                headers=headers,  # EXPLICIT headers on every request
-            )
-        except Exception as exc:
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, _MAX_RETRY_ATTEMPTS + 1):
+            try:
+                resp = self.session.post(
+                    url,
+                    params=safe_params,
+                    json=json_data,
+                    timeout=_REQUEST_TIMEOUT,
+                    headers=headers,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if attempt < _MAX_RETRY_ATTEMPTS and _is_transient_exception(exc):
+                    backoff = _backoff_with_jitter(attempt - 1)
+                    logger.warning(
+                        "[LEAFLINK_REQUEST_RETRY] url=%s method=POST attempt=%s/%s backoff=%.1fs error=%s",
+                        url, attempt, _MAX_RETRY_ATTEMPTS, backoff, type(exc).__name__,
+                    )
+                    time.sleep(backoff)
+                    continue
+                else:
+                    logger.error(
+                        "[LEAFLINK_REQUEST_FAILED] url=%s method=POST attempt=%s/%s error=%s",
+                        url, attempt, _MAX_RETRY_ATTEMPTS, str(exc)[:200],
+                    )
+                continue
+
+            if resp.status_code in (401, 403):
+                logger.error(
+                    "[LeafLinkAuth] post_auth_failed status=%s url=%s",
+                    resp.status_code, url,
+                )
+                return resp
+            elif not resp.ok and resp.status_code in _RETRY_STATUS_CODES and attempt < _MAX_RETRY_ATTEMPTS:
+                backoff = _backoff_with_jitter(attempt - 1)
+                logger.warning(
+                    "[LEAFLINK_REQUEST_RETRY] url=%s method=POST attempt=%s/%s backoff=%.1fs status=%s",
+                    url, attempt, _MAX_RETRY_ATTEMPTS, backoff, resp.status_code,
+                )
+                time.sleep(backoff)
+                continue
+            else:
+                if resp.ok:
+                    logger.info(
+                        "[LEAFLINK_REQUEST_SUCCESS] url=%s method=POST status=%s",
+                        url, resp.status_code,
+                    )
+                else:
+                    logger.error(
+                        "[LEAFLINK_REQUEST_FAILED] url=%s method=POST status=%s reason=%s",
+                        url, resp.status_code, resp.text[:200],
+                    )
+
+            return resp
+
+        if last_exc is not None:
             logger.error(
-                "[LeafLinkAuth] request_error method=POST full_url=%s error=%s",
-                url,
-                exc,
+                "[LEAFLINK_REQUEST_FAILED] url=%s method=POST all_attempts_exhausted error=%s",
+                url, str(last_exc)[:200],
             )
-            raise
+            raise last_exc
+        raise RuntimeError(f"LeafLink POST request failed after {_MAX_RETRY_ATTEMPTS} attempts: {url}")
 
     def list_orders(
         self,
@@ -450,7 +471,6 @@ class LeafLinkClient:
         modified__gte: Optional[str] = None,
         status: Optional[str] = None,
     ) -> Any:
-        logger.error("[CLIENT DEBUG] list_orders() called limit=%s offset=%s", limit, offset)
         # FIXED: Use exact working endpoint
         # https://www.leaflink.com/api/v2/orders-received/
         # Trailing slash on /orders-received/ is REQUIRED
@@ -464,29 +484,15 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
-        # Build URL with exactly one slash between base_url and endpoint
-        _param_str = "&".join(f"{k}={v}" for k, v in params.items())
-        final_url = f"{self.base_url.rstrip('/')}/{_orders_path}?{_param_str}"
-
-        logger.error("[LEAFLINK_TEST] endpoint=%s", _orders_path)
-        logger.error("[LEAFLINK_TEST] final_url=%s", final_url)
-        logger.error("[LEAFLINK_ACTUAL] url=%s", final_url)
-        logger.error("[LEAFLINK_ACTUAL] auth_scheme=%s key_len=%s", self.auth_scheme or "Token", len(self.api_key or ""))
-
         try:
             resp = self._get_raw(_orders_path, params=params)
         except Exception as exc:
             logger.error(
-                "leaflink: list_orders_request_failed brand=%s error=%s",
+                "[LEAFLINK_REQUEST_FAILED] list_orders brand=%s error=%s",
                 self.brand_id,
-                exc,
+                str(exc)[:200],
             )
             raise
-
-        logger.error("[LEAFLINK_TEST] response_status=%s", resp.status_code)
-        logger.error("[LEAFLINK_TEST] response_body=%s", resp.text[:500])
-        logger.error("[LEAFLINK_ACTUAL] response_status=%s response_body=%s", resp.status_code, resp.text[:500])
-        logger.info("[LeafLink] response_status=%s", resp.status_code)
 
         content_type = resp.headers.get("Content-Type", "")
 
@@ -499,23 +505,14 @@ class LeafLinkClient:
             logger.info("[LeafLink] results_count=%s", results_count)
             return data
 
-        if resp.status_code in (401, 403):
-            logger.error(
-                "[LeafLinkAuth] list_orders_auth_failed brand=%s status=%s body=%s",
-                self.brand_id,
-                resp.status_code,
-                resp.text[:500],
-            )
-        else:
-            logger.error(
-                "leaflink: list_orders failed brand=%s status=%s content_type=%s body_preview=%s",
-                self.brand_id,
-                resp.status_code,
-                content_type,
-                resp.text[:220],
-            )
+        logger.error(
+            "[LEAFLINK_REQUEST_FAILED] list_orders brand=%s status=%s body=%s",
+            self.brand_id,
+            resp.status_code,
+            resp.text[:200],
+        )
         raise RuntimeError(
-            f"LeafLink API error: status={resp.status_code} content_type={content_type} body={resp.text[:220]}"
+            f"LeafLink API error: status={resp.status_code} content_type={content_type} body={resp.text[:200]}"
         )
 
     def _extract_customer_name(self, raw: Dict[str, Any]) -> str:
@@ -748,10 +745,9 @@ class LeafLinkClient:
                 ``total_count``       – total order count reported by LeafLink (first page only)
                 ``total_pages``       – estimated total pages (total_count / page_size, rounded up)
         """
-        logger.error(
-            "[LeafLink DEBUG] fetch_orders_page_range_start base_url=%s company_id=%s",
+        logger.info(
+            "[LeafLink] fetch_orders_page_range_start base_url=%s",
             self.base_url,
-            self.company_id,
         )
         all_orders: List[Dict[str, Any]] = []
         pages_fetched = 0
@@ -887,11 +883,9 @@ class LeafLinkClient:
                 ``orders``       – list of order dicts
                 ``pages_fetched`` – number of pages retrieved
         """
-        logger.error("[CLIENT DEBUG] fetch_recent_orders() called base_url=%s company_id=%s", self.base_url, self.company_id)
-        logger.error(
-            "[LeafLink DEBUG] fetch_recent_orders_start base_url=%s company_id=%s",
+        logger.info(
+            "[LeafLink] fetch_recent_orders_start base_url=%s",
             self.base_url,
-            self.company_id,
         )
         effective_max = max_pages if max_pages is not None else 10_000
 
@@ -907,29 +901,14 @@ class LeafLinkClient:
                     # Follow the ``next`` URL returned by LeafLink directly.
                     # _get_raw_url() explicitly attaches the Authorization header so
                     # that pagination requests are authenticated the same way as page 1.
-                    logger.info("[LeafLink] final_url=%s", next_url)
-                    logger.info("[LeafLink] auth_scheme=%s", self.auth_scheme)
                     resp = self._get_raw_url(next_url)
-                    logger.info("[LeafLink] response_status=%s", resp.status_code)
                     if resp.status_code in (401, 403):
-                        logger.error(
-                            "[LeafLinkAuth] pagination_auth_failed offset=%s status=%s body=%s",
-                            offset,
-                            resp.status_code,
-                            resp.text[:200],
-                        )
                         raise RuntimeError(
-                            f"LeafLink pagination auth failed: status={resp.status_code} body={resp.text[:220]}"
+                            f"LeafLink pagination auth failed: status={resp.status_code} body={resp.text[:200]}"
                         )
                     if not resp.ok:
-                        logger.error(
-                            "[LeafLinkSync] offset=%s http_error status=%s body=%s",
-                            offset,
-                            resp.status_code,
-                            resp.text[:500],
-                        )
                         raise RuntimeError(
-                            f"LeafLink API error: status={resp.status_code} body={resp.text[:220]}"
+                            f"LeafLink API error: status={resp.status_code} body={resp.text[:200]}"
                         )
                     payload = resp.json()
                 else:

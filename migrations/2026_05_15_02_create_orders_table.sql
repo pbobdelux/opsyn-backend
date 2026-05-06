@@ -14,17 +14,17 @@ CREATE TABLE IF NOT EXISTS orders (
     item_count INTEGER,
     unit_count INTEGER,
     line_items_json JSONB,
-    source VARCHAR(50) NOT NULL DEFAULT 'leaflink',
+    source VARCHAR(50) NOT NULL DEFAULT 'leaflink'::text,
     review_status VARCHAR(50),
-    sync_status VARCHAR(50) NOT NULL DEFAULT 'ok',
+    sync_status VARCHAR(50) NOT NULL DEFAULT 'ok'::text,
     raw_payload JSONB,
     external_created_at TIMESTAMP WITH TIME ZONE,
     external_updated_at TIMESTAMP WITH TIME ZONE,
-    synced_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    last_synced_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    synced_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()::timestamptz,
+    last_synced_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()::timestamptz,
     sync_run_id INTEGER,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()::timestamptz,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()::timestamptz,
     CONSTRAINT uq_brand_external_order UNIQUE (brand_id, external_order_id)
 );
 
@@ -50,11 +50,11 @@ CREATE TABLE IF NOT EXISTS order_lines (
     unit_price NUMERIC(12, 2),
     total_price NUMERIC(12, 2),
     mapped_product_id VARCHAR(120),
-    mapping_status VARCHAR(50) DEFAULT 'unknown',
+    mapping_status VARCHAR(50) DEFAULT 'unknown'::text,
     mapping_issue VARCHAR(255),
     raw_payload JSONB,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()::timestamptz,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()::timestamptz
 );
 
 -- Create indexes for order_lines
@@ -66,9 +66,9 @@ CREATE INDEX IF NOT EXISTS ix_order_lines_mapping_status ON order_lines(mapping_
 CREATE TABLE IF NOT EXISTS sync_runs (
     id BIGSERIAL PRIMARY KEY,
     brand_id VARCHAR(255) NOT NULL,
-    integration_name VARCHAR(50) NOT NULL DEFAULT 'leaflink',
-    status VARCHAR(20) NOT NULL DEFAULT 'queued',
-    mode VARCHAR(20) NOT NULL DEFAULT 'incremental',
+    integration_name VARCHAR(50) NOT NULL DEFAULT 'leaflink'::text,
+    status VARCHAR(20) NOT NULL DEFAULT 'queued'::text,
+    mode VARCHAR(20) NOT NULL DEFAULT 'incremental'::text,
     pages_synced INTEGER NOT NULL DEFAULT 0,
     total_pages INTEGER,
     orders_loaded_this_run INTEGER NOT NULL DEFAULT 0,
@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     current_page INTEGER DEFAULT 1,
     last_successful_cursor TEXT,
     last_successful_page INTEGER,
-    started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()::timestamptz,
     last_progress_at TIMESTAMP WITH TIME ZONE,
     completed_at TIMESTAMP WITH TIME ZONE,
     last_error TEXT,
@@ -85,8 +85,8 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     stalled_reason VARCHAR(255),
     worker_id VARCHAR(100),
     last_heartbeat_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()::timestamptz,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()::timestamptz
 );
 
 -- Create indexes for sync_runs
@@ -98,12 +98,12 @@ CREATE INDEX IF NOT EXISTS ix_sync_runs_brand_started ON sync_runs(brand_id, sta
 CREATE TABLE IF NOT EXISTS sync_requests (
     id BIGSERIAL PRIMARY KEY,
     brand_id VARCHAR(120) NOT NULL,
-    status VARCHAR(50) DEFAULT 'pending',
+    status VARCHAR(50) DEFAULT 'pending'::text,
     start_page INTEGER DEFAULT 1,
     total_pages INTEGER,
     total_orders_available INTEGER,
     error TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()::timestamptz,
     started_at TIMESTAMP WITH TIME ZONE,
     completed_at TIMESTAMP WITH TIME ZONE
 );
