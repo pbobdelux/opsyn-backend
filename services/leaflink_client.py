@@ -991,15 +991,39 @@ class LeafLinkClient:
         limit: int = 100,
         offset: int = 0,
         modified__gte: Optional[str] = None,
+        modified__lte: Optional[str] = None,
         status: Optional[str] = None,
+        skip_date_filters: bool = False,
     ) -> Any:
-        # FIXED: Use exact working endpoint — no company scoping in the path.
-        # https://www.leaflink.com/api/v2/orders-received/
-        # Trailing slash on /orders-received/ is REQUIRED.
+        # ---------------------------------------------------------------------------
+        # ENDPOINT CHOICE — LeafLink v2 API docs
+        # ---------------------------------------------------------------------------
+        # The correct endpoint is /orders-received/ WITHOUT any company scoping.
+        # Using /companies/{company_id}/orders-received/ is NOT the right path for
+        # the v2 API — it returns 404 or an empty result set for most accounts.
+        # company_id is stored in DB for tenant resolution only; it is NOT used here.
+        # ---------------------------------------------------------------------------
         _orders_path = "orders-received/"
 
         # Build the final URL for validation logging BEFORE making the request
         _final_url = f"{self.base_url.rstrip('/')}/{_orders_path}"
+
+        # Log endpoint choice with reasoning
+        _company_scoping = "yes" if "/companies/" in _final_url else "no"
+        logger.info(
+            "[LEAFLINK_ENDPOINT_CHOICE] endpoint=%s reason=v2_api_no_company_scoping_required"
+            " company_id=%s company_scoping=%s",
+            _final_url,
+            self.company_id or "none",
+            _company_scoping,
+        )
+
+        # Log company_id usage
+        logger.info(
+            "[LEAFLINK_REQUEST] company_id=%s company_scoping=%s",
+            self.company_id or "none",
+            _company_scoping,
+        )
 
         # Hard-fail: reject any URL that contains the truncated form (missing final "d")
         import re as _re_lo
@@ -1015,8 +1039,9 @@ class LeafLinkClient:
                 f"without the final 'd'. Correct endpoint is /orders-received/. URL: {_final_url}"
             )
 
+        # Log the final URL being called
         logger.info(
-            "[LEAFLINK_FINAL_URL] final_url=%s brand_id=%s",
+            "[LEAFLINK_REQUEST] final_url=%s brand_id=%s",
             _final_url,
             self.brand_id,
         )
@@ -1025,10 +1050,40 @@ class LeafLinkClient:
             "limit": limit,
             "offset": offset,
         }
-        if modified__gte:
-            params["modified__gte"] = modified__gte
+
+        # ---------------------------------------------------------------------------
+        # Date filter handling — disabled on first call to test without filters.
+        # If date filters are the cause of zero results, removing them will return
+        # orders and confirm the filter range is the problem.
+        # ---------------------------------------------------------------------------
+        if skip_date_filters:
+            # Testing without date filters — helps isolate whether filters cause zero results
+            logger.info(
+                "[LEAFLINK_REQUEST] date_filters=none (testing without filters)"
+                " brand_id=%s",
+                self.brand_id,
+            )
+        else:
+            if modified__gte:
+                params["modified__gte"] = modified__gte
+            if modified__lte:
+                params["modified__lte"] = modified__lte
+            logger.info(
+                "[LEAFLINK_REQUEST] date_filters=modified__gte=%s modified__lte=%s brand_id=%s",
+                modified__gte or "none",
+                modified__lte or "none",
+                self.brand_id,
+            )
+
         if status:
             params["status"] = status
+
+        # Log all query parameters being sent
+        logger.info(
+            "[LEAFLINK_REQUEST] params=%s brand_id=%s",
+            params,
+            self.brand_id,
+        )
 
         try:
             resp = self._get_raw(_orders_path, params=params)
@@ -1042,8 +1097,50 @@ class LeafLinkClient:
 
         content_type = resp.headers.get("Content-Type", "")
 
+        # Log HTTP status code
+        logger.info(
+            "[LEAFLINK_RESPONSE] status_code=%s brand_id=%s",
+            resp.status_code,
+            self.brand_id,
+        )
+
+        # Log response preview (first 1000 chars)
+        _resp_preview = resp.text[:1000] if resp.text else ""
+        logger.info(
+            "[LEAFLINK_RESPONSE] response_preview=%s brand_id=%s",
+            _resp_preview,
+            self.brand_id,
+        )
+
         if resp.ok and "application/json" in content_type.lower():
             data = resp.json()
+
+            # Log response type
+            if isinstance(data, list):
+                _resp_type = "list"
+            elif isinstance(data, dict):
+                _resp_type = "dict"
+            else:
+                _resp_type = "other"
+            logger.info(
+                "[LEAFLINK_RESPONSE] response_type=%s brand_id=%s",
+                _resp_type,
+                self.brand_id,
+            )
+
+            # If response is a dict, log pagination fields
+            if isinstance(data, dict):
+                _count = data.get("count")
+                _next = data.get("next")
+                _previous = data.get("previous")
+                logger.info(
+                    "[LEAFLINK_RESPONSE] count=%s next=%s previous=%s brand_id=%s",
+                    _count,
+                    _next or "none",
+                    _previous or "none",
+                    self.brand_id,
+                )
+
             return data
 
         if resp.status_code in (401, 403):

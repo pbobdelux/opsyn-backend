@@ -32,6 +32,7 @@ from routes.debug import router as debug_router
 from routes.auth import router as auth_router
 from routes.webhooks import router as webhooks_router
 from routes.sync import router as sync_router
+from routes.diagnostics import router as diagnostics_router
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("opsyn-backend")
@@ -660,6 +661,7 @@ app.include_router(admin_router)
 app.include_router(auth_router)
 app.include_router(webhooks_router)
 app.include_router(sync_router)
+app.include_router(diagnostics_router)
 logger.info("[Routes] registered debug routes")
 
 logger.error("[STARTUP DEBUG] Registered routes:")

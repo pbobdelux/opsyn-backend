@@ -2011,6 +2011,17 @@ async def sync_leaflink_background_continuous(
             brand_id,
         )
 
+        # [LEAFLINK_SYNC_START] Log sync start with all relevant parameters
+        logger.info(
+            "[LEAFLINK_SYNC_START] brand_id=%s company_id=%s start_page=%s"
+            " total_pages=%s total_orders_available=%s",
+            brand_id,
+            company_id or "none",
+            start_page,
+            total_pages or "unknown",
+            total_orders_available or "unknown",
+        )
+
         loop = asyncio.get_event_loop()
 
         async def _fetch_with_retry(
@@ -2181,6 +2192,29 @@ async def sync_leaflink_background_continuous(
             pages_fetched_this_batch = fetch_result.get("pages_fetched", batch_size)
             next_cursor = fetch_result.get("next_url")
             next_page = fetch_result.get("next_page")
+
+            # [LEAFLINK_SYNC_RESPONSE] Log what list_orders returned
+            _orders_count = len(batch_orders)
+            _resp_type = "list" if isinstance(batch_orders, list) else type(batch_orders).__name__
+            logger.info(
+                "[LEAFLINK_SYNC_RESPONSE] brand_id=%s orders_count=%s response_type=%s"
+                " pages_fetched=%s next_cursor=%s",
+                brand_id,
+                _orders_count,
+                _resp_type,
+                pages_fetched_this_batch,
+                "present" if next_cursor else "none",
+            )
+
+            # [LEAFLINK_SYNC_ZERO_ORDERS] Explicitly flag when API returns zero orders
+            if _orders_count == 0:
+                logger.warning(
+                    "[LEAFLINK_SYNC_ZERO_ORDERS] brand_id=%s reason=api_returned_empty"
+                    " page=%s company_id=%s",
+                    brand_id,
+                    current_page,
+                    company_id or "none",
+                )
 
             # [LEAFLINK_ENDPOINT_COMPARE] If first batch returns zero orders, run endpoint comparison
             # to diagnose whether the endpoint or company_id is the issue.
