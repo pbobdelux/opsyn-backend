@@ -2003,6 +2003,14 @@ async def sync_leaflink_background_continuous(
                     pass
             return
 
+        # [LEAFLINK_COMPANY_ROLE] Log company_id at sync start for role verification diagnostics
+        logger.info(
+            "[LEAFLINK_COMPANY_ROLE] company_id=%s credential_company_id=%s brand_id=%s note=verify_company_id_role_in_leaflink_account",
+            company_id,
+            company_id,
+            brand_id,
+        )
+
         loop = asyncio.get_event_loop()
 
         async def _fetch_with_retry(
@@ -2174,6 +2182,34 @@ async def sync_leaflink_background_continuous(
             next_cursor = fetch_result.get("next_url")
             next_page = fetch_result.get("next_page")
 
+            # [LEAFLINK_ENDPOINT_COMPARE] If first batch returns zero orders, run endpoint comparison
+            # to diagnose whether the endpoint or company_id is the issue.
+            if not batch_orders and current_page == start_page:
+                logger.warning(
+                    "[LEAFLINK_EMPTY_RESULT] brand_id=%s company_id=%s page=%s pages_fetched=%s — zero orders returned, running endpoint comparison",
+                    brand_id,
+                    company_id,
+                    current_page,
+                    pages_fetched_this_batch,
+                )
+                try:
+                    await loop.run_in_executor(
+                        _leaflink_executor,
+                        client.test_endpoint_comparison,
+                    )
+                except Exception as _cmp_exc:
+                    logger.warning(
+                        "[LEAFLINK_ENDPOINT_COMPARE] comparison_failed brand=%s error=%s",
+                        brand_id,
+                        str(_cmp_exc)[:200],
+                    )
+
+                # Also log company role inference (no first order available)
+                logger.info(
+                    "[LEAFLINK_COMPANY_ROLE] company_id=%s is_seller=unknown is_buyer=unknown first_order_seller_id=none first_order_buyer_id=none note=no_orders_returned_cannot_infer_role",
+                    company_id,
+                )
+
             # ------------------------------------------------------------------ #
             # Cursor-loop detection: same cursor returned twice → stalled         #
             # ------------------------------------------------------------------ #
@@ -2203,6 +2239,32 @@ async def sync_leaflink_background_continuous(
             # Upsert order headers (headers-only, line items deferred)            #
             # ------------------------------------------------------------------ #
             if batch_orders:
+                # [LEAFLINK_COMPANY_ROLE] Infer company role from first order on first page
+                if current_page == start_page and len(batch_orders) > 0:
+                    try:
+                        _first_order = batch_orders[0]
+                        if isinstance(_first_order, dict):
+                            _seller = _first_order.get("seller") or _first_order.get("seller_company") or {}
+                            _buyer = _first_order.get("buyer") or _first_order.get("buyer_company") or {}
+                            _seller_id = _seller.get("id") if isinstance(_seller, dict) else _seller
+                            _buyer_id = _buyer.get("id") if isinstance(_buyer, dict) else _buyer
+                            _is_seller = str(_seller_id) == str(company_id) if _seller_id else False
+                            _is_buyer = str(_buyer_id) == str(company_id) if _buyer_id else False
+                            logger.info(
+                                "[LEAFLINK_COMPANY_ROLE] company_id=%s is_seller=%s is_buyer=%s first_order_seller_id=%s first_order_buyer_id=%s",
+                                company_id,
+                                _is_seller,
+                                _is_buyer,
+                                _seller_id,
+                                _buyer_id,
+                            )
+                    except Exception as _role_exc:
+                        logger.warning(
+                            "[LEAFLINK_COMPANY_ROLE] role_inference_failed company_id=%s error=%s",
+                            company_id,
+                            str(_role_exc)[:200],
+                        )
+
                 try:
                     persist_result = await sync_leaflink_orders_headers_only(
                         brand_id=brand_id,
