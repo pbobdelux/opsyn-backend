@@ -92,7 +92,8 @@ async def _update_sync_health_phase1(
                         total_orders_synced = sync_health.total_orders_synced + :count,
                         updated_at = :now
                 """),
-                {"brand_id": brand_id, "now": utc_now(), "count": (orders_count or 0)},
+                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+                {"brand_id": brand_id, "now": ensure_utc(utc_now()), "count": (orders_count or 0)},
             )
             await db.commit()
             logger.info(
@@ -125,7 +126,8 @@ async def _update_sync_health_phase2(
                         updated_at = :now
                     WHERE brand_id = :brand_id
                 """),
-                {"brand_id": brand_id, "now": utc_now(), "count": line_items_count},
+                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+                {"brand_id": brand_id, "now": ensure_utc(utc_now()), "count": line_items_count},
             )
             await db.commit()
             logger.info(
@@ -154,7 +156,8 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
                         consecutive_failures = sync_health.consecutive_failures + 1,
                         updated_at = :now
                 """),
-                {"brand_id": brand_id, "error": str(error)[:500], "now": utc_now()},
+                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+                {"brand_id": brand_id, "error": str(error)[:500], "now": ensure_utc(utc_now())},
             )
             await db.commit()
     except Exception as exc:
@@ -206,7 +209,8 @@ async def _dead_letter_line_item(
                     "raw_payload": raw_payload_str,
                     "reason": failure_reason[:500],
                     "count": failure_count,
-                    "now": utc_now(),
+                    # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+                    "now": ensure_utc(utc_now()),
                 },
             )
             await db.commit()
@@ -512,8 +516,9 @@ async def _insert_line_items_standalone(
                 else None
             )
 
-            created_at_val = ensure_utc_aware(utc_now(), "created_at")
-            updated_at_val = ensure_utc_aware(utc_now(), "updated_at")
+            # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+            created_at_val = ensure_utc(utc_now())
+            updated_at_val = ensure_utc(utc_now())
 
             insert_params: dict[str, Any] = {
                 "order_id": order_id,
@@ -712,10 +717,11 @@ async def sync_leaflink_orders(
                 existing.raw_payload = make_json_safe(raw_payload)
                 existing.review_status = review_status
                 existing.sync_status = "ok"
-                existing.synced_at = normalize_datetime(now)
-                existing.last_synced_at = normalize_datetime(now)
-                existing.external_created_at = normalize_datetime(external_created_at)
-                existing.external_updated_at = normalize_datetime(external_updated_at)
+                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+                existing.synced_at = ensure_utc(now)
+                existing.last_synced_at = ensure_utc(now)
+                existing.external_created_at = ensure_utc(external_created_at)
+                existing.external_updated_at = ensure_utc(external_updated_at)
                 # Always stamp org_id so existing rows get backfilled on re-sync
                 if org_id:
                     existing.org_id = org_id
@@ -738,10 +744,11 @@ async def sync_leaflink_orders(
                     source="leaflink",
                     review_status=review_status,
                     sync_status="ok",
-                    synced_at=normalize_datetime(now),
-                    last_synced_at=normalize_datetime(now),
-                    external_created_at=normalize_datetime(external_created_at),
-                    external_updated_at=normalize_datetime(external_updated_at),
+                    # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+                    synced_at=ensure_utc(now),
+                    last_synced_at=ensure_utc(now),
+                    external_created_at=ensure_utc(external_created_at),
+                    external_updated_at=ensure_utc(external_updated_at),
                 )
                 db.add(order_row)
                 # Flush to get the auto-generated order_row.id before writing lines.
@@ -753,7 +760,8 @@ async def sync_leaflink_orders(
                 delete(OrderLine).where(OrderLine.order_id == order_row.id)
             )
 
-            line_now = ensure_utc_aware(utc_now(), "line_now")
+            # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+            line_now = ensure_utc(utc_now())
             for item in normalized_line_items:
                 db.add(
                     OrderLine(
@@ -999,11 +1007,11 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
 
                             now = datetime.now(timezone.utc)
 
-                            # Defensively normalize all datetime fields
-                            synced_at_val = ensure_utc_aware(now, "synced_at")
-                            updated_at_val = ensure_utc_aware(now, "updated_at")
-                            ext_created_val = ensure_utc_aware(external_created_at, "external_created_at")
-                            ext_updated_val = ensure_utc_aware(external_updated_at, "external_updated_at")
+                            # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+                            synced_at_val = ensure_utc(now)
+                            updated_at_val = ensure_utc(now)
+                            ext_created_val = ensure_utc(external_created_at)
+                            ext_updated_val = ensure_utc(external_updated_at)
 
                             update_params = {
                                 "org_id": org_id_value,
@@ -1057,11 +1065,11 @@ INSERT INTO orders (
 
                             now = datetime.now(timezone.utc)
 
-                            # Defensively normalize all datetime fields
-                            created_at_val = ensure_utc_aware(now, "created_at")
-                            synced_at_val = ensure_utc_aware(now, "synced_at")
-                            ext_created_val = ensure_utc_aware(external_created_at, "external_created_at")
-                            ext_updated_val = ensure_utc_aware(external_updated_at, "external_updated_at")
+                            # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+                            created_at_val = ensure_utc(now)
+                            synced_at_val = ensure_utc(now)
+                            ext_created_val = ensure_utc(external_created_at)
+                            ext_updated_val = ensure_utc(external_updated_at)
 
                             insert_params = {
                                 "org_id": org_id_value,
@@ -1092,7 +1100,6 @@ INSERT INTO orders (
                                 insert_params,
                             )
                             batch_created += 1
-
                 # Explicit commit guarantee
                 await db.commit()
 
@@ -1369,12 +1376,12 @@ async def sync_leaflink_line_items(
                     else None
                 )
 
-                now_val = ensure_utc_aware(utc_now(), "now")
 
                 # Defensive null checks — ensure required numeric fields have defaults
                 quantity = item.get("quantity") or 0
                 unit_price = item.get("unit_price") or 0
-                total_price = item.get("total_price") or 0
+                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+                now_val = ensure_utc(utc_now())
 
                 insert_params: dict[str, Any] = {
                     "order_id": order_id_val,
