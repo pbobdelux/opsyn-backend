@@ -243,12 +243,31 @@ CREATE TABLE IF NOT EXISTS assistant_sessions (
     id SERIAL PRIMARY KEY,
     org_id VARCHAR(120) NOT NULL,
     user_id VARCHAR(120),
-    session_key VARCHAR(255) UNIQUE NOT NULL,
+    session_key VARCHAR(255),
     context JSONB,
     is_active BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Ensure session_key column exists even if the table was created by an earlier
+-- schema version (e.g. via SQLAlchemy create_all) that did not include it.
+ALTER TABLE assistant_sessions
+    ADD COLUMN IF NOT EXISTS session_key VARCHAR(255);
+
+-- Add unique constraint only if it does not already exist.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'assistant_sessions_session_key_key'
+          AND conrelid = 'assistant_sessions'::regclass
+    ) THEN
+        ALTER TABLE assistant_sessions
+            ADD CONSTRAINT assistant_sessions_session_key_key UNIQUE (session_key);
+    END IF;
+END;
+$$;
 
 CREATE INDEX IF NOT EXISTS ix_assistant_sessions_org_id ON assistant_sessions(org_id);
 CREATE INDEX IF NOT EXISTS ix_assistant_sessions_session_key ON assistant_sessions(session_key);

@@ -10,15 +10,23 @@ call, so each migration file is split on `;` and each statement is executed
 individually via ``conn.exec_driver_sql()`` (raw SQL, bypasses prepared-statement
 overhead). Each migration runs in its own transaction so a failure in one file
 does not abort subsequent migrations.
+
+Ordering guarantee: any migration whose filename contains "fix_leaflink" is
+promoted to run first, before all other migrations (alphabetical within that
+group, then alphabetical for the rest).
 """
 
 import logging
 import os
+import re
 import time
 
 logger = logging.getLogger("migration_runner")
 
 MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "migrations")
+
+# Migrations whose filenames match this pattern are promoted to run first.
+_LEAFLINK_REPAIR_PATTERN = re.compile(r"fix_leaflink", re.IGNORECASE)
 
 CREATE_SCHEMA_MIGRATIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -32,28 +40,93 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 def _split_statements(sql: str) -> list[str]:
     """
-    Split a SQL file into individual statements.
+    Split a SQL file into individual statements, correctly handling
+    dollar-quoted blocks (DO $ ... $) so that semicolons inside
+    PL/pgSQL bodies are not treated as statement terminators.
 
-    Strips comment-only lines and blank lines, then splits on `;`.
-    Returns only non-empty statement strings.
+    Algorithm:
+      - Scan character-by-character tracking whether we are inside a
+        dollar-quote (e.g. ``$`` or ``$tag`).
+      - Only split on ``;`` when outside a dollar-quote.
+      - Strip comment-only lines and blank lines from each resulting chunk.
     """
-    statements = []
-    for raw in sql.split(";"):
-        # Strip whitespace and filter out lines that are purely comments or blank
+    statements: list[str] = []
+    current: list[str] = []
+    dollar_tag: str | None = None  # None = not inside a dollar-quote
+    i = 0
+
+    while i < len(sql):
+        ch = sql[i]
+
+        if dollar_tag is None:
+            # Look for the start of a dollar-quote: $tag$ or $
+            if ch == "$":
+                # Find the closing $ of the opening tag
+                j = sql.find("$", i + 1)
+                if j != -1:
+                    tag = sql[i : j + 1]  # e.g. "$" or "$body$"
+                    dollar_tag = tag
+                    current.append(tag)
+                    i = j + 1
+                    continue
+            if ch == ";":
+                chunk = "".join(current)
+                # Strip comment-only lines and blank lines
+                lines = [
+                    line for line in chunk.splitlines()
+                    if line.strip() and not line.strip().startswith("--")
+                ]
+                stmt = "\n".join(lines).strip()
+                if stmt:
+                    statements.append(stmt)
+                current = []
+                i += 1
+                continue
+        else:
+            # Inside a dollar-quote — look for the matching closing tag
+            if sql[i : i + len(dollar_tag)] == dollar_tag:
+                current.append(dollar_tag)
+                i += len(dollar_tag)
+                dollar_tag = None
+                continue
+
+        current.append(ch)
+        i += 1
+
+    # Handle any trailing content after the last semicolon
+    if current:
+        chunk = "".join(current)
         lines = [
-            line for line in raw.splitlines()
+            line for line in chunk.splitlines()
             if line.strip() and not line.strip().startswith("--")
         ]
         stmt = "\n".join(lines).strip()
         if stmt:
             statements.append(stmt)
+
     return statements
+
+
+def _order_migrations(sql_files: list[str]) -> list[str]:
+    """
+    Return migration filenames in execution order:
+      1. LeafLink repair migrations (filenames matching ``fix_leaflink``), sorted.
+      2. All other migrations, sorted alphabetically.
+    """
+    repair = sorted(f for f in sql_files if _LEAFLINK_REPAIR_PATTERN.search(f))
+    others = sorted(f for f in sql_files if not _LEAFLINK_REPAIR_PATTERN.search(f))
+    return repair + others
 
 
 async def run_migrations() -> list[str]:
     """
     Scan the migrations/ directory, apply any pending .sql files in order,
     and record each applied migration in the schema_migrations table.
+
+    - LeafLink repair migrations run first (see ``_order_migrations``).
+    - Non-critical migration failures are logged and skipped; the runner
+      continues with the remaining migrations.
+    - A summary is logged after all migrations have been attempted.
 
     Returns a list of migration filenames that were applied in this run.
     """
@@ -64,6 +137,7 @@ async def run_migrations() -> list[str]:
         return []
 
     applied: list[str] = []
+    failed: list[str] = []
 
     try:
         # Collect and sort migration files by filename (timestamp-based ordering)
@@ -71,23 +145,38 @@ async def run_migrations() -> list[str]:
             logger.warning("[Migration] migrations directory not found at %s", MIGRATIONS_DIR)
             return []
 
-        sql_files = sorted(
-            f for f in os.listdir(MIGRATIONS_DIR) if f.endswith(".sql")
-        )
+        raw_files = [f for f in os.listdir(MIGRATIONS_DIR) if f.endswith(".sql")]
+        sql_files = _order_migrations(raw_files)
 
         if not sql_files:
             logger.info("[Migration] no migration files found")
             return []
 
-        # Bootstrap: ensure the tracking table exists in its own transaction
-        async with engine.connect() as bootstrap_conn:
-            for stmt in _split_statements(CREATE_SCHEMA_MIGRATIONS_TABLE):
-                await bootstrap_conn.exec_driver_sql(stmt)
-            await bootstrap_conn.commit()
+        # Bootstrap: ensure the tracking table exists in its own transaction.
+        # This is a CRITICAL step — if it fails, we cannot track migrations at all.
+        try:
+            async with engine.connect() as bootstrap_conn:
+                for stmt in _split_statements(CREATE_SCHEMA_MIGRATIONS_TABLE):
+                    await bootstrap_conn.exec_driver_sql(stmt)
+                await bootstrap_conn.commit()
+        except Exception as bootstrap_exc:
+            logger.error(
+                "[Migration] CRITICAL bootstrap failed — cannot create schema_migrations table: %s",
+                bootstrap_exc,
+                exc_info=True,
+            )
+            raise RuntimeError(
+                f"[Migration] Critical failure: could not bootstrap schema_migrations table: {bootstrap_exc}"
+            )
 
         # Apply each migration in an independent top-level transaction so that a
         # failure in one file does not abort the remaining migrations.
-        for filename in sql_files:
+        for order_idx, filename in enumerate(sql_files, start=1):
+            logger.info(
+                "[MIGRATION_ORDER] executing_migration=%s order=%d",
+                filename,
+                order_idx,
+            )
             try:
                 # Use a plain connection (no implicit transaction) to check whether
                 # this migration has already been applied.
@@ -142,16 +231,38 @@ async def run_migrations() -> list[str]:
                 applied.append(filename)
 
             except Exception as migration_exc:
-                # Transaction is automatically rolled back by the context manager on exception
-                logger.error(
-                    "[Migration] failed migration=%s error=%s",
+                # Transaction is automatically rolled back by the context manager on exception.
+                # Log as non-critical and continue — one broken migration must not abort startup.
+                logger.warning(
+                    "[MIGRATION_FAILED_NONCRITICAL] migration=%s error=%s",
                     filename,
                     migration_exc,
+                )
+                logger.debug(
+                    "[Migration] failed migration=%s full traceback",
+                    filename,
                     exc_info=True,
                 )
+                failed.append(filename)
                 # Continue with remaining migrations rather than aborting startup
 
+    except RuntimeError:
+        # Re-raise critical failures (e.g. bootstrap failure) immediately.
+        raise
     except Exception as exc:
         logger.error("[Migration] runner error=%s", exc, exc_info=True)
+
+    total = len(applied) + len(failed)
+    logger.info(
+        "[MIGRATION_SUMMARY] total=%d passed=%d failed=%d",
+        total,
+        len(applied),
+        len(failed),
+    )
+    if failed:
+        logger.warning(
+            "[MIGRATION_SUMMARY] failed_migrations=%s",
+            ", ".join(failed),
+        )
 
     return applied
