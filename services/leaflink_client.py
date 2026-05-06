@@ -521,6 +521,61 @@ class LeafLinkClient:
                     "[LEAFLINK_REQUEST_SUCCESS] method=GET endpoint=%s status=%s",
                     path, resp.status_code,
                 )
+                # [LEAFLINK_RESPONSE_META] Log detailed response metadata for diagnostics
+                try:
+                    _meta_data = resp.json()
+                    _response_count = _meta_data.get("count") if isinstance(_meta_data, dict) else None
+                    _next = _meta_data.get("next") if isinstance(_meta_data, dict) else None
+                    _previous = _meta_data.get("previous") if isinstance(_meta_data, dict) else None
+                    _results = _meta_data.get("results") if isinstance(_meta_data, dict) else (_meta_data if isinstance(_meta_data, list) else [])
+                    _results_length = len(_results) if isinstance(_results, list) else 0
+                    _top_level_keys = list(_meta_data.keys()) if isinstance(_meta_data, dict) else []
+
+                    logger.info(
+                        "[LEAFLINK_RESPONSE_META] endpoint=%s status=%s response_count=%s next=%s previous=%s results_length=%s top_level_keys=%s company_id=%s",
+                        path,
+                        resp.status_code,
+                        _response_count,
+                        "present" if _next else "none",
+                        "present" if _previous else "none",
+                        _results_length,
+                        _top_level_keys,
+                        self.company_id,
+                    )
+
+                    # [LEAFLINK_EMPTY_RESULT] Explicitly log when API returns 200 but zero results
+                    if _results_length == 0 and _response_count == 0:
+                        logger.warning(
+                            "[LEAFLINK_EMPTY_RESULT] endpoint=%s status=%s response_count=%s results_length=%s company_id=%s",
+                            path,
+                            resp.status_code,
+                            _response_count,
+                            _results_length,
+                            self.company_id,
+                        )
+
+                    # [LEAFLINK_FIRST_OBJECT] Log structure of first result when results exist
+                    if isinstance(_results, list) and len(_results) > 0:
+                        _first = _results[0]
+                        if isinstance(_first, dict):
+                            _order_id = _first.get("id") or _first.get("external_id") or _first.get("order_id") or "unknown"
+                            _seller = _first.get("seller") or _first.get("seller_company") or _first.get("from_company") or "unknown"
+                            _buyer = _first.get("buyer") or _first.get("buyer_company") or _first.get("to_company") or "unknown"
+                            _source_company = _first.get("source_company_id") or _first.get("from_company_id") or "unknown"
+                            _destination_company = _first.get("destination_company_id") or _first.get("to_company_id") or "unknown"
+                            _first_keys = list(_first.keys())
+
+                            logger.info(
+                                "[LEAFLINK_FIRST_OBJECT] order_id=%s seller=%s buyer=%s source_company=%s destination_company=%s top_level_keys=%s",
+                                _order_id,
+                                _seller,
+                                _buyer,
+                                _source_company,
+                                _destination_company,
+                                _first_keys,
+                            )
+                except Exception as _meta_exc:
+                    logger.warning("[LEAFLINK_RESPONSE_META] failed to parse response: %s", str(_meta_exc)[:200])
 
             return resp
 
@@ -814,6 +869,99 @@ class LeafLinkClient:
         raise RuntimeError(
             f"LeafLink API error: status={resp.status_code} content_type={content_type} body={resp.text[:200]}"
         )
+
+    def test_endpoint_comparison(self) -> None:
+        """Test both /orders-received/ and /orders/ endpoints for comparison.
+
+        Call this once per sync if primary endpoint returns zero results.
+        Helps diagnose whether the endpoint type is correct.
+        """
+        logger.info("[LEAFLINK_ENDPOINT_COMPARE] starting_comparison company_id=%s", self.company_id)
+
+        # Test /companies/{company_id}/orders-received/ (or unscoped /orders-received/)
+        try:
+            resp1 = self._get_raw("orders-received/", params={"limit": 1, "offset": 0})
+            data1 = resp1.json() if resp1.ok else {}
+            count1 = data1.get("count") if isinstance(data1, dict) else None
+            results1 = data1.get("results") if isinstance(data1, dict) else []
+            results_length1 = len(results1) if isinstance(results1, list) else 0
+            status1 = resp1.status_code
+        except Exception as exc:
+            logger.warning("[LEAFLINK_ENDPOINT_COMPARE] orders-received_test_failed: %s", str(exc)[:200])
+            count1 = None
+            results_length1 = 0
+            status1 = "error"
+
+        # Test /orders/ endpoint
+        try:
+            resp2 = self._get_raw("orders/", params={"limit": 1, "offset": 0})
+            data2 = resp2.json() if resp2.ok else {}
+            count2 = data2.get("count") if isinstance(data2, dict) else None
+            results2 = data2.get("results") if isinstance(data2, dict) else []
+            results_length2 = len(results2) if isinstance(results2, list) else 0
+            status2 = resp2.status_code
+        except Exception as exc:
+            logger.warning("[LEAFLINK_ENDPOINT_COMPARE] orders_test_failed: %s", str(exc)[:200])
+            count2 = None
+            results_length2 = 0
+            status2 = "error"
+
+        logger.info(
+            "[LEAFLINK_ENDPOINT_COMPARE] company_id=%s endpoint_orders_received_count=%s endpoint_orders_received_results=%s endpoint_orders_received_status=%s endpoint_orders_count=%s endpoint_orders_results=%s endpoint_orders_status=%s",
+            self.company_id,
+            count1,
+            results_length1,
+            status1,
+            count2,
+            results_length2,
+            status2,
+        )
+
+    def test_unscoped_endpoint(self) -> None:
+        """Test unscoped /api/v2/orders-received/ endpoint for diagnostics.
+
+        Only call if explicitly enabled. Helps determine if company_id scoping is the issue.
+        """
+        logger.info("[LEAFLINK_UNSCOPED_TEST] starting_unscoped_test company_id=%s", self.company_id)
+
+        try:
+            # Build unscoped URL directly (strip any company-scoped path from base_url)
+            # base_url is typically https://marketplace.leaflink.com/api/v2/companies/{id}
+            # We want https://marketplace.leaflink.com/api/v2/orders-received/
+            _base = self.base_url.rstrip("/")
+            # If base_url already contains /companies/, strip back to the api/v2 root
+            if "/companies/" in _base:
+                _api_root = _base[:_base.index("/companies/")]
+            else:
+                _api_root = _base
+            unscoped_url = f"{_api_root}/orders-received/"
+
+            headers = {
+                **self._get_auth_header(),
+                "Content-Type": "application/json",
+            }
+
+            resp = self.session.get(
+                unscoped_url,
+                params={"limit": 1, "offset": 0},
+                timeout=30,
+                headers=headers,
+            )
+
+            data = resp.json() if resp.ok else {}
+            count = data.get("count") if isinstance(data, dict) else None
+            results = data.get("results") if isinstance(data, dict) else []
+            results_length = len(results) if isinstance(results, list) else 0
+
+            logger.info(
+                "[LEAFLINK_UNSCOPED_TEST] endpoint=%s/orders-received/ status=%s count=%s results_length=%s",
+                _api_root,
+                resp.status_code,
+                count,
+                results_length,
+            )
+        except Exception as exc:
+            logger.warning("[LEAFLINK_UNSCOPED_TEST] failed: %s", str(exc)[:200])
 
     def _extract_customer_name(self, raw: Dict[str, Any]) -> str:
         buyer = raw.get("buyer") if isinstance(raw.get("buyer"), dict) else {}
