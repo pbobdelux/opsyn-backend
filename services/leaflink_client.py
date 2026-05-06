@@ -260,16 +260,54 @@ class LeafLinkClient:
         auth_scheme: Optional[AuthScheme] = None,
     ) -> None:
         self.brand_id = brand_id or "unknown"
-        if not base_url:
-            logger.warning("leaflink: client_init brand=%s missing base_url — no env var fallback", self.brand_id)
-            raise ValueError("Missing base_url — LeafLink base_url must be provided per brand (not from env vars)")
-        self.base_url = base_url.strip().rstrip("/")
 
-        if "marketplace.leaflink.com" not in self.base_url.lower():
-            logger.error(
-                "[LeafLinkAuth] WRONG_BASE_URL=%s expected marketplace.leaflink.com",
+        # Canonical LeafLink API base URL
+        _CANONICAL_BASE_URL = "https://www.leaflink.com/api/v2"
+
+        # Normalize and validate base_url
+        if not base_url or base_url.strip() == "":
+            # No base_url provided — use canonical
+            self.base_url = _CANONICAL_BASE_URL
+            logger.info(
+                "[LEAFLINK_BASE_URL_CANONICALIZED] brand_id=%s original=none final=%s reason=empty_base_url",
+                self.brand_id,
                 self.base_url,
             )
+        elif "marketplace.leaflink.com" in base_url.lower():
+            # Broken marketplace.leaflink.com URL — rewrite to canonical
+            self.base_url = _CANONICAL_BASE_URL
+            logger.warning(
+                "[LEAFLINK_BASE_URL_CANONICALIZED] brand_id=%s original=%s final=%s reason=marketplace_rewrite",
+                self.brand_id,
+                base_url[:50],
+                self.base_url,
+            )
+        else:
+            # Use provided base_url (assume it's valid)
+            self.base_url = base_url.strip().rstrip("/")
+            logger.info(
+                "[LEAFLINK_BASE_URL_CANONICALIZED] brand_id=%s original=%s final=%s reason=credential_provided",
+                self.brand_id,
+                base_url[:50],
+                self.base_url,
+            )
+
+        # Verify base_url is valid
+        if not self.base_url.startswith("https://"):
+            logger.error(
+                "[LEAFLINK_BASE_URL_INVALID] brand_id=%s base_url=%s reason=not_https",
+                self.brand_id,
+                self.base_url[:50],
+            )
+            raise ValueError(f"LeafLink base_url must start with https://: {self.base_url}")
+
+        if "leaflink.com" not in self.base_url.lower():
+            logger.error(
+                "[LEAFLINK_BASE_URL_INVALID] brand_id=%s base_url=%s reason=not_leaflink_domain",
+                self.brand_id,
+                self.base_url[:50],
+            )
+            raise ValueError(f"LeafLink base_url must contain leaflink.com: {self.base_url}")
 
         # Clean the API key: strip whitespace and remove "Token " prefix if present
         # api_key is required — no env var fallback (multi-tenant: each brand has its own key)
@@ -376,6 +414,20 @@ class LeafLinkClient:
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         """Make GET request with explicit Authorization header and retry logic."""
         url = f"{self.base_url}/{path.lstrip('/')}"
+
+        # Defensive: ensure no marketplace.leaflink.com in final URL
+        if "marketplace.leaflink.com" in url.lower():
+            logger.error(
+                "[LEAFLINK_FINAL_URL_ERROR] final_url=%s reason=marketplace_in_final_url",
+                url[:100],
+            )
+            raise ValueError(f"LeafLink URL contains broken marketplace domain: {url}")
+
+        logger.info(
+            "[LEAFLINK_FINAL_URL] final_url=%s method=GET endpoint=%s",
+            url,
+            path,
+        )
 
         # Build headers with explicit Authorization
         headers = {
@@ -586,6 +638,19 @@ class LeafLinkClient:
 
     def _get_raw_url(self, url: str) -> requests.Response:
         """Make GET request to full URL with explicit Authorization header and retry logic."""
+        # Defensive: ensure no marketplace.leaflink.com in final URL
+        if "marketplace.leaflink.com" in url.lower():
+            logger.error(
+                "[LEAFLINK_FINAL_URL_ERROR] final_url=%s reason=marketplace_in_final_url",
+                url[:100],
+            )
+            raise ValueError(f"LeafLink URL contains broken marketplace domain: {url}")
+
+        logger.info(
+            "[LEAFLINK_FINAL_URL] final_url=%s method=GET endpoint=full_url",
+            url,
+        )
+
         # Build headers with explicit Authorization
         headers = {
             **self._get_auth_header(),
@@ -739,6 +804,20 @@ class LeafLinkClient:
         """Make POST request with explicit Authorization header."""
         url = f"{self.base_url}/{path.lstrip('/')}"
         safe_params = {k: v for k, v in (params or {}).items() if k not in ("api_key", "token", "secret")}
+
+        # Defensive: ensure no marketplace.leaflink.com in final URL
+        if "marketplace.leaflink.com" in url.lower():
+            logger.error(
+                "[LEAFLINK_FINAL_URL_ERROR] final_url=%s reason=marketplace_in_final_url",
+                url[:100],
+            )
+            raise ValueError(f"LeafLink URL contains broken marketplace domain: {url}")
+
+        logger.info(
+            "[LEAFLINK_FINAL_URL] final_url=%s method=POST endpoint=%s",
+            url,
+            path,
+        )
 
         # Build headers with explicit Authorization
         headers = {

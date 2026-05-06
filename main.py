@@ -702,6 +702,11 @@ async def sync_leaflink(
                     # they do not block the event loop while paginating LeafLink.
                     logger.info("leaflink: sync_client_init brand_id=%s", brand_id)
                     client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=brand_id)
+                    logger.info(
+                        "[LEAFLINK_STARTUP_VERIFY] canonical_base_url=%s brand_id=%s",
+                        client.base_url,
+                        brand_id,
+                    )
                     logger.info("[SyncEndpoint] leaflink_fetch_start")
                     loop = asyncio.get_event_loop()
                     fetch_result = await asyncio.wait_for(
@@ -871,6 +876,11 @@ async def sync_leaflink_now(
                 # they do not block the event loop while paginating LeafLink.
                 logger.info("leaflink: sync_client_init brand_id=%s", brand_id)
                 client = LeafLinkClient(api_key=api_key, company_id=company_id, brand_id=brand_id)
+                logger.info(
+                    "[LEAFLINK_STARTUP_VERIFY] canonical_base_url=%s brand_id=%s",
+                    client.base_url,
+                    brand_id,
+                )
                 logger.info("[SyncEndpoint] leaflink_fetch_start")
                 loop = asyncio.get_event_loop()
                 fetch_result = await asyncio.wait_for(

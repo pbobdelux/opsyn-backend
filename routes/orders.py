@@ -192,6 +192,26 @@ async def resolve_leaflink_credential(
 
                 logger.info("[CredentialResolver] final_source=db tenant_isolated=true")
 
+                # Validate base_url from DB and log for observability
+                _cred_base_url = cred.base_url or ""
+                if _cred_base_url and "marketplace.leaflink.com" in _cred_base_url.lower():
+                    logger.warning(
+                        "[LEAFLINK_CREDENTIAL_VALIDATION] brand_id=%s base_url_from_db=%s is_valid=false reason=marketplace_domain",
+                        cred.brand_id,
+                        _cred_base_url[:50],
+                    )
+                elif not _cred_base_url:
+                    logger.info(
+                        "[LEAFLINK_CREDENTIAL_VALIDATION] brand_id=%s base_url_from_db=none is_valid=true reason=will_use_canonical",
+                        cred.brand_id,
+                    )
+                else:
+                    logger.info(
+                        "[LEAFLINK_CREDENTIAL_VALIDATION] brand_id=%s base_url_from_db=%s is_valid=true",
+                        cred.brand_id,
+                        _cred_base_url[:50],
+                    )
+
                 return cred
             else:
                 logger.info(
