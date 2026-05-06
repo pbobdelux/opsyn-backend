@@ -85,14 +85,14 @@ async def run_migrations() -> list[str]:
                 await bootstrap_conn.exec_driver_sql(stmt)
             await bootstrap_conn.commit()
 
-        # Apply each migration in an independent transaction so that a failure
-        # in one file does not abort the remaining migrations.
+        # Apply each migration in an independent top-level transaction so that a
+        # failure in one file does not abort the remaining migrations.
         for filename in sql_files:
             try:
-                async with engine.connect() as conn:
-                    # Check whether this migration has already been applied
-                    # (outside the migration transaction so we can safely skip)
-                    row = await conn.exec_driver_sql(
+                # Use a plain connection (no implicit transaction) to check whether
+                # this migration has already been applied.
+                async with engine.connect() as check_conn:
+                    row = await check_conn.exec_driver_sql(
                         "SELECT 1 FROM schema_migrations WHERE migration_name = $1",
                         (filename,),
                     )
@@ -100,46 +100,46 @@ async def run_migrations() -> list[str]:
                         logger.debug("[Migration] already applied migration=%s — skipping", filename)
                         continue
 
-                    # Read and execute the migration SQL
-                    migration_path = os.path.join(MIGRATIONS_DIR, filename)
-                    with open(migration_path, "r", encoding="utf-8") as fh:
-                        sql = fh.read()
+                # Read the migration SQL before opening the transaction connection.
+                migration_path = os.path.join(MIGRATIONS_DIR, filename)
+                with open(migration_path, "r", encoding="utf-8") as fh:
+                    sql = fh.read()
 
-                    logger.info("[Migration] applying migration=%s", filename)
-                    start_ms = time.monotonic()
+                logger.info("[Migration] applying migration=%s", filename)
+                start_ms = time.monotonic()
 
-                    # Each migration runs in its own explicit transaction so that
-                    # a failure rolls back cleanly and does not leave the connection
-                    # in a broken state for subsequent migrations.
-                    async with conn.begin():
-                        # Execute each statement individually — asyncpg does not
-                        # support multiple statements in a single prepared call.
-                        statements = _split_statements(sql)
-                        logger.debug(
-                            "[Migration] migration=%s statement_count=%s",
-                            filename,
-                            len(statements),
-                        )
-                        for stmt in statements:
-                            await conn.exec_driver_sql(stmt)
-
-                        duration_ms = int((time.monotonic() - start_ms) * 1000)
-
-                        # Record the migration as applied (inside the same transaction
-                        # so it is atomically committed or rolled back with the migration)
-                        await conn.exec_driver_sql(
-                            "INSERT INTO schema_migrations (migration_name, duration_ms) "
-                            "VALUES ($1, $2)",
-                            (filename, duration_ms),
-                        )
-                    # Commit happens automatically when the `async with conn.begin()` block exits
-
-                    logger.info(
-                        "[Migration] applied migration=%s duration_ms=%s",
+                # Use engine.begin() so the connection starts a fresh top-level
+                # transaction — no nested begin() calls that can trigger
+                # "cannot execute DDL in a read-only transaction" errors.
+                async with engine.begin() as conn:
+                    # Execute each statement individually — asyncpg does not
+                    # support multiple statements in a single prepared call.
+                    statements = _split_statements(sql)
+                    logger.debug(
+                        "[Migration] migration=%s statement_count=%s",
                         filename,
-                        duration_ms,
+                        len(statements),
                     )
-                    applied.append(filename)
+                    for stmt in statements:
+                        await conn.exec_driver_sql(stmt)
+
+                    duration_ms = int((time.monotonic() - start_ms) * 1000)
+
+                    # Record the migration as applied inside the same transaction
+                    # so it is atomically committed or rolled back with the migration.
+                    await conn.exec_driver_sql(
+                        "INSERT INTO schema_migrations (migration_name, duration_ms) "
+                        "VALUES ($1, $2)",
+                        (filename, duration_ms),
+                    )
+                # Transaction is committed automatically when engine.begin() block exits.
+
+                logger.info(
+                    "[Migration] applied migration=%s duration_ms=%s",
+                    filename,
+                    duration_ms,
+                )
+                applied.append(filename)
 
             except Exception as migration_exc:
                 # Transaction is automatically rolled back by the context manager on exception
