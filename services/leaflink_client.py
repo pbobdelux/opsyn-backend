@@ -19,6 +19,44 @@ LEAFLINK_API_VERSION = os.getenv("LEAFLINK_API_VERSION", "").strip()
 LEAFLINK_USER_AGENT = os.getenv("LEAFLINK_USER_AGENT", "opsyn-backend").strip()
 MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
 
+# ---------------------------------------------------------------------------
+# Canonical endpoint constants — single source of truth
+# ---------------------------------------------------------------------------
+
+LEAFLINK_CANONICAL_BASE_URL = "https://www.leaflink.com/api/v2"
+LEAFLINK_ORDERS_ENDPOINT = "orders-received/"
+LEAFLINK_ORDERS_FULL_URL = f"{LEAFLINK_CANONICAL_BASE_URL}/{LEAFLINK_ORDERS_ENDPOINT}"
+
+# Log the canonical endpoint at module import time so it appears in every deploy log.
+logger.info(
+    "[LEAFLINK_FINAL_URL] final_url=%s",
+    LEAFLINK_ORDERS_FULL_URL,
+)
+
+
+def validate_leaflink_endpoint_url(url: str) -> tuple[bool, str]:
+    """Validate that a LeafLink orders endpoint URL is correctly formed.
+
+    Returns (is_valid, reason).  reason is empty string when valid.
+
+    Checks:
+    - URL must not contain 'orders-receive' without the trailing 'd'
+    - URL must end with 'orders-received/' (trailing slash required)
+    """
+    import re as _re
+
+    if _re.search(r"orders-receive(?!d)", url):
+        return False, "missing_final_d"
+
+    if "orders-received" in url and not url.rstrip("?").endswith("orders-received/"):
+        # Allow query strings — strip them before checking trailing slash
+        path_part = url.split("?")[0]
+        if not path_part.endswith("orders-received/"):
+            return False, "missing_trailing_slash"
+
+    return True, ""
+
+
 # Retry configuration for transient HTTP errors and network failures
 _RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 _MAX_RETRY_ATTEMPTS = 3
@@ -422,6 +460,25 @@ class LeafLinkClient:
                 url[:100],
             )
             raise ValueError(f"LeafLink URL contains broken marketplace domain: {url}")
+
+        # Guardrail: detect truncated "orders-receive" (missing final "d") in the URL.
+        # This catches typos like /orders-receive or /companies/{id}/orders-receive
+        # before they cause a 404 from the LeafLink API.
+        import re as _re
+        if _re.search(r"orders-receive(?!d)", url):
+            logger.error(
+                "[LEAFLINK_ENDPOINT_VALIDATION] endpoint_valid=false reason=missing_final_d final_url=%s",
+                url[:150],
+            )
+            raise ValueError(
+                f"LeafLink endpoint URL contains 'orders-receive' without the final 'd'. "
+                f"The correct endpoint is /orders-received/ (with trailing slash). URL: {url}"
+            )
+        else:
+            logger.info(
+                "[LEAFLINK_ENDPOINT_VALIDATION] endpoint_valid=true final_url=%s",
+                url[:150],
+            )
 
         logger.info(
             "[LEAFLINK_FINAL_URL] final_url=%s method=GET endpoint=%s",

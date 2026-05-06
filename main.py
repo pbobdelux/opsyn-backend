@@ -347,6 +347,40 @@ async def lifespan(app: FastAPI):
     await _verify_database_schema()
 
     await _resume_interrupted_syncs()
+
+    # ---------------------------------------------------------------------------
+    # LeafLink endpoint startup validation — fail fast if the endpoint is wrong
+    # ---------------------------------------------------------------------------
+    try:
+        from services.leaflink_client import (
+            LEAFLINK_ORDERS_FULL_URL,
+            validate_leaflink_endpoint_url,
+        )
+
+        _endpoint_valid, _endpoint_reason = validate_leaflink_endpoint_url(LEAFLINK_ORDERS_FULL_URL)
+        if _endpoint_valid:
+            logger.info(
+                "[LEAFLINK_STARTUP_VALIDATION] endpoint_check=passed canonical_url=%s",
+                LEAFLINK_ORDERS_FULL_URL,
+            )
+        else:
+            logger.error(
+                "[LEAFLINK_STARTUP_VALIDATION] endpoint_check=failed reason=%s canonical_url=%s",
+                _endpoint_reason,
+                LEAFLINK_ORDERS_FULL_URL,
+            )
+            raise RuntimeError(
+                f"LeafLink endpoint validation failed at startup: reason={_endpoint_reason} "
+                f"url={LEAFLINK_ORDERS_FULL_URL}. "
+                f"The correct endpoint is https://www.leaflink.com/api/v2/orders-received/"
+            )
+    except ImportError as _import_exc:
+        logger.error(
+            "[LEAFLINK_STARTUP_VALIDATION] endpoint_check=failed reason=import_error error=%s",
+            _import_exc,
+        )
+        raise RuntimeError(f"Failed to import LeafLink client for startup validation: {_import_exc}")
+
     route_count = len(app.routes)
     logger.info("[Startup] routes_registered count=%s", route_count)
 
