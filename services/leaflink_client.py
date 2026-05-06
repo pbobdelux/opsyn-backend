@@ -1,10 +1,13 @@
 import logging
 import os
 import random
+import socket
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout as RequestsTimeout
 
@@ -24,6 +27,169 @@ _REQUEST_TIMEOUT = 30       # seconds per HTTP request
 
 # Network-level errors that are always retryable (DNS, connection reset, timeout)
 _RETRYABLE_NETWORK_EXCEPTIONS = (RequestsConnectionError, RequestsTimeout, OSError)
+
+# ---------------------------------------------------------------------------
+# Module-level singleton session with connection pooling
+# ---------------------------------------------------------------------------
+
+_GLOBAL_SESSION: Optional[requests.Session] = None
+
+
+def _get_global_session() -> requests.Session:
+    """Get or create the global requests.Session with connection pooling."""
+    global _GLOBAL_SESSION
+    if _GLOBAL_SESSION is None:
+        _GLOBAL_SESSION = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=20,
+            pool_maxsize=50,
+            max_retries=0,  # Custom retry logic in _get_raw, _get_raw_url, _post_raw
+        )
+        _GLOBAL_SESSION.mount("http://", adapter)
+        _GLOBAL_SESSION.mount("https://", adapter)
+    return _GLOBAL_SESSION
+
+
+# ---------------------------------------------------------------------------
+# DNS failure cooldown
+# ---------------------------------------------------------------------------
+
+_last_dns_failure_time: Optional[float] = None
+_DNS_COOLDOWN_SECONDS = 60
+
+
+def _is_in_dns_cooldown() -> bool:
+    """Check if we're in DNS failure cooldown period."""
+    global _last_dns_failure_time
+    if _last_dns_failure_time is None:
+        return False
+    elapsed = time.time() - _last_dns_failure_time
+    return elapsed < _DNS_COOLDOWN_SECONDS
+
+
+def _record_dns_failure() -> None:
+    """Record a DNS failure and start cooldown."""
+    global _last_dns_failure_time
+    _last_dns_failure_time = time.time()
+
+
+def _get_dns_cooldown_remaining() -> float:
+    """Get remaining cooldown time in seconds."""
+    global _last_dns_failure_time
+    if _last_dns_failure_time is None:
+        return 0.0
+    elapsed = time.time() - _last_dns_failure_time
+    return max(0.0, _DNS_COOLDOWN_SECONDS - elapsed)
+
+
+# ---------------------------------------------------------------------------
+# Health check cache
+# ---------------------------------------------------------------------------
+
+_last_health_check_time: Optional[float] = None
+_last_health_check_ok: bool = False
+_HEALTH_CHECK_CACHE_SECONDS = 30
+
+
+def _check_leaflink_health(base_url: str) -> bool:
+    """Check if LeafLink API is reachable. Cache result for 30 seconds."""
+    global _last_health_check_time, _last_health_check_ok
+
+    now = time.time()
+    if _last_health_check_time is not None:
+        elapsed = now - _last_health_check_time
+        if elapsed < _HEALTH_CHECK_CACHE_SECONDS:
+            return _last_health_check_ok
+
+    try:
+        session = _get_global_session()
+        resp = session.get(
+            f"{base_url.rstrip('/')}/",
+            timeout=5,
+            allow_redirects=False,
+        )
+        ok = resp.status_code < 400
+        _last_health_check_time = now
+        _last_health_check_ok = ok
+
+        if ok:
+            logger.info("[LEAFLINK_HEALTH_CHECK_OK] status=%s", resp.status_code)
+        else:
+            logger.warning("[LEAFLINK_HEALTH_CHECK_FAILED] status=%s", resp.status_code)
+
+        return ok
+    except Exception as exc:
+        logger.warning("[LEAFLINK_HEALTH_CHECK_FAILED] error=%s", type(exc).__name__)
+        _last_health_check_time = now
+        _last_health_check_ok = False
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker
+# ---------------------------------------------------------------------------
+
+_consecutive_request_failures: int = 0
+_circuit_breaker_state: str = "closed"  # closed, open, half_open
+_circuit_breaker_open_time: Optional[float] = None
+_CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
+_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 120
+
+
+def _check_circuit_breaker() -> bool:
+    """Check if circuit breaker allows requests. Return True if requests should proceed."""
+    global _circuit_breaker_state, _circuit_breaker_open_time
+
+    if _circuit_breaker_state == "closed":
+        return True
+
+    if _circuit_breaker_state == "open":
+        if _circuit_breaker_open_time is None:
+            return False
+        elapsed = time.time() - _circuit_breaker_open_time
+        if elapsed >= _CIRCUIT_BREAKER_COOLDOWN_SECONDS:
+            _circuit_breaker_state = "half_open"
+            logger.warning("[LEAFLINK_CIRCUIT_HALF_OPEN] attempting_recovery")
+            return True
+        remaining = _CIRCUIT_BREAKER_COOLDOWN_SECONDS - elapsed
+        logger.warning(
+            "[LEAFLINK_CIRCUIT_OPEN] cooldown_active remaining=%.1fs",
+            remaining,
+        )
+        return False
+
+    # half_open — allow one probe request
+    return True
+
+
+def _record_request_success() -> None:
+    """Record a successful request. Reset circuit breaker if needed."""
+    global _consecutive_request_failures, _circuit_breaker_state
+
+    if _circuit_breaker_state == "half_open":
+        logger.info("[LEAFLINK_CIRCUIT_CLOSED] recovered")
+
+    _consecutive_request_failures = 0
+    _circuit_breaker_state = "closed"
+
+
+def _record_request_failure() -> None:
+    """Record a request failure. Open circuit breaker if threshold reached."""
+    global _consecutive_request_failures, _circuit_breaker_state, _circuit_breaker_open_time
+
+    _consecutive_request_failures += 1
+
+    if _circuit_breaker_state == "half_open":
+        _circuit_breaker_state = "open"
+        _circuit_breaker_open_time = time.time()
+        logger.error("[LEAFLINK_CIRCUIT_OPEN] recovery_failed")
+    elif _consecutive_request_failures >= _CIRCUIT_BREAKER_FAILURE_THRESHOLD:
+        _circuit_breaker_state = "open"
+        _circuit_breaker_open_time = time.time()
+        logger.error(
+            "[LEAFLINK_CIRCUIT_OPEN] failures=%s cooldown=120s",
+            _consecutive_request_failures,
+        )
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -93,7 +259,6 @@ class LeafLinkClient:
         brand_id: Optional[str] = None,
         auth_scheme: Optional[AuthScheme] = None,
     ) -> None:
-        logger.error("[CLIENT DEBUG] LeafLinkClient.__init__ base_url=%s company_id=%s brand_id=%s", base_url, company_id, brand_id)
         self.brand_id = brand_id or "unknown"
         if not base_url:
             logger.warning("leaflink: client_init brand=%s missing base_url — no env var fallback", self.brand_id)
@@ -162,7 +327,7 @@ class LeafLinkClient:
                 "[LeafLinkAuth] using_default_scheme scheme=Api-Key",
             )
 
-        self.session = requests.Session()
+        self.session = _get_global_session()
         # Base session headers — Authorization header is built per-request from
         # the instance api_key so each brand uses its own credential.
         self.session.headers.update({
@@ -210,13 +375,7 @@ class LeafLinkClient:
 
     def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         """Make GET request with explicit Authorization header and retry logic."""
-        logger.error("[CLIENT DEBUG] _get_raw() called path=%s", path)
         url = f"{self.base_url}/{path.lstrip('/')}"
-        logger.error("[CLIENT DEBUG] FINAL_URL=%s", url)
-        logger.error(
-            "[LeafLink DEBUG] _get_raw_url=%s",
-            url,
-        )
 
         # Build headers with explicit Authorization
         headers = {
@@ -224,48 +383,72 @@ class LeafLinkClient:
             "Content-Type": "application/json",
         }
 
-        logger.error(
-            "[LEAFLINK_ACTUAL] request_headers Authorization=%s",
-            (headers.get("Authorization", "MISSING")[:20] + "..."),
-        )
-
         if not self._validate_request_headers(headers):
             logger.error("[LeafLinkAuth] invalid_headers aborting_request path=%s", path)
             raise ValueError("Invalid Authorization header")
 
-        logger.info(
-            "[LeafLinkAuth] request_start full_url=%s scheme=%s api_key_len=%s",
-            url,
-            self.auth_scheme,
-            len(self.api_key),
-        )
+        # DNS cooldown check — skip if we recently had a DNS failure
+        if _is_in_dns_cooldown():
+            remaining = _get_dns_cooldown_remaining()
+            logger.warning(
+                "[LEAFLINK_DNS_COOLDOWN] cooldown_active remaining=%.1fs next_retry_at=%s",
+                remaining,
+                datetime.fromtimestamp(time.time() + remaining).isoformat(),
+            )
+            raise RuntimeError(f"DNS cooldown active, retry in {remaining:.1f}s")
 
-        logger.info(
-            "[LeafLink] final_url=%s auth_scheme=%s key_len=%s",
-            url,
-            self.auth_scheme,
-            len(self.api_key) if self.api_key else 0,
-        )
+        # Circuit breaker check
+        if not _check_circuit_breaker():
+            raise RuntimeError("Circuit breaker is open, requests paused")
 
         last_exc: Optional[Exception] = None
         for attempt in range(1, _MAX_RETRY_ATTEMPTS + 1):
             try:
-                logger.info(
-                    "[LEAFLINK_FINAL] url=%s auth_scheme=%s key_len=%s key_prefix=%s",
-                    url,
-                    self.auth_scheme or "Token",
-                    len(self.api_key or ""),
-                    (self.api_key[:8] if self.api_key and len(self.api_key) >= 8 else "SHORT"),
-                )
                 resp = self.session.get(
                     url,
                     params=params,
                     timeout=_REQUEST_TIMEOUT,
                     headers=headers,
                 )
-            except _RETRYABLE_NETWORK_EXCEPTIONS as exc:
-                # DNS failures (NameResolutionError), connection resets, timeouts
+            except socket.gaierror as exc:
+                # DNS failure — transient, don't dump traceback
+                _record_dns_failure()
+                _record_request_failure()
+                logger.error(
+                    "[LEAFLINK_DNS_FAILURE] error=%s cooldown_started duration=60s",
+                    str(exc)[:200],
+                )
                 last_exc = exc
+                continue
+            except (RequestsConnectionError, RequestsTimeout) as exc:
+                # Check for DNS-related connection errors
+                exc_str = str(exc)
+                if "Name or service not known" in exc_str or "NameResolutionError" in exc_str or "getaddrinfo" in exc_str:
+                    _record_dns_failure()
+                    logger.error(
+                        "[LEAFLINK_DNS_FAILURE] error=%s cooldown_started duration=60s",
+                        type(exc).__name__,
+                    )
+                last_exc = exc
+                _record_request_failure()
+                if attempt < _MAX_RETRY_ATTEMPTS:
+                    backoff = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                    jitter = random.uniform(0, backoff * 0.1)
+                    backoff_total = round(backoff + jitter, 2)
+                    logger.warning(
+                        "[LEAFLINK_REQUEST_RETRY] method=GET endpoint=%s error=%s attempt=%s backoff=%ss",
+                        path, type(exc).__name__, attempt, backoff_total,
+                    )
+                    time.sleep(backoff_total)
+                else:
+                    logger.error(
+                        "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s error=%s max_retries_exceeded",
+                        path, type(exc).__name__,
+                    )
+                continue
+            except OSError as exc:
+                last_exc = exc
+                _record_request_failure()
                 if attempt < _MAX_RETRY_ATTEMPTS:
                     backoff = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
                     jitter = random.uniform(0, backoff * 0.1)
@@ -282,10 +465,11 @@ class LeafLinkClient:
                     )
                 continue
             except Exception as exc:
-                logger.error(
-                    "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s error=%s",
+                logger.exception(
+                    "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s unexpected_error=%s",
                     path, type(exc).__name__,
                 )
+                _record_request_failure()
                 last_exc = exc
                 continue
 
@@ -312,6 +496,7 @@ class LeafLinkClient:
                         "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s status=%s",
                         path, resp.status_code,
                     )
+                    _record_request_failure()
                     # Do NOT retry auth failures
                     return resp
                 elif resp.status_code in _RETRY_STATUS_CODES and attempt < _MAX_RETRY_ATTEMPTS:
@@ -329,7 +514,9 @@ class LeafLinkClient:
                         "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s status=%s",
                         path, resp.status_code,
                     )
+                    _record_request_failure()
             else:
+                _record_request_success()
                 logger.info(
                     "[LEAFLINK_REQUEST_SUCCESS] method=GET endpoint=%s status=%s",
                     path, resp.status_code,
@@ -354,7 +541,19 @@ class LeafLinkClient:
             logger.error("[LeafLinkAuth] invalid_headers aborting_request full_url=%s", url)
             raise ValueError("Invalid Authorization header")
 
-        logger.info("[LeafLinkAuth] pagination_request_start full_url=%s scheme=%s", url, self.auth_scheme)
+        # DNS cooldown check — skip if we recently had a DNS failure
+        if _is_in_dns_cooldown():
+            remaining = _get_dns_cooldown_remaining()
+            logger.warning(
+                "[LEAFLINK_DNS_COOLDOWN] cooldown_active remaining=%.1fs next_retry_at=%s",
+                remaining,
+                datetime.fromtimestamp(time.time() + remaining).isoformat(),
+            )
+            raise RuntimeError(f"DNS cooldown active, retry in {remaining:.1f}s")
+
+        # Circuit breaker check
+        if not _check_circuit_breaker():
+            raise RuntimeError("Circuit breaker is open, requests paused")
 
         last_exc: Optional[Exception] = None
         for attempt in range(1, _MAX_RETRY_ATTEMPTS + 1):
@@ -365,9 +564,45 @@ class LeafLinkClient:
                     timeout=_REQUEST_TIMEOUT,
                     headers=headers,
                 )
-            except _RETRYABLE_NETWORK_EXCEPTIONS as exc:
-                # DNS failures (NameResolutionError), connection resets, timeouts
+            except socket.gaierror as exc:
+                # DNS failure — transient, don't dump traceback
+                _record_dns_failure()
+                _record_request_failure()
+                logger.error(
+                    "[LEAFLINK_DNS_FAILURE] error=%s cooldown_started duration=60s",
+                    str(exc)[:200],
+                )
                 last_exc = exc
+                continue
+            except (RequestsConnectionError, RequestsTimeout) as exc:
+                # Check for DNS-related connection errors
+                exc_str = str(exc)
+                if "Name or service not known" in exc_str or "NameResolutionError" in exc_str or "getaddrinfo" in exc_str:
+                    _record_dns_failure()
+                    logger.error(
+                        "[LEAFLINK_DNS_FAILURE] error=%s cooldown_started duration=60s",
+                        type(exc).__name__,
+                    )
+                last_exc = exc
+                _record_request_failure()
+                if attempt < _MAX_RETRY_ATTEMPTS:
+                    backoff = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                    jitter = random.uniform(0, backoff * 0.1)
+                    backoff_total = round(backoff + jitter, 2)
+                    logger.warning(
+                        "[LEAFLINK_REQUEST_RETRY] method=GET endpoint=%s error=%s attempt=%s backoff=%ss",
+                        url, type(exc).__name__, attempt, backoff_total,
+                    )
+                    time.sleep(backoff_total)
+                else:
+                    logger.error(
+                        "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s error=%s max_retries_exceeded",
+                        url, type(exc).__name__,
+                    )
+                continue
+            except OSError as exc:
+                last_exc = exc
+                _record_request_failure()
                 if attempt < _MAX_RETRY_ATTEMPTS:
                     backoff = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
                     jitter = random.uniform(0, backoff * 0.1)
@@ -384,10 +619,11 @@ class LeafLinkClient:
                     )
                 continue
             except Exception as exc:
-                logger.error(
-                    "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s error=%s",
+                logger.exception(
+                    "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s unexpected_error=%s",
                     url, type(exc).__name__,
                 )
+                _record_request_failure()
                 last_exc = exc
                 continue
 
@@ -407,6 +643,7 @@ class LeafLinkClient:
                     "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s status=%s",
                     url, resp.status_code,
                 )
+                _record_request_failure()
                 # Do NOT retry auth failures
                 return resp
             elif not resp.ok and resp.status_code in _RETRY_STATUS_CODES and attempt < _MAX_RETRY_ATTEMPTS:
@@ -420,8 +657,15 @@ class LeafLinkClient:
                 time.sleep(backoff_total)
                 continue
             elif resp.ok:
+                _record_request_success()
                 logger.info(
                     "[LEAFLINK_REQUEST_SUCCESS] method=GET endpoint=%s status=%s",
+                    url, resp.status_code,
+                )
+            else:
+                _record_request_failure()
+                logger.error(
+                    "[LEAFLINK_REQUEST_FAILED] method=GET endpoint=%s status=%s",
                     url, resp.status_code,
                 )
 
@@ -441,12 +685,6 @@ class LeafLinkClient:
         url = f"{self.base_url}/{path.lstrip('/')}"
         safe_params = {k: v for k, v in (params or {}).items() if k not in ("api_key", "token", "secret")}
 
-        logger.info(
-            "[LeafLinkAuth] request_start method=POST full_url=%s scheme=%s",
-            url,
-            self.auth_scheme,
-        )
-
         # Build headers with explicit Authorization
         headers = {
             **self._get_auth_header(),
@@ -457,19 +695,68 @@ class LeafLinkClient:
             logger.error("[LeafLinkAuth] invalid_headers aborting_request method=POST full_url=%s", url)
             raise ValueError("Invalid Authorization header")
 
+        # DNS cooldown check — skip if we recently had a DNS failure
+        if _is_in_dns_cooldown():
+            remaining = _get_dns_cooldown_remaining()
+            logger.warning(
+                "[LEAFLINK_DNS_COOLDOWN] cooldown_active remaining=%.1fs next_retry_at=%s",
+                remaining,
+                datetime.fromtimestamp(time.time() + remaining).isoformat(),
+            )
+            raise RuntimeError(f"DNS cooldown active, retry in {remaining:.1f}s")
+
+        # Circuit breaker check
+        if not _check_circuit_breaker():
+            raise RuntimeError("Circuit breaker is open, requests paused")
+
         try:
-            return self.session.post(
+            resp = self.session.post(
                 url,
                 params=safe_params,
                 json=json_data,
                 timeout=_REQUEST_TIMEOUT,
                 headers=headers,  # EXPLICIT headers on every request
             )
-        except Exception as exc:
+            if resp.ok:
+                _record_request_success()
+                logger.info(
+                    "[LEAFLINK_REQUEST_SUCCESS] method=POST endpoint=%s status=%s",
+                    path, resp.status_code,
+                )
+            else:
+                _record_request_failure()
+                logger.error(
+                    "[LEAFLINK_REQUEST_FAILED] method=POST endpoint=%s status=%s",
+                    path, resp.status_code,
+                )
+            return resp
+        except socket.gaierror as exc:
+            _record_dns_failure()
+            _record_request_failure()
             logger.error(
-                "[LeafLinkAuth] request_error method=POST full_url=%s error=%s",
-                url,
-                exc,
+                "[LEAFLINK_DNS_FAILURE] error=%s cooldown_started duration=60s",
+                str(exc)[:200],
+            )
+            raise
+        except (RequestsConnectionError, RequestsTimeout) as exc:
+            exc_str = str(exc)
+            if "Name or service not known" in exc_str or "NameResolutionError" in exc_str or "getaddrinfo" in exc_str:
+                _record_dns_failure()
+                logger.error(
+                    "[LEAFLINK_DNS_FAILURE] error=%s cooldown_started duration=60s",
+                    type(exc).__name__,
+                )
+            _record_request_failure()
+            logger.warning(
+                "[LEAFLINK_REQUEST_FAILED] method=POST endpoint=%s error=%s",
+                path, type(exc).__name__,
+            )
+            raise
+        except Exception as exc:
+            _record_request_failure()
+            logger.exception(
+                "[LEAFLINK_REQUEST_FAILED] method=POST endpoint=%s unexpected_error=%s",
+                path, type(exc).__name__,
             )
             raise
 
@@ -480,7 +767,6 @@ class LeafLinkClient:
         modified__gte: Optional[str] = None,
         status: Optional[str] = None,
     ) -> Any:
-        logger.error("[CLIENT DEBUG] list_orders() called limit=%s offset=%s", limit, offset)
         # FIXED: Use exact working endpoint
         # https://www.leaflink.com/api/v2/orders-received/
         # Trailing slash on /orders-received/ is REQUIRED
@@ -494,39 +780,20 @@ class LeafLinkClient:
         if status:
             params["status"] = status
 
-        # Build URL with exactly one slash between base_url and endpoint
-        _param_str = "&".join(f"{k}={v}" for k, v in params.items())
-        final_url = f"{self.base_url.rstrip('/')}/{_orders_path}?{_param_str}"
-
-        logger.error("[LEAFLINK_TEST] endpoint=%s", _orders_path)
-        logger.error("[LEAFLINK_TEST] final_url=%s", final_url)
-        logger.error("[LEAFLINK_ACTUAL] url=%s", final_url)
-        logger.error("[LEAFLINK_ACTUAL] auth_scheme=%s key_len=%s", self.auth_scheme or "Token", len(self.api_key or ""))
-
         try:
             resp = self._get_raw(_orders_path, params=params)
         except Exception as exc:
             logger.error(
                 "leaflink: list_orders_request_failed brand=%s error=%s",
                 self.brand_id,
-                exc,
+                str(exc)[:200],
             )
             raise
-
-        logger.error("[LEAFLINK_TEST] response_status=%s", resp.status_code)
-        logger.error("[LEAFLINK_TEST] response_body=%s", resp.text[:500])
-        logger.error("[LEAFLINK_ACTUAL] response_status=%s response_body=%s", resp.status_code, resp.text[:500])
-        logger.info("[LeafLink] response_status=%s", resp.status_code)
 
         content_type = resp.headers.get("Content-Type", "")
 
         if resp.ok and "application/json" in content_type.lower():
             data = resp.json()
-            count = data.get("count") if isinstance(data, dict) else None
-            results = data.get("results") if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            results_count = len(results) if isinstance(results, list) else 0
-            logger.info("[LeafLink] count=%s", count)
-            logger.info("[LeafLink] results_count=%s", results_count)
             return data
 
         if resp.status_code in (401, 403):
@@ -534,7 +801,7 @@ class LeafLinkClient:
                 "[LeafLinkAuth] list_orders_auth_failed brand=%s status=%s body=%s",
                 self.brand_id,
                 resp.status_code,
-                resp.text[:500],
+                resp.text[:200],
             )
         else:
             logger.error(
@@ -542,10 +809,10 @@ class LeafLinkClient:
                 self.brand_id,
                 resp.status_code,
                 content_type,
-                resp.text[:220],
+                resp.text[:200],
             )
         raise RuntimeError(
-            f"LeafLink API error: status={resp.status_code} content_type={content_type} body={resp.text[:220]}"
+            f"LeafLink API error: status={resp.status_code} content_type={content_type} body={resp.text[:200]}"
         )
 
     def _extract_customer_name(self, raw: Dict[str, Any]) -> str:
@@ -778,11 +1045,10 @@ class LeafLinkClient:
                 ``total_count``       – total order count reported by LeafLink (first page only)
                 ``total_pages``       – estimated total pages (total_count / page_size, rounded up)
         """
-        logger.error(
-            "[LeafLink DEBUG] fetch_orders_page_range_start base_url=%s company_id=%s",
-            self.base_url,
-            self.company_id,
-        )
+        if not _check_leaflink_health(self.base_url):
+            logger.warning("[LEAFLINK_SYNC_SKIPPED] health_check_failed brand=%s", self.brand_id)
+            return {"orders": [], "pages_fetched": 0, "next_url": None, "next_page": None, "total_count": None, "total_pages": None}
+
         all_orders: List[Dict[str, Any]] = []
         pages_fetched = 0
         next_url: Optional[str] = resume_url
@@ -917,12 +1183,10 @@ class LeafLinkClient:
                 ``orders``       – list of order dicts
                 ``pages_fetched`` – number of pages retrieved
         """
-        logger.error("[CLIENT DEBUG] fetch_recent_orders() called base_url=%s company_id=%s", self.base_url, self.company_id)
-        logger.error(
-            "[LeafLink DEBUG] fetch_recent_orders_start base_url=%s company_id=%s",
-            self.base_url,
-            self.company_id,
-        )
+        if not _check_leaflink_health(self.base_url):
+            logger.warning("[LEAFLINK_SYNC_SKIPPED] health_check_failed brand=%s", self.brand_id)
+            return {"orders": [], "pages_fetched": 0}
+
         effective_max = max_pages if max_pages is not None else 10_000
 
         all_orders: List[Dict[str, Any]] = []
@@ -937,10 +1201,7 @@ class LeafLinkClient:
                     # Follow the ``next`` URL returned by LeafLink directly.
                     # _get_raw_url() explicitly attaches the Authorization header so
                     # that pagination requests are authenticated the same way as page 1.
-                    logger.info("[LeafLink] final_url=%s", next_url)
-                    logger.info("[LeafLink] auth_scheme=%s", self.auth_scheme)
                     resp = self._get_raw_url(next_url)
-                    logger.info("[LeafLink] response_status=%s", resp.status_code)
                     if resp.status_code in (401, 403):
                         logger.error(
                             "[LeafLinkAuth] pagination_auth_failed offset=%s status=%s body=%s",
@@ -956,10 +1217,10 @@ class LeafLinkClient:
                             "[LeafLinkSync] offset=%s http_error status=%s body=%s",
                             offset,
                             resp.status_code,
-                            resp.text[:500],
+                            resp.text[:200],
                         )
                         raise RuntimeError(
-                            f"LeafLink API error: status={resp.status_code} body={resp.text[:220]}"
+                            f"LeafLink API error: status={resp.status_code} body={resp.text[:200]}"
                         )
                     payload = resp.json()
                 else:
@@ -981,20 +1242,11 @@ class LeafLinkClient:
                         or []
                     )
                     next_url = payload.get("next")
-                    count = payload.get("count")
-                    logger.info("[LeafLink] count=%s", count)
                 else:
                     raise RuntimeError(f"Unexpected LeafLink response type: {type(payload).__name__}")
 
                 if not isinstance(results, list):
                     raise RuntimeError(f"Unexpected LeafLink results type: {type(results).__name__}")
-
-                logger.info(
-                    "[LeafLink] results_count=%s offset=%s brand=%s",
-                    len(results),
-                    offset,
-                    brand,
-                )
 
                 pages_fetched += 1
 
@@ -1019,17 +1271,9 @@ class LeafLinkClient:
             logger.error(
                 "[LeafLinkSync] API call failed brand=%s error=%s mock_mode=%s",
                 brand,
-                exc,
+                str(exc)[:200],
                 MOCK_MODE,
             )
-            if MOCK_MODE:
-                logger.error(
-                    "[LeafLinkSync] API failed and MOCK_MODE=true — refusing to return mock data when live data is expected"
-                )
-                logger.error("[LeafLinkSync] error=%s", exc)
-                logger.error("[LeafLinkSync] returning_mock=true (blocked — raising instead)")
-                raise  # Re-raise the original exception instead of returning mock
-            logger.info("[LeafLinkSync] returning_mock=false")
             raise
 
         logger.info(
