@@ -16,7 +16,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import get_db
+from database import get_db, has_column
+from models import Order, SyncRequest, SyncRun
 from models.sync_health import DeadLetterLineItem, SyncHealth
 from utils.json_utils import make_json_safe
 
@@ -120,8 +121,6 @@ async def replay_dead_letter_item(
     record on success.
     """
     import json
-    from database import has_column
-    from utils.json_utils import make_json_safe
     from datetime import datetime, timezone
 
     result = await db.execute(
@@ -259,8 +258,6 @@ async def recover_sync(
     enqueues a new pending SyncRequest so the worker will retry on next poll.
     Returns immediately — the sync runs in the background.
     """
-    from models import SyncRequest
-
     result = await db.execute(
         select(SyncHealth).where(
             SyncHealth.brand_id == brand_id,
@@ -306,7 +303,7 @@ async def trigger_leaflink_sync(
     Looks up the brand's credentials and enqueues a sync request.
     Returns immediately — the sync runs in the background.
     """
-    from models import BrandAPICredential, SyncRequest
+    from models import BrandAPICredential
 
     # Look up credentials
     result = await db.execute(
