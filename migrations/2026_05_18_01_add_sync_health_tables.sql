@@ -5,8 +5,8 @@
 -- sync_health: one row per brand, tracks last successful/attempted sync,
 --   consecutive failures, and running totals.
 --
--- dead_letter_line_items: line items that failed after MAX_RETRIES; allows
---   admin inspection and manual replay without blocking the sync loop.
+-- dead_letter_line_items: line items that failed after MAX_RETRIES.
+--   Allows admin inspection and manual replay without blocking the sync loop.
 --
 -- order_lines unique index: (order_id, sku, product_name) enables
 --   INSERT ... ON CONFLICT DO UPDATE so retries never create duplicates.
