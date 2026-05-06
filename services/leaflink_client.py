@@ -389,7 +389,7 @@ class LeafLinkClient:
                 f"Invalid LeafLink API key length: {len(self.api_key)} (expected ~40)"
             )
 
-        # Determine auth scheme — LeafLink requires Api-Key format
+        # Determine auth scheme — LeafLink requires Token format
         if auth_scheme:
             self.auth_scheme: str = auth_scheme
             logger.info(
@@ -397,11 +397,46 @@ class LeafLinkClient:
                 auth_scheme,
             )
         else:
-            # Default to Api-Key (LeafLink requirement)
-            self.auth_scheme = "Api-Key"
+            # Default to Token (correct LeafLink auth scheme)
+            self.auth_scheme = "Token"
             logger.info(
-                "[LeafLinkAuth] using_default_scheme scheme=Api-Key",
+                "[LeafLinkAuth] using_default_scheme scheme=Token",
             )
+
+        # ---------------------------------------------------------------------------
+        # Hard-fail guards — reject stale credential values before any HTTP call
+        # ---------------------------------------------------------------------------
+        if "marketplace.leaflink.com" in self.base_url.lower():
+            logger.error(
+                "[LEAFLINK_BASE_URL_INVALID] brand_id=%s base_url=%s reason=marketplace_domain_rejected",
+                self.brand_id,
+                self.base_url[:80],
+            )
+            raise ValueError(
+                f"[LEAFLINK_BASE_URL_INVALID] base_url contains deprecated marketplace domain: {self.base_url}"
+            )
+
+        if self.auth_scheme == "Api-Key":
+            logger.error(
+                "[LEAFLINK_AUTH_SCHEME_INVALID] brand_id=%s auth_scheme=%s reason=api_key_deprecated",
+                self.brand_id,
+                self.auth_scheme,
+            )
+            raise ValueError(
+                "[LEAFLINK_AUTH_SCHEME_INVALID] auth_scheme 'Api-Key' is deprecated; use 'Token'"
+            )
+
+        # Log the final resolved values for every client instantiation
+        logger.info(
+            "[LEAFLINK_BASE_URL_FINAL] brand_id=%s base_url=%s",
+            self.brand_id,
+            self.base_url,
+        )
+        logger.info(
+            "[LEAFLINK_AUTH_SCHEME_FINAL] brand_id=%s auth_scheme=%s",
+            self.brand_id,
+            self.auth_scheme,
+        )
 
         self.session = _get_global_session()
         # Base session headers — Authorization header is built per-request from
@@ -958,10 +993,34 @@ class LeafLinkClient:
         modified__gte: Optional[str] = None,
         status: Optional[str] = None,
     ) -> Any:
-        # FIXED: Use exact working endpoint
+        # FIXED: Use exact working endpoint — no company scoping in the path.
         # https://www.leaflink.com/api/v2/orders-received/
-        # Trailing slash on /orders-received/ is REQUIRED
+        # Trailing slash on /orders-received/ is REQUIRED.
         _orders_path = "orders-received/"
+
+        # Build the final URL for validation logging BEFORE making the request
+        _final_url = f"{self.base_url.rstrip('/')}/{_orders_path}"
+
+        # Hard-fail: reject any URL that contains the truncated form (missing final "d")
+        import re as _re_lo
+        if _re_lo.search(r"orders-receive(?!d)", _final_url):
+            logger.error(
+                "[LEAFLINK_FINAL_URL_INVALID] brand_id=%s final_url=%s"
+                " reason=orders_receive_missing_d",
+                self.brand_id,
+                _final_url,
+            )
+            raise ValueError(
+                f"[LEAFLINK_FINAL_URL_INVALID] orders endpoint URL contains 'orders-receive' "
+                f"without the final 'd'. Correct endpoint is /orders-received/. URL: {_final_url}"
+            )
+
+        logger.info(
+            "[LEAFLINK_FINAL_URL] final_url=%s brand_id=%s",
+            _final_url,
+            self.brand_id,
+        )
+
         params: Dict[str, Any] = {
             "limit": limit,
             "offset": offset,
