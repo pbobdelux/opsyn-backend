@@ -126,6 +126,77 @@ async def resolve_brand_credential(
                 row[2],
                 row[3],
             )
+
+            # ---------------------------------------------------------------------------
+            # LeafLink credential canonicalization — fix stale DB values before returning
+            # ---------------------------------------------------------------------------
+            if normalized_integration == "leaflink":
+                _LEAFLINK_CANONICAL_BASE_URL = "https://www.leaflink.com/api/v2"
+
+                # Unpack mutable copies of the fields we may need to rewrite
+                _raw_base_url = row[8] or ""
+                _raw_auth_scheme = row[9] or ""
+
+                _canonical_base_url = _raw_base_url
+                _canonical_auth_scheme = _raw_auth_scheme
+
+                # Fix base_url: rewrite marketplace domain → canonical www domain
+                if "marketplace.leaflink.com" in _raw_base_url.lower():
+                    _canonical_base_url = _LEAFLINK_CANONICAL_BASE_URL
+                    logger.warning(
+                        "[LEAFLINK_BASE_URL_CANONICALIZED] original=%s final=%s"
+                        " brand_id=%s reason=marketplace_rewrite",
+                        _raw_base_url,
+                        _canonical_base_url,
+                        brand_id,
+                    )
+                elif not _raw_base_url:
+                    _canonical_base_url = _LEAFLINK_CANONICAL_BASE_URL
+                    logger.info(
+                        "[LEAFLINK_BASE_URL_CANONICALIZED] original=empty final=%s"
+                        " brand_id=%s reason=empty_base_url",
+                        _canonical_base_url,
+                        brand_id,
+                    )
+                else:
+                    # Ensure the URL ends with /api/v2
+                    _stripped = _raw_base_url.rstrip("/")
+                    if not _stripped.endswith("/api/v2"):
+                        _canonical_base_url = _stripped + "/api/v2"
+                        logger.info(
+                            "[LEAFLINK_BASE_URL_CANONICALIZED] original=%s final=%s"
+                            " brand_id=%s reason=appended_api_v2",
+                            _raw_base_url,
+                            _canonical_base_url,
+                            brand_id,
+                        )
+
+                # Fix auth_scheme: rewrite deprecated Api-Key → Token
+                if _raw_auth_scheme == "Api-Key":
+                    _canonical_auth_scheme = "Token"
+                    logger.warning(
+                        "[LEAFLINK_AUTH_SCHEME_CANONICALIZED] original=%s final=%s"
+                        " brand_id=%s reason=api_key_deprecated",
+                        _raw_auth_scheme,
+                        _canonical_auth_scheme,
+                        brand_id,
+                    )
+
+                # If either value changed, rebuild the row tuple with corrected values
+                if _canonical_base_url != _raw_base_url or _canonical_auth_scheme != _raw_auth_scheme:
+                    row = (
+                        row[0],  # id
+                        row[1],  # brand_id
+                        row[2],  # integration_name
+                        row[3],  # company_id
+                        row[4],  # api_key
+                        row[5],  # is_active
+                        row[6],  # sync_status
+                        row[7],  # last_synced_page
+                        _canonical_base_url,   # base_url  (canonicalized)
+                        _canonical_auth_scheme, # auth_scheme (canonicalized)
+                    )
+
             return row
         else:
             logger.info(
