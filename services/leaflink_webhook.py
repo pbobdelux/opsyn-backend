@@ -423,11 +423,35 @@ async def upsert_webhook_order(
             existing.last_synced_at = now
             existing.external_created_at = external_created_at
             existing.external_updated_at = external_updated_at
+            # FINAL coercion immediately before ORM write — belt-and-suspenders
+            _write_org_id = safe_uuid_for_db(_write_org_id, "org_id")
+            _write_brand_id = safe_uuid_for_db(_write_brand_id, "brand_id") or _write_brand_id
+            logger.error(
+                "[FINAL_SQL_PARAMS] org_id=%s org_type=%s brand_id=%s brand_type=%s"
+                " external_id=%s action=update function=upsert_webhook_order",
+                _write_org_id,
+                type(_write_org_id).__name__,
+                _write_brand_id,
+                type(_write_brand_id).__name__,
+                external_id,
+            )
             if _write_org_id:
                 existing.org_id = _write_org_id
             order_row = existing
             action = "updated"
         else:
+            # FINAL coercion immediately before ORM write — belt-and-suspenders
+            _write_org_id = safe_uuid_for_db(_write_org_id, "org_id")
+            _write_brand_id = safe_uuid_for_db(_write_brand_id, "brand_id") or _write_brand_id
+            logger.error(
+                "[FINAL_SQL_PARAMS] org_id=%s org_type=%s brand_id=%s brand_type=%s"
+                " external_id=%s action=insert function=upsert_webhook_order",
+                _write_org_id,
+                type(_write_org_id).__name__,
+                _write_brand_id,
+                type(_write_brand_id).__name__,
+                external_id,
+            )
             order_row = Order(
                 org_id=_write_org_id,
                 brand_id=_write_brand_id,

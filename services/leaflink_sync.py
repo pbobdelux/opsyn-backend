@@ -1486,6 +1486,19 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 "updated_at": updated_at_val,
                             }
 
+                            # FINAL validation — enforce coercion directly into params dict
+                            # immediately before execute() so no mutation after coercion can slip through.
+                            update_params["org_id"] = safe_uuid_for_db(update_params.get("org_id"), "org_id")
+                            update_params["brand_id"] = safe_uuid_for_db(update_params.get("brand_id"), "brand_id") or update_params.get("brand_id")
+                            logger.error(
+                                "[FINAL_SQL_PARAMS] org_id=%s org_type=%s brand_id=%s brand_type=%s"
+                                " external_id=%s action=update function=sync_leaflink_orders_headers_only",
+                                update_params.get("org_id"),
+                                type(update_params.get("org_id")).__name__,
+                                update_params.get("brand_id"),
+                                type(update_params.get("brand_id")).__name__,
+                                external_id,
+                            )
                             logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
                             logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
                             await db.execute(
@@ -1574,6 +1587,19 @@ INSERT INTO orders (
                                 "updated_at": created_at_val,
                             }
 
+                            # FINAL validation — enforce coercion directly into params dict
+                            # immediately before execute() so no mutation after coercion can slip through.
+                            insert_params["org_id"] = safe_uuid_for_db(insert_params.get("org_id"), "org_id")
+                            insert_params["brand_id"] = safe_uuid_for_db(insert_params.get("brand_id"), "brand_id") or insert_params.get("brand_id")
+                            logger.error(
+                                "[FINAL_SQL_PARAMS] org_id=%s org_type=%s brand_id=%s brand_type=%s"
+                                " external_id=%s action=insert function=sync_leaflink_orders_headers_only",
+                                insert_params.get("org_id"),
+                                type(insert_params.get("org_id")).__name__,
+                                insert_params.get("brand_id"),
+                                type(insert_params.get("brand_id")).__name__,
+                                external_id,
+                            )
                             logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
                             logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
                             await db.execute(
@@ -2084,6 +2110,22 @@ async def sync_leaflink_line_items(
                 if enabled_columns.get("total_price_cents", False):
                     insert_params["total_price_cents"] = item.get("total_price_cents")
 
+                # FINAL validation — enforce coercion directly into params dict
+                # immediately before execute() so no mutation after coercion can slip through.
+                if "mapped_product_id" in insert_params:
+                    insert_params["mapped_product_id"] = safe_uuid_mapped_product(insert_params.get("mapped_product_id"))
+                logger.error(
+                    "[FINAL_SQL_PARAMS] org_id=%s org_type=%s brand_id=%s brand_type=%s"
+                    " mapped_product_id=%s mapped_type=%s order_id=%s sku=%s function=_upsert_line_items",
+                    org_id_value,
+                    type(org_id_value).__name__,
+                    brand_id_value,
+                    type(brand_id_value).__name__,
+                    insert_params.get("mapped_product_id"),
+                    type(insert_params.get("mapped_product_id")).__name__,
+                    order_id_val,
+                    sku,
+                )
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
