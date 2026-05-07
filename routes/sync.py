@@ -2,13 +2,15 @@
 Admin recovery endpoints for LeafLink sync operations.
 
 Provides:
-  - POST /orders/sync/leaflink          — manually trigger a sync for a brand
+  - POST /orders/sync/leaflink          — trigger async background sync (returns immediately)
+  - GET  /orders/sync/status/{sync_run_id} — poll status of a background sync run
   - GET  /orders/sync/leaflink/status   — get sync health state for a brand
   - GET  /orders/sync/leaflink/dead-letter — list dead-lettered line items
   - POST /orders/sync/leaflink/replay-dead-letter — replay a dead-lettered item
   - POST /orders/sync/recover           — retry failed/retryable sync runs
 """
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -16,14 +18,283 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import get_db, has_column
-from models import Order, SyncRequest, SyncRun
+from database import AsyncSessionLocal, get_db, has_column
+from models import BrandAPICredential, Order, SyncRequest, SyncRun
 from models.sync_health import DeadLetterLineItem, SyncHealth
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("sync_routes")
 
 router = APIRouter(prefix="/orders/sync", tags=["sync"])
+
+
+# ---------------------------------------------------------------------------
+# Background sync task
+# ---------------------------------------------------------------------------
+
+async def _run_leaflink_sync_background(
+    brand_id: str,
+    sync_run_id: int,
+    mode: str,
+    max_pages: Optional[int],
+) -> None:
+    """
+    Background coroutine that loads credentials, calls the continuous sync
+    function, and updates the SyncRun with the final status.
+
+    Spawned via asyncio.create_task() so the HTTP handler returns immediately.
+    """
+    from services.background_sync_manager import sync_manager
+    from services.credential_resolver import resolve_brand_credential
+    from services.leaflink_sync import sync_leaflink_background_continuous
+    from services.sync_run_manager import mark_completed, mark_failed
+
+    logger.info(
+        "[SYNC_BACKGROUND_STARTED] brand_id=%s sync_run_id=%s mode=%s max_pages=%s",
+        brand_id,
+        sync_run_id,
+        mode,
+        max_pages,
+    )
+
+    try:
+        # Load credentials inside the background task using a fresh DB session
+        async with AsyncSessionLocal() as db:
+            cred = await resolve_brand_credential(db, brand_id, "leaflink")
+
+        if cred is None:
+            logger.error(
+                "[SYNC_BACKGROUND_ERROR] brand_id=%s sync_run_id=%s reason=credentials_not_found",
+                brand_id,
+                sync_run_id,
+            )
+            async with AsyncSessionLocal() as db:
+                async with db.begin():
+                    await mark_failed(db, sync_run_id, "LeafLink credentials not found")
+            return
+
+        # cred indices: 0=id, 1=brand_id, 2=integration_name, 3=company_id,
+        #               4=api_key, 5=is_active, 6=sync_status, 7=last_synced_page,
+        #               8=base_url, 9=auth_scheme
+        api_key = cred[4] or ""
+        company_id = cred[3] or ""
+        base_url = cred[8] or "https://www.leaflink.com/api/v2"
+        auth_scheme = cred[9] or "Token"
+
+        if not api_key:
+            logger.error(
+                "[SYNC_BACKGROUND_ERROR] brand_id=%s sync_run_id=%s reason=api_key_empty",
+                brand_id,
+                sync_run_id,
+            )
+            async with AsyncSessionLocal() as db:
+                async with db.begin():
+                    await mark_failed(db, sync_run_id, "LeafLink API key is empty")
+            return
+
+        await sync_leaflink_background_continuous(
+            brand_id=brand_id,
+            api_key=api_key,
+            company_id=company_id,
+            start_page=1,
+            total_pages=max_pages,
+            manager=sync_manager,
+            sync_run_id=sync_run_id,
+            auth_scheme=auth_scheme,
+            base_url=base_url,
+        )
+
+        # Mark completed (sync_leaflink_background_continuous may already do this,
+        # but we call it defensively to ensure the run is never left in "queued")
+        async with AsyncSessionLocal() as db:
+            async with db.begin():
+                result = await db.execute(
+                    select(SyncRun).where(SyncRun.id == sync_run_id)
+                )
+                run = result.scalar_one_or_none()
+                if run and run.status not in ("completed", "failed", "stalled"):
+                    await mark_completed(db, sync_run_id)
+
+        logger.info(
+            "[SYNC_BACKGROUND_COMPLETE] brand_id=%s sync_run_id=%s mode=%s",
+            brand_id,
+            sync_run_id,
+            mode,
+        )
+
+    except asyncio.CancelledError:
+        logger.info(
+            "[SYNC_BACKGROUND_CANCELLED] brand_id=%s sync_run_id=%s",
+            brand_id,
+            sync_run_id,
+        )
+        raise
+
+    except Exception as exc:
+        logger.error(
+            "[SYNC_BACKGROUND_FAILED] brand_id=%s sync_run_id=%s error=%s",
+            brand_id,
+            sync_run_id,
+            str(exc)[:500],
+            exc_info=True,
+        )
+        try:
+            async with AsyncSessionLocal() as db:
+                async with db.begin():
+                    await mark_failed(db, sync_run_id, str(exc)[:500])
+        except Exception as inner_exc:
+            logger.error(
+                "[SYNC_BACKGROUND_MARK_FAILED_ERROR] sync_run_id=%s error=%s",
+                sync_run_id,
+                inner_exc,
+            )
+
+
+@router.post("/leaflink")
+async def trigger_leaflink_sync_async(
+    brand_id: str = Query(..., description="Brand ID to sync"),
+    mode: str = Query(
+        "test",
+        description=(
+            "Sync mode: "
+            "'test' fetches 1 page (~100 orders), "
+            "'incremental' fetches up to 10 pages of recent orders, "
+            "'backfill' fetches all pages (full sync)"
+        ),
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Trigger an async LeafLink order sync for a brand.
+
+    Returns immediately with a sync_run_id. The sync runs in the background.
+    Poll GET /orders/sync/status/{sync_run_id} to check progress.
+
+    Modes:
+    - test (default): 1 page / ~100 orders — safe for verifying DB writes
+    - incremental: up to 10 pages of recent orders
+    - backfill: full pagination, all orders (no page limit)
+    """
+    from services.sync_run_manager import create_sync_run
+
+    # Validate mode
+    valid_modes = ("test", "incremental", "backfill")
+    if mode not in valid_modes:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid mode={mode!r}. Must be one of: {', '.join(valid_modes)}",
+        )
+
+    # Resolve page limits per mode
+    if mode == "test":
+        max_pages = 1
+        max_orders = 100
+    elif mode == "incremental":
+        max_pages = 10
+        max_orders = None
+    else:  # backfill
+        max_pages = None
+        max_orders = None
+
+    logger.info("[SYNC_MODE] mode=%s", mode)
+    logger.info("[SYNC_MODE_DEFAULT] mode=%s reason=safety_limit", mode)
+    logger.info(
+        "[SYNC_LIMITS] max_pages=%s max_orders=%s",
+        max_pages if max_pages is not None else "unlimited",
+        max_orders if max_orders is not None else "unlimited",
+    )
+
+    # Verify credentials exist before creating the SyncRun
+    result = await db.execute(
+        select(BrandAPICredential).where(
+            BrandAPICredential.brand_id == brand_id,
+            BrandAPICredential.integration_name == "leaflink",
+            BrandAPICredential.is_active == True,
+        )
+    )
+    cred = result.scalar_one_or_none()
+    if cred is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active LeafLink credential found for brand_id={brand_id}",
+        )
+
+    # Create a SyncRun record immediately so we have an ID to return
+    try:
+        run = await create_sync_run(db, brand_id, mode=mode)
+        await db.commit()
+    except ValueError as exc:
+        # An active run already exists for this brand
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    sync_run_id = run.id
+
+    logger.info(
+        "[SYNC_RUN_CREATED] brand_id=%s sync_run_id=%s mode=%s",
+        brand_id,
+        sync_run_id,
+        mode,
+    )
+
+    # Spawn background task — returns immediately, does NOT await
+    asyncio.create_task(
+        _run_leaflink_sync_background(
+            brand_id=brand_id,
+            sync_run_id=sync_run_id,
+            mode=mode,
+            max_pages=max_pages,
+        ),
+        name=f"leaflink_sync_{brand_id}_{sync_run_id}",
+    )
+
+    return {
+        "ok": True,
+        "sync_run_id": sync_run_id,
+        "status": "started",
+        "message": "LeafLink sync started in background",
+        "mode": mode,
+        "limits": {
+            "max_pages": max_pages,
+            "max_orders": max_orders,
+        },
+    }
+
+
+@router.get("/status/{sync_run_id}")
+async def get_sync_run_status(
+    sync_run_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Poll the status of a background sync run by its ID.
+
+    Returns current progress counters, timing, and any error message.
+    Use the sync_run_id returned by POST /orders/sync/leaflink.
+    """
+    result = await db.execute(
+        select(SyncRun).where(SyncRun.id == sync_run_id)
+    )
+    run = result.scalar_one_or_none()
+
+    if run is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"SyncRun {sync_run_id} not found",
+        )
+
+    return {
+        "ok": True,
+        "sync_run_id": run.id,
+        "brand_id": run.brand_id,
+        "status": run.status,
+        "mode": run.mode,
+        "fetched": run.orders_loaded_this_run,
+        "pages_synced": run.pages_synced,
+        "total_pages": run.total_pages,
+        "errors": run.error_count,
+        "error_message": run.last_error,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "last_progress_at": run.last_progress_at.isoformat() if run.last_progress_at else None,
+    }
 
 
 @router.get("/leaflink/status")
@@ -303,8 +574,6 @@ async def trigger_leaflink_sync(
     Looks up the brand's credentials and enqueues a sync request.
     Returns immediately — the sync runs in the background.
     """
-    from models import BrandAPICredential
-
     # Look up credentials
     result = await db.execute(
         select(BrandAPICredential).where(
