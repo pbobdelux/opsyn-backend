@@ -20,7 +20,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db, has_column
 from models import Order, SyncRequest, SyncRun
 from models.sync_health import DeadLetterLineItem, SyncHealth
-from services.leaflink_sync import normalize_datetime_fields, safe_uuid_for_db, safe_uuid_mapped_product, sanitize_sql_params
+from services.leaflink_sync import (
+    normalize_datetime_fields,
+    normalize_uuid_fields,
+    safe_uuid_for_db,
+    safe_uuid_mapped_product,
+    sanitize_sql_params,
+)
+from utils.json_utils import make_json_safe
+
+logger = logging.getLogger("sync_routes")
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("sync_routes")
@@ -296,13 +305,22 @@ async def replay_dead_letter_item(
         )
         # Sanitize SQL params: remove provider dates, keep only operational timestamps
         params = sanitize_sql_params(params)
+        # Sanitize SQL params: remove provider dates, keep only operational timestamps
+        params = sanitize_sql_params(params)
+        
+        # === DATETIME + UUID NORMALIZATION (CRITICAL) ===
         params = normalize_datetime_fields(params)
-        for _k, _v in params.items():
-            if isinstance(_v, datetime):
-                logger.info(
-                    "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                    _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
-                )
+        params = normalize_uuid_fields(params)
+
+        await db.execute(text(upsert_stmt), params)
+        await db.commit()
+
+        logger.info(
+            "[REPLAY_UPSERT_SUCCESS] item_id=%s order_id=%s sku=%s",
+            item_id,
+            params.get("order_id"),
+            params.get("sku"),
+        )
         await db.execute(text(upsert_stmt), params)
         await db.commit()
         logger.info(
