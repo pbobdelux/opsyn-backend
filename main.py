@@ -44,6 +44,7 @@ from routes.sync import router as sync_router
 from routes.diagnostics import router as diagnostics_router
 from routes.drivers import router as drivers_router
 from routes.routes import router as routes_router
+from routes.driver_app import router as driver_app_router
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("opsyn-backend")
@@ -709,6 +710,7 @@ app.include_router(sync_router)
 app.include_router(diagnostics_router)
 app.include_router(drivers_router)
 app.include_router(routes_router)
+app.include_router(driver_app_router)
 logger.info("[Routes] registered debug routes")
 
 logger.error("[STARTUP DEBUG] Registered routes:")
