@@ -10,6 +10,7 @@ Provides:
 """
 
 import logging
+import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -246,6 +247,13 @@ async def replay_dead_letter_item(
         params["org_id"] = safe_uuid_for_db(params.get("org_id"), "org_id")
         params["brand_id"] = safe_uuid_for_db(params.get("brand_id"), "brand_id")
         params["mapped_product_id"] = safe_uuid_mapped_product(params.get("mapped_product_id"))
+        assert (
+            params.get("mapped_product_id") is None
+            or isinstance(params.get("mapped_product_id"), (str, uuid.UUID))
+        ), (
+            f"mapped_product_id must be None, str, or UUID, "
+            f"got {type(params.get('mapped_product_id'))}"
+        )
         logger.error(
             "[FINAL_SQL_PARAMS] org_id=%s org_type=%s brand_id=%s brand_type=%s"
             " mapped_product_id=%s mapped_type=%s item_id=%s function=replay_dead_letter_item",
@@ -256,6 +264,15 @@ async def replay_dead_letter_item(
             params.get("mapped_product_id"),
             type(params.get("mapped_product_id")).__name__,
             item_id,
+        )
+        logger.error(
+            "[FINAL_SQL_PARAMS_AUDIT] mapped_product_id=%s type=%s is_none=%s is_str=%s is_uuid=%s"
+            " function=replay_dead_letter_item",
+            params.get("mapped_product_id"),
+            type(params.get("mapped_product_id")).__name__,
+            params.get("mapped_product_id") is None,
+            isinstance(params.get("mapped_product_id"), str),
+            isinstance(params.get("mapped_product_id"), uuid.UUID),
         )
         logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id)
         logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id)

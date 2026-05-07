@@ -171,9 +171,10 @@ if DATABASE_URL:
         echo=False,
         pool_pre_ping=True,
         connect_args={"ssl": "require"},  # Force SSL for asyncpg
+        execution_options={"compiled_cache": None},  # Disable statement cache to prevent UUID/VARCHAR type confusion
     )
 
-    logger.info("[DB] engine_created with connect_args_ssl=require")
+    logger.info("[DB] engine_created with connect_args_ssl=require compiled_cache=disabled")
 
     AsyncSessionLocal = async_sessionmaker(
         bind=engine,
@@ -215,6 +216,7 @@ async def refresh_connection_pool() -> None:
         echo=False,
         pool_pre_ping=True,
         connect_args={"ssl": "require"},  # Force SSL for asyncpg
+        execution_options={"compiled_cache": None},  # Disable statement cache to prevent UUID/VARCHAR type confusion
     )
 
     AsyncSessionLocal = async_sessionmaker(
@@ -223,7 +225,7 @@ async def refresh_connection_pool() -> None:
         expire_on_commit=False,
     )
 
-    logger.info("[Database] connection_pool_recreated with connect_args_ssl=require")
+    logger.info("[Database] connection_pool_recreated with connect_args_ssl=require compiled_cache=disabled")
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +278,7 @@ async def dispose_and_recreate_engine() -> None:
         echo=False,
         pool_pre_ping=True,
         connect_args={"ssl": "require"},
+        execution_options={"compiled_cache": None},  # Disable statement cache to prevent UUID/VARCHAR type confusion
     )
 
     AsyncSessionLocal = async_sessionmaker(
@@ -284,7 +287,7 @@ async def dispose_and_recreate_engine() -> None:
         expire_on_commit=False,
     )
 
-    logger.info("[DB_STARTUP] engine_recreated_after_dispose")
+    logger.info("[DB_STARTUP] engine_recreated_after_dispose compiled_cache=disabled")
 
 
 async def confirm_database_identity() -> None:

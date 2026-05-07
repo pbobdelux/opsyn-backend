@@ -9,7 +9,6 @@ because this __init__.py re-exports everything that was previously in models.py.
 # ---------------------------------------------------------------------------
 # Base / existing models (previously in root models.py)
 # ---------------------------------------------------------------------------
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -24,7 +23,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PostgresUUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -151,7 +151,10 @@ class OrderLine(Base):
     unit_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
     total_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
 
-    mapped_product_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    mapped_product_id: Mapped[str | None] = mapped_column(
+        PostgresUUID(as_uuid=False),
+        nullable=True,
+    )
     mapping_status: Mapped[str | None] = mapped_column(String(50), nullable=True, default="unknown")
     mapping_issue: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
