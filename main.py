@@ -9,6 +9,15 @@ from typing import Optional
 
 from services.sync_scheduler import run_scheduler
 
+# ---------------------------------------------------------------------------
+# Feature flags — read once at import time
+# ---------------------------------------------------------------------------
+LEAFLINK_SYNC_ENABLED = os.getenv("LEAFLINK_SYNC_ENABLED", "true").lower() == "true"
+LEAFLINK_DEBUG_SQL = os.getenv("LEAFLINK_DEBUG_SQL", "false").lower() == "true"
+LEAFLINK_REPROCESS_ENABLED = os.getenv("LEAFLINK_REPROCESS_ENABLED", "true").lower() == "true"
+LEAFLINK_MAX_RETRY_ATTEMPTS = int(os.getenv("LEAFLINK_MAX_RETRY_ATTEMPTS", "5"))
+LEAFLINK_SYNC_STALE_MINUTES = int(os.getenv("LEAFLINK_SYNC_STALE_MINUTES", "60"))
+
 from fastapi import Depends, FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -399,6 +408,40 @@ async def lifespan(app: FastAPI):
 
     # Verify database schema and log connection details
     await _verify_database_schema()
+
+    # ---------------------------------------------------------------------------
+    # Startup safety checks — verify required tables, columns, and indexes
+    # ---------------------------------------------------------------------------
+    try:
+        from services.startup_checks import run_startup_schema_checks
+        _schema_check_result = await run_startup_schema_checks()
+        if not _schema_check_result.get("ok"):
+            logger.warning(
+                "[STARTUP_SCHEMA_WARNING] schema_check_failed warnings=%s errors=%s",
+                _schema_check_result.get("warnings", []),
+                _schema_check_result.get("errors", []),
+            )
+        else:
+            logger.info("[STARTUP_SCHEMA_OK] all_schema_checks_passed")
+    except RuntimeError:
+        # RuntimeError from startup_checks means core tables are missing — re-raise to crash
+        raise
+    except Exception as _sc_exc:
+        logger.warning("[STARTUP_SCHEMA_WARNING] schema_check_exception error=%s", str(_sc_exc)[:300])
+
+    # ---------------------------------------------------------------------------
+    # Log feature flags at startup
+    # ---------------------------------------------------------------------------
+    logger.info(
+        "[FEATURE_FLAGS] LEAFLINK_SYNC_ENABLED=%s LEAFLINK_DEBUG_SQL=%s"
+        " LEAFLINK_REPROCESS_ENABLED=%s LEAFLINK_MAX_RETRY_ATTEMPTS=%s"
+        " LEAFLINK_SYNC_STALE_MINUTES=%s",
+        LEAFLINK_SYNC_ENABLED,
+        LEAFLINK_DEBUG_SQL,
+        LEAFLINK_REPROCESS_ENABLED,
+        LEAFLINK_MAX_RETRY_ATTEMPTS,
+        LEAFLINK_SYNC_STALE_MINUTES,
+    )
 
     await _resume_interrupted_syncs()
 
