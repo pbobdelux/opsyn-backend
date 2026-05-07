@@ -18,7 +18,7 @@ import logging
 import os
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 
 import bcrypt
@@ -31,8 +31,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models.auth_models import Organization
 from models.driver import Driver
+from models.driver_location import DriverLocation
+from models.driver_route_history import DriverRouteHistory
 from models.route import Route
 from models.route_stop import RouteStop
+from services.location_service import get_active_route_for_driver
 from services.route_events import log_route_event
 from utils.json_utils import make_json_safe
 
@@ -52,6 +55,14 @@ VALID_PAYMENT_METHODS = {"cash", "check", "card", "other"}
 
 # Stop statuses that trigger completed_at timestamp
 TERMINAL_STOP_STATUSES = {"completed", "failed", "skipped"}
+
+# ---------------------------------------------------------------------------
+# Module-level route cache: { driver_id (UUID) -> (route_id | None, datetime) }
+# Shared across requests within the same process. 5-minute TTL enforced by
+# get_active_route_for_driver(). Not shared across workers — acceptable for
+# the <100ms latency requirement.
+# ---------------------------------------------------------------------------
+_route_id_cache: dict = {}
 
 
 # =============================================================================
@@ -82,6 +93,8 @@ class DriverLoginRequest(BaseModel):
 class StopStatusUpdate(BaseModel):
     status: str
     notes: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
     @field_validator("status")
     @classmethod
@@ -112,6 +125,47 @@ class CollectionUpdate(BaseModel):
             raise ValueError(
                 f"payment_method must be one of: {', '.join(sorted(VALID_PAYMENT_METHODS))}"
             )
+        return v
+
+
+class LocationPing(BaseModel):
+    latitude: float
+    longitude: float
+    accuracy_meters: Optional[float] = None
+    speed_mph: Optional[float] = None
+    heading: Optional[float] = None
+    altitude_meters: Optional[float] = None
+    battery_percent: Optional[int] = None
+    is_moving: Optional[bool] = False
+    source: Optional[str] = "gps"
+    recorded_at: Optional[datetime] = None
+
+
+class BatchLocationRequest(BaseModel):
+    locations: List[LocationPing]
+
+
+class RouteStartRequest(BaseModel):
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    notes: Optional[str] = None
+
+
+class RouteCompleteRequest(BaseModel):
+    notes: Optional[str] = None
+
+
+class BreakRequest(BaseModel):
+    action: str  # "start" or "end"
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    notes: Optional[str] = None
+
+    @field_validator("action")
+    @classmethod
+    def validate_action(cls, v: str) -> str:
+        if v not in {"start", "end"}:
+            raise ValueError("action must be 'start' or 'end'")
         return v
 
 
@@ -658,6 +712,9 @@ async def update_stop_status(
 
     Creates route_events for: stop_status_changed, and route_completed
     if the route auto-completes.
+
+    Also inserts a driver_route_history row for the status change, including
+    optional lat/lng if provided in the request body.
     """
     # Verify route belongs to this driver
     route_result = await db.execute(
@@ -706,7 +763,6 @@ async def update_stop_status(
         logger.error("[DRIVER_STOP_UPDATE] uuid_parse_error error=%s", exc)
         raise HTTPException(status_code=500, detail="Internal ID format error")
 
-
     # Log stop_status_changed event
     await log_route_event(
         db=db,
@@ -720,6 +776,37 @@ async def update_stop_status(
             "old_status": old_status,
             "new_status": body.status,
         },
+    )
+
+    # Map stop status to driver_route_history event_type
+    _status_to_history_event = {
+        "arrived": "stop_arrived",
+        "completed": "stop_completed",
+        "failed": "stop_failed",
+        "skipped": "stop_skipped",
+    }
+    history_event_type = _status_to_history_event.get(body.status)
+    if history_event_type:
+        history_row = DriverRouteHistory(
+            driver_id=driver_uuid,
+            route_id=route_uuid,
+            org_id=org_uuid,
+            event_type=history_event_type,
+            stop_id=stop_uuid,
+            latitude=body.latitude,
+            longitude=body.longitude,
+            event_metadata={"old_status": old_status, "new_status": body.status},
+            notes=body.notes,
+            recorded_at=now,
+        )
+        db.add(history_row)
+
+    logger.info(
+        "[STOP_STATUS_CHANGED] driver=%s stop=%s status=%s location=%s",
+        driver.id,
+        stop_id,
+        body.status,
+        f"{body.latitude},{body.longitude}" if body.latitude is not None else "none",
     )
 
     # --- Auto-complete: check if all stops are now in a terminal state ---
@@ -859,3 +946,402 @@ async def record_collection(
         "ok": True,
         "stop": _serialize_route_stop(stop),
     }
+
+
+# =============================================================================
+# Endpoint: POST /driver/location
+# =============================================================================
+
+
+@router.post("/location")
+async def post_driver_location(
+    body: LocationPing,
+    driver: Driver = Depends(get_current_driver),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Record a single GPS location ping from the driver app.
+
+    Auto-detects the driver's active route for today using a 5-minute
+    in-memory cache to keep latency well under 100ms. Inserts a single
+    row into driver_locations — no upserts, no reads beyond the cache check.
+    """
+    now = datetime.now(timezone.utc)
+    recorded_at = body.recorded_at or now
+
+    driver_uuid = UUID(str(driver.id))
+    org_uuid = UUID(str(driver.org_id))
+
+    # Resolve active route (cached — avoids DB hit on most pings)
+    route_id = await get_active_route_for_driver(
+        db=db,
+        driver_id=driver_uuid,
+        org_id=org_uuid,
+        cache=_route_id_cache,
+    )
+
+    location = DriverLocation(
+        driver_id=driver_uuid,
+        org_id=org_uuid,
+        route_id=route_id,
+        latitude=body.latitude,
+        longitude=body.longitude,
+        accuracy_meters=body.accuracy_meters,
+        speed_mph=body.speed_mph,
+        heading=body.heading,
+        altitude_meters=body.altitude_meters,
+        battery_percent=body.battery_percent,
+        is_moving=body.is_moving if body.is_moving is not None else False,
+        source=body.source or "gps",
+        recorded_at=recorded_at,
+    )
+    db.add(location)
+
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        logger.error(
+            "[DRIVER_LOCATION] commit_failed driver=%s error=%s",
+            driver.id, exc, exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Unexpected error saving location")
+
+    logger.debug(
+        "[DRIVER_LOCATION] driver=%s lat=%s lng=%s route=%s",
+        driver.id, body.latitude, body.longitude, route_id,
+    )
+
+    return {"ok": True, "tracked": True}
+
+
+# =============================================================================
+# Endpoint: POST /driver/location/batch
+# =============================================================================
+
+
+@router.post("/location/batch")
+async def post_driver_location_batch(
+    body: BatchLocationRequest,
+    driver: Driver = Depends(get_current_driver),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Record a batch of GPS location pings (offline sync / reconnect flush).
+
+    Attaches the driver's active route_id to all rows using the same
+    cached lookup as the single-ping endpoint.
+    """
+    if not body.locations:
+        return {"ok": True, "tracked": 0}
+
+    driver_uuid = UUID(str(driver.id))
+    org_uuid = UUID(str(driver.org_id))
+
+    # Single route lookup for the whole batch
+    route_id = await get_active_route_for_driver(
+        db=db,
+        driver_id=driver_uuid,
+        org_id=org_uuid,
+        cache=_route_id_cache,
+    )
+
+    now = datetime.now(timezone.utc)
+    rows = []
+    for ping in body.locations:
+        recorded_at = ping.recorded_at or now
+        rows.append(
+            DriverLocation(
+                driver_id=driver_uuid,
+                org_id=org_uuid,
+                route_id=route_id,
+                latitude=ping.latitude,
+                longitude=ping.longitude,
+                accuracy_meters=ping.accuracy_meters,
+                speed_mph=ping.speed_mph,
+                heading=ping.heading,
+                altitude_meters=ping.altitude_meters,
+                battery_percent=ping.battery_percent,
+                is_moving=ping.is_moving if ping.is_moving is not None else False,
+                source=ping.source or "gps",
+                recorded_at=recorded_at,
+            )
+        )
+
+    for row in rows:
+        db.add(row)
+
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        logger.error(
+            "[DRIVER_LOCATION_BATCH] commit_failed driver=%s count=%s error=%s",
+            driver.id, len(rows), exc, exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Unexpected error saving location batch")
+
+    logger.debug(
+        "[DRIVER_LOCATION_BATCH] driver=%s count=%s route=%s",
+        driver.id, len(rows), route_id,
+    )
+
+    return {"ok": True, "tracked": len(rows)}
+
+
+# =============================================================================
+# Endpoint: POST /driver/routes/{route_id}/start
+# =============================================================================
+
+
+@router.post("/routes/{route_id}/start")
+async def start_route(
+    route_id: str,
+    body: RouteStartRequest,
+    driver: Driver = Depends(get_current_driver),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Mark a route as started (out_for_delivery).
+
+    Transitions route.status from 'assigned' → 'out_for_delivery'.
+    Records a route_started event in driver_route_history.
+    """
+    route_result = await db.execute(
+        select(Route).where(
+            Route.id == route_id,
+            Route.assigned_driver_id == driver.id,
+        )
+    )
+    route = route_result.scalar_one_or_none()
+    if route is None:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    now = datetime.now(timezone.utc)
+
+    try:
+        route_uuid = UUID(str(route.id))
+        org_uuid = UUID(str(route.org_id))
+        driver_uuid = UUID(str(driver.id))
+    except (ValueError, AttributeError) as exc:
+        logger.error("[ROUTE_STARTED] uuid_parse_error error=%s", exc)
+        raise HTTPException(status_code=500, detail="Internal ID format error")
+
+    if route.status == "assigned":
+        route.status = "out_for_delivery"
+        route.updated_at = now
+        route.version = (route.version or 1) + 1
+
+    history_row = DriverRouteHistory(
+        driver_id=driver_uuid,
+        route_id=route_uuid,
+        org_id=org_uuid,
+        event_type="route_started",
+        latitude=body.latitude,
+        longitude=body.longitude,
+        notes=body.notes,
+        event_metadata={},
+        recorded_at=now,
+    )
+    db.add(history_row)
+
+    try:
+        await db.commit()
+        await db.refresh(route)
+    except Exception as exc:
+        await db.rollback()
+        logger.error(
+            "[ROUTE_STARTED] commit_failed driver=%s route=%s error=%s",
+            driver.id, route_id, exc, exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Unexpected error starting route")
+
+    logger.info(
+        "[ROUTE_STARTED] driver=%s route=%s location=%s",
+        driver.id,
+        route_id,
+        f"{body.latitude},{body.longitude}" if body.latitude is not None else "none",
+    )
+
+    stops_result = await db.execute(
+        select(RouteStop)
+        .where(RouteStop.route_id == route.id)
+        .order_by(RouteStop.stop_order.asc())
+    )
+    stops = stops_result.scalars().all()
+
+    return {
+        "ok": True,
+        "route": _serialize_route_detail(route, stops),
+    }
+
+
+# =============================================================================
+# Endpoint: POST /driver/routes/{route_id}/complete
+# =============================================================================
+
+
+@router.post("/routes/{route_id}/complete")
+async def complete_route(
+    route_id: str,
+    body: RouteCompleteRequest,
+    driver: Driver = Depends(get_current_driver),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Mark a route as completed.
+
+    Validates that all stops are in a terminal state (completed/failed/skipped).
+    Returns an error listing pending stop count if any stops are still pending.
+    Records a route_completed event in driver_route_history.
+    """
+    route_result = await db.execute(
+        select(Route).where(
+            Route.id == route_id,
+            Route.assigned_driver_id == driver.id,
+        )
+    )
+    route = route_result.scalar_one_or_none()
+    if route is None:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    # Check all stops are in terminal state
+    all_stops_result = await db.execute(
+        select(RouteStop).where(RouteStop.route_id == route.id)
+    )
+    all_stops = all_stops_result.scalars().all()
+
+    pending_stops = [
+        s for s in all_stops if s.status not in _DONE_STOP_STATUSES
+    ]
+    if pending_stops:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{len(pending_stops)} stops still pending",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    try:
+        route_uuid = UUID(str(route.id))
+        org_uuid = UUID(str(route.org_id))
+        driver_uuid = UUID(str(driver.id))
+    except (ValueError, AttributeError) as exc:
+        logger.error("[ROUTE_COMPLETED] uuid_parse_error error=%s", exc)
+        raise HTTPException(status_code=500, detail="Internal ID format error")
+
+    route.status = "completed"
+    route.updated_at = now
+    route.version = (route.version or 1) + 1
+
+    history_row = DriverRouteHistory(
+        driver_id=driver_uuid,
+        route_id=route_uuid,
+        org_id=org_uuid,
+        event_type="route_completed",
+        notes=body.notes,
+        event_metadata={"total_stops": len(all_stops)},
+        recorded_at=now,
+    )
+    db.add(history_row)
+
+    try:
+        await db.commit()
+        await db.refresh(route)
+    except Exception as exc:
+        await db.rollback()
+        logger.error(
+            "[ROUTE_COMPLETED] commit_failed driver=%s route=%s error=%s",
+            driver.id, route_id, exc, exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Unexpected error completing route")
+
+    logger.info(
+        "[ROUTE_COMPLETED] driver=%s route=%s",
+        driver.id,
+        route_id,
+    )
+
+    stops_result = await db.execute(
+        select(RouteStop)
+        .where(RouteStop.route_id == route.id)
+        .order_by(RouteStop.stop_order.asc())
+    )
+    stops = stops_result.scalars().all()
+
+    return {
+        "ok": True,
+        "route": _serialize_route_detail(route, stops),
+    }
+
+
+# =============================================================================
+# Endpoint: POST /driver/routes/{route_id}/break
+# =============================================================================
+
+
+@router.post("/routes/{route_id}/break")
+async def record_break_event(
+    route_id: str,
+    body: BreakRequest,
+    driver: Driver = Depends(get_current_driver),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Record a break start or end event for a route.
+
+    Inserts a driver_route_history row with event_type='break_started'
+    or 'break_ended' depending on body.action.
+    """
+    route_result = await db.execute(
+        select(Route).where(
+            Route.id == route_id,
+            Route.assigned_driver_id == driver.id,
+        )
+    )
+    route = route_result.scalar_one_or_none()
+    if route is None:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    now = datetime.now(timezone.utc)
+    event_type = "break_started" if body.action == "start" else "break_ended"
+
+    try:
+        route_uuid = UUID(str(route.id))
+        org_uuid = UUID(str(route.org_id))
+        driver_uuid = UUID(str(driver.id))
+    except (ValueError, AttributeError) as exc:
+        logger.error("[BREAK_EVENT] uuid_parse_error error=%s", exc)
+        raise HTTPException(status_code=500, detail="Internal ID format error")
+
+    history_row = DriverRouteHistory(
+        driver_id=driver_uuid,
+        route_id=route_uuid,
+        org_id=org_uuid,
+        event_type=event_type,
+        latitude=body.latitude,
+        longitude=body.longitude,
+        notes=body.notes,
+        event_metadata={"action": body.action},
+        recorded_at=now,
+    )
+    db.add(history_row)
+
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        logger.error(
+            "[BREAK_EVENT] commit_failed driver=%s route=%s action=%s error=%s",
+            driver.id, route_id, body.action, exc, exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Unexpected error recording break event")
+
+    logger.info(
+        "[BREAK_EVENT] driver=%s route=%s action=%s",
+        driver.id,
+        route_id,
+        body.action,
+    )
+
+    return {"ok": True, "event_type": event_type}

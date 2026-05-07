@@ -185,6 +185,8 @@ class OrganizationBrandBinding(Base):
 # =============================================================================
 
 from models.driver import Driver  # noqa: F401, E402
+from models.driver_location import DriverLocation  # noqa: F401, E402
+from models.driver_route_history import DriverRouteHistory  # noqa: F401, E402
 from models.route import Route  # noqa: F401, E402
 from models.route_event import RouteEvent  # noqa: F401, E402
 from models.route_stop import RouteStop  # noqa: F401, E402
