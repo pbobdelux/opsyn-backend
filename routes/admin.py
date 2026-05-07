@@ -1,15 +1,19 @@
+import csv
+import io
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone
 from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
+from models import Order
 from models.driver import Driver
 from models.route import Route
 from models.route_event import RouteEvent
@@ -373,6 +377,408 @@ async def update_and_publish_route(
     })
 
 
+
+# =============================================================================
+# Compliance helpers
+# =============================================================================
+
+
+async def _resolve_driver(db: AsyncSession, driver_id) -> Optional[Driver]:
+    """Fetch a Driver by id, returning None if not found."""
+    if driver_id is None:
+        return None
+    result = await db.execute(select(Driver).where(Driver.id == driver_id))
+    return result.scalar_one_or_none()
+
+
+async def _get_stop_timestamps(
+    db: AsyncSession,
+    route_id,
+) -> tuple[Optional[datetime], Optional[datetime]]:
+    """
+    Return (started_at, completed_at) for a route derived from its stops.
+
+    started_at  = MIN(updated_at) where status = 'arrived'
+    completed_at = MAX(completed_at) across all stops
+    """
+    started_result = await db.execute(
+        select(func.min(RouteStop.updated_at)).where(
+            RouteStop.route_id == route_id,
+            RouteStop.status == "arrived",
+        )
+    )
+    started_at: Optional[datetime] = started_result.scalar_one_or_none()
+
+    completed_result = await db.execute(
+        select(func.max(RouteStop.completed_at)).where(
+            RouteStop.route_id == route_id,
+        )
+    )
+    completed_at: Optional[datetime] = completed_result.scalar_one_or_none()
+
+    return started_at, completed_at
+
+
+def _duration_minutes(
+    started_at: Optional[datetime],
+    completed_at: Optional[datetime],
+) -> Optional[float]:
+    """Return duration in minutes between two timestamps, or None if either is missing."""
+    if started_at is None or completed_at is None:
+        return None
+    delta = completed_at - started_at
+    return round(delta.total_seconds() / 60, 1)
+
+
+async def _get_source_order_number(db: AsyncSession, source_order_id) -> Optional[str]:
+    """
+    Look up the order_number from the orders table for a given source_order_id (UUID).
+
+    source_order_id is stored as a UUID in route_stops, but Order.id is an integer.
+    We attempt integer conversion; if that fails we return None.
+    """
+    if source_order_id is None:
+        return None
+    try:
+        int_id = int(str(source_order_id))
+    except (ValueError, TypeError):
+        return None
+    result = await db.execute(
+        select(Order.order_number).where(Order.id == int_id)
+    )
+    row = result.fetchone()
+    return row[0] if row else None
+
+
+async def _get_org_info(db: AsyncSession, org_id: str) -> dict:
+    """
+    Fetch org name and code from the organizations table.
+    Falls back gracefully if the table or row is missing.
+    """
+    try:
+        result = await db.execute(
+            text(
+                "SELECT id, name, org_code FROM organizations WHERE id = :org_id LIMIT 1"
+            ),
+            {"org_id": org_id},
+        )
+        row = result.fetchone()
+        if row:
+            return {"id": str(row[0]), "name": row[1], "code": row[2]}
+    except Exception:
+        pass
+    return {"id": org_id, "name": None, "code": None}
+
+
+# =============================================================================
+# Endpoint: GET /admin/routes/history
+# NOTE: Registered before /{route_id} endpoints so FastAPI matches the literal
+#       path segment "history" before the parameterized {route_id} pattern.
+# =============================================================================
+
+
+@router.get("/routes/history")
+async def get_routes_history(
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    status: Optional[str] = Query(default="completed"),
+    driver_id: Optional[str] = Query(default=None),
+    date_from: Optional[str] = Query(default=None, description="ISO date YYYY-MM-DD"),
+    date_to: Optional[str] = Query(default=None, description="ISO date YYYY-MM-DD"),
+    search: Optional[str] = Query(default=None, description="Search route_number, driver name, or stop customer_name"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return paginated route history for compliance and the 'Previous Routes' admin tab.
+
+    All results are scoped to the authenticated org. Supports filtering by status,
+    driver, date range, and free-text search across route_number, driver name, and
+    stop customer_name.
+    """
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+
+    # --- Parse and validate date filters ---
+    parsed_date_from: Optional[date] = None
+    parsed_date_to: Optional[date] = None
+    if date_from:
+        try:
+            parsed_date_from = date.fromisoformat(date_from)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date_from must be a valid ISO date (YYYY-MM-DD)")
+    if date_to:
+        try:
+            parsed_date_to = date.fromisoformat(date_to)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date_to must be a valid ISO date (YYYY-MM-DD)")
+
+    # --- Build base query ---
+    query = select(Route).where(Route.org_id == org_id)
+
+    if status:
+        query = query.where(Route.status == status)
+    if parsed_date_from:
+        query = query.where(Route.route_date >= parsed_date_from)
+    if parsed_date_to:
+        query = query.where(Route.route_date <= parsed_date_to)
+    if driver_id:
+        try:
+            driver_uuid = UUID(driver_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="driver_id must be a valid UUID")
+        query = query.where(Route.assigned_driver_id == driver_uuid)
+
+    # --- Search filter: route_number or driver name or stop customer_name ---
+    if search:
+        search_term = f"%{search}%"
+        # Subquery: route IDs that have a matching stop customer_name
+        stop_match_subq = (
+            select(RouteStop.route_id)
+            .where(
+                RouteStop.org_id == org_id,
+                RouteStop.customer_name.ilike(search_term),
+            )
+            .scalar_subquery()
+        )
+        # Driver name match: join Driver inline
+        driver_match_subq = (
+            select(Driver.id)
+            .where(
+                Driver.org_id == org_id,
+                Driver.name.ilike(search_term),
+            )
+            .scalar_subquery()
+        )
+        query = query.where(
+            or_(
+                Route.route_number.ilike(search_term),
+                Route.assigned_driver_id.in_(driver_match_subq),
+                Route.id.in_(stop_match_subq),
+            )
+        )
+
+    query = query.order_by(Route.route_date.desc(), Route.created_at.desc())
+    query = query.offset(offset).limit(limit)
+
+    result = await db.execute(query)
+    routes = result.scalars().all()
+
+    # --- Serialize each route with stop counts and financial totals ---
+    serialized = []
+    for route in routes:
+        # Fetch driver
+        driver = await _resolve_driver(db, route.assigned_driver_id)
+
+        # Fetch stop aggregates
+        stops_result = await db.execute(
+            select(RouteStop).where(RouteStop.route_id == route.id)
+        )
+        stops = stops_result.scalars().all()
+
+        stop_count = len(stops)
+        completed_stop_count = sum(1 for s in stops if s.status == "completed")
+        failed_stop_count = sum(1 for s in stops if s.status == "failed")
+        skipped_stop_count = sum(1 for s in stops if s.status == "skipped")
+        total_collected = sum(
+            (s.amount_collected or 0) for s in stops
+        )
+
+        # Derive timestamps from stops
+        started_at, completed_at = await _get_stop_timestamps(db, route.id)
+        duration = _duration_minutes(started_at, completed_at)
+
+        serialized.append(make_json_safe({
+            "route_id": route.id,
+            "route_number": route.route_number,
+            "route_date": route.route_date,
+            "status": route.status,
+            "assigned_driver": {
+                "id": driver.id if driver else None,
+                "name": driver.name if driver else None,
+                "phone": driver.phone if driver else None,
+                "license_plate": driver.license_plate if driver else None,
+            } if driver else None,
+            "stop_count": stop_count,
+            "completed_stop_count": completed_stop_count,
+            "failed_stop_count": failed_stop_count,
+            "skipped_stop_count": skipped_stop_count,
+            "total_value": route.total_value,
+            "total_collected": total_collected,
+            "total_units": route.total_units,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "published_at": route.published_at,
+            "duration_minutes": duration,
+        }))
+
+    filters_applied = {
+        "status": status,
+        "driver_id": driver_id,
+        "date_from": date_from,
+        "date_to": date_to,
+        "search": search,
+    }
+    logger.info(
+        "[ROUTES_HISTORY] org_id=%s count=%s filters=%s",
+        org_id,
+        len(serialized),
+        filters_applied,
+    )
+
+    return {"ok": True, "count": len(serialized), "routes": serialized}
+
+
+# =============================================================================
+# Endpoint: GET /admin/routes/history/export
+# NOTE: Registered before /{route_id} endpoints so FastAPI matches the literal
+#       path segment "history" before the parameterized {route_id} pattern.
+# =============================================================================
+
+
+@router.get("/routes/history/export")
+async def export_routes_history(
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    status: Optional[str] = Query(default=None),
+    driver_id: Optional[str] = Query(default=None),
+    date_from: Optional[str] = Query(default=None, description="ISO date YYYY-MM-DD"),
+    date_to: Optional[str] = Query(default=None, description="ISO date YYYY-MM-DD"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Export route history as a CSV file download.
+
+    Applies the same filters as GET /routes/history. Returns a CSV attachment
+    suitable for regulatory record-keeping (METRC, OMMA).
+    """
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+
+    # --- Parse and validate date filters ---
+    parsed_date_from: Optional[date] = None
+    parsed_date_to: Optional[date] = None
+    if date_from:
+        try:
+            parsed_date_from = date.fromisoformat(date_from)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date_from must be a valid ISO date (YYYY-MM-DD)")
+    if date_to:
+        try:
+            parsed_date_to = date.fromisoformat(date_to)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date_to must be a valid ISO date (YYYY-MM-DD)")
+
+    # --- Build query (no pagination — export all matching rows) ---
+    query = select(Route).where(Route.org_id == org_id)
+
+    if status:
+        query = query.where(Route.status == status)
+    if parsed_date_from:
+        query = query.where(Route.route_date >= parsed_date_from)
+    if parsed_date_to:
+        query = query.where(Route.route_date <= parsed_date_to)
+    if driver_id:
+        try:
+            driver_uuid = UUID(driver_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="driver_id must be a valid UUID")
+        query = query.where(Route.assigned_driver_id == driver_uuid)
+
+    query = query.order_by(Route.route_date.desc(), Route.created_at.desc())
+
+    result = await db.execute(query)
+    routes = result.scalars().all()
+
+    # --- Build CSV in memory ---
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    # Header row
+    writer.writerow([
+        "route_date",
+        "route_number",
+        "driver_name",
+        "driver_license_plate",
+        "status",
+        "total_stops",
+        "completed_stops",
+        "failed_stops",
+        "total_value",
+        "total_collected",
+        "started_at",
+        "completed_at",
+        "duration_minutes",
+        "stop_details",
+    ])
+
+    for route in routes:
+        driver = await _resolve_driver(db, route.assigned_driver_id)
+
+        stops_result = await db.execute(
+            select(RouteStop)
+            .where(RouteStop.route_id == route.id)
+            .order_by(RouteStop.stop_order.asc())
+        )
+        stops = stops_result.scalars().all()
+
+        completed_stop_count = sum(1 for s in stops if s.status == "completed")
+        failed_stop_count = sum(1 for s in stops if s.status == "failed")
+        total_collected = float(sum((s.amount_collected or 0) for s in stops))
+
+        started_at, completed_at = await _get_stop_timestamps(db, route.id)
+        duration = _duration_minutes(started_at, completed_at)
+
+        # Build semicolon-separated stop summary
+        stop_parts = []
+        for s in stops:
+            stop_parts.append(
+                f"{s.stop_order}:{s.customer_name or s.stop_name or 'unknown'}:"
+                f"{s.status}:${float(s.amount_collected or 0):.2f}"
+            )
+        stop_details = "; ".join(stop_parts)
+
+        writer.writerow([
+            route.route_date.isoformat() if route.route_date else "",
+            route.route_number or "",
+            driver.name if driver else "",
+            driver.license_plate if driver else "",
+            route.status,
+            len(stops),
+            completed_stop_count,
+            failed_stop_count,
+            float(route.total_value or 0),
+            total_collected,
+            started_at.isoformat() if started_at else "",
+            completed_at.isoformat() if completed_at else "",
+            duration if duration is not None else "",
+            stop_details,
+        ])
+
+    csv_content = output.getvalue()
+    output.close()
+
+    # Build filename
+    date_from_str = date_from or "all"
+    date_to_str = date_to or "all"
+    filename = f"route_history_{org_id}_{date_from_str}_{date_to_str}.csv"
+
+    logger.info(
+        "[ROUTES_HISTORY_EXPORT] org_id=%s rows=%s date_range=%s_%s",
+        org_id,
+        len(routes),
+        date_from_str,
+        date_to_str,
+    )
+
+    return StreamingResponse(
+        iter([csv_content]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
+
 # =============================================================================
 # Endpoint: GET /admin/routes/{route_id}/changelog
 # =============================================================================
@@ -480,4 +886,185 @@ async def get_route_live_status(
         "version": route.version,
         "status": route.status,
         "stops": serialized_stops,
+    })
+
+
+# =============================================================================
+# Endpoint: GET /admin/routes/{route_id}/compliance-report
+# =============================================================================
+
+
+@router.get("/routes/{route_id}/compliance-report")
+async def get_compliance_report(
+    route_id: str,
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Full compliance-ready detail for a single route.
+
+    Returns all stop-level data, financial totals, driver info, and org metadata
+    in a format suitable for METRC / OMMA regulatory inspections.
+    """
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+    route = await _get_route_or_404(db, route_id, org_id)
+
+    now = datetime.now(timezone.utc)
+
+    # Fetch org info
+    org_info = await _get_org_info(db, org_id)
+
+    # Fetch driver
+    driver = await _resolve_driver(db, route.assigned_driver_id)
+
+    # Fetch stops ordered by stop_order
+    stops_result = await db.execute(
+        select(RouteStop)
+        .where(RouteStop.route_id == route.id)
+        .order_by(RouteStop.stop_order.asc())
+    )
+    stops = stops_result.scalars().all()
+
+    # Derive route-level timestamps from stops
+    started_at, completed_at = await _get_stop_timestamps(db, route.id)
+    duration = _duration_minutes(started_at, completed_at)
+
+    # Compute totals
+    total_stops = len(stops)
+    completed_count = sum(1 for s in stops if s.status == "completed")
+    failed_count = sum(1 for s in stops if s.status == "failed")
+    skipped_count = sum(1 for s in stops if s.status == "skipped")
+    pending_count = sum(1 for s in stops if s.status == "pending")
+    total_value = float(route.total_value or 0)
+    total_collected = float(sum((s.amount_collected or 0) for s in stops))
+    collection_rate = (
+        round((total_collected / total_value) * 100, 1)
+        if total_value > 0
+        else 0.0
+    )
+    total_units = route.total_units or 0
+
+    # Serialize stops with source_order_number lookup
+    serialized_stops = []
+    for stop in stops:
+        source_order_number = await _get_source_order_number(db, stop.source_order_id)
+        serialized_stops.append(make_json_safe({
+            "stop_order": stop.stop_order,
+            "stop_type": stop.stop_type,
+            "status": stop.status,
+            "customer_name": stop.customer_name,
+            "stop_name": stop.stop_name,
+            "address": stop.address,
+            "contact_name": stop.contact_name,
+            "contact_phone": stop.contact_phone,
+            "source_order_id": stop.source_order_id,
+            "source_order_number": source_order_number,
+            "amount_due": stop.amount_due,
+            "amount_collected": stop.amount_collected,
+            "ar_status": stop.ar_status,
+            "completed_at": stop.completed_at,
+            "notes": stop.notes,
+            "time_window": stop.time_window,
+        }))
+
+    logger.info(
+        "[COMPLIANCE_REPORT] org_id=%s route_id=%s generated_at=%s",
+        org_id,
+        route_id,
+        now.isoformat(),
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "route_id": route.id,
+        "route_number": route.route_number,
+        "route_date": route.route_date,
+        "status": route.status,
+        "org": org_info,
+        "driver": {
+            "id": driver.id,
+            "name": driver.name,
+            "phone": driver.phone,
+            "license_plate": driver.license_plate,
+            "vehicle_type": driver.vehicle_type,
+        } if driver else None,
+        "published_at": route.published_at,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "duration_minutes": duration,
+        "version": route.version,
+        "stops": serialized_stops,
+        "totals": {
+            "total_stops": total_stops,
+            "completed": completed_count,
+            "failed": failed_count,
+            "skipped": skipped_count,
+            "pending": pending_count,
+            "total_value": total_value,
+            "total_collected": total_collected,
+            "collection_rate_percent": collection_rate,
+            "total_units": total_units,
+        },
+        "metadata": {
+            "created_at": route.created_at,
+            "updated_at": route.updated_at,
+            "created_by": route.created_by,
+            "version": route.version,
+            "report_generated_at": now,
+        },
+    })
+
+
+# =============================================================================
+# Endpoint: GET /admin/routes/{route_id}/events
+# =============================================================================
+
+
+@router.get("/routes/{route_id}/events")
+async def get_route_events(
+    route_id: str,
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return all route_events for a route ordered by created_at ASC.
+
+    Used by the admin changelog and compliance audit trail. Provides a
+    complete, immutable record of every action taken on the route.
+    """
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+    route = await _get_route_or_404(db, route_id, org_id)
+
+    events_result = await db.execute(
+        select(RouteEvent)
+        .where(RouteEvent.route_id == route.id)
+        .order_by(RouteEvent.created_at.asc())
+    )
+    events = events_result.scalars().all()
+
+    serialized_events = [
+        make_json_safe({
+            "event_id": event.id,
+            "event_type": event.event_type,
+            "actor_type": event.actor_type,
+            "actor_id": event.actor_id,
+            "metadata": event.metadata,
+            "created_at": event.created_at,
+        })
+        for event in events
+    ]
+
+    logger.info(
+        "[ROUTE_EVENTS] org_id=%s route_id=%s count=%s",
+        org_id,
+        route_id,
+        len(serialized_events),
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "route_id": route_id,
+        "events": serialized_events,
     })
