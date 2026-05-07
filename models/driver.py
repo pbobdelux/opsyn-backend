@@ -13,7 +13,6 @@ from sqlalchemy import (
     DateTime,
     Index,
     Text,
-    UniqueConstraint,
     VARCHAR,
     func,
     text,
@@ -68,12 +67,15 @@ class Driver(Base):
             "status IN ('active', 'inactive')",
             name="ck_drivers_status",
         ),
-        UniqueConstraint(
-            "org_id",
-            "email",
-            name="uq_drivers_org_email",
-            postgresql_where=text("email IS NOT NULL"),
-        ),
         Index("ix_drivers_org_id", "org_id"),
         Index("ix_drivers_org_status", "org_id", "status"),
     )
+
+
+Index(
+    "uq_drivers_org_email",
+    Driver.org_id,
+    Driver.email,
+    unique=True,
+    postgresql_where=Driver.email.isnot(None),
+)
