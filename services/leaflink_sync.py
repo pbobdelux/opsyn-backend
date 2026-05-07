@@ -1216,13 +1216,18 @@ async def _insert_line_items_standalone(
         if enabled_columns.get(col, False):
             insert_columns.append(col)
 
+
     # UUID columns that require explicit CAST in the SQL VALUES clause so
     # PostgreSQL never infers the parameter type as character varying.
     _uuid_columns = {"mapped_product_id"}
+    # TIMESTAMPTZ columns that require explicit CAST to avoid asyncpg bind mismatch
+    _timestamptz_columns = {"created_at", "updated_at"}
 
     columns_str = ", ".join(insert_columns)
     placeholders = ", ".join(
-        f"CAST(:{col} AS UUID)" if col in _uuid_columns else f":{col}"
+        f"CAST(:{col} AS UUID)" if col in _uuid_columns
+        else f"CAST(:{col} AS TIMESTAMPTZ)" if col in _timestamptz_columns
+        else f":{col}"
         for col in insert_columns
     )
     logger.info(
@@ -1233,6 +1238,7 @@ async def _insert_line_items_standalone(
         INSERT INTO public.order_lines ({columns_str})
         VALUES ({placeholders})
     """
+
 
     # Delete stale line items before inserting fresh ones
     await db.execute(delete(OrderLine).where(OrderLine.order_id == order_id))
@@ -1382,6 +1388,21 @@ async def _insert_line_items_standalone(
 
             # Assert no naive datetimes remain anywhere
             assert_no_naive_datetimes(insert_params, "params")
+
+            # Convert created_at and updated_at to ISO8601 strings for TIMESTAMPTZ binding
+            if isinstance(insert_params.get("created_at"), datetime):
+                insert_params["created_at"] = insert_params["created_at"].astimezone(timezone.utc).isoformat()
+            if isinstance(insert_params.get("updated_at"), datetime):
+                insert_params["updated_at"] = insert_params["updated_at"].astimezone(timezone.utc).isoformat()
+
+            # Log the stringified values
+            logger.error(
+                "[ORDER_LINES_STRINGIFIED_DATETIME] created_at=%s type=%s updated_at=%s type=%s",
+                insert_params.get("created_at"),
+                type(insert_params.get("created_at")).__name__,
+                insert_params.get("updated_at"),
+                type(insert_params.get("updated_at")).__name__,
+            )
 
             await db.execute(text(line_insert_stmt), insert_params)
             inserted += 1
@@ -1706,10 +1727,14 @@ async def sync_leaflink_orders(
 
                 # UUID columns that require explicit CAST in the SQL VALUES clause
                 _li_uuid_columns = {"mapped_product_id"}
+                # TIMESTAMPTZ columns that require explicit CAST to avoid asyncpg bind mismatch
+                _li_timestamptz_columns = {"created_at", "updated_at"}
 
                 _li_columns_str = ", ".join(_li_insert_columns)
                 _li_placeholders = ", ".join(
-                    f"CAST(:{col} AS UUID)" if col in _li_uuid_columns else f":{col}"
+                    f"CAST(:{col} AS UUID)" if col in _li_uuid_columns
+                    else f"CAST(:{col} AS TIMESTAMPTZ)" if col in _li_timestamptz_columns
+                    else f":{col}"
                     for col in _li_insert_columns
                 )
                 logger.info(
@@ -1833,6 +1858,21 @@ async def sync_leaflink_orders(
 
                     # Assert no naive datetimes remain anywhere
                     assert_no_naive_datetimes(_li_params, "params")
+
+                    # Convert created_at and updated_at to ISO8601 strings for TIMESTAMPTZ binding
+                    if isinstance(_li_params.get("created_at"), datetime):
+                        _li_params["created_at"] = _li_params["created_at"].astimezone(timezone.utc).isoformat()
+                    if isinstance(_li_params.get("updated_at"), datetime):
+                        _li_params["updated_at"] = _li_params["updated_at"].astimezone(timezone.utc).isoformat()
+
+                    # Log the stringified values
+                    logger.error(
+                        "[ORDER_LINES_STRINGIFIED_DATETIME] created_at=%s type=%s updated_at=%s type=%s",
+                        _li_params.get("created_at"),
+                        type(_li_params.get("created_at")).__name__,
+                        _li_params.get("updated_at"),
+                        type(_li_params.get("updated_at")).__name__,
+                    )
 
                     await db.execute(text(_li_insert_stmt), _li_params)
 
@@ -2781,10 +2821,14 @@ async def sync_leaflink_line_items(
     # UUID columns that require explicit CAST in the SQL VALUES clause so
     # PostgreSQL never infers the parameter type as character varying.
     _uuid_columns = {"mapped_product_id"}
+    # TIMESTAMPTZ columns that require explicit CAST to avoid asyncpg bind mismatch
+    _timestamptz_columns = {"created_at", "updated_at"}
 
     columns_str = ", ".join(insert_columns)
     placeholders = ", ".join(
-        f"CAST(:{col} AS UUID)" if col in _uuid_columns else f":{col}"
+        f"CAST(:{col} AS UUID)" if col in _uuid_columns
+        else f"CAST(:{col} AS TIMESTAMPTZ)" if col in _timestamptz_columns
+        else f":{col}"
         for col in insert_columns
     )
     logger.info(
@@ -2993,6 +3037,21 @@ async def sync_leaflink_line_items(
 
                 # Assert no naive datetimes remain anywhere
                 assert_no_naive_datetimes(insert_params, "params")
+
+                # Convert created_at and updated_at to ISO8601 strings for TIMESTAMPTZ binding
+                if isinstance(insert_params.get("created_at"), datetime):
+                    insert_params["created_at"] = insert_params["created_at"].astimezone(timezone.utc).isoformat()
+                if isinstance(insert_params.get("updated_at"), datetime):
+                    insert_params["updated_at"] = insert_params["updated_at"].astimezone(timezone.utc).isoformat()
+
+                # Log the stringified values
+                logger.error(
+                    "[ORDER_LINES_STRINGIFIED_DATETIME] created_at=%s type=%s updated_at=%s type=%s",
+                    insert_params.get("created_at"),
+                    type(insert_params.get("created_at")).__name__,
+                    insert_params.get("updated_at"),
+                    type(insert_params.get("updated_at")).__name__,
+                )
 
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
