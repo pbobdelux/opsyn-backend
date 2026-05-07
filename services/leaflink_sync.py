@@ -1150,6 +1150,12 @@ async def _insert_line_items_standalone(
             )
             insert_params = normalize_uuid_fields(insert_params)
             insert_params = normalize_datetime_fields(insert_params)
+            # Belt-and-suspenders: explicitly ensure created_at/updated_at are UTC-aware
+            # immediately before execute() so no intermediate mutation can introduce a naive datetime.
+            if "created_at" in insert_params:
+                insert_params["created_at"] = ensure_utc(insert_params["created_at"], "created_at") or utc_now()
+            if "updated_at" in insert_params:
+                insert_params["updated_at"] = ensure_utc(insert_params["updated_at"], "updated_at") or utc_now()
 
             await db.execute(text(line_insert_stmt), insert_params)
             inserted += 1
@@ -1552,6 +1558,12 @@ async def sync_leaflink_orders(
 
                     _li_params = normalize_uuid_fields(_li_params)
                     _li_params = normalize_datetime_fields(_li_params)
+                    # Belt-and-suspenders: explicitly ensure created_at/updated_at are UTC-aware
+                    # immediately before execute() so no intermediate mutation can introduce a naive datetime.
+                    if "created_at" in _li_params:
+                        _li_params["created_at"] = ensure_utc(_li_params["created_at"], "created_at") or utc_now()
+                    if "updated_at" in _li_params:
+                        _li_params["updated_at"] = ensure_utc(_li_params["updated_at"], "updated_at") or utc_now()
                     await db.execute(text(_li_insert_stmt), _li_params)
 
                 total_lines_written += len(normalized_line_items)
@@ -2664,6 +2676,12 @@ async def sync_leaflink_line_items(
                 )
                 insert_params = normalize_uuid_fields(insert_params)
                 insert_params = normalize_datetime_fields(insert_params)
+                # Belt-and-suspenders: explicitly ensure created_at/updated_at are UTC-aware
+                # immediately before execute() so no intermediate mutation can introduce a naive datetime.
+                if "created_at" in insert_params:
+                    insert_params["created_at"] = ensure_utc(insert_params["created_at"], "created_at") or utc_now()
+                if "updated_at" in insert_params:
+                    insert_params["updated_at"] = ensure_utc(insert_params["updated_at"], "updated_at") or utc_now()
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
