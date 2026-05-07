@@ -85,7 +85,7 @@ async def _update_sync_health_phase1(
         async with AsyncSessionLocal() as db:
             _phase1_params = normalize_uuid_fields(
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                {\"brand_id\": brand_id, \"now\": ensure_utc(utc_now(), \"now\"), \"count\": (orders_count or 0)}
+                {"brand_id": brand_id, "now": ensure_utc(utc_now(), "now"), "count": (orders_count or 0)}
             )
             _phase1_params = normalize_datetime_fields(_phase1_params)
             logger.info(
@@ -131,7 +131,7 @@ async def _update_sync_health_phase2(
         async with AsyncSessionLocal() as db:
             _phase2_params = normalize_uuid_fields(
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                {\"brand_id\": brand_id, \"now\": ensure_utc(utc_now(), \"now\"), \"count\": line_items_count}
+                {"brand_id": brand_id, "now": ensure_utc(utc_now(), "now"), "count": line_items_count}
             )
             _phase2_params = normalize_datetime_fields(_phase2_params)
             logger.info(
@@ -175,7 +175,7 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
         async with AsyncSessionLocal() as db:
             _sync_error_params = normalize_uuid_fields(
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                {\"brand_id\": brand_id, \"error\": str(error)[:500], \"now\": ensure_utc(utc_now(), \"now\")}
+                {"brand_id": brand_id, "error": str(error)[:500], "now": ensure_utc(utc_now(), "now")}
             )
             _sync_error_params = normalize_datetime_fields(_sync_error_params)
             logger.info(
@@ -213,7 +213,7 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
     try:
         async with AsyncSessionLocal() as db:
             _retryable_params = normalize_uuid_fields(
-                {\"brand_id\": brand_id, \"error\": error_msg[:500], \"now\": ensure_utc(utc_now(), \"now\")}
+                {"brand_id": brand_id, "error": error_msg[:500], "now": ensure_utc(utc_now(), "now")}
             )
             _retryable_params = normalize_datetime_fields(_retryable_params)
             logger.info(
