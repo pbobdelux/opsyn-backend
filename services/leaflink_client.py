@@ -129,35 +129,61 @@ _last_health_check_ok: bool = False
 _HEALTH_CHECK_CACHE_SECONDS = 30
 
 
-def _check_leaflink_health(base_url: str) -> bool:
-    """Check if LeafLink API is reachable. Cache result for 30 seconds."""
+def _check_leaflink_health() -> bool:
+    """Check if LeafLink API is reachable by probing the canonical orders-received endpoint.
+
+    Probes ONLY https://www.leaflink.com/api/v2/orders-received/ with minimal params.
+    Does NOT use company-scoped paths, marketplace.leaflink.com, or Api-Key auth.
+    Result is cached for 30 seconds to avoid hammering the API.
+    """
     global _last_health_check_time, _last_health_check_ok
 
     now = time.time()
     if _last_health_check_time is not None:
         elapsed = now - _last_health_check_time
         if elapsed < _HEALTH_CHECK_CACHE_SECONDS:
+            logger.info(
+                "[LEAFLINK_HEALTH_CHECK_CACHED] ok=%s age=%.1fs",
+                _last_health_check_ok,
+                elapsed,
+            )
             return _last_health_check_ok
+
+    _health_url = "https://www.leaflink.com/api/v2/orders-received/"
+    _health_params = {"limit": 1, "offset": 0}
 
     try:
         session = _get_global_session()
         resp = session.get(
-            f"{base_url.rstrip('/')}/",
+            _health_url,
+            params=_health_params,
             timeout=5,
             allow_redirects=False,
         )
-        ok = resp.status_code < 400
+        ok = resp.status_code < 500
         _last_health_check_time = now
         _last_health_check_ok = ok
 
         if ok:
-            logger.info("[LEAFLINK_HEALTH_CHECK_OK] status=%s", resp.status_code)
+            logger.info(
+                "[LEAFLINK_HEALTH_CHECK_OK] url=%s status=%s",
+                _health_url,
+                resp.status_code,
+            )
         else:
-            logger.warning("[LEAFLINK_HEALTH_CHECK_FAILED] status=%s", resp.status_code)
+            logger.warning(
+                "[LEAFLINK_HEALTH_CHECK_FAILED] url=%s status=%s",
+                _health_url,
+                resp.status_code,
+            )
 
         return ok
     except Exception as exc:
-        logger.warning("[LEAFLINK_HEALTH_CHECK_FAILED] error=%s", type(exc).__name__)
+        logger.warning(
+            "[LEAFLINK_HEALTH_CHECK_FAILED] url=%s error=%s",
+            _health_url,
+            type(exc).__name__,
+        )
         _last_health_check_time = now
         _last_health_check_ok = False
         return False
@@ -1481,8 +1507,19 @@ class LeafLinkClient:
             "present" if resume_url else "none",
         )
 
-        # Health check gate removed — the successful orders-received request IS the health check.
-        # Skipping _check_leaflink_health() to avoid blocking sync unnecessarily.
+        # Non-blocking health check — probe the canonical endpoint but never abort on failure.
+        # The sync proceeds regardless of the health check result.
+        _health_ok = _check_leaflink_health()
+        if not _health_ok:
+            logger.warning(
+                "[SYNC_HEALTH_BYPASSED] health_check_failed brand=%s — proceeding with fetch anyway",
+                self.brand_id,
+            )
+        logger.info(
+            "[SYNC_PROCEEDING_WITH_FETCH] brand=%s health_ok=%s",
+            self.brand_id,
+            _health_ok,
+        )
 
         all_orders: List[Dict[str, Any]] = []
         pages_fetched = 0
@@ -1670,8 +1707,19 @@ class LeafLinkClient:
                 ``orders``       – list of order dicts
                 ``pages_fetched`` – number of pages retrieved
         """
-        # Health check gate removed — the successful orders-received request IS the health check.
-        # Skipping _check_leaflink_health() to avoid blocking sync unnecessarily.
+        # Non-blocking health check — probe the canonical endpoint but never abort on failure.
+        # The sync proceeds regardless of the health check result.
+        _health_ok = _check_leaflink_health()
+        if not _health_ok:
+            logger.warning(
+                "[SYNC_HEALTH_BYPASSED] health_check_failed brand=%s — proceeding with fetch anyway",
+                self.brand_id,
+            )
+        logger.info(
+            "[SYNC_PROCEEDING_WITH_FETCH] brand=%s health_ok=%s",
+            self.brand_id,
+            _health_ok,
+        )
 
         effective_max = max_pages if max_pages is not None else 10_000
 
