@@ -446,6 +446,50 @@ def safe_uuid(value: str | None) -> str | None:
         return value  # Return as-is if not a valid UUID
 
 
+def safe_uuid_mapped_product(value: Any) -> str | None:
+    """Coerce value to valid UUID string, or return None if invalid.
+
+    Used exclusively for mapped_product_id fields that target UUID columns in
+    PostgreSQL.  Unlike safe_uuid(), this function returns None (not the
+    original value) when the input is not a well-formed UUID, preventing
+    ``column "mapped_product_id" is of type uuid but expression is of type
+    character varying`` errors from sending orders to the dead-letter queue.
+
+    The original mapping value is always preserved in the order/line-item
+    raw_payload JSONB column and can be reprocessed by reconciliation jobs.
+
+    Args:
+        value: Any value (string, UUID object, None, etc.)
+
+    Returns:
+        Valid UUID string in canonical form, or None if invalid.
+
+    Logs:
+        [PRODUCT_MAPPING_INVALID_UUID] if value is not a valid UUID
+    """
+    if value is None or value == "":
+        return None
+
+    if isinstance(value, UUID):
+        return str(value)
+
+    if isinstance(value, str):
+        try:
+            return str(UUID(value))
+        except (ValueError, TypeError):
+            logger.warning(
+                "[PRODUCT_MAPPING_INVALID_UUID] value=%s reason=not_valid_uuid",
+                value[:100] if len(value) > 100 else value,
+            )
+            return None
+
+    logger.warning(
+        "[PRODUCT_MAPPING_INVALID_UUID] value_type=%s reason=unexpected_type",
+        type(value).__name__,
+    )
+    return None
+
+
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None or value == "":
@@ -512,6 +556,24 @@ def normalize_line_items(raw_line_items: Any) -> list[dict[str, Any]]:
         if not sku and not mapping_issue:
             mapping_issue = "Unknown SKU"
 
+        # Coerce mapped_product_id to a valid UUID or None.
+        # safe_uuid_mapped_product() logs [PRODUCT_MAPPING_INVALID_UUID] if the
+        # raw value is present but not a valid UUID.  We then log
+        # [PRODUCT_MAPPING_FALLBACK] + [PRODUCT_MAPPING_NULL_APPLIED] so that
+        # operators can trace exactly which line items had their mapping dropped.
+        _raw_mapped_id = item.get("mapped_product_id")
+        mapped_product_id_coerced = safe_uuid_mapped_product(_raw_mapped_id)
+        if _raw_mapped_id is not None and _raw_mapped_id != "" and mapped_product_id_coerced is None:
+            logger.warning(
+                "[PRODUCT_MAPPING_FALLBACK] sku=%s original_value=%s reason=invalid_uuid",
+                sku,
+                str(_raw_mapped_id)[:100],
+            )
+            logger.warning(
+                "[PRODUCT_MAPPING_NULL_APPLIED] field=mapped_product_id sku=%s",
+                sku,
+            )
+
         normalized.append(
             {
                 "sku": sku,
@@ -521,7 +583,7 @@ def normalize_line_items(raw_line_items: Any) -> list[dict[str, Any]]:
                 "total_price": total_price,
                 "unit_price_cents": decimal_to_cents(unit_price),
                 "total_price_cents": decimal_to_cents(total_price),
-                "mapped_product_id": safe_str(item.get("mapped_product_id")),
+                "mapped_product_id": mapped_product_id_coerced,
                 "mapping_status": mapping_status,
                 "mapping_issue": mapping_issue,
                 "raw_payload": item,
@@ -629,7 +691,7 @@ async def _insert_line_items_standalone(
             }
 
             if enabled_columns.get("mapped_product_id", False):
-                insert_params["mapped_product_id"] = item.get("mapped_product_id")
+                insert_params["mapped_product_id"] = safe_uuid_mapped_product(item.get("mapped_product_id"))
             if enabled_columns.get("mapping_status", False):
                 insert_params["mapping_status"] = item.get("mapping_status")
             if enabled_columns.get("mapping_issue", False):
@@ -934,7 +996,7 @@ async def sync_leaflink_orders(
                             total_price=item.get("total_price"),
                             unit_price_cents=item.get("unit_price_cents"),
                             total_price_cents=item.get("total_price_cents"),
-                            mapped_product_id=item.get("mapped_product_id"),
+                            mapped_product_id=safe_uuid_mapped_product(item.get("mapped_product_id")),
                             mapping_status=item.get("mapping_status"),
                             mapping_issue=item.get("mapping_issue"),
                             raw_payload=make_json_safe(item.get("raw_payload")),
@@ -1842,7 +1904,7 @@ async def sync_leaflink_line_items(
                 }
 
                 if enabled_columns.get("mapped_product_id", False):
-                    insert_params["mapped_product_id"] = item.get("mapped_product_id")
+                    insert_params["mapped_product_id"] = safe_uuid_mapped_product(item.get("mapped_product_id"))
                 if enabled_columns.get("mapping_status", False):
                     insert_params["mapping_status"] = item.get("mapping_status")
                 if enabled_columns.get("mapping_issue", False):
