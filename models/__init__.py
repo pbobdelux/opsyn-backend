@@ -12,6 +12,7 @@ because this __init__.py re-exports everything that was previously in models.py.
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
+import uuid
 
 from sqlalchemy import (
     Boolean,
