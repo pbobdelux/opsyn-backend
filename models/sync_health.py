@@ -6,10 +6,12 @@ Tables:
   - dead_letter_line_items   — line items that failed after max retries
 """
 
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PostgresUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
@@ -36,7 +38,7 @@ class SyncHealth(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    brand_id: Mapped[str] = mapped_column(String(120), nullable=False, unique=True, index=True)
+    brand_id: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False, unique=True, index=True)
 
     last_successful_sync_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -81,7 +83,7 @@ class DeadLetterLineItem(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    brand_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    brand_id: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False, index=True)
     external_order_id: Mapped[str] = mapped_column(String(120), nullable=False)
 
     # Resolved DB order PK (may be None if the parent order was never found)

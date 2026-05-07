@@ -43,7 +43,7 @@ class BrandAPICredential(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    brand_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    brand_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True, nullable=False)
     integration_name: Mapped[str] = mapped_column(String(50), nullable=False, default="leaflink")
     base_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
     api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -72,8 +72,8 @@ class BrandAPICredential(Base):
         default=None,
         comment="LeafLink webhook secret for HMAC-SHA256 signature verification",
     )
-    org_id: Mapped[Optional[str]] = mapped_column(
-        String(120),
+    org_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
         nullable=True,
         default=None,
         comment="Organization UUID for fast tenant resolution from webhook payloads",
@@ -92,8 +92,8 @@ class Order(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    org_id: Mapped[str | None] = mapped_column(String(120), index=True, nullable=True)
-    brand_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    org_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True, nullable=True)
+    brand_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True, nullable=False)
     external_order_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
 
     order_number: Mapped[str | None] = mapped_column(String(120), nullable=True)
@@ -170,8 +170,8 @@ class OrganizationBrandBinding(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    org_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
-    brand_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True, nullable=False)
+    brand_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True, nullable=False)
     brand_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     source: Mapped[str | None] = mapped_column(String(50), nullable=True, default="manual")
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -188,7 +188,7 @@ class Driver(Base):
     __tablename__ = "drivers"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    org_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     # nullable=True in DB for legacy rows; email is required at the API level for new drivers.
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -210,7 +210,7 @@ class Route(Base):
     __tablename__ = "dispatch_routes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    org_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True, nullable=False)
     driver_id: Mapped[int | None] = mapped_column(ForeignKey("drivers.id", ondelete="SET NULL"), nullable=True, index=True)
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
@@ -254,7 +254,7 @@ class TenantCredential(Base):
     __tablename__ = "tenant_credentials"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    org_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False, unique=True)
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True, nullable=False, unique=True)
     api_secret: Mapped[str] = mapped_column(String(255), nullable=False)  # hashed secret
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)

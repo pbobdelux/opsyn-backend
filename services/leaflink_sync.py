@@ -304,6 +304,21 @@ async def _write_sync_dead_letter(
                 "[ORG_ID_BEFORE_SQL] field=org_id value=%s function=_write_sync_dead_letter",
                 _sql_org_id,
             )
+            logger.error(
+                "[FINAL_SQL_PARAMS] org_id=%s type=%s brand_id=%s type=%s function=_write_sync_dead_letter",
+                _sql_org_id,
+                type(_sql_org_id).__name__,
+                _sql_brand_id,
+                type(_sql_brand_id).__name__,
+            )
+            assert (
+                _sql_org_id is None
+                or isinstance(_sql_org_id, (str, UUID))
+            ), f"org_id must be None, str, or UUID, got {type(_sql_org_id)}"
+            assert (
+                _sql_brand_id is None
+                or isinstance(_sql_brand_id, (str, UUID))
+            ), f"brand_id must be None, str, or UUID, got {type(_sql_brand_id)}"
             await db.execute(
                 text("""
                     INSERT INTO sync_dead_letters
