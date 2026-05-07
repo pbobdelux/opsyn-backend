@@ -443,101 +443,57 @@ def ensure_utc(dt: Any) -> "datetime | None":
     return dt.astimezone(timezone.utc)
 
 
-def ensure_utc_aware(dt: Any, field_name: str) -> "datetime | None":
-    """Normalize datetime and log only if it was naive (validation failure)."""
-    normalized = normalize_datetime(dt)
+def strip_provider_dates_from_params(params: dict, timestamp_field_names: list[str] = None) -> dict:
+    """Remove all provider-sourced date fields from SQL params.
 
-    if normalized is None:
-        return None
+    Keeps only server-owned operational timestamps:
+    - created_at (set to utc_now())
+    - updated_at (set to utc_now())
+    - synced_at (set to utc_now())
+    - last_synced_at (set to utc_now())
 
-    if normalized.tzinfo is None:
-        logger.error(
-            "[DT_VALIDATION_FAILED] field=%s value=%s tzinfo=None — fixing to UTC",
-            field_name,
-            normalized,
-        )
-        normalized = normalized.replace(tzinfo=timezone.utc)
-
-    return normalized
-
-
-def normalize_all_datetimes(params: dict) -> dict:
-    """Normalize all datetime/date parameters to UTC-aware datetimes.
-
-    Iterates through params dict and ensures all datetime-like values are
-    timezone-aware UTC datetimes. Handles:
-    - datetime objects (naive → attach UTC, aware → convert to UTC)
-    - date objects (convert to UTC datetime at midnight)
-    - ISO datetime strings in timestamp fields (parse and convert to UTC)
-    - Other values (pass through unchanged)
+    Removes all external/provider dates:
+    - external_created_at → NULL
+    - external_updated_at → NULL
+    - Any other *_date, *_at, *_time field from provider payload
 
     Args:
-        params: Dictionary of SQL parameters
+        params: SQL parameters dict
+        timestamp_field_names: Optional list of field names to treat as timestamps
 
     Returns:
-        Dictionary with all datetime values normalized to UTC-aware datetimes
+        Cleaned params dict with only server timestamps
     """
-    timestamp_field_suffixes = ('_at', '_date', '_time')
+    if timestamp_field_names is None:
+        timestamp_field_names = [
+            'external_created_at', 'external_updated_at', 'paid_date', 'ship_date',
+            'approved_at', 'fulfilled_at', 'cancelled_at', 'delivery_date',
+            'expected_delivery_date', 'shipped_date', 'order_date', 'placed_at'
+        ]
 
-    for key, value in params.items():
-        if value is None:
-            continue
-
-        # Check if this field name suggests it's a timestamp field
-        is_timestamp_field = any(key.endswith(suffix) for suffix in timestamp_field_suffixes)
-
-        # Handle datetime objects
-        if isinstance(value, datetime):
-            if value.tzinfo is None:
-                # Naive datetime - attach UTC
-                params[key] = value.replace(tzinfo=timezone.utc)
-                logger.error(
-                    "[DATETIME_FINAL_PARAMS_AUDIT] key=%s value=%s type=datetime tzinfo=None→UTC",
-                    key,
-                    params[key],
-                )
-            else:
-                # Aware datetime - convert to UTC
-                params[key] = value.astimezone(timezone.utc)
-                logger.error(
-                    "[DATETIME_FINAL_PARAMS_AUDIT] key=%s value=%s type=datetime tzinfo=%s→UTC",
-                    key,
-                    params[key],
-                    value.tzinfo,
-                )
-
-        # Handle date objects (not datetime)
-        elif isinstance(value, date) and not isinstance(value, datetime):
-            # Convert date to UTC datetime at midnight
-            params[key] = datetime.combine(value, datetime.min.time()).replace(tzinfo=timezone.utc)
-            logger.error(
-                "[DATETIME_FINAL_PARAMS_AUDIT] key=%s value=%s type=date→datetime_utc",
-                key,
-                params[key],
+    # Remove all provider date fields
+    for field in timestamp_field_names:
+        if field in params:
+            del params[field]
+            logger.info(
+                "[STRIP_PROVIDER_DATE] field=%s reason=removed_from_sql_params",
+                field,
             )
 
-        # Handle ISO datetime strings in timestamp fields
-        elif isinstance(value, str) and is_timestamp_field:
-            try:
-                # Try to parse as ISO datetime
-                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                else:
-                    parsed = parsed.astimezone(timezone.utc)
-                params[key] = parsed
-                logger.error(
-                    "[DATETIME_FINAL_PARAMS_AUDIT] key=%s value=%s type=string→datetime_utc",
-                    key,
-                    params[key],
-                )
-            except (ValueError, TypeError):
-                # Not a valid ISO datetime - leave as-is
-                logger.error(
-                    "[DATETIME_FINAL_PARAMS_AUDIT] key=%s value=%s type=string_not_datetime",
-                    key,
-                    value[:100] if len(value) > 100 else value,
-                )
+    # Ensure operational timestamps are server UTC
+    now = utc_now()
+    params['created_at'] = now
+    params['updated_at'] = now
+    params['synced_at'] = now
+    params['last_synced_at'] = now
+
+    logger.info(
+        "[OPERATIONAL_TIMESTAMPS_SET] created_at=%s updated_at=%s synced_at=%s last_synced_at=%s",
+        now,
+        now,
+        now,
+        now,
+    )
 
     return params
 
@@ -918,9 +874,13 @@ async def _insert_line_items_standalone(
                 isinstance(insert_params.get("mapped_product_id"), UUID),
             )
 
-            # Universal datetime normalization — coerce ALL datetime/date
-            # params to UTC-aware before SQL execution.
-            insert_params = normalize_all_datetimes(insert_params)
+            # Raw-first ingestion: strip all provider dates, use only server UTC
+            insert_params = strip_provider_dates_from_params(insert_params)
+            logger.info(
+                "[RAW_FIRST_INGESTION] action=insert_line_item order_id=%s sku=%s",
+                insert_params.get('order_id'),
+                insert_params.get('sku'),
+            )
             await db.execute(text(line_insert_stmt), insert_params)
             inserted += 1
 
@@ -1659,11 +1619,14 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 update_params.get("updated_at"),
                                 type(update_params.get("updated_at")),
                             )
-                            # Universal datetime normalization — coerce ALL datetime/date
-                            # params to UTC-aware before SQL execution, not just the known
-                            # operational fields. Prevents "can't subtract offset-naive and
-                            # offset-aware datetimes" from any LeafLink payload field.
-                            update_params = normalize_all_datetimes(update_params)
+                            # Raw-first ingestion: strip all provider dates, use only server UTC
+                            update_params = strip_provider_dates_from_params(update_params)
+                            logger.info(
+                                "[RAW_FIRST_INGESTION] action=update order_id=%s brand_id=%s external_order_id=%s",
+                                update_params.get('id'),
+                                update_params.get('brand_id'),
+                                update_params.get('external_order_id'),
+                            )
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -1779,11 +1742,13 @@ INSERT INTO orders (
                                 insert_params.get("updated_at"),
                                 type(insert_params.get("updated_at")),
                             )
-                            # Universal datetime normalization — coerce ALL datetime/date
-                            # params to UTC-aware before SQL execution, not just the known
-                            # operational fields. Prevents "can't subtract offset-naive and
-                            # offset-aware datetimes" from any LeafLink payload field.
-                            insert_params = normalize_all_datetimes(insert_params)
+                            # Raw-first ingestion: strip all provider dates, use only server UTC
+                            insert_params = strip_provider_dates_from_params(insert_params)
+                            logger.info(
+                                "[RAW_FIRST_INGESTION] action=insert brand_id=%s external_order_id=%s",
+                                insert_params.get('brand_id'),
+                                insert_params.get('external_order_id'),
+                            )
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
@@ -2324,9 +2289,13 @@ async def sync_leaflink_line_items(
                     isinstance(insert_params.get("mapped_product_id"), str),
                     isinstance(insert_params.get("mapped_product_id"), UUID),
                 )
-                # Universal datetime normalization — coerce ALL datetime/date
-                # params to UTC-aware before SQL execution.
-                insert_params = normalize_all_datetimes(insert_params)
+                # Raw-first ingestion: strip all provider dates, use only server UTC
+                insert_params = strip_provider_dates_from_params(insert_params)
+                logger.info(
+                    "[RAW_FIRST_INGESTION] action=upsert_line_item order_id=%s sku=%s",
+                    insert_params.get('order_id'),
+                    insert_params.get('sku'),
+                )
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
