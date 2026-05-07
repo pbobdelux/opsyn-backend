@@ -15,6 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models import Order
 from models.driver import Driver
+from models.driver_location import DriverLocation
+from models.driver_route_history import DriverRouteHistory
 from models.route import Route
 from models.route_event import RouteEvent
 from models.route_stop import RouteStop
@@ -1069,4 +1071,361 @@ async def get_route_events(
         "ok": True,
         "route_id": route_id,
         "events": serialized_events,
+    })
+
+
+# =============================================================================
+# Endpoint: GET /admin/drivers/{driver_id}/location
+# =============================================================================
+
+
+@router.get("/drivers/{driver_id}/location")
+async def get_driver_current_location(
+    driver_id: str,
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return the most recent GPS location for a driver.
+
+    Returns 404 if no location data exists for this driver.
+    """
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+
+    try:
+        driver_uuid = UUID(driver_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="driver_id must be a valid UUID")
+
+    result = await db.execute(
+        select(DriverLocation)
+        .where(
+            DriverLocation.driver_id == driver_uuid,
+            DriverLocation.org_id == org_id,
+        )
+        .order_by(DriverLocation.recorded_at.desc())
+        .limit(1)
+    )
+    loc = result.scalar_one_or_none()
+
+    if loc is None:
+        raise HTTPException(status_code=404, detail="No location data found for this driver")
+
+    logger.info(
+        "[DRIVER_LOCATION_CURRENT] org=%s driver=%s",
+        org_id,
+        driver_id,
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "location": {
+            "driver_id": loc.driver_id,
+            "latitude": loc.latitude,
+            "longitude": loc.longitude,
+            "speed_mph": loc.speed_mph,
+            "heading": loc.heading,
+            "battery_percent": loc.battery_percent,
+            "is_moving": loc.is_moving,
+            "recorded_at": loc.recorded_at,
+            "route_id": loc.route_id,
+        },
+    })
+
+
+# =============================================================================
+# Endpoint: GET /admin/drivers/{driver_id}/location/history
+# =============================================================================
+
+
+@router.get("/drivers/{driver_id}/location/history")
+async def get_driver_location_history(
+    driver_id: str,
+    since: str = Query(..., description="ISO 8601 timestamp (required)"),
+    until: Optional[str] = Query(default=None, description="ISO 8601 timestamp (default: now)"),
+    limit: int = Query(default=500, ge=1, le=5000),
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return GPS location history for a driver between since and until.
+
+    Points are ordered by recorded_at ASC. Maximum 5000 points per request.
+    """
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+
+    try:
+        driver_uuid = UUID(driver_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="driver_id must be a valid UUID")
+
+    try:
+        since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="since must be a valid ISO 8601 timestamp",
+        )
+
+    until_dt: datetime
+    if until:
+        try:
+            until_dt = datetime.fromisoformat(until.replace("Z", "+00:00"))
+            if until_dt.tzinfo is None:
+                until_dt = until_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="until must be a valid ISO 8601 timestamp",
+            )
+    else:
+        until_dt = datetime.now(timezone.utc)
+
+    result = await db.execute(
+        select(DriverLocation)
+        .where(
+            DriverLocation.driver_id == driver_uuid,
+            DriverLocation.org_id == org_id,
+            DriverLocation.recorded_at >= since_dt,
+            DriverLocation.recorded_at <= until_dt,
+        )
+        .order_by(DriverLocation.recorded_at.asc())
+        .limit(limit)
+    )
+    locations = result.scalars().all()
+
+    serialized = [
+        make_json_safe({
+            "latitude": loc.latitude,
+            "longitude": loc.longitude,
+            "speed_mph": loc.speed_mph,
+            "heading": loc.heading,
+            "accuracy_meters": loc.accuracy_meters,
+            "battery_percent": loc.battery_percent,
+            "is_moving": loc.is_moving,
+            "source": loc.source,
+            "recorded_at": loc.recorded_at,
+            "route_id": loc.route_id,
+        })
+        for loc in locations
+    ]
+
+    logger.info(
+        "[DRIVER_LOCATION_HISTORY] org=%s driver=%s count=%s",
+        org_id,
+        driver_id,
+        len(serialized),
+    )
+
+    return {"ok": True, "count": len(serialized), "locations": serialized}
+
+
+# =============================================================================
+# Endpoint: GET /admin/routes/{route_id}/tracking
+# =============================================================================
+
+
+@router.get("/routes/{route_id}/tracking")
+async def get_route_tracking(
+    route_id: str,
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return a combined real-time tracking view for a route.
+
+    Includes:
+    - current_location: latest GPS ping for the assigned driver
+    - history_events: all driver_route_history rows ordered by recorded_at ASC
+    - stops: all route_stops with status and timestamps
+    """
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+    route = await _get_route_or_404(db, route_id, org_id)
+
+    # Current location for assigned driver
+    current_location = None
+    if route.assigned_driver_id is not None:
+        loc_result = await db.execute(
+            select(DriverLocation)
+            .where(
+                DriverLocation.driver_id == route.assigned_driver_id,
+                DriverLocation.org_id == org_id,
+            )
+            .order_by(DriverLocation.recorded_at.desc())
+            .limit(1)
+        )
+        loc = loc_result.scalar_one_or_none()
+        if loc is not None:
+            current_location = make_json_safe({
+                "driver_id": loc.driver_id,
+                "latitude": loc.latitude,
+                "longitude": loc.longitude,
+                "speed_mph": loc.speed_mph,
+                "heading": loc.heading,
+                "battery_percent": loc.battery_percent,
+                "is_moving": loc.is_moving,
+                "recorded_at": loc.recorded_at,
+            })
+
+    # Route history events
+    history_result = await db.execute(
+        select(DriverRouteHistory)
+        .where(DriverRouteHistory.route_id == route.id)
+        .order_by(DriverRouteHistory.recorded_at.asc())
+    )
+    history_events = history_result.scalars().all()
+
+    serialized_history = [
+        make_json_safe({
+            "id": event.id,
+            "event_type": event.event_type,
+            "stop_id": event.stop_id,
+            "latitude": event.latitude,
+            "longitude": event.longitude,
+            "address_snapshot": event.address_snapshot,
+            "event_metadata": event.event_metadata,
+            "notes": event.notes,
+            "recorded_at": event.recorded_at,
+        })
+        for event in history_events
+    ]
+
+    # Stops
+    stops_result = await db.execute(
+        select(RouteStop)
+        .where(RouteStop.route_id == route.id)
+        .order_by(RouteStop.stop_order.asc())
+    )
+    stops = stops_result.scalars().all()
+
+    serialized_stops = [
+        make_json_safe({
+            "id": stop.id,
+            "stop_order": stop.stop_order,
+            "customer_name": stop.customer_name,
+            "stop_name": stop.stop_name,
+            "address": stop.address,
+            "status": stop.status,
+            "completed_at": stop.completed_at,
+            "updated_at": stop.updated_at,
+        })
+        for stop in stops
+    ]
+
+    logger.info(
+        "[ROUTE_TRACKING] org=%s route=%s",
+        org_id,
+        route_id,
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "route_id": route_id,
+        "current_location": current_location,
+        "history_events": serialized_history,
+        "stops": serialized_stops,
+    })
+
+
+# =============================================================================
+# Endpoint: GET /admin/routes/{route_id}/timeline
+# =============================================================================
+
+
+@router.get("/routes/{route_id}/timeline")
+async def get_route_timeline(
+    route_id: str,
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return a human-readable timeline for a route built from driver_route_history.
+
+    Events are ordered chronologically. Times are formatted as "H:MM AM/PM"
+    using the UTC timestamp (ISO fallback if no timezone info).
+    """
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+    route = await _get_route_or_404(db, route_id, org_id)
+
+    history_result = await db.execute(
+        select(DriverRouteHistory)
+        .where(DriverRouteHistory.route_id == route.id)
+        .order_by(DriverRouteHistory.recorded_at.asc())
+    )
+    history_events = history_result.scalars().all()
+
+    # Build stop name lookup for stop_id → display name
+    stops_result = await db.execute(
+        select(RouteStop).where(RouteStop.route_id == route.id)
+    )
+    stops = stops_result.scalars().all()
+    stop_name_map = {
+        str(s.id): s.customer_name or s.stop_name or s.address or "Stop"
+        for s in stops
+    }
+
+    # Human-readable event labels
+    _event_labels = {
+        "route_started": "Route started",
+        "stop_arrived": "Arrived at stop",
+        "stop_departed": "Departed stop",
+        "stop_completed": "Stop completed",
+        "stop_failed": "Stop failed",
+        "stop_skipped": "Stop skipped",
+        "route_completed": "Route completed",
+        "route_paused": "Route paused",
+        "route_resumed": "Route resumed",
+        "break_started": "Break started",
+        "break_ended": "Break ended",
+        "deviation_detected": "Route deviation detected",
+    }
+
+    timeline = []
+    for event in history_events:
+        # Format time
+        ts = event.recorded_at
+        if ts is not None:
+            try:
+                time_str = ts.strftime("%-I:%M %p")
+            except ValueError:
+                time_str = ts.isoformat()
+        else:
+            time_str = "Unknown time"
+
+        label = _event_labels.get(event.event_type, event.event_type)
+
+        # Build location string
+        location_str = event.address_snapshot
+        if location_str is None and event.stop_id is not None:
+            location_str = stop_name_map.get(str(event.stop_id))
+        if location_str is None and event.latitude is not None and event.longitude is not None:
+            location_str = f"{event.latitude}, {event.longitude}"
+
+        timeline.append({
+            "time": time_str,
+            "event": label,
+            "event_type": event.event_type,
+            "location": location_str,
+            "stop_id": str(event.stop_id) if event.stop_id else None,
+            "notes": event.notes,
+            "recorded_at": event.recorded_at.isoformat() if event.recorded_at else None,
+        })
+
+    logger.info(
+        "[ROUTE_TIMELINE] org=%s route=%s events=%s",
+        org_id,
+        route_id,
+        len(timeline),
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "route_id": route_id,
+        "timeline": timeline,
     })
