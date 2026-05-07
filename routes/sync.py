@@ -276,8 +276,21 @@ async def replay_dead_letter_item(
         )
         logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id)
         logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id)
+        logger.info(
+            "[REPLAY_UPSERT_ATTEMPT] item_id=%s order_id=%s sku=%s product_name=%s",
+            item_id,
+            params.get("order_id"),
+            params.get("sku"),
+            params.get("product_name"),
+        )
         await db.execute(text(upsert_stmt), params)
         await db.commit()
+        logger.info(
+            "[REPLAY_UPSERT_SUCCESS] item_id=%s order_id=%s sku=%s",
+            item_id,
+            params.get("order_id"),
+            params.get("sku"),
+        )
 
         # Remove from dead letter on success
         await db.execute(
@@ -304,15 +317,29 @@ async def replay_dead_letter_item(
 
     except Exception as exc:
         await db.rollback()
-        logger.error(
-            "[DEAD_LETTER_REPLAY_FAILED] item_id=%s error=%s",
-            item_id,
-            str(exc)[:300],
-        )
+        exc_str = str(exc)
+        is_duplicate = "duplicate key" in exc_str.lower() or "uq_order_line_identity" in exc_str.lower()
+        if is_duplicate:
+            logger.error(
+                "[DEAD_LETTER_REPLAY_DUPLICATE_KEY] item_id=%s order_id=%s sku=%s"
+                " product_name=%s constraint=uq_order_line_identity error=%s",
+                item_id,
+                params.get("order_id"),
+                params.get("sku"),
+                params.get("product_name"),
+                exc_str[:500],
+            )
+        else:
+            logger.error(
+                "[DEAD_LETTER_REPLAY_FAILED] item_id=%s error=%s",
+                item_id,
+                exc_str[:300],
+            )
         return {
             "ok": False,
-            "error": str(exc)[:500],
+            "error": exc_str[:500],
             "item_id": item_id,
+            "duplicate_key_violation": is_duplicate,
         }
 
 

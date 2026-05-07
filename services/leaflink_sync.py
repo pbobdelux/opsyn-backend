@@ -293,16 +293,32 @@ async def _write_sync_dead_letter(
                 else json.dumps({})
             )
             now = ensure_utc(utc_now())
-            # Re-coerce immediately before SQL to guarantee no raw value slips through
-            _sql_brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id
-            _sql_org_id = safe_uuid_for_db(org_id, "org_id")
-            logger.info(
-                "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s function=_write_sync_dead_letter",
-                _sql_brand_id,
-            )
-            logger.info(
-                "[ORG_ID_BEFORE_SQL] field=org_id value=%s function=_write_sync_dead_letter",
-                _sql_org_id,
+            # Build params dict first so final coercion can be applied directly
+            # into it immediately before execute() — belt-and-suspenders guard.
+            params = {
+                "source": source,
+                "brand_id": safe_uuid_for_db(brand_id, "brand_id") or brand_id,
+                "org_id": safe_uuid_for_db(org_id, "org_id"),
+                "external_id": external_id,
+                "order_number": order_number,
+                "raw_payload": raw_payload_str,
+                "error_stage": error_stage,
+                "error_message": error_message[:2000],
+                "now": now,
+            }
+            # FINAL coercion — apply safe_uuid_for_db() directly into the params
+            # dict immediately before execute() so no mutation after coercion can
+            # slip through.  This is the last line of defence against the
+            # "column org_id is of type uuid but expression is of type character
+            # varying" error.
+            params["org_id"] = safe_uuid_for_db(params.get("org_id"), "org_id")
+            params["brand_id"] = safe_uuid_for_db(params.get("brand_id"), "brand_id") or params.get("brand_id")
+            logger.error(
+                "[DEAD_LETTER_FINAL_TYPES] org_id=%s org_type=%s brand_id=%s brand_type=%s",
+                params.get("org_id"),
+                type(params.get("org_id")),
+                params.get("brand_id"),
+                type(params.get("brand_id")),
             )
             await db.execute(
                 text("""
@@ -315,17 +331,7 @@ async def _write_sync_dead_letter(
                          CAST(:raw_payload AS jsonb), :error_stage, :error_message,
                          0, :now)
                 """),
-                {
-                    "source": source,
-                    "brand_id": _sql_brand_id,
-                    "org_id": _sql_org_id,
-                    "external_id": external_id,
-                    "order_number": order_number,
-                    "raw_payload": raw_payload_str,
-                    "error_stage": error_stage,
-                    "error_message": error_message[:2000],
-                    "now": now,
-                },
+                params,
             )
             await db.commit()
         logger.warning(
