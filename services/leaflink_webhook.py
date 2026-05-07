@@ -393,6 +393,20 @@ async def upsert_webhook_order(
         )
         existing = existing_result.scalar_one_or_none()
 
+        # Re-coerce immediately before every DB write — belt-and-suspenders guard
+        _write_org_id = safe_uuid_for_db(org_id, "org_id")
+        _write_brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id
+        logger.info(
+            "[ORG_ID_BEFORE_SQL] field=org_id value=%s external_id=%s function=upsert_webhook_order",
+            _write_org_id,
+            external_id,
+        )
+        logger.info(
+            "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s external_id=%s function=upsert_webhook_order",
+            _write_brand_id,
+            external_id,
+        )
+
         if existing:
             existing.customer_name = customer_name
             existing.status = status
@@ -409,14 +423,14 @@ async def upsert_webhook_order(
             existing.last_synced_at = now
             existing.external_created_at = external_created_at
             existing.external_updated_at = external_updated_at
-            if org_id:
-                existing.org_id = org_id
+            if _write_org_id:
+                existing.org_id = _write_org_id
             order_row = existing
             action = "updated"
         else:
             order_row = Order(
-                org_id=org_id,
-                brand_id=brand_id,
+                org_id=_write_org_id,
+                brand_id=_write_brand_id,
                 external_order_id=external_id,
                 order_number=order_number,
                 customer_name=customer_name,
@@ -524,6 +538,15 @@ async def process_leaflink_webhook(
     # errors from sending webhook orders to the dead-letter queue.
     brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
     org_id = safe_uuid_for_db(org_id, "org_id")
+
+    logger.info(
+        "[ORG_ID_BEFORE_SQL] field=org_id value=%s function=process_leaflink_webhook",
+        org_id,
+    )
+    logger.info(
+        "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s function=process_leaflink_webhook",
+        brand_id,
+    )
 
     # ------------------------------------------------------------------ #
     # Step 2: Verify signature                                            #

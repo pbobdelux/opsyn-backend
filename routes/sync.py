@@ -199,6 +199,20 @@ async def replay_dead_letter_item(
         brand_id,
     )
 
+    # Re-coerce immediately before SQL params — belt-and-suspenders guard
+    _sql_org_id = safe_uuid_for_db(org_id, "org_id")
+    _sql_brand_id = safe_uuid_for_db(brand_id, "brand_id")
+    logger.info(
+        "[ORG_ID_BEFORE_SQL] field=org_id value=%s item_id=%s function=replay_dead_letter_item",
+        _sql_org_id,
+        item_id,
+    )
+    logger.info(
+        "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s item_id=%s function=replay_dead_letter_item",
+        _sql_brand_id,
+        item_id,
+    )
+
     params: dict = {
         "order_id": item.order_id,
         "sku": item.sku or "unknown",

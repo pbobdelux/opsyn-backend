@@ -282,6 +282,13 @@ async def reprocess_dead_letters(
 
     now = datetime.now(timezone.utc)
 
+    # Re-coerce immediately before SQL — belt-and-suspenders guard
+    _sql_brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id
+    logger.info(
+        "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s function=reprocess_dead_letters",
+        _sql_brand_id,
+    )
+
     # Fetch unresolved dead-letter records for this brand
     try:
         result = await db.execute(
@@ -293,7 +300,7 @@ async def reprocess_dead_letters(
                 ORDER BY created_at ASC
                 LIMIT :limit
             """),
-            {"brand_id": brand_id, "limit": limit},
+            {"brand_id": _sql_brand_id, "limit": limit},
         )
         rows = result.fetchall()
     except Exception as exc:
@@ -445,6 +452,13 @@ async def reprocess_order(
 
     now = datetime.now(timezone.utc)
 
+    # Re-coerce immediately before SQL — belt-and-suspenders guard
+    _sql_brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id
+    logger.info(
+        "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s function=reprocess_order",
+        _sql_brand_id,
+    )
+
     # Fetch the most recent unresolved dead-letter record for this order
     try:
         result = await db.execute(
@@ -457,7 +471,7 @@ async def reprocess_order(
                 ORDER BY created_at DESC
                 LIMIT 1
             """),
-            {"brand_id": brand_id, "external_id": order_id},
+            {"brand_id": _sql_brand_id, "external_id": order_id},
         )
         row = result.fetchone()
     except Exception as exc:
@@ -608,6 +622,13 @@ async def backfill_normalized_dates(
 
     now = datetime.now(timezone.utc)
 
+    # Re-coerce immediately before SQL — belt-and-suspenders guard
+    _sql_brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id
+    logger.info(
+        "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s function=backfill_normalized_dates",
+        _sql_brand_id,
+    )
+
     # Fetch orders with NULL external timestamps that have raw_payload
     try:
         result = await db.execute(
@@ -620,7 +641,7 @@ async def backfill_normalized_dates(
                 ORDER BY id ASC
                 LIMIT :limit
             """),
-            {"brand_id": brand_id, "limit": limit},
+            {"brand_id": _sql_brand_id, "limit": limit},
         )
         rows = result.fetchall()
     except Exception as exc:
