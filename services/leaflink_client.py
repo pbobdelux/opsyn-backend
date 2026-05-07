@@ -1052,28 +1052,13 @@ class LeafLinkClient:
         }
 
         # ---------------------------------------------------------------------------
-        # Date filter handling — disabled on first call to test without filters.
-        # If date filters are the cause of zero results, removing them will return
-        # orders and confirm the filter range is the problem.
+        # Date filters are permanently disabled — bulletproof mode.
+        # Fetch all orders using limit/offset only; no modified__gte or modified__lte.
         # ---------------------------------------------------------------------------
-        if skip_date_filters:
-            # Testing without date filters — helps isolate whether filters cause zero results
-            logger.info(
-                "[LEAFLINK_REQUEST] date_filters=none (testing without filters)"
-                " brand_id=%s",
-                self.brand_id,
-            )
-        else:
-            if modified__gte:
-                params["modified__gte"] = modified__gte
-            if modified__lte:
-                params["modified__lte"] = modified__lte
-            logger.info(
-                "[LEAFLINK_REQUEST] date_filters=modified__gte=%s modified__lte=%s brand_id=%s",
-                modified__gte or "none",
-                modified__lte or "none",
-                self.brand_id,
-            )
+        logger.info(
+            "[LEAFLINK_FILTER_DISABLED] filter_type=modified_date reason=bulletproof_mode brand_id=%s",
+            self.brand_id,
+        )
 
         if status:
             params["status"] = status
@@ -1496,21 +1481,8 @@ class LeafLinkClient:
             "present" if resume_url else "none",
         )
 
-        _health_ok = _check_leaflink_health(self.base_url)
-        logger.info(
-            "[SYNC_HEALTH_CHECK] brand=%s base_url=%s health_ok=%s",
-            self.brand_id,
-            self.base_url,
-            _health_ok,
-        )
-        if not _health_ok:
-            logger.error(
-                "[LEAFLINK_SYNC_SKIPPED] health_check_failed brand=%s base_url=%s"
-                " — returning empty orders list, this may cause fetched_count=0",
-                self.brand_id,
-                self.base_url,
-            )
-            return {"orders": [], "pages_fetched": 0, "next_url": None, "next_page": None, "total_count": None, "total_pages": None}
+        # Health check gate removed — the successful orders-received request IS the health check.
+        # Skipping _check_leaflink_health() to avoid blocking sync unnecessarily.
 
         all_orders: List[Dict[str, Any]] = []
         pages_fetched = 0
@@ -1657,6 +1629,9 @@ class LeafLinkClient:
             total_count,
         )
 
+        # [LEAFLINK_FETCH_OK] Successful fetch — raw_count is the health signal
+        logger.info("[LEAFLINK_FETCH_OK] raw_count=%s brand=%s", len(all_orders), self.brand_id)
+
         return {
             "orders": all_orders,
             "pages_fetched": pages_fetched,
@@ -1695,9 +1670,8 @@ class LeafLinkClient:
                 ``orders``       – list of order dicts
                 ``pages_fetched`` – number of pages retrieved
         """
-        if not _check_leaflink_health(self.base_url):
-            logger.warning("[LEAFLINK_SYNC_SKIPPED] health_check_failed brand=%s", self.brand_id)
-            return {"orders": [], "pages_fetched": 0}
+        # Health check gate removed — the successful orders-received request IS the health check.
+        # Skipping _check_leaflink_health() to avoid blocking sync unnecessarily.
 
         effective_max = max_pages if max_pages is not None else 10_000
 
@@ -1813,4 +1787,6 @@ class LeafLinkClient:
             pages_fetched,
             brand,
         )
+        # [LEAFLINK_FETCH_OK] Successful fetch — raw_count is the health signal
+        logger.info("[LEAFLINK_FETCH_OK] raw_count=%s brand=%s", len(all_orders), brand)
         return {"orders": all_orders, "pages_fetched": pages_fetched}
