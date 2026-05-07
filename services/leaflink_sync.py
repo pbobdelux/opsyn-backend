@@ -83,6 +83,10 @@ async def _update_sync_health_phase1(
     """Record that Phase 1 started/completed for this brand."""
     try:
         async with AsyncSessionLocal() as db:
+            _phase1_params = normalize_uuid_fields(
+                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+                {"brand_id": brand_id, "now": ensure_utc(utc_now()), "count": (orders_count or 0)}
+            )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, updated_at)
@@ -92,8 +96,7 @@ async def _update_sync_health_phase1(
                         total_orders_synced = sync_health.total_orders_synced + :count,
                         updated_at = :now
                 """),
-                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                {"brand_id": brand_id, "now": ensure_utc(utc_now()), "count": (orders_count or 0)},
+                _phase1_params,
             )
             await db.commit()
             logger.info(
@@ -116,6 +119,10 @@ async def _update_sync_health_phase2(
     """Record that Phase 2 completed successfully for this brand."""
     try:
         async with AsyncSessionLocal() as db:
+            _phase2_params = normalize_uuid_fields(
+                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+                {"brand_id": brand_id, "now": ensure_utc(utc_now()), "count": line_items_count}
+            )
             await db.execute(
                 text("""
                     UPDATE sync_health SET
@@ -126,8 +133,7 @@ async def _update_sync_health_phase2(
                         updated_at = :now
                     WHERE brand_id = :brand_id
                 """),
-                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                {"brand_id": brand_id, "now": ensure_utc(utc_now()), "count": line_items_count},
+                _phase2_params,
             )
             await db.commit()
             logger.info(
@@ -147,6 +153,10 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
     """Increment consecutive_failures and record the last error message."""
     try:
         async with AsyncSessionLocal() as db:
+            _sync_error_params = normalize_uuid_fields(
+                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+                {"brand_id": brand_id, "error": str(error)[:500], "now": ensure_utc(utc_now())}
+            )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
@@ -156,8 +166,7 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
                         consecutive_failures = sync_health.consecutive_failures + 1,
                         updated_at = :now
                 """),
-                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                {"brand_id": brand_id, "error": str(error)[:500], "now": ensure_utc(utc_now())},
+                _sync_error_params,
             )
             await db.commit()
     except Exception as exc:
@@ -172,6 +181,9 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
     """Record a retryable (transient) sync error in sync_health without incrementing consecutive_failures."""
     try:
         async with AsyncSessionLocal() as db:
+            _retryable_params = normalize_uuid_fields(
+                {"brand_id": brand_id, "error": error_msg[:500], "now": ensure_utc(utc_now())}
+            )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
@@ -180,7 +192,7 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
                         last_error = :error,
                         updated_at = :now
                 """),
-                {"brand_id": brand_id, "error": error_msg[:500], "now": ensure_utc(utc_now())},
+                _retryable_params,
             )
             await db.commit()
     except Exception as exc:
@@ -223,6 +235,7 @@ async def _dead_letter_line_item(
             # Restore 'now' if sanitize_sql_params removed it (it's not in the operational whitelist)
             if "now" not in _dead_letter_params:
                 _dead_letter_params["now"] = ensure_utc(utc_now())
+            _dead_letter_params = normalize_uuid_fields(_dead_letter_params)
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -323,6 +336,7 @@ async def _write_sync_dead_letter(
                 params.get("brand_id"),
                 type(params.get("brand_id")),
             )
+            params = normalize_uuid_fields(params)
             await db.execute(
                 text("""
                     INSERT INTO sync_dead_letters
@@ -674,6 +688,79 @@ def safe_uuid_for_db(value: Any, field_name: str = "uuid_field") -> str | None:
     return None
 
 
+def normalize_uuid_fields(params: dict) -> dict:
+    """Normalize UUID-type parameters before SQL execution.
+
+    Iterates all SQL params and for any key ending in:
+    - "_id"
+    - "_uuid"
+    - "mapped_product_id"
+
+    Apply transformations:
+    - None stays None
+    - Empty string becomes None
+    - Valid UUID strings become uuid.UUID(value)
+    - Invalid UUID strings: log [UUID_PARAM_INVALID], set to None, NEVER raise
+
+    Returns normalized params dict.
+    """
+    normalized = dict(params)
+
+    for key, value in params.items():
+        is_uuid_field = (
+            key.endswith("_id")
+            or key.endswith("_uuid")
+            or key == "mapped_product_id"
+        )
+        if not is_uuid_field:
+            continue
+
+        original_type = type(value).__name__
+
+        if value is None:
+            # Keep as None — no transformation needed
+            continue
+
+        if value == "":
+            normalized[key] = None
+            logger.info(
+                "[UUID_PARAM_NORMALIZED] key=%s original_type=%s final_type=%s reason=empty_string_to_null",
+                key,
+                original_type,
+                "NoneType",
+            )
+            continue
+
+        if isinstance(value, UUID):
+            # Already a UUID object — pass through as-is (asyncpg accepts uuid.UUID)
+            logger.info(
+                "[UUID_PARAM_NORMALIZED] key=%s original_type=UUID final_type=UUID",
+                key,
+            )
+            continue
+
+        if isinstance(value, str):
+            try:
+                normalized[key] = UUID(value)
+                logger.info(
+                    "[UUID_PARAM_NORMALIZED] key=%s original_type=str final_type=UUID",
+                    key,
+                )
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[UUID_PARAM_INVALID] key=%s value=%s reason=not_valid_uuid setting_to_null",
+                    key,
+                    value[:100] if len(value) > 100 else value,
+                )
+                normalized[key] = None
+            continue
+
+        # Non-string, non-UUID, non-None value for a UUID field — leave as-is
+        # (e.g. integer PKs that happen to end in _id should not be coerced)
+
+    return normalized
+
+
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None or value == "":
@@ -930,6 +1017,7 @@ async def _insert_line_items_standalone(
                 insert_params.get('order_id'),
                 insert_params.get('sku'),
             )
+            insert_params = normalize_uuid_fields(insert_params)
             await db.execute(text(line_insert_stmt), insert_params)
             inserted += 1
 
@@ -1680,6 +1768,7 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 update_params.get('brand_id'),
                                 update_params.get('external_order_id'),
                             )
+                            update_params = normalize_uuid_fields(update_params)
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -1802,6 +1891,7 @@ INSERT INTO orders (
                                 insert_params.get('brand_id'),
                                 insert_params.get('external_order_id'),
                             )
+                            insert_params = normalize_uuid_fields(insert_params)
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
@@ -2349,6 +2439,7 @@ async def sync_leaflink_line_items(
                     insert_params.get('order_id'),
                     insert_params.get('sku'),
                 )
+                insert_params = normalize_uuid_fields(insert_params)
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
@@ -2633,6 +2724,11 @@ async def sync_leaflink_line_items(
         total_inserted,
         bg_duration,
         len(errors),
+    )
+    logger.info(
+        "[UUID_NORMALIZATION_COMPLETE] brand_id=%s orders_processed=%s",
+        brand_id_value,
+        total_orders,
     )
 
     # Update sync health after Phase 2 completes
