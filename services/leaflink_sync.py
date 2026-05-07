@@ -254,6 +254,67 @@ async def _dead_letter_line_item(
         )
 
 
+async def _write_sync_dead_letter(
+    brand_id: str,
+    raw_payload: Any,
+    error_stage: str,
+    error_message: str,
+    org_id: Optional[str] = None,
+    external_id: Optional[str] = None,
+    order_number: Optional[str] = None,
+    source: str = "leaflink",
+) -> None:
+    """Write a dead-letter record to sync_dead_letters for an order that could not be processed."""
+    try:
+        async with AsyncSessionLocal() as db:
+            raw_payload_str = (
+                json.dumps(make_json_safe(raw_payload))
+                if raw_payload is not None
+                else json.dumps({})
+            )
+            now = ensure_utc(utc_now())
+            await db.execute(
+                text("""
+                    INSERT INTO sync_dead_letters
+                        (source, brand_id, org_id, external_id, order_number,
+                         raw_payload, error_stage, error_message, retry_count, created_at)
+                    VALUES
+                        (:source, CAST(:brand_id AS uuid), CAST(:org_id AS uuid),
+                         :external_id, :order_number,
+                         CAST(:raw_payload AS jsonb), :error_stage, :error_message,
+                         0, :now)
+                """),
+                {
+                    "source": source,
+                    "brand_id": brand_id,
+                    "org_id": org_id,
+                    "external_id": external_id,
+                    "order_number": order_number,
+                    "raw_payload": raw_payload_str,
+                    "error_stage": error_stage,
+                    "error_message": error_message[:2000],
+                    "now": now,
+                },
+            )
+            await db.commit()
+        logger.warning(
+            "[SYNC_DEAD_LETTER_WRITTEN] external_id=%s order_number=%s error_stage=%s error_message=%s brand_id=%s",
+            external_id,
+            order_number,
+            error_stage,
+            error_message[:200],
+            brand_id,
+        )
+    except Exception as exc:
+        logger.error(
+            "[SYNC_DEAD_LETTER_WRITE_ERROR] brand_id=%s external_id=%s error_stage=%s write_error=%s",
+            brand_id,
+            external_id,
+            error_stage,
+            str(exc)[:300],
+        )
+
+
 def utc_now() -> datetime:
     """Return current time as timezone-aware UTC datetime."""
     return datetime.now(timezone.utc)
@@ -604,6 +665,12 @@ async def sync_leaflink_orders(
 ) -> dict[str, Any]:
     """Upsert *pre-fetched* LeafLink orders and their line items.
 
+    Resilient ingestion pipeline:
+    - Per-order error isolation: one bad order never fails the whole sync
+    - Partial success: header saved even if line items fail (sync_status='partial')
+    - Dead-letter: unfixable orders written to sync_dead_letters for reprocessing
+    - Non-blocking: returns ok=true if majority succeeds, warning=true if some failed
+
     The caller is responsible for:
     - Credential lookup and API fetch (before calling this function)
     - Committing or rolling back the session after this function returns
@@ -623,10 +690,11 @@ async def sync_leaflink_orders(
     sync_start = time.monotonic()
 
     logger.info(
-        "[DB] upserting_orders count=%s brand_id=%s org_id=%s",
-        len(orders),
+        "[SYNC_ENTRY] sync_leaflink_orders brand_id=%s org_id=%s order_count=%s pages_fetched=%s",
         brand_id,
         org_id,
+        len(orders),
+        pages_fetched,
     )
 
     using_mock = any(isinstance(o, dict) and o.get("mock_data") for o in orders)
@@ -639,7 +707,8 @@ async def sync_leaflink_orders(
     created = 0
     updated = 0
     skipped = 0
-    errors_count = 0
+    partial = 0
+    dead_letter = 0
     total_lines_written = 0
     errors: list[str] = []
     newest_order_date: datetime | None = None
@@ -655,10 +724,13 @@ async def sync_leaflink_orders(
     # ------------------------------------------------------------------
     # Upsert orders and write line items using the caller's session.
     # No begin() here — the route handler owns the transaction lifecycle.
-    # Per-order error handling: log, skip, continue — never crash the loop.
+    # Per-order error isolation: one bad order never crashes the loop.
     # ------------------------------------------------------------------
     for o in orders:
         order_external_id_for_log = "unknown"
+        order_number_for_log: Optional[str] = None
+        raw_payload_for_dead_letter: Any = o
+
         try:
             if not isinstance(o, dict):
                 skipped += 1
@@ -666,9 +738,19 @@ async def sync_leaflink_orders(
 
             external_id = safe_str(o.get("external_id"))
             order_external_id_for_log = external_id or "missing"
+            order_number_for_log = safe_str(o.get("order_number"))
+            raw_payload_for_dead_letter = o
+
             if not external_id:
                 skipped += 1
                 continue
+
+            logger.info(
+                "[SYNC_ORDER_PROCESSING] external_id=%s order_number=%s brand_id=%s",
+                external_id,
+                order_number_for_log,
+                brand_id,
+            )
 
             customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
             status = (safe_str(o.get("status")) or "submitted").lower()
@@ -708,11 +790,9 @@ async def sync_leaflink_orders(
             review_status = derive_review_status(normalized_line_items)
 
             # Use server time for all DB timestamp columns — bulletproof mode.
-            # LeafLink date fields (created_on, paid_date, etc.) are stored
-            # inside raw_payload JSONB exactly as received from the API.
             now = ensure_utc(utc_now())
 
-            # raw_payload stores the full LeafLink order dict (including all date fields)
+            # Always save raw payload first (core resilience principle)
             raw_payload = o.get("raw_payload") if isinstance(o.get("raw_payload"), dict) else o
 
             existing_result = await db.execute(
@@ -723,88 +803,134 @@ async def sync_leaflink_orders(
             )
             existing = existing_result.scalar_one_or_none()
 
-            if existing:
-                existing.customer_name = customer_name
-                existing.status = status
-                existing.order_number = order_number
-                existing.total_cents = total_cents
-                existing.amount = amount_decimal
-                existing.item_count = item_count
-                existing.unit_count = unit_count
-                existing.line_items_json = make_json_safe(normalized_line_items)
-                existing.raw_payload = make_json_safe(raw_payload)
-                existing.review_status = review_status
-                existing.sync_status = "ok"
-                # Use server timestamps for all DB columns — bulletproof mode
-                existing.synced_at = now
-                existing.last_synced_at = now
-                # Leave external_created_at / external_updated_at null rather than
-                # risk a timestamp conversion failure — LeafLink dates live in raw_payload
-                # Always stamp org_id so existing rows get backfilled on re-sync
-                if org_id:
-                    existing.org_id = org_id
-                order_row = existing
-                updated += 1
-            else:
-                order_row = Order(
-                    org_id=org_id,
-                    brand_id=brand_id,
-                    external_order_id=external_id,
-                    order_number=order_number,
-                    customer_name=customer_name,
-                    status=status,
-                    total_cents=total_cents,
-                    amount=amount_decimal,
-                    item_count=item_count,
-                    unit_count=unit_count,
-                    line_items_json=make_json_safe(normalized_line_items),
-                    raw_payload=make_json_safe(raw_payload),
-                    source="leaflink",
-                    review_status=review_status,
-                    sync_status="ok",
-                    # Use server timestamps for all DB columns — bulletproof mode
-                    synced_at=now,
-                    last_synced_at=now,
-                    # Leave external_created_at / external_updated_at null rather than
-                    # risk a timestamp conversion failure — LeafLink dates live in raw_payload
-                )
-                db.add(order_row)
-                # Flush to get the auto-generated order_row.id before writing lines.
-                await db.flush()
-                created += 1
-
-            # Delete stale line items then insert fresh ones.
-            await db.execute(
-                delete(OrderLine).where(OrderLine.order_id == order_row.id)
-            )
-
-            # Use server time for line item timestamps — bulletproof mode
-            line_now = ensure_utc(utc_now())
-            for item in normalized_line_items:
-                db.add(
-                    OrderLine(
-                        order_id=order_row.id,
-                        sku=item.get("sku"),
-                        product_name=item.get("product_name"),
-                        quantity=item.get("quantity"),
-                        unit_price=item.get("unit_price"),
-                        total_price=item.get("total_price"),
-                        unit_price_cents=item.get("unit_price_cents"),
-                        total_price_cents=item.get("total_price_cents"),
-                        mapped_product_id=item.get("mapped_product_id"),
-                        mapping_status=item.get("mapping_status"),
-                        mapping_issue=item.get("mapping_issue"),
-                        raw_payload=make_json_safe(item.get("raw_payload")),
-                        created_at=line_now,
-                        updated_at=line_now,
+            # ----------------------------------------------------------
+            # Header insert/update — isolated in its own try/except.
+            # On failure: write to sync_dead_letters, continue to next order.
+            # ----------------------------------------------------------
+            try:
+                if existing:
+                    existing.customer_name = customer_name
+                    existing.status = status
+                    existing.order_number = order_number
+                    existing.total_cents = total_cents
+                    existing.amount = amount_decimal
+                    existing.item_count = item_count
+                    existing.unit_count = unit_count
+                    existing.line_items_json = make_json_safe(normalized_line_items)
+                    existing.raw_payload = make_json_safe(raw_payload)
+                    existing.review_status = review_status
+                    existing.sync_status = "ok"
+                    existing.synced_at = now
+                    existing.last_synced_at = now
+                    if org_id:
+                        existing.org_id = org_id
+                    order_row = existing
+                    updated += 1
+                else:
+                    order_row = Order(
+                        org_id=org_id,
+                        brand_id=brand_id,
+                        external_order_id=external_id,
+                        order_number=order_number,
+                        customer_name=customer_name,
+                        status=status,
+                        total_cents=total_cents,
+                        amount=amount_decimal,
+                        item_count=item_count,
+                        unit_count=unit_count,
+                        line_items_json=make_json_safe(normalized_line_items),
+                        raw_payload=make_json_safe(raw_payload),
+                        source="leaflink",
+                        review_status=review_status,
+                        sync_status="ok",
+                        synced_at=now,
+                        last_synced_at=now,
                     )
+                    db.add(order_row)
+                    await db.flush()
+                    created += 1
+
+                logger.info(
+                    "[SYNC_HEADER_SAVED] external_id=%s order_number=%s brand_id=%s action=%s",
+                    external_id,
+                    order_number,
+                    brand_id,
+                    "updated" if existing else "created",
                 )
 
-            total_lines_written += len(normalized_line_items)
+            except Exception as header_exc:
+                header_err_msg = str(header_exc)[:500]
+                logger.error(
+                    "[SYNC_HEADER_INSERT_FAILED] external_id=%s order_number=%s brand_id=%s error=%s",
+                    external_id,
+                    order_number,
+                    brand_id,
+                    header_err_msg,
+                    exc_info=True,
+                )
+                await _write_sync_dead_letter(
+                    brand_id=brand_id,
+                    raw_payload=raw_payload_for_dead_letter,
+                    error_stage="header_insert",
+                    error_message=header_err_msg,
+                    org_id=org_id,
+                    external_id=external_id,
+                    order_number=order_number,
+                )
+                dead_letter += 1
+                if len(errors) < 10:
+                    errors.append(f"header_insert external_id={external_id}: {header_err_msg[:200]}")
+                continue
+
+            # ----------------------------------------------------------
+            # Line item insert — isolated in its own try/except.
+            # On failure: mark header as 'partial', log, continue.
+            # ----------------------------------------------------------
+            try:
+                await db.execute(
+                    delete(OrderLine).where(OrderLine.order_id == order_row.id)
+                )
+
+                line_now = ensure_utc(utc_now())
+                for item in normalized_line_items:
+                    db.add(
+                        OrderLine(
+                            order_id=order_row.id,
+                            sku=item.get("sku"),
+                            product_name=item.get("product_name"),
+                            quantity=item.get("quantity"),
+                            unit_price=item.get("unit_price"),
+                            total_price=item.get("total_price"),
+                            unit_price_cents=item.get("unit_price_cents"),
+                            total_price_cents=item.get("total_price_cents"),
+                            mapped_product_id=item.get("mapped_product_id"),
+                            mapping_status=item.get("mapping_status"),
+                            mapping_issue=item.get("mapping_issue"),
+                            raw_payload=make_json_safe(item.get("raw_payload")),
+                            created_at=line_now,
+                            updated_at=line_now,
+                        )
+                    )
+
+                total_lines_written += len(normalized_line_items)
+
+            except Exception as line_exc:
+                line_err_msg = str(line_exc)[:500]
+                logger.error(
+                    "[SYNC_PARTIAL_SUCCESS] external_id=%s brand_id=%s header_saved=true line_items_failed=true error=%s",
+                    external_id,
+                    brand_id,
+                    line_err_msg,
+                )
+                try:
+                    order_row.sync_status = "partial"
+                except Exception:
+                    pass
+                partial += 1
+                if len(errors) < 10:
+                    errors.append(f"line_item_transform external_id={external_id}: {line_err_msg[:200]}")
 
         except Exception as order_exc:
-            # Per-order failure: log with [ORDER_TRANSFORM_SKIPPED], continue — never crash the loop
-            errors_count += 1
             err_reason = str(order_exc)[:300]
             logger.warning(
                 "[ORDER_TRANSFORM_SKIPPED] external_id=%s reason=%s",
@@ -818,22 +944,34 @@ async def sync_leaflink_orders(
                 err_reason,
                 exc_info=True,
             )
-            if len(errors) < 5:
+            await _write_sync_dead_letter(
+                brand_id=brand_id,
+                raw_payload=raw_payload_for_dead_letter,
+                error_stage="order_transform",
+                error_message=err_reason,
+                org_id=org_id,
+                external_id=order_external_id_for_log if order_external_id_for_log != "unknown" else None,
+                order_number=order_number_for_log,
+            )
+            dead_letter += 1
+            if len(errors) < 10:
                 errors.append(f"order={order_external_id_for_log} error={err_reason}")
             skipped += 1
             continue
 
     sync_duration = round(time.monotonic() - sync_start, 2)
-    error_count = errors_count
-    all_failed = (created == 0 and updated == 0 and error_count > 0 and len(orders) > 0)
+    error_count = len(errors)
+    fetched_count = len(orders)
+    all_failed = (created == 0 and updated == 0 and partial == 0 and error_count > 0 and fetched_count > 0)
+    has_warning = error_count > 0 or dead_letter > 0 or partial > 0
 
     logger.info(
-        "leaflink: upsert_complete org_id=%s brand_id=%s created=%s updated=%s skipped=%s errors=%s duration=%ss",
-        org_id, brand_id, created, updated, skipped, error_count, sync_duration,
+        "[SYNC_FINAL_REPORT] fetched=%s inserted=%s updated=%s partial=%s skipped=%s dead_letter=%s error=%s duration=%ss brand_id=%s",
+        fetched_count, created, updated, partial, skipped, dead_letter, error_count, sync_duration, brand_id,
     )
     logger.info(
         "[LEAFLINK_FETCH_OK] raw_count=%s brand_id=%s",
-        len(orders),
+        fetched_count,
         brand_id,
     )
     logger.info(
@@ -842,23 +980,34 @@ async def sync_leaflink_orders(
     )
     logger.info(
         "[LEAFLINK_SYNC_COMPLETE] fetched=%s inserted=%s updated=%s brand_id=%s",
-        len(orders), created, updated, brand_id,
+        fetched_count, created, updated, brand_id,
     )
 
     return {
         "ok": not all_failed,
-        "orders_fetched": len(orders),
+        "warning": has_warning,
+        "fetched_count": fetched_count,
+        "inserted_count": created,
+        "updated_count": updated,
+        "partial_count": partial,
+        "skipped_count": skipped,
+        "dead_letter_count": dead_letter,
+        "error_count": error_count,
+        # Legacy keys kept for backward compatibility
+        "orders_fetched": fetched_count,
         "created": created,
         "updated": updated,
         "skipped": skipped,
-        "error_count": error_count,
         "line_items_written": total_lines_written,
         "newest_order_date": newest_order_date,
         "pages_fetched": pages_fetched,
         "sync_duration_seconds": sync_duration,
         "errors": errors,
         "mock_data": using_mock,
-        "message": f"Synced {len(orders)} orders: {created} created, {updated} updated, {skipped} skipped, {error_count} errors",
+        "message": (
+            f"Synced {fetched_count} orders: {created} inserted, {updated} updated, "
+            f"{partial} partial, {skipped} skipped, {dead_letter} dead_letter, {error_count} errors"
+        ),
     }
 
 
@@ -899,6 +1048,7 @@ async def sync_leaflink_orders_headers_only(
     total_created = 0
     total_updated = 0
     total_skipped = 0
+    total_dead_letter = 0
     errors: list[str] = []
     newest_order_date: datetime | None = None
     fetched_count = len(orders)
@@ -937,12 +1087,15 @@ async def sync_leaflink_orders_headers_only(
         batch_created = 0
         batch_updated = 0
         batch_skipped = 0
+        batch_dead_letter = 0
 
         try:
             async with AsyncSessionLocal() as db:
                 async with db.begin():
                     for o in batch:
                         _order_ext_id_for_log = "unknown"
+                        _order_number_for_log = None
+                        _raw_payload_ref: Any = o
                         try:
                           if not isinstance(o, dict):
                             logger.warning(
@@ -956,6 +1109,8 @@ async def sync_leaflink_orders_headers_only(
                           # (LeafLink raw payloads carry the order PK in "id").
                           external_id = safe_str(o.get("id") or o.get("external_id") or o.get("external_order_id"))
                           _order_ext_id_for_log = external_id or "missing"
+                          _order_number_for_log = safe_str(o.get("order_number"))
+                          _raw_payload_ref = o
                           if not external_id:
                             logger.error(
                                 "[OrdersSync] skip_no_external_id batch=%s order_number=%s",
@@ -968,6 +1123,15 @@ async def sync_leaflink_orders_headers_only(
                             )
                             batch_skipped += 1
                             continue
+
+                          logger.info(
+                              "[SYNC_ORDER_PROCESSING] external_id=%s order_number=%s brand_id=%s batch=%s/%s",
+                              external_id,
+                              _order_number_for_log,
+                              brand_id_value,
+                              batch_num,
+                              len(batches),
+                          )
 
                           # [COMPANY_ID_MISMATCH] Log payload company_id for alignment tracing.
                           # Compare against credential_company_id from [BRAND_CONFIG_AUDIT] logs.
@@ -1101,6 +1265,12 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 synced_at_val.isoformat() if synced_at_val else None,
                                 "updated",
                             )
+                            logger.info(
+                                "[SYNC_HEADER_SAVED] external_id=%s order_number=%s brand_id=%s action=updated",
+                                external_id,
+                                order_number,
+                                brand_id_value,
+                            )
                           else:
                             # Use raw SQL INSERT with CAST so PostgreSQL receives
                             # explicit type coercion for UUID columns instead of
@@ -1166,8 +1336,14 @@ INSERT INTO orders (
                                 synced_at_val.isoformat() if synced_at_val else None,
                                 "created",
                             )
+                            logger.info(
+                                "[SYNC_HEADER_SAVED] external_id=%s order_number=%s brand_id=%s action=created",
+                                external_id,
+                                order_number,
+                                brand_id_value,
+                            )
                         except Exception as _order_exc:
-                            # Per-order failure: log with [ORDER_TRANSFORM_SKIPPED], continue
+                            # Per-order failure: log, write dead-letter, continue
                             _err_reason = str(_order_exc)[:300]
                             logger.warning(
                                 "[ORDER_TRANSFORM_SKIPPED] external_id=%s reason=%s",
@@ -1175,13 +1351,32 @@ INSERT INTO orders (
                                 _err_reason,
                             )
                             logger.error(
-                                "leaflink: headers_only_order_failed brand_id=%s order=%s error=%s",
-                                brand_id_value,
+                                "[SYNC_HEADER_INSERT_FAILED] external_id=%s order_number=%s brand_id=%s batch=%s/%s error=%s",
                                 _order_ext_id_for_log,
+                                _order_number_for_log,
+                                brand_id_value,
+                                batch_num,
+                                len(batches),
                                 _err_reason,
                                 exc_info=True,
                             )
+                            asyncio.create_task(
+                                _write_sync_dead_letter(
+                                    brand_id=brand_id_value,
+                                    raw_payload=_raw_payload_ref,
+                                    error_stage="header_insert",
+                                    error_message=_err_reason,
+                                    org_id=org_id_value,
+                                    external_id=_order_ext_id_for_log if _order_ext_id_for_log != "unknown" else None,
+                                    order_number=_order_number_for_log,
+                                )
+                            )
+                            batch_dead_letter += 1
                             batch_skipped += 1
+                            if len(errors) < 10:
+                                errors.append(
+                                    f"header_insert external_id={_order_ext_id_for_log}: {_err_reason[:200]}"
+                                )
                             continue
                 # Explicit commit guarantee
                 await db.commit()
@@ -1203,18 +1398,20 @@ INSERT INTO orders (
             )
             logger.info("[ORDER_SAVE_COMMIT] brand_id=%s created=%s updated=%s batch=%s/%s", brand_id_value, batch_created, batch_updated, batch_num, len(batches))
             logger.info(
-                "[OrdersSync] batch_committed batch=%s/%s brand=%s created=%s updated=%s skipped=%s duration=%ss",
+                "[OrdersSync] batch_committed batch=%s/%s brand=%s created=%s updated=%s skipped=%s dead_letter=%s duration=%ss",
                 batch_num,
                 len(batches),
                 brand_id_value,
                 batch_created,
                 batch_updated,
                 batch_skipped,
+                batch_dead_letter,
                 batch_duration,
             )
             total_created += batch_created
             total_updated += batch_updated
             total_skipped += batch_skipped
+            total_dead_letter += batch_dead_letter
 
         except Exception as batch_exc:
             batch_duration = round(time.monotonic() - batch_start, 2)
@@ -1343,6 +1540,13 @@ INSERT INTO orders (
 
     asyncio.create_task(_background_line_items())
 
+    error_count = len(errors)
+    has_warning = error_count > 0 or total_dead_letter > 0
+
+    logger.info(
+        "[SYNC_FINAL_REPORT] fetched=%s inserted=%s updated=%s partial=0 skipped=%s dead_letter=%s error=%s duration=%ss brand_id=%s",
+        fetched_count, total_created, total_updated, total_skipped, total_dead_letter, error_count, sync_duration, brand_id_value,
+    )
     logger.info(
         "[LEAFLINK_FETCH_OK] raw_count=%s brand_id=%s",
         fetched_count,
@@ -1350,7 +1554,7 @@ INSERT INTO orders (
     )
     logger.info(
         "[LEAFLINK_DB_WRITE_OK] inserted=%s updated=%s skipped=%s errors=%s brand_id=%s",
-        total_created, total_updated, total_skipped, len(errors), brand_id_value,
+        total_created, total_updated, total_skipped, error_count, brand_id_value,
     )
     logger.info(
         "[LEAFLINK_SYNC_COMPLETE] fetched=%s inserted=%s updated=%s brand_id=%s",
@@ -1359,8 +1563,16 @@ INSERT INTO orders (
 
     return {
         "ok": len(errors) == 0,
-        "orders_fetched": fetched_count,
+        "warning": has_warning,
         "fetched_count": fetched_count,
+        "inserted_count": total_created,
+        "updated_count": total_updated,
+        "partial_count": 0,
+        "skipped_count": total_skipped,
+        "dead_letter_count": total_dead_letter,
+        "error_count": error_count,
+        # Legacy keys kept for backward compatibility
+        "orders_fetched": fetched_count,
         "created": total_created,
         "updated": total_updated,
         "skipped": total_skipped,
@@ -1370,7 +1582,10 @@ INSERT INTO orders (
         "sync_duration_seconds": sync_duration,
         "errors": errors,
         "mock_data": any(isinstance(o, dict) and o.get("mock_data") for o in orders),
-        "message": f"Upserted {total_created + total_updated} order headers ({total_created} new, {total_updated} updated)",
+        "message": (
+            f"Upserted {total_created + total_updated} order headers "
+            f"({total_created} new, {total_updated} updated, {total_dead_letter} dead_letter)"
+        ),
     }
 
 
