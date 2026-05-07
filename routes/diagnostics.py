@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models import BrandAPICredential
 from services.leaflink_client import LeafLinkClient
+from services.leaflink_sync import safe_uuid_for_db
 
 logger = logging.getLogger("diagnostics")
 
@@ -269,6 +270,10 @@ async def reprocess_dead_letters(
     from database import AsyncSessionLocal
     from services.leaflink_sync import sync_leaflink_orders
 
+    # Coerce brand_id to a valid UUID or None before using it in UUID columns.
+    # CAST(:brand_id AS uuid) in the SQL will fail if the value is not a valid UUID string.
+    brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
+
     logger.info(
         "[REPROCESS_STARTED] brand_id=%s limit=%s source=reprocess-dead-letters",
         brand_id,
@@ -428,6 +433,10 @@ async def reprocess_order(
     from database import AsyncSessionLocal
     from services.leaflink_sync import sync_leaflink_orders
 
+    # Coerce brand_id to a valid UUID or None before using it in UUID columns.
+    # CAST(:brand_id AS uuid) in the SQL will fail if the value is not a valid UUID string.
+    brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
+
     logger.info(
         "[REPROCESS_STARTED] brand_id=%s external_id=%s source=reprocess-order",
         brand_id,
@@ -586,6 +595,10 @@ async def backfill_normalized_dates(
       [REPROCESS_COMPLETE] — when all records have been attempted
     """
     from services.leaflink_sync import normalize_datetime, ensure_utc
+
+    # Coerce brand_id to a valid UUID or None before using it in UUID columns.
+    # CAST(:brand_id AS uuid) in the SQL will fail if the value is not a valid UUID string.
+    brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
 
     logger.info(
         "[REPROCESS_STARTED] brand_id=%s limit=%s source=backfill-normalized-dates",
