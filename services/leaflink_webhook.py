@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal
 from models import BrandAPICredential, Order
-from services.leaflink_sync import safe_uuid_mapped_product
+from services.leaflink_sync import safe_uuid_for_db, safe_uuid_mapped_product
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("leaflink_webhook")
@@ -334,6 +334,12 @@ async def upsert_webhook_order(
     Returns:
         {"action": "created" | "updated" | "skipped", "external_order_id": str, "error": str | None}
     """
+    # Coerce org_id and brand_id to valid UUIDs or None before any DB write.
+    # This prevents "column is of type uuid but expression is of type character varying"
+    # errors from sending webhook orders to the dead-letter queue.
+    brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
+    org_id = safe_uuid_for_db(org_id, "org_id")
+
     external_id = _safe_str(
         order_data.get("id")
         or order_data.get("external_id")
@@ -512,6 +518,12 @@ async def process_leaflink_webhook(
     brand_id: str = tenant["brand_id"]
     org_id: Optional[str] = tenant["org_id"]
     cred: BrandAPICredential = tenant["credential"]
+
+    # Coerce org_id and brand_id to valid UUIDs or None before any DB write.
+    # This prevents "column is of type uuid but expression is of type character varying"
+    # errors from sending webhook orders to the dead-letter queue.
+    brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
+    org_id = safe_uuid_for_db(org_id, "org_id")
 
     # ------------------------------------------------------------------ #
     # Step 2: Verify signature                                            #

@@ -280,6 +280,11 @@ async def _write_sync_dead_letter(
         order_number:  Human-readable order number (nullable).
         source:        Integration name (default 'leaflink').
     """
+    # Coerce brand_id and org_id to valid UUIDs or None before writing to the dead-letter table.
+    # CAST(:brand_id AS uuid) in the SQL will fail if the value is not a valid UUID string.
+    brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
+    org_id = safe_uuid_for_db(org_id, "org_id")
+
     try:
         async with AsyncSessionLocal() as db:
             raw_payload_str = (
@@ -485,6 +490,67 @@ def safe_uuid_mapped_product(value: Any) -> str | None:
 
     logger.warning(
         "[PRODUCT_MAPPING_INVALID_UUID] value_type=%s reason=unexpected_type",
+        type(value).__name__,
+    )
+    return None
+
+
+def safe_uuid_for_db(value: Any, field_name: str = "uuid_field") -> str | None:
+    """Coerce value to valid UUID string, or return None if invalid.
+
+    Used for org_id, brand_id, and other UUID columns that must be strict.
+    Returns None (not original value) when input is not a well-formed UUID,
+    preventing ``column "org_id" is of type uuid but expression is of type
+    character varying`` errors from sending orders to the dead-letter queue.
+
+    The original value is always preserved in the order raw_payload JSONB
+    column and can be reprocessed by reconciliation jobs.
+
+    Args:
+        value:      Any value (string, UUID object, None, etc.)
+        field_name: Field name for logging (e.g., "org_id", "brand_id")
+
+    Returns:
+        Valid UUID string in canonical form, or None if invalid.
+
+    Logs:
+        [ORG_UUID_COERCED]      if value is coerced to valid UUID
+        [ORG_UUID_NULL_APPLIED] if value is invalid and becomes NULL
+    """
+    if value is None or value == "":
+        return None
+
+    if isinstance(value, UUID):
+        coerced = str(value)
+        logger.info(
+            "[ORG_UUID_COERCED] field=%s original_type=UUID coerced=%s",
+            field_name,
+            coerced,
+        )
+        return coerced
+
+    if isinstance(value, str):
+        try:
+            coerced = str(UUID(value))
+            if coerced != value:
+                logger.info(
+                    "[ORG_UUID_COERCED] field=%s original=%s coerced=%s",
+                    field_name,
+                    value[:100],
+                    coerced,
+                )
+            return coerced
+        except (ValueError, TypeError):
+            logger.warning(
+                "[ORG_UUID_NULL_APPLIED] field=%s value=%s reason=not_valid_uuid",
+                field_name,
+                value[:100] if len(value) > 100 else value,
+            )
+            return None
+
+    logger.warning(
+        "[ORG_UUID_NULL_APPLIED] field=%s value_type=%s reason=unexpected_type",
+        field_name,
         type(value).__name__,
     )
     return None
@@ -766,6 +832,12 @@ async def sync_leaflink_orders(
                 order row so GET /orders can filter by org_id AND brand_id.
     """
     sync_start = time.monotonic()
+
+    # Coerce org_id and brand_id to valid UUIDs or None before any DB write.
+    # This prevents "column is of type uuid but expression is of type character varying"
+    # errors from sending entire orders to the dead-letter queue.
+    org_id = safe_uuid_for_db(org_id, "org_id")
+    brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
 
     logger.info(
         "[SYNC_ENTRY] sync_leaflink_orders brand_id=%s org_id=%s order_count=%s pages_fetched=%s",
@@ -1142,10 +1214,12 @@ async def sync_leaflink_orders_headers_only(
 
     sync_start = time.monotonic()
 
-    # Cast brand_id and org_id to canonical UUID form so that PostgreSQL UUID
-    # columns never receive a plain character-varying expression.
-    brand_id_value = safe_uuid(brand_id)
-    org_id_value = safe_uuid(org_id) if org_id else None
+    # Coerce brand_id and org_id to valid UUIDs or None before any DB write.
+    # safe_uuid_for_db() returns None (not the original value) for non-UUID strings,
+    # preventing "column is of type uuid but expression is of type character varying"
+    # errors. The original values are preserved in raw_payload JSONB.
+    brand_id_value = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
+    org_id_value = safe_uuid_for_db(org_id, "org_id") if org_id else None
 
     total_created = 0
     total_updated = 0
@@ -1742,9 +1816,11 @@ async def sync_leaflink_line_items(
     bg_start = time.monotonic()
     errors: list[str] = []
 
-    # Cast brand_id to canonical UUID form to match what was written in Phase 1.
-    brand_id_value = safe_uuid(brand_id)
-    org_id_value = safe_uuid(org_id) if org_id else None
+    # Coerce brand_id and org_id to valid UUIDs or None to match what was written in Phase 1.
+    # safe_uuid_for_db() returns None (not the original value) for non-UUID strings,
+    # preventing "column is of type uuid but expression is of type character varying" errors.
+    brand_id_value = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
+    org_id_value = safe_uuid_for_db(org_id, "org_id") if org_id else None
 
     try:
         async with AsyncSessionLocal() as check_db:

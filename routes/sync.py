@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db, has_column
 from models import Order, SyncRequest, SyncRun
 from models.sync_health import DeadLetterLineItem, SyncHealth
-from services.leaflink_sync import safe_uuid_mapped_product
+from services.leaflink_sync import safe_uuid_for_db, safe_uuid_mapped_product
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("sync_routes")
@@ -186,6 +186,19 @@ async def replay_dead_letter_item(
 
     # Extract values from raw_payload if available
     raw = item.raw_payload or {}
+
+    # Coerce org_id and brand_id from raw payload to valid UUIDs or None.
+    # These may be present in the raw payload and must not be passed as arbitrary
+    # strings to UUID columns, which would cause PostgreSQL type errors.
+    org_id = safe_uuid_for_db(raw.get("org_id"), "org_id")
+    brand_id = safe_uuid_for_db(raw.get("brand_id") or item.brand_id, "brand_id")
+    logger.info(
+        "[REPLAY_UUID_COERCE] item_id=%s org_id=%s brand_id=%s",
+        item_id,
+        org_id,
+        brand_id,
+    )
+
     params: dict = {
         "order_id": item.order_id,
         "sku": item.sku or "unknown",
