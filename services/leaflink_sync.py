@@ -639,9 +639,18 @@ async def sync_leaflink_orders(
     created = 0
     updated = 0
     skipped = 0
+    errors_count = 0
     total_lines_written = 0
     errors: list[str] = []
     newest_order_date: datetime | None = None
+
+    # [LEAFLINK_TIMESTAMP_STRATEGY] Use server time for all DB columns — bulletproof mode
+    logger.info(
+        "[LEAFLINK_TIMESTAMP_STRATEGY] using=server_time reason=bulletproof_mode brand_id=%s",
+        brand_id,
+    )
+    # [LEAFLINK_UPSERT_KEY] Upsert by stable LeafLink identifier only — no date keys
+    logger.info("[LEAFLINK_UPSERT_KEY] key=external_id brand_id=%s", brand_id)
 
     # ------------------------------------------------------------------
     # Upsert orders and write line items using the caller's session.
@@ -697,9 +706,13 @@ async def sync_leaflink_orders(
                 unit_count = sum(item.get("quantity", 0) or 0 for item in normalized_line_items)
 
             review_status = derive_review_status(normalized_line_items)
-            # Normalize now() to guarantee a timezone-aware UTC datetime
-            now = normalize_datetime(utc_now())
 
+            # Use server time for all DB timestamp columns — bulletproof mode.
+            # LeafLink date fields (created_on, paid_date, etc.) are stored
+            # inside raw_payload JSONB exactly as received from the API.
+            now = ensure_utc(utc_now())
+
+            # raw_payload stores the full LeafLink order dict (including all date fields)
             raw_payload = o.get("raw_payload") if isinstance(o.get("raw_payload"), dict) else o
 
             existing_result = await db.execute(
@@ -709,30 +722,6 @@ async def sync_leaflink_orders(
                 )
             )
             existing = existing_result.scalar_one_or_none()
-
-            # Map external timestamps from LeafLink payload.
-            # LeafLink uses "created" and "modified" fields; fall back to common alternatives.
-            created_raw = o.get("created") or o.get("created_at") or o.get("external_created_at")
-            modified_raw = o.get("modified") or o.get("updated") or o.get("updated_at") or o.get("external_updated_at")
-
-            # NORMALIZE to UTC-aware
-            external_created_at = ensure_utc(normalize_datetime(created_raw))
-            external_updated_at = ensure_utc(normalize_datetime(modified_raw))
-
-            # Track the newest order date for the response.
-            for ts_dt in (external_updated_at, external_created_at):
-                if ts_dt:
-                    order_date_utc = ensure_utc(ts_dt)
-                    newest_order_date_utc = ensure_utc(newest_order_date)
-                    if order_date_utc and (newest_order_date_utc is None or order_date_utc > newest_order_date_utc):
-                        newest_order_date = order_date_utc
-                    break
-
-            # Defensively normalize all datetime fields — ensure_utc_aware logs
-            # only on validation failure (naive datetime), keeping logs quiet.
-            now = ensure_utc_aware(now, "synced_at")
-            external_created_at = ensure_utc_aware(external_created_at, "external_created_at")
-            external_updated_at = ensure_utc_aware(external_updated_at, "external_updated_at")
 
             if existing:
                 existing.customer_name = customer_name
@@ -746,11 +735,11 @@ async def sync_leaflink_orders(
                 existing.raw_payload = make_json_safe(raw_payload)
                 existing.review_status = review_status
                 existing.sync_status = "ok"
-                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                existing.synced_at = ensure_utc(now)
-                existing.last_synced_at = ensure_utc(now)
-                existing.external_created_at = ensure_utc(external_created_at)
-                existing.external_updated_at = ensure_utc(external_updated_at)
+                # Use server timestamps for all DB columns — bulletproof mode
+                existing.synced_at = now
+                existing.last_synced_at = now
+                # Leave external_created_at / external_updated_at null rather than
+                # risk a timestamp conversion failure — LeafLink dates live in raw_payload
                 # Always stamp org_id so existing rows get backfilled on re-sync
                 if org_id:
                     existing.org_id = org_id
@@ -773,11 +762,11 @@ async def sync_leaflink_orders(
                     source="leaflink",
                     review_status=review_status,
                     sync_status="ok",
-                    # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                    synced_at=ensure_utc(now),
-                    last_synced_at=ensure_utc(now),
-                    external_created_at=ensure_utc(external_created_at),
-                    external_updated_at=ensure_utc(external_updated_at),
+                    # Use server timestamps for all DB columns — bulletproof mode
+                    synced_at=now,
+                    last_synced_at=now,
+                    # Leave external_created_at / external_updated_at null rather than
+                    # risk a timestamp conversion failure — LeafLink dates live in raw_payload
                 )
                 db.add(order_row)
                 # Flush to get the auto-generated order_row.id before writing lines.
@@ -789,7 +778,7 @@ async def sync_leaflink_orders(
                 delete(OrderLine).where(OrderLine.order_id == order_row.id)
             )
 
-            # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
+            # Use server time for line item timestamps — bulletproof mode
             line_now = ensure_utc(utc_now())
             for item in normalized_line_items:
                 db.add(
@@ -814,26 +803,46 @@ async def sync_leaflink_orders(
             total_lines_written += len(normalized_line_items)
 
         except Exception as order_exc:
-            # Per-order failure: log, record error, skip this order, continue
-            err_msg = f"order={order_external_id_for_log} error={str(order_exc)[:300]}"
+            # Per-order failure: log with [ORDER_TRANSFORM_SKIPPED], continue — never crash the loop
+            errors_count += 1
+            err_reason = str(order_exc)[:300]
+            logger.warning(
+                "[ORDER_TRANSFORM_SKIPPED] external_id=%s reason=%s",
+                order_external_id_for_log,
+                err_reason,
+            )
             logger.error(
-                "leaflink: upsert_order_failed brand_id=%s %s",
+                "leaflink: upsert_order_failed brand_id=%s order=%s error=%s",
                 brand_id,
-                err_msg,
+                order_external_id_for_log,
+                err_reason,
                 exc_info=True,
             )
             if len(errors) < 5:
-                errors.append(err_msg)
+                errors.append(f"order={order_external_id_for_log} error={err_reason}")
             skipped += 1
             continue
 
     sync_duration = round(time.monotonic() - sync_start, 2)
-    error_count = len(errors)
+    error_count = errors_count
     all_failed = (created == 0 and updated == 0 and error_count > 0 and len(orders) > 0)
 
     logger.info(
         "leaflink: upsert_complete org_id=%s brand_id=%s created=%s updated=%s skipped=%s errors=%s duration=%ss",
         org_id, brand_id, created, updated, skipped, error_count, sync_duration,
+    )
+    logger.info(
+        "[LEAFLINK_FETCH_OK] raw_count=%s brand_id=%s",
+        len(orders),
+        brand_id,
+    )
+    logger.info(
+        "[LEAFLINK_DB_WRITE_OK] inserted=%s updated=%s skipped=%s errors=%s brand_id=%s",
+        created, updated, skipped, error_count, brand_id,
+    )
+    logger.info(
+        "[LEAFLINK_SYNC_COMPLETE] fetched=%s inserted=%s updated=%s brand_id=%s",
+        len(orders), created, updated, brand_id,
     )
 
     return {
@@ -908,6 +917,14 @@ async def sync_leaflink_orders_headers_only(
         len(batches),
     )
 
+    # [LEAFLINK_TIMESTAMP_STRATEGY] Use server time for all DB columns — bulletproof mode
+    logger.info(
+        "[LEAFLINK_TIMESTAMP_STRATEGY] using=server_time reason=bulletproof_mode brand_id=%s",
+        brand_id_value,
+    )
+    # [LEAFLINK_UPSERT_KEY] Upsert by stable LeafLink identifier only — no date keys
+    logger.info("[LEAFLINK_UPSERT_KEY] key=external_id brand_id=%s", brand_id_value)
+
     # ------------------------------------------------------------------
     # Phase 1: Upsert all order headers and commit each batch before
     # spawning the line-item background task.  This guarantees that every
@@ -925,7 +942,9 @@ async def sync_leaflink_orders_headers_only(
             async with AsyncSessionLocal() as db:
                 async with db.begin():
                     for o in batch:
-                        if not isinstance(o, dict):
+                        _order_ext_id_for_log = "unknown"
+                        try:
+                          if not isinstance(o, dict):
                             logger.warning(
                                 "[ORDER_SKIPPED] brand_id=%s external_order_id=unknown reason=invalid_payload details=not_a_dict",
                                 brand_id_value,
@@ -933,10 +952,11 @@ async def sync_leaflink_orders_headers_only(
                             batch_skipped += 1
                             continue
 
-                        # Map external_order_id: use order["id"] as primary source
-                        # (LeafLink raw payloads carry the order PK in "id").
-                        external_id = safe_str(o.get("id") or o.get("external_id") or o.get("external_order_id"))
-                        if not external_id:
+                          # Map external_order_id: use order["id"] as primary source
+                          # (LeafLink raw payloads carry the order PK in "id").
+                          external_id = safe_str(o.get("id") or o.get("external_id") or o.get("external_order_id"))
+                          _order_ext_id_for_log = external_id or "missing"
+                          if not external_id:
                             logger.error(
                                 "[OrdersSync] skip_no_external_id batch=%s order_number=%s",
                                 batch_num,
@@ -949,11 +969,11 @@ async def sync_leaflink_orders_headers_only(
                             batch_skipped += 1
                             continue
 
-                        # [COMPANY_ID_MISMATCH] Log payload company_id for alignment tracing.
-                        # Compare against credential_company_id from [BRAND_CONFIG_AUDIT] logs.
-                        # Logged only when the payload carries a company_id or source field.
-                        _payload_company_id = o.get("company_id") or o.get("source")
-                        if _payload_company_id:
+                          # [COMPANY_ID_MISMATCH] Log payload company_id for alignment tracing.
+                          # Compare against credential_company_id from [BRAND_CONFIG_AUDIT] logs.
+                          # Logged only when the payload carries a company_id or source field.
+                          _payload_company_id = o.get("company_id") or o.get("source")
+                          if _payload_company_id:
                             logger.info(
                                 "[COMPANY_ID_MISMATCH] brand_id=%s external_order_id=%s payload_company_id=%s note=compare_with_BRAND_CONFIG_AUDIT_for_credential_company_id",
                                 brand_id_value,
@@ -961,73 +981,62 @@ async def sync_leaflink_orders_headers_only(
                                 _payload_company_id,
                             )
 
-                        customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
-                        status = (safe_str(o.get("status")) or "submitted").lower()
-                        order_number = safe_str(o.get("order_number"))
+                          customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
+                          status = (safe_str(o.get("status")) or "submitted").lower()
+                          order_number = safe_str(o.get("order_number"))
 
-                        amount_decimal = safe_decimal(
+                          amount_decimal = safe_decimal(
                             o.get("total_amount")
                             or o.get("amount")
                             or o.get("total")
                             or o.get("subtotal")
                             or o.get("price")
-                        )
-                        total_cents = decimal_to_cents(amount_decimal) or 0
+                          )
+                          total_cents = decimal_to_cents(amount_decimal) or 0
 
-                        item_count = safe_int(o.get("item_count"), default=0)
-                        unit_count = safe_int(o.get("unit_count"), default=0)
+                          item_count = safe_int(o.get("item_count"), default=0)
+                          unit_count = safe_int(o.get("unit_count"), default=0)
 
-                        # Normalise line items and store as JSON — do NOT write
-                        # OrderLine rows here; that is deferred to the background worker.
-                        raw_line_items = o.get("line_items", [])
-                        normalized_line_items = normalize_line_items(raw_line_items)
+                          # Normalise line items and store as JSON — do NOT write
+                          # OrderLine rows here; that is deferred to the background worker.
+                          raw_line_items = o.get("line_items", [])
+                          normalized_line_items = normalize_line_items(raw_line_items)
 
-                        if item_count == 0:
+                          if item_count == 0:
                             item_count = len(normalized_line_items)
-                        if unit_count == 0:
+                          if unit_count == 0:
                             unit_count = sum(
                                 item.get("quantity", 0) or 0
                                 for item in normalized_line_items
                             )
 
-                        review_status = derive_review_status(normalized_line_items)
-                        now = utc_now()
-                        raw_payload = (
+                          review_status = derive_review_status(normalized_line_items)
+
+                          # Use server time for all DB timestamp columns — bulletproof mode.
+                          # LeafLink date fields (created_on, paid_date, etc.) are stored
+                          # inside raw_payload JSONB exactly as received from the API.
+                          now = ensure_utc(utc_now())
+
+                          # raw_payload stores the full LeafLink order dict (including all date fields)
+                          raw_payload = (
                             o.get("raw_payload")
                             if isinstance(o.get("raw_payload"), dict)
                             else o
-                        )
+                          )
 
-                        # Map external timestamps from LeafLink payload.
-                        # LeafLink uses "created" and "modified" fields; fall back
-                        # to common alternatives so the mapping is robust.
-                        created_raw = o.get("created") or o.get("created_at") or o.get("external_created_at")
-                        modified_raw = o.get("modified") or o.get("updated") or o.get("updated_at") or o.get("external_updated_at")
-
-                        # NORMALIZE to UTC-aware
-                        external_created_at = ensure_utc(normalize_datetime(created_raw))
-                        external_updated_at = ensure_utc(normalize_datetime(modified_raw))
-
-                        for ts_dt in (external_updated_at, external_created_at):
-                            if ts_dt:
-                                order_date_utc = ensure_utc(ts_dt)
-                                newest_order_date_utc = ensure_utc(newest_order_date)
-                                if order_date_utc and (newest_order_date_utc is None or order_date_utc > newest_order_date_utc):
-                                    newest_order_date = order_date_utc
-                                break
-
-                        existing_result = await db.execute(
+                          existing_result = await db.execute(
                             select(Order).where(
                                 Order.brand_id == brand_id_value,
                                 Order.external_order_id == external_id,
                             )
-                        )
-                        existing = existing_result.scalar_one_or_none()
+                          )
+                          existing = existing_result.scalar_one_or_none()
 
-                        if existing:
+                          if existing:
                             # Use raw SQL UPDATE with CAST so PostgreSQL receives
                             # explicit type coercion for UUID columns instead of
                             # rejecting a character-varying bound parameter.
+                            # Use server timestamps only — bulletproof mode.
                             update_stmt = """
 UPDATE orders SET
     org_id = CAST(:org_id AS uuid),
@@ -1044,8 +1053,6 @@ UPDATE orders SET
     sync_status = :sync_status,
     synced_at = :synced_at,
     last_synced_at = :last_synced_at,
-    external_created_at = :external_created_at,
-    external_updated_at = :external_updated_at,
     updated_at = :updated_at
 WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :external_order_id
 """
@@ -1054,13 +1061,9 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
                             raw_payload_str = json.dumps(make_json_safe(raw_payload)) if raw_payload else None
 
-                            now = datetime.now(timezone.utc)
-
-                            # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                            synced_at_val = ensure_utc(now)
-                            updated_at_val = ensure_utc(now)
-                            ext_created_val = ensure_utc(external_created_at)
-                            ext_updated_val = ensure_utc(external_updated_at)
+                            # Use server timestamps — bulletproof mode
+                            synced_at_val = now
+                            updated_at_val = now
 
                             update_params = {
                                 "org_id": org_id_value,
@@ -1079,8 +1082,6 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 "sync_status": "ok",
                                 "synced_at": synced_at_val,
                                 "last_synced_at": synced_at_val,
-                                "external_created_at": ext_created_val,
-                                "external_updated_at": ext_updated_val,
                                 "updated_at": updated_at_val,
                             }
 
@@ -1091,32 +1092,31 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             batch_updated += 1
                             # [ORDER_DB_WRITE] Log every successful order update
                             logger.info(
-                                "[ORDER_DB_WRITE] db_order_id=%s external_order_id=%s brand_id=%s org_id=%s customer_name=%s synced_at=%s external_created_at=%s external_updated_at=%s status=%s",
+                                "[ORDER_DB_WRITE] db_order_id=%s external_order_id=%s brand_id=%s org_id=%s customer_name=%s synced_at=%s status=%s",
                                 existing.id,
                                 external_id,
                                 brand_id_value,
                                 org_id_value,
                                 customer_name,
                                 synced_at_val.isoformat() if synced_at_val else None,
-                                ext_created_val.isoformat() if ext_created_val else None,
-                                ext_updated_val.isoformat() if ext_updated_val else None,
                                 "updated",
                             )
-                        else:
+                          else:
                             # Use raw SQL INSERT with CAST so PostgreSQL receives
                             # explicit type coercion for UUID columns instead of
                             # rejecting a character-varying bound parameter.
+                            # Use server timestamps only — bulletproof mode.
                             insert_stmt = """
 INSERT INTO orders (
     org_id, brand_id, external_order_id, order_number, customer_name, status,
     total_cents, amount, item_count, unit_count, line_items_json, raw_payload,
     source, review_status, sync_status, synced_at, last_synced_at,
-    external_created_at, external_updated_at, created_at, updated_at
+    created_at, updated_at
 ) VALUES (
     CAST(:org_id AS uuid), CAST(:brand_id AS uuid), :external_order_id, :order_number,
     :customer_name, :status, :total_cents, :amount, :item_count, :unit_count,
     :line_items_json, :raw_payload, :source, :review_status, :sync_status,
-    :synced_at, :last_synced_at, :external_created_at, :external_updated_at,
+    :synced_at, :last_synced_at,
     :created_at, :updated_at
 )
 """
@@ -1125,13 +1125,9 @@ INSERT INTO orders (
                             line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
                             raw_payload_str = json.dumps(make_json_safe(raw_payload)) if raw_payload else None
 
-                            now = datetime.now(timezone.utc)
-
-                            # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                            created_at_val = ensure_utc(now)
-                            synced_at_val = ensure_utc(now)
-                            ext_created_val = ensure_utc(external_created_at)
-                            ext_updated_val = ensure_utc(external_updated_at)
+                            # Use server timestamps — bulletproof mode
+                            created_at_val = now
+                            synced_at_val = now
 
                             insert_params = {
                                 "org_id": org_id_value,
@@ -1151,8 +1147,6 @@ INSERT INTO orders (
                                 "sync_status": "ok",
                                 "synced_at": synced_at_val,
                                 "last_synced_at": synced_at_val,
-                                "external_created_at": ext_created_val,
-                                "external_updated_at": ext_updated_val,
                                 "created_at": created_at_val,
                                 "updated_at": created_at_val,
                             }
@@ -1164,16 +1158,31 @@ INSERT INTO orders (
                             batch_created += 1
                             # [ORDER_DB_WRITE] Log every successful order insert
                             logger.info(
-                                "[ORDER_DB_WRITE] db_order_id=pending external_order_id=%s brand_id=%s org_id=%s customer_name=%s synced_at=%s external_created_at=%s external_updated_at=%s status=%s",
+                                "[ORDER_DB_WRITE] db_order_id=pending external_order_id=%s brand_id=%s org_id=%s customer_name=%s synced_at=%s status=%s",
                                 external_id,
                                 brand_id_value,
                                 org_id_value,
                                 customer_name,
                                 synced_at_val.isoformat() if synced_at_val else None,
-                                ext_created_val.isoformat() if ext_created_val else None,
-                                ext_updated_val.isoformat() if ext_updated_val else None,
                                 "created",
                             )
+                        except Exception as _order_exc:
+                            # Per-order failure: log with [ORDER_TRANSFORM_SKIPPED], continue
+                            _err_reason = str(_order_exc)[:300]
+                            logger.warning(
+                                "[ORDER_TRANSFORM_SKIPPED] external_id=%s reason=%s",
+                                _order_ext_id_for_log,
+                                _err_reason,
+                            )
+                            logger.error(
+                                "leaflink: headers_only_order_failed brand_id=%s order=%s error=%s",
+                                brand_id_value,
+                                _order_ext_id_for_log,
+                                _err_reason,
+                                exc_info=True,
+                            )
+                            batch_skipped += 1
+                            continue
                 # Explicit commit guarantee
                 await db.commit()
 
@@ -1334,9 +1343,24 @@ INSERT INTO orders (
 
     asyncio.create_task(_background_line_items())
 
+    logger.info(
+        "[LEAFLINK_FETCH_OK] raw_count=%s brand_id=%s",
+        fetched_count,
+        brand_id_value,
+    )
+    logger.info(
+        "[LEAFLINK_DB_WRITE_OK] inserted=%s updated=%s skipped=%s errors=%s brand_id=%s",
+        total_created, total_updated, total_skipped, len(errors), brand_id_value,
+    )
+    logger.info(
+        "[LEAFLINK_SYNC_COMPLETE] fetched=%s inserted=%s updated=%s brand_id=%s",
+        fetched_count, total_created, total_updated, brand_id_value,
+    )
+
     return {
         "ok": len(errors) == 0,
         "orders_fetched": fetched_count,
+        "fetched_count": fetched_count,
         "created": total_created,
         "updated": total_updated,
         "skipped": total_skipped,
