@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db, has_column
 from models import Order, SyncRequest, SyncRun
 from models.sync_health import DeadLetterLineItem, SyncHealth
+from services.leaflink_sync import safe_uuid_mapped_product
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("sync_routes")
@@ -192,7 +193,7 @@ async def replay_dead_letter_item(
         "quantity": raw.get("quantity", 0),
         "unit_price": raw.get("unit_price"),
         "total_price": raw.get("total_price"),
-        "mapped_product_id": raw.get("mapped_product_id"),
+        "mapped_product_id": safe_uuid_mapped_product(raw.get("mapped_product_id")),
         "mapping_status": raw.get("mapping_status", "unknown"),
         "mapping_issue": raw.get("mapping_issue"),
         "raw_payload": json.dumps(make_json_safe(raw)) if raw else None,

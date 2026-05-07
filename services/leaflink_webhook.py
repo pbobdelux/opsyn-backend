@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal
 from models import BrandAPICredential, Order
+from services.leaflink_sync import safe_uuid_mapped_product
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("leaflink_webhook")
@@ -260,6 +261,24 @@ def _normalize_line_items(raw_line_items: Any) -> list[dict[str, Any]]:
         if not sku and not mapping_issue:
             mapping_issue = "Unknown SKU"
 
+        # Coerce mapped_product_id to a valid UUID or None.
+        # safe_uuid_mapped_product() logs [PRODUCT_MAPPING_INVALID_UUID] if the
+        # raw value is present but not a valid UUID, preventing
+        # "column mapped_product_id is of type uuid but expression is of type
+        # character varying" errors from reaching the database.
+        _raw_mapped_id = item.get("mapped_product_id")
+        mapped_product_id_coerced = safe_uuid_mapped_product(_raw_mapped_id)
+        if _raw_mapped_id is not None and _raw_mapped_id != "" and mapped_product_id_coerced is None:
+            logger.warning(
+                "[PRODUCT_MAPPING_FALLBACK] sku=%s original_value=%s reason=invalid_uuid",
+                sku,
+                str(_raw_mapped_id)[:100],
+            )
+            logger.warning(
+                "[PRODUCT_MAPPING_NULL_APPLIED] field=mapped_product_id sku=%s",
+                sku,
+            )
+
         normalized.append({
             "sku": sku,
             "product_name": product_name,
@@ -268,7 +287,7 @@ def _normalize_line_items(raw_line_items: Any) -> list[dict[str, Any]]:
             "total_price": total_price,
             "unit_price_cents": _decimal_to_cents(unit_price),
             "total_price_cents": _decimal_to_cents(total_price),
-            "mapped_product_id": _safe_str(item.get("mapped_product_id")),
+            "mapped_product_id": mapped_product_id_coerced,
             "mapping_status": mapping_status,
             "mapping_issue": mapping_issue,
             "raw_payload": item,
