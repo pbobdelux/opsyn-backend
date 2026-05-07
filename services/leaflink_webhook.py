@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal
 from models import BrandAPICredential, Order
-from services.leaflink_sync import safe_uuid_for_db, safe_uuid_mapped_product
+from services.leaflink_sync import safe_uuid_for_db
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("leaflink_webhook")
@@ -262,12 +262,12 @@ def _normalize_line_items(raw_line_items: Any) -> list[dict[str, Any]]:
             mapping_issue = "Unknown SKU"
 
         # Coerce mapped_product_id to a valid UUID or None.
-        # safe_uuid_mapped_product() logs [PRODUCT_MAPPING_INVALID_UUID] if the
-        # raw value is present but not a valid UUID, preventing
+        # safe_uuid_for_db() returns None (not the original value) when the
+        # input is not a well-formed UUID, preventing
         # "column mapped_product_id is of type uuid but expression is of type
         # character varying" errors from reaching the database.
         _raw_mapped_id = item.get("mapped_product_id")
-        mapped_product_id_coerced = safe_uuid_mapped_product(_raw_mapped_id)
+        mapped_product_id_coerced = safe_uuid_for_db(_raw_mapped_id, "mapped_product_id")
         if _raw_mapped_id is not None and _raw_mapped_id != "" and mapped_product_id_coerced is None:
             logger.warning(
                 "[PRODUCT_MAPPING_FALLBACK] sku=%s original_value=%s reason=invalid_uuid",
@@ -439,6 +439,14 @@ async def upsert_webhook_order(
                 existing.org_id = _write_org_id
             order_row = existing
             action = "updated"
+            # Log mapped_product_id values for every line item being written
+            for _li in normalized_line_items:
+                _mpid = _li.get("mapped_product_id")
+                logger.error(
+                    "[FINAL_SQL_PARAMS] function=upsert_webhook_order action=update mapped_product_id=%s type=%s",
+                    _mpid,
+                    type(_mpid).__name__,
+                )
         else:
             # FINAL coercion immediately before ORM write — belt-and-suspenders
             _write_org_id = safe_uuid_for_db(_write_org_id, "org_id")
@@ -452,6 +460,14 @@ async def upsert_webhook_order(
                 type(_write_brand_id).__name__,
                 external_id,
             )
+            # Log mapped_product_id values for every line item being written
+            for _li in normalized_line_items:
+                _mpid = _li.get("mapped_product_id")
+                logger.error(
+                    "[FINAL_SQL_PARAMS] function=upsert_webhook_order action=insert mapped_product_id=%s type=%s",
+                    _mpid,
+                    type(_mpid).__name__,
+                )
             order_row = Order(
                 org_id=_write_org_id,
                 brand_id=_write_brand_id,
