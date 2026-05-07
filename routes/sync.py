@@ -235,6 +235,8 @@ async def replay_dead_letter_item(
         params["total_price_cents"] = raw.get("total_price_cents")
 
     try:
+        logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id)
+        logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id)
         await db.execute(text(upsert_stmt), params)
         await db.commit()
 

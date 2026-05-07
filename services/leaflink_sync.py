@@ -1471,6 +1471,8 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 "updated_at": updated_at_val,
                             }
 
+                            logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
+                            logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -1557,6 +1559,8 @@ INSERT INTO orders (
                                 "updated_at": created_at_val,
                             }
 
+                            logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
+                            logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
@@ -2059,6 +2063,8 @@ async def sync_leaflink_line_items(
                 if enabled_columns.get("total_price_cents", False):
                     insert_params["total_price_cents"] = item.get("total_price_cents")
 
+                logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
+                logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
