@@ -100,11 +100,12 @@ async def _update_sync_health_phase1(
                     )
             await db.execute(
                 text("""
-                    INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, updated_at)
-                    VALUES (CAST(:brand_id AS UUID), :now, :count, 0, 0, :now)
+                    INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, orders_fetched_last_run, updated_at)
+                    VALUES (CAST(:brand_id AS UUID), :now, :count, 0, 0, :count, :now)
                     ON CONFLICT (brand_id) DO UPDATE SET
                         last_attempted_sync_at = :now,
                         total_orders_synced = sync_health.total_orders_synced + :count,
+                        orders_fetched_last_run = :count,
                         updated_at = :now
                 """),
                 _phase1_params,
@@ -151,6 +152,7 @@ async def _update_sync_health_phase2(
                         last_successful_sync_at = :now,
                         consecutive_failures = 0,
                         total_line_items_synced = total_line_items_synced + :count,
+                        orders_written_last_run = :count,
                         last_error = NULL,
                         updated_at = :now
                     WHERE brand_id = CAST(:brand_id AS UUID)
@@ -192,11 +194,12 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
                     )
             await db.execute(
                 text("""
-                    INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
-                    VALUES (CAST(:brand_id AS UUID), :error, 1, :now)
+                    INSERT INTO sync_health (brand_id, last_error, consecutive_failures, last_error_at, updated_at)
+                    VALUES (CAST(:brand_id AS UUID), :error, 1, :now, :now)
                     ON CONFLICT (brand_id) DO UPDATE SET
                         last_error = :error,
                         consecutive_failures = sync_health.consecutive_failures + 1,
+                        last_error_at = :now,
                         updated_at = :now
                 """),
                 _sync_error_params,
@@ -1372,7 +1375,7 @@ async def _insert_line_items_standalone(
                 f"mapped_product_id must be None, str, or UUID, "
                 f"got {type(insert_params.get('mapped_product_id'))}"
             )
-            logger.info(
+            logger.debug(
                 "[FINAL_SQL_PARAMS_AUDIT] mapped_product_id=%s type=%s is_none=%s is_str=%s is_uuid=%s"
                 " function=_insert_line_items_for_order",
                 insert_params.get("mapped_product_id"),
@@ -1420,9 +1423,9 @@ async def _insert_line_items_standalone(
                     f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
                 )
 
-            # Log every parameter in final order with position
+            # Log every parameter in final order with position (DEBUG only — high volume)
             for idx, (k, v) in enumerate(insert_params.items(), start=1):
-                logger.info(
+                logger.debug(
                     "[ORDER_LINES_PARAM_POSITION] idx=%s key=%s type=%s value=%r tzinfo=%s aware=%s",
                     idx,
                     k,
@@ -1861,7 +1864,7 @@ async def sync_leaflink_orders(
                         f"mapped_product_id must be None, str, or UUID, "
                         f"got {type(_mapped_product_id_coerced)}"
                     )
-                    logger.info(
+                    logger.debug(
                         "[FINAL_SQL_PARAMS_AUDIT] mapped_product_id=%s type=%s is_none=%s is_str=%s is_uuid=%s"
                         " function=sync_leaflink_orders",
                         _mapped_product_id_coerced,
@@ -1938,9 +1941,9 @@ async def sync_leaflink_orders(
                             f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
                         )
 
-                    # Log every parameter in final order with position
+                    # Log every parameter in final order with position (DEBUG only — high volume)
                     for idx, (k, v) in enumerate(_li_params.items(), start=1):
-                        logger.info(
+                        logger.debug(
                             "[ORDER_LINES_PARAM_POSITION] idx=%s key=%s type=%s value=%r tzinfo=%s aware=%s",
                             idx,
                             k,
@@ -3081,7 +3084,7 @@ async def sync_leaflink_line_items(
                     order_id_val,
                     sku,
                 )
-                logger.info(
+                logger.debug(
                     "[FINAL_SQL_PARAMS_AUDIT] mapped_product_id=%s type=%s is_none=%s is_str=%s is_uuid=%s"
                     " function=_upsert_line_items",
                     insert_params.get("mapped_product_id"),
@@ -3128,9 +3131,9 @@ async def sync_leaflink_line_items(
                         f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
                     )
 
-                # Log every parameter in final order with position
+                # Log every parameter in final order with position (DEBUG only — high volume)
                 for idx, (k, v) in enumerate(insert_params.items(), start=1):
-                    logger.info(
+                    logger.debug(
                         "[ORDER_LINES_PARAM_POSITION] idx=%s key=%s type=%s value=%r tzinfo=%s aware=%s",
                         idx,
                         k,
@@ -3782,6 +3785,14 @@ async def sync_leaflink_background_continuous(
                 else:
                     # Permanent error — detect auth failures specifically before propagating
                     _err_lower = _err_str.lower()
+                    _is_auth_failure = (
+                        "status=401" in _err_lower
+                        or "auth failed" in _err_lower
+                        or "authentication failed" in _err_lower
+                        or "status=403" in _err_lower
+                        or "forbidden" in _err_lower
+                        or "invalid_token" in _err_lower
+                    )
                     if "status=401" in _err_lower or "auth failed" in _err_lower or "authentication failed" in _err_lower:
                         logger.error(
                             "[LeafLinkSync] auth_failed id=%s status=401 error=%s",
@@ -3802,6 +3813,36 @@ async def sync_leaflink_background_continuous(
                             sync_run_id,
                             _err_str[:500],
                         )
+
+                    # Circuit breaker: mark brand credential as auth_failed to stop retries
+                    if _is_auth_failure:
+                        logger.error(
+                            "[LEAFLINK_AUTH_CIRCUIT_BREAKER] brand_id=%s marking_auth_failed"
+                            " — stopping retries. Check API key in brand_api_credentials.",
+                            brand_id,
+                        )
+                        try:
+                            async with AsyncSessionLocal() as _auth_db:
+                                async with _auth_db.begin():
+                                    await _auth_db.execute(
+                                        text("""
+                                            UPDATE brand_api_credentials
+                                            SET sync_status = 'auth_failed',
+                                                last_error = :error,
+                                                updated_at = NOW()
+                                            WHERE brand_id = CAST(:brand_id AS uuid)
+                                              AND integration_name = 'leaflink'
+                                              AND is_active = true
+                                        """),
+                                        {"brand_id": safe_uuid_for_db(brand_id, "brand_id") or brand_id,
+                                         "error": _err_str[:500]},
+                                    )
+                        except Exception as _auth_cb_exc:
+                            logger.error(
+                                "[LEAFLINK_AUTH_CIRCUIT_BREAKER] failed_to_mark_auth_failed brand_id=%s error=%s",
+                                brand_id,
+                                str(_auth_cb_exc)[:200],
+                            )
 
                     logger.error(
                         "[OrdersSync] sync_failed_permanent_error brand=%s error=%s",

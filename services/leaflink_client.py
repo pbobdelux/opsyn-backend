@@ -61,7 +61,7 @@ def validate_leaflink_endpoint_url(url: str) -> tuple[bool, str]:
 _RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 _MAX_RETRY_ATTEMPTS = 3
 _RETRY_BACKOFF_BASE = 1.0   # seconds (doubles each attempt: 1s, 2s, 4s)
-_REQUEST_TIMEOUT = 30       # seconds per HTTP request
+_REQUEST_TIMEOUT = 25       # seconds per HTTP request (spec: timeout every request at 25s)
 
 # Network-level errors that are always retryable (DNS, connection reset, timeout)
 _RETRYABLE_NETWORK_EXCEPTIONS = (RequestsConnectionError, RequestsTimeout, OSError)

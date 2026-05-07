@@ -1,8 +1,12 @@
 import logging
+import os
+import time
 from datetime import datetime, timezone
+from typing import Any, Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -19,9 +23,308 @@ logger = logging.getLogger("health")
 
 router = APIRouter(prefix="/health", tags=["health"])
 
+# ---------------------------------------------------------------------------
+# Feature flags
+# ---------------------------------------------------------------------------
+_LEAFLINK_SYNC_STALE_MINUTES = int(os.getenv("LEAFLINK_SYNC_STALE_MINUTES", "60"))
+_WATCHDOG_CONSECUTIVE_FAILURE_THRESHOLD = 3
+_WATCHDOG_DEAD_LETTER_THRESHOLD = 10
+
+APP_VERSION = "1.0.0"
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _sanitize_db_host(database_url: str) -> str:
+    """Return only the hostname from a DATABASE_URL — no credentials."""
+    try:
+        parsed = urlparse(database_url)
+        return parsed.hostname or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _compute_sync_status(
+    consecutive_failures: int,
+    last_successful_sync_at: Optional[datetime],
+    dead_letter_count: int,
+    stale_minutes: int = _LEAFLINK_SYNC_STALE_MINUTES,
+) -> str:
+    """Compute watchdog status: healthy | degraded | failing."""
+    if consecutive_failures >= _WATCHDOG_CONSECUTIVE_FAILURE_THRESHOLD:
+        return "failing"
+    if dead_letter_count >= _WATCHDOG_DEAD_LETTER_THRESHOLD:
+        return "degraded"
+    if last_successful_sync_at is not None:
+        age_minutes = (datetime.now(timezone.utc) - last_successful_sync_at).total_seconds() / 60
+        if age_minutes > stale_minutes:
+            return "degraded"
+    return "healthy"
+
+
+# ---------------------------------------------------------------------------
+# GET /health — top-level service health
+# ---------------------------------------------------------------------------
+
+@router.get("")
+@router.get("/")
+async def health_root(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """
+    Top-level service health check.
+
+    Returns:
+      {
+        "ok": true,
+        "service": "opsyn-backend",
+        "version": "1.0.0",
+        "timestamp": "<ISO>",
+        "database": "ok|error",
+        "leaflink_sync": "ok|warning|error"
+      }
+    """
+    timestamp = _utc_now_iso()
+    database_status = "ok"
+    leaflink_sync_status = "ok"
+
+    # --- Database ping ---
+    try:
+        await db.execute(text("SELECT 1"))
+        logger.info("[DB_HEALTH_OK] health_check=passed")
+    except Exception as db_exc:
+        database_status = "error"
+        logger.error("[DB_HEALTH_FAIL] health_check=failed error=%s", str(db_exc)[:200])
+
+    # --- LeafLink sync health ---
+    try:
+        result = await db.execute(
+            text("""
+                SELECT
+                    consecutive_failures,
+                    last_successful_sync_at,
+                    (SELECT COUNT(*) FROM sync_dead_letters WHERE resolved_at IS NULL) AS dead_letter_count
+                FROM sync_health
+                ORDER BY updated_at DESC
+                LIMIT 1
+            """)
+        )
+        row = result.fetchone()
+        if row:
+            consecutive_failures = row[0] or 0
+            last_successful_sync_at = row[1]
+            dead_letter_count = row[2] or 0
+            status = _compute_sync_status(consecutive_failures, last_successful_sync_at, dead_letter_count)
+            if status == "failing":
+                leaflink_sync_status = "error"
+            elif status == "degraded":
+                leaflink_sync_status = "warning"
+            else:
+                leaflink_sync_status = "ok"
+        else:
+            leaflink_sync_status = "warning"  # no sync health data yet
+    except Exception as sync_exc:
+        leaflink_sync_status = "error"
+        logger.warning("[SYNC_HEALTH_STATUS] check_failed error=%s", str(sync_exc)[:200])
+
+    logger.info(
+        "[SYNC_HEALTH_STATUS] database=%s leaflink_sync=%s",
+        database_status,
+        leaflink_sync_status,
+    )
+
+    return {
+        "ok": database_status == "ok",
+        "service": "opsyn-backend",
+        "version": APP_VERSION,
+        "timestamp": timestamp,
+        "database": database_status,
+        "leaflink_sync": leaflink_sync_status,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /health/db — database connectivity check
+# ---------------------------------------------------------------------------
+
+@router.get("/db")
+async def health_db(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """
+    Database connectivity health check.
+
+    Runs SELECT 1, measures latency, returns sanitized host (no credentials).
+    """
+    database_url = os.getenv("DATABASE_URL", "")
+    db_host = _sanitize_db_host(database_url)
+
+    start = time.monotonic()
+    try:
+        await db.execute(text("SELECT 1"))
+        latency_ms = round((time.monotonic() - start) * 1000, 2)
+        logger.info("[DB_HEALTH_OK] host=%s latency_ms=%s", db_host, latency_ms)
+        return {
+            "ok": True,
+            "database": "ok",
+            "host": db_host,
+            "latency_ms": latency_ms,
+            "timestamp": _utc_now_iso(),
+        }
+    except Exception as exc:
+        latency_ms = round((time.monotonic() - start) * 1000, 2)
+        logger.error("[DB_HEALTH_FAIL] host=%s latency_ms=%s error=%s", db_host, latency_ms, str(exc)[:200])
+        return {
+            "ok": False,
+            "database": "error",
+            "host": db_host,
+            "latency_ms": latency_ms,
+            "error": str(exc)[:200],
+            "timestamp": _utc_now_iso(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# GET /health/sync — per-brand sync health
+# ---------------------------------------------------------------------------
+
+@router.get("/sync")
+async def health_sync(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """
+    Per-brand LeafLink sync health.
+
+    Returns one entry per brand with:
+      - brand_id
+      - last_successful_sync_at
+      - last_sync_attempt_at
+      - last_error_at
+      - last_error_message
+      - orders_fetched_last_run
+      - orders_written_last_run
+      - dead_letter_count
+      - consecutive_failures
+      - status: healthy | degraded | failing
+    """
+    timestamp = _utc_now_iso()
+
+    try:
+        # Fetch all sync_health rows, joined with credential auth status
+        result = await db.execute(
+            text("""
+                SELECT
+                    sh.brand_id,
+                    sh.last_successful_sync_at,
+                    sh.last_attempted_sync_at,
+                    sh.last_error,
+                    sh.consecutive_failures,
+                    COALESCE(sh.orders_fetched_last_run, 0) AS orders_fetched_last_run,
+                    COALESCE(sh.orders_written_last_run, 0) AS orders_written_last_run,
+                    sh.last_error_at,
+                    (
+                        SELECT COUNT(*)
+                        FROM sync_dead_letters sdl
+                        WHERE sdl.brand_id = sh.brand_id::uuid
+                          AND sdl.resolved_at IS NULL
+                    ) AS dead_letter_count,
+                    (
+                        SELECT bac.sync_status
+                        FROM brand_api_credentials bac
+                        WHERE bac.brand_id = sh.brand_id
+                          AND bac.integration_name = 'leaflink'
+                          AND bac.is_active = true
+                        LIMIT 1
+                    ) AS credential_sync_status
+                FROM sync_health sh
+                ORDER BY sh.brand_id
+            """)
+        )
+        rows = result.fetchall()
+
+        brands = []
+        overall_status = "healthy"
+
+        for row in rows:
+            brand_id = row[0]
+            last_successful_sync_at = row[1]
+            last_sync_attempt_at = row[2]
+            last_error_message = row[3]
+            consecutive_failures = row[4] or 0
+            orders_fetched_last_run = row[5] or 0
+            orders_written_last_run = row[6] or 0
+            last_error_at = row[7]
+            dead_letter_count = int(row[8] or 0)
+            credential_sync_status = row[9] if len(row) > 9 else None
+
+            # Auth failure circuit breaker: if credential is auth_failed, mark as failing
+            auth_failed = credential_sync_status == "auth_failed"
+            if auth_failed:
+                status = "failing"
+            else:
+                status = _compute_sync_status(
+                    consecutive_failures,
+                    last_successful_sync_at,
+                    dead_letter_count,
+                )
+
+            if status == "failing" and overall_status != "failing":
+                overall_status = "failing"
+            elif status == "degraded" and overall_status == "healthy":
+                overall_status = "degraded"
+
+            # Emit watchdog warning log if degraded/failing
+            if status in ("degraded", "failing"):
+                logger.warning(
+                    "[SYNC_WATCHDOG_WARNING] brand_id=%s status=%s consecutive_failures=%s"
+                    " dead_letter_count=%s last_successful_sync_at=%s auth_failed=%s",
+                    brand_id,
+                    status,
+                    consecutive_failures,
+                    dead_letter_count,
+                    last_successful_sync_at.isoformat() if last_successful_sync_at else "never",
+                    auth_failed,
+                )
+
+            brands.append({
+                "brand_id": brand_id,
+                "last_successful_sync_at": last_successful_sync_at.isoformat() if last_successful_sync_at else None,
+                "last_sync_attempt_at": last_sync_attempt_at.isoformat() if last_sync_attempt_at else None,
+                "last_error_at": last_error_at.isoformat() if last_error_at else None,
+                "last_error_message": last_error_message,
+                "orders_fetched_last_run": orders_fetched_last_run,
+                "orders_written_last_run": orders_written_last_run,
+                "dead_letter_count": dead_letter_count,
+                "consecutive_failures": consecutive_failures,
+                "auth_failed": auth_failed,
+                "auth_failed_message": (
+                    "LeafLink API key is invalid or expired. Update credentials in brand_api_credentials."
+                    if auth_failed else None
+                ),
+                "status": status,
+            })
+
+        logger.info(
+            "[SYNC_HEALTH_STATUS] brands=%s overall=%s timestamp=%s",
+            len(brands),
+            overall_status,
+            timestamp,
+        )
+
+        return make_json_safe({
+            "ok": True,
+            "timestamp": timestamp,
+            "overall_status": overall_status,
+            "brand_count": len(brands),
+            "brands": brands,
+        })
+
+    except Exception as exc:
+        logger.error("[SYNC_HEALTH_STATUS] check_failed error=%s", str(exc)[:300], exc_info=True)
+        return {
+            "ok": False,
+            "timestamp": timestamp,
+            "overall_status": "error",
+            "brand_count": 0,
+            "brands": [],
+            "error": str(exc)[:300],
+        }
 
 
 @router.get("/data")

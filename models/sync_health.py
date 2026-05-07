@@ -54,6 +54,15 @@ class SyncHealth(Base):
     total_orders_synced: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_line_items_synced: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # Per-run counters (updated each sync run)
+    orders_fetched_last_run: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    orders_written_last_run: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Error tracking
+    last_error_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
     )

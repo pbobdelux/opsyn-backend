@@ -16,6 +16,7 @@ Use backfill-normalized-dates to re-parse LeafLink dates in existing orders.
 """
 import json
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -32,6 +33,12 @@ from services.leaflink_sync import safe_uuid_for_db
 logger = logging.getLogger("diagnostics")
 
 router = APIRouter(prefix="/diagnostics", tags=["diagnostics"])
+
+# ---------------------------------------------------------------------------
+# Feature flags
+# ---------------------------------------------------------------------------
+_REPROCESS_ENABLED = os.getenv("LEAFLINK_REPROCESS_ENABLED", "true").lower() == "true"
+_MAX_RETRY_ATTEMPTS_DEFAULT = int(os.getenv("LEAFLINK_MAX_RETRY_ATTEMPTS", "5"))
 
 # Thread pool for running synchronous LeafLink HTTP calls off the event loop
 _diag_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="leaflink-diag")
@@ -252,44 +259,54 @@ async def diagnostic_leaflink_orders_raw(
 @router.post("/leaflink/reprocess-dead-letters")
 async def reprocess_dead_letters(
     brand_id: str = Query(..., description="Brand ID to reprocess dead letters for"),
-    limit: int = Query(100, ge=1, le=1000, description="Max records to reprocess per call"),
+    limit: int = Query(10, ge=1, le=1000, description="Max records to reprocess per call (default 10)"),
+    max_attempts: int = Query(0, ge=0, description="Skip records with retry_count >= this value (0 = use env LEAFLINK_MAX_RETRY_ATTEMPTS)"),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """Retry all unresolved dead-letter records for a brand.
+    """Retry unresolved dead-letter records for a brand.
 
-    Reads raw_payload from sync_dead_letters, attempts to re-insert each order
-    via sync_leaflink_orders(), and marks successfully reprocessed records as
-    resolved (resolved_at = NOW()).
+    Self-healing reprocessing with:
+      - Batch size limit (default 10 per call)
+      - Skip permanently bad records after max_attempts (default 5 from env)
+      - Updates retry_count and last_retry_at on each attempt
+      - Marks resolved when successful
+      - Returns: attempted, succeeded, failed, skipped, remaining
 
-    Returns counts of attempted, succeeded, and failed reprocessing attempts.
+    Feature flag: LEAFLINK_REPROCESS_ENABLED=true (default)
 
     Logs:
-      [REPROCESS_STARTED]  — when reprocessing begins
-      [REPROCESS_COMPLETE] — when all records have been attempted
+      [REPROCESS_STARTED]          — when reprocessing begins
+      [DEAD_LETTER_REPROCESS_OK]   — per successful record
+      [DEAD_LETTER_REPROCESS_FAIL] — per failed record
+      [REPROCESS_COMPLETE]         — summary when done
     """
+    if not _REPROCESS_ENABLED:
+        return {
+            "ok": False,
+            "brand_id": brand_id,
+            "message": "Reprocessing is disabled (LEAFLINK_REPROCESS_ENABLED=false)",
+        }
+
     from database import AsyncSessionLocal
     from services.leaflink_sync import sync_leaflink_orders
 
+    # Resolve max_attempts from env if not provided
+    effective_max_attempts = max_attempts if max_attempts > 0 else _MAX_RETRY_ATTEMPTS_DEFAULT
+
     # Coerce brand_id to a valid UUID or None before using it in UUID columns.
-    # CAST(:brand_id AS uuid) in the SQL will fail if the value is not a valid UUID string.
-    brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
+    brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id
 
     logger.info(
-        "[REPROCESS_STARTED] brand_id=%s limit=%s source=reprocess-dead-letters",
+        "[REPROCESS_STARTED] brand_id=%s limit=%s max_attempts=%s source=reprocess-dead-letters",
         brand_id,
         limit,
+        effective_max_attempts,
     )
 
     now = datetime.now(timezone.utc)
-
-    # Re-coerce immediately before SQL — belt-and-suspenders guard
     _sql_brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id
-    logger.info(
-        "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s function=reprocess_dead_letters",
-        _sql_brand_id,
-    )
 
-    # Fetch unresolved dead-letter records for this brand
+    # Fetch unresolved dead-letter records for this brand (all unresolved, to compute remaining)
     try:
         result = await db.execute(
             text("""
@@ -298,40 +315,49 @@ async def reprocess_dead_letters(
                 WHERE brand_id = CAST(:brand_id AS uuid)
                   AND resolved_at IS NULL
                 ORDER BY created_at ASC
-                LIMIT :limit
             """),
-            {"brand_id": _sql_brand_id, "limit": limit},
+            {"brand_id": _sql_brand_id},
         )
-        rows = result.fetchall()
+        all_rows = result.fetchall()
     except Exception as exc:
-        logger.error(
-            "[REPROCESS_ERROR] brand_id=%s error=%s",
-            brand_id,
-            str(exc)[:300],
-        )
+        logger.error("[REPROCESS_ERROR] brand_id=%s error=%s", brand_id, str(exc)[:300])
         raise HTTPException(status_code=500, detail=f"Failed to fetch dead letters: {str(exc)[:300]}")
 
-    if not rows:
-        logger.info("[REPROCESS_COMPLETE] brand_id=%s attempted=0 succeeded=0 failed=0 reason=no_unresolved_records", brand_id)
+    total_unresolved = len(all_rows)
+
+    if not all_rows:
+        logger.info(
+            "[REPROCESS_COMPLETE] brand_id=%s attempted=0 succeeded=0 failed=0 skipped=0 remaining=0 reason=no_unresolved_records",
+            brand_id,
+        )
         return {
             "ok": True,
             "brand_id": brand_id,
             "attempted": 0,
             "succeeded": 0,
             "failed": 0,
+            "skipped": 0,
+            "remaining": 0,
             "message": "No unresolved dead-letter records found",
         }
+
+    # Separate: rows eligible for retry vs permanently skipped
+    eligible_rows = [r for r in all_rows if (r[5] or 0) < effective_max_attempts]
+    permanently_skipped = total_unresolved - len(eligible_rows)
+
+    # Apply batch limit to eligible rows
+    batch_rows = eligible_rows[:limit]
 
     attempted = 0
     succeeded = 0
     failed = 0
-    failed_ids: list[int] = []
+    skipped = permanently_skipped  # start with permanently skipped count
 
-    for row in rows:
+    for row in batch_rows:
         record_id = row[0]
         external_id = row[1]
         raw_payload = row[3]
-        retry_count = row[5]
+        retry_count = row[5] or 0
         attempted += 1
 
         try:
@@ -349,12 +375,13 @@ async def reprocess_dead_letters(
             updated = reprocess_result.get("updated_count", 0)
 
             if inserted > 0 or updated > 0:
-                # Mark as resolved
+                # Mark as resolved, update retry_count and last_retry_at
                 await db.execute(
                     text("""
                         UPDATE sync_dead_letters
                         SET resolved_at = :now,
-                            retry_count = retry_count + 1
+                            retry_count = retry_count + 1,
+                            last_retry_at = :now
                         WHERE id = :id
                     """),
                     {"now": now, "id": record_id},
@@ -362,52 +389,72 @@ async def reprocess_dead_letters(
                 await db.commit()
                 succeeded += 1
                 logger.info(
-                    "[REPROCESS_ORDER_SUCCESS] brand_id=%s external_id=%s record_id=%s",
+                    "[DEAD_LETTER_REPROCESS_OK] brand_id=%s external_id=%s record_id=%s retry_count=%s",
                     brand_id,
                     external_id,
                     record_id,
+                    retry_count + 1,
                 )
             else:
-                # Increment retry count but leave unresolved
+                # Increment retry count and last_retry_at, leave unresolved
                 await db.execute(
                     text("""
                         UPDATE sync_dead_letters
-                        SET retry_count = retry_count + 1
+                        SET retry_count = retry_count + 1,
+                            last_retry_at = :now
                         WHERE id = :id
                     """),
-                    {"id": record_id},
+                    {"now": now, "id": record_id},
                 )
                 await db.commit()
                 failed += 1
-                failed_ids.append(record_id)
                 logger.warning(
-                    "[REPROCESS_ORDER_FAILED] brand_id=%s external_id=%s record_id=%s reason=no_rows_written",
+                    "[DEAD_LETTER_REPROCESS_FAIL] brand_id=%s external_id=%s record_id=%s"
+                    " retry_count=%s reason=no_rows_written",
                     brand_id,
                     external_id,
                     record_id,
+                    retry_count + 1,
                 )
 
         except Exception as exc:
             failed += 1
-            failed_ids.append(record_id)
             logger.error(
-                "[REPROCESS_ORDER_ERROR] brand_id=%s external_id=%s record_id=%s error=%s",
+                "[DEAD_LETTER_REPROCESS_FAIL] brand_id=%s external_id=%s record_id=%s error=%s",
                 brand_id,
                 external_id,
                 record_id,
                 str(exc)[:300],
             )
+            # Update last_retry_at even on failure so we track the attempt
             try:
-                await db.rollback()
+                await db.execute(
+                    text("""
+                        UPDATE sync_dead_letters
+                        SET retry_count = retry_count + 1,
+                            last_retry_at = :now
+                        WHERE id = :id
+                    """),
+                    {"now": now, "id": record_id},
+                )
+                await db.commit()
             except Exception:
-                pass
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+
+    # Remaining = total unresolved - succeeded (resolved this run)
+    remaining = total_unresolved - succeeded
 
     logger.info(
-        "[REPROCESS_COMPLETE] brand_id=%s attempted=%s succeeded=%s failed=%s",
+        "[REPROCESS_COMPLETE] brand_id=%s attempted=%s succeeded=%s failed=%s skipped=%s remaining=%s",
         brand_id,
         attempted,
         succeeded,
         failed,
+        skipped,
+        remaining,
     )
 
     return {
@@ -417,8 +464,13 @@ async def reprocess_dead_letters(
         "attempted": attempted,
         "succeeded": succeeded,
         "failed": failed,
-        "failed_record_ids": failed_ids[:20],
-        "message": f"Reprocessed {attempted} dead-letter records: {succeeded} succeeded, {failed} failed",
+        "skipped": skipped,
+        "remaining": remaining,
+        "message": (
+            f"Reprocessed {attempted} dead-letter records: {succeeded} succeeded, "
+            f"{failed} failed, {skipped} skipped (exceeded max_attempts={effective_max_attempts}), "
+            f"{remaining} remaining"
+        ),
     }
 
 
