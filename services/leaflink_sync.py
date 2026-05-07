@@ -87,10 +87,13 @@ async def _update_sync_health_phase1(
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
                 {"brand_id": brand_id, "now": ensure_utc(utc_now()), "count": (orders_count or 0)}
             )
+            logger.info(
+                "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase1 columns=brand_id"
+            )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, updated_at)
-                    VALUES (:brand_id, :now, :count, 0, 0, :now)
+                    VALUES (CAST(:brand_id AS UUID), :now, :count, 0, 0, :now)
                     ON CONFLICT (brand_id) DO UPDATE SET
                         last_attempted_sync_at = :now,
                         total_orders_synced = sync_health.total_orders_synced + :count,
@@ -123,6 +126,9 @@ async def _update_sync_health_phase2(
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
                 {"brand_id": brand_id, "now": ensure_utc(utc_now()), "count": line_items_count}
             )
+            logger.info(
+                "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase2 columns=brand_id"
+            )
             await db.execute(
                 text("""
                     UPDATE sync_health SET
@@ -131,7 +137,7 @@ async def _update_sync_health_phase2(
                         total_line_items_synced = total_line_items_synced + :count,
                         last_error = NULL,
                         updated_at = :now
-                    WHERE brand_id = :brand_id
+                    WHERE brand_id = CAST(:brand_id AS UUID)
                 """),
                 _phase2_params,
             )
@@ -157,10 +163,13 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
                 {"brand_id": brand_id, "error": str(error)[:500], "now": ensure_utc(utc_now())}
             )
+            logger.info(
+                "[UUID_SQL_CAST_APPLIED] statement=_record_sync_error columns=brand_id"
+            )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
-                    VALUES (:brand_id, :error, 1, :now)
+                    VALUES (CAST(:brand_id AS UUID), :error, 1, :now)
                     ON CONFLICT (brand_id) DO UPDATE SET
                         last_error = :error,
                         consecutive_failures = sync_health.consecutive_failures + 1,
@@ -184,10 +193,13 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
             _retryable_params = normalize_uuid_fields(
                 {"brand_id": brand_id, "error": error_msg[:500], "now": ensure_utc(utc_now())}
             )
+            logger.info(
+                "[UUID_SQL_CAST_APPLIED] statement=_record_retryable_error columns=brand_id"
+            )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
-                    VALUES (:brand_id, :error, 0, :now)
+                    VALUES (CAST(:brand_id AS UUID), :error, 0, :now)
                     ON CONFLICT (brand_id) DO UPDATE SET
                         last_error = :error,
                         updated_at = :now
@@ -236,13 +248,16 @@ async def _dead_letter_line_item(
             if "now" not in _dead_letter_params:
                 _dead_letter_params["now"] = ensure_utc(utc_now())
             _dead_letter_params = normalize_uuid_fields(_dead_letter_params)
+            logger.info(
+                "[UUID_SQL_CAST_APPLIED] statement=_dead_letter_line_item columns=brand_id"
+            )
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
                         (brand_id, external_order_id, order_id, sku, product_name,
                          raw_payload, failure_reason, failure_count, last_failed_at, created_at)
                     VALUES
-                        (:brand_id, :external_order_id, :order_id, :sku, :product_name,
+                        (CAST(:brand_id AS UUID), :external_order_id, :order_id, :sku, :product_name,
                          CAST(:raw_payload AS jsonb), :reason, :count, :now, :now)
                     ON CONFLICT (brand_id, external_order_id, sku) DO UPDATE SET
                         failure_count = dead_letter_line_items.failure_count + 1,
@@ -337,6 +352,9 @@ async def _write_sync_dead_letter(
                 type(params.get("brand_id")),
             )
             params = normalize_uuid_fields(params)
+            logger.info(
+                "[UUID_SQL_CAST_APPLIED] statement=_write_sync_dead_letter columns=brand_id,org_id"
+            )
             await db.execute(
                 text("""
                     INSERT INTO sync_dead_letters
@@ -910,8 +928,19 @@ async def _insert_line_items_standalone(
         if enabled_columns.get(col, False):
             insert_columns.append(col)
 
+    # UUID columns that require explicit CAST in the SQL VALUES clause so
+    # PostgreSQL never infers the parameter type as character varying.
+    _uuid_columns = {"mapped_product_id"}
+
     columns_str = ", ".join(insert_columns)
-    placeholders = ", ".join([f":{col}" for col in insert_columns])
+    placeholders = ", ".join(
+        f"CAST(:{col} AS UUID)" if col in _uuid_columns else f":{col}"
+        for col in insert_columns
+    )
+    logger.info(
+        "[UUID_SQL_CAST_APPLIED] statement=_insert_line_items_standalone columns=%s",
+        ",".join(col for col in insert_columns if col in _uuid_columns),
+    )
     line_insert_stmt = f"""
         INSERT INTO public.order_lines ({columns_str})
         VALUES ({placeholders})
@@ -1769,6 +1798,9 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 update_params.get('external_order_id'),
                             )
                             update_params = normalize_uuid_fields(update_params)
+                            logger.info(
+                                "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders_headers_only_update columns=org_id,brand_id"
+                            )
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -1892,6 +1924,9 @@ INSERT INTO orders (
                                 insert_params.get('external_order_id'),
                             )
                             insert_params = normalize_uuid_fields(insert_params)
+                            logger.info(
+                                "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders_headers_only_insert columns=org_id,brand_id"
+                            )
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
@@ -2283,8 +2318,19 @@ async def sync_leaflink_line_items(
         if enabled_columns.get(col, False):
             insert_columns.append(col)
 
+    # UUID columns that require explicit CAST in the SQL VALUES clause so
+    # PostgreSQL never infers the parameter type as character varying.
+    _uuid_columns = {"mapped_product_id"}
+
     columns_str = ", ".join(insert_columns)
-    placeholders = ", ".join([f":{col}" for col in insert_columns])
+    placeholders = ", ".join(
+        f"CAST(:{col} AS UUID)" if col in _uuid_columns else f":{col}"
+        for col in insert_columns
+    )
+    logger.info(
+        "[UUID_SQL_CAST_APPLIED] statement=_upsert_line_items columns=%s",
+        ",".join(col for col in insert_columns if col in _uuid_columns),
+    )
 
     # Build the ON CONFLICT DO UPDATE clause — only include columns that exist
     update_set_clauses = [
