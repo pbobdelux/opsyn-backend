@@ -5,7 +5,7 @@ import logging
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID
@@ -461,6 +461,87 @@ def ensure_utc_aware(dt: Any, field_name: str) -> "datetime | None":
     return normalized
 
 
+def normalize_all_datetimes(params: dict) -> dict:
+    """Normalize all datetime/date parameters to UTC-aware datetimes.
+
+    Iterates through params dict and ensures all datetime-like values are
+    timezone-aware UTC datetimes. Handles:
+    - datetime objects (naive → attach UTC, aware → convert to UTC)
+    - date objects (convert to UTC datetime at midnight)
+    - ISO datetime strings in timestamp fields (parse and convert to UTC)
+    - Other values (pass through unchanged)
+
+    Args:
+        params: Dictionary of SQL parameters
+
+    Returns:
+        Dictionary with all datetime values normalized to UTC-aware datetimes
+    """
+    timestamp_field_suffixes = ('_at', '_date', '_time')
+
+    for key, value in params.items():
+        if value is None:
+            continue
+
+        # Check if this field name suggests it's a timestamp field
+        is_timestamp_field = any(key.endswith(suffix) for suffix in timestamp_field_suffixes)
+
+        # Handle datetime objects
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                # Naive datetime - attach UTC
+                params[key] = value.replace(tzinfo=timezone.utc)
+                logger.error(
+                    "[DATETIME_FINAL_PARAMS_AUDIT] key=%s value=%s type=datetime tzinfo=None→UTC",
+                    key,
+                    params[key],
+                )
+            else:
+                # Aware datetime - convert to UTC
+                params[key] = value.astimezone(timezone.utc)
+                logger.error(
+                    "[DATETIME_FINAL_PARAMS_AUDIT] key=%s value=%s type=datetime tzinfo=%s→UTC",
+                    key,
+                    params[key],
+                    value.tzinfo,
+                )
+
+        # Handle date objects (not datetime)
+        elif isinstance(value, date) and not isinstance(value, datetime):
+            # Convert date to UTC datetime at midnight
+            params[key] = datetime.combine(value, datetime.min.time()).replace(tzinfo=timezone.utc)
+            logger.error(
+                "[DATETIME_FINAL_PARAMS_AUDIT] key=%s value=%s type=date→datetime_utc",
+                key,
+                params[key],
+            )
+
+        # Handle ISO datetime strings in timestamp fields
+        elif isinstance(value, str) and is_timestamp_field:
+            try:
+                # Try to parse as ISO datetime
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                else:
+                    parsed = parsed.astimezone(timezone.utc)
+                params[key] = parsed
+                logger.error(
+                    "[DATETIME_FINAL_PARAMS_AUDIT] key=%s value=%s type=string→datetime_utc",
+                    key,
+                    params[key],
+                )
+            except (ValueError, TypeError):
+                # Not a valid ISO datetime - leave as-is
+                logger.error(
+                    "[DATETIME_FINAL_PARAMS_AUDIT] key=%s value=%s type=string_not_datetime",
+                    key,
+                    value[:100] if len(value) > 100 else value,
+                )
+
+    return params
+
+
 def safe_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -837,6 +918,9 @@ async def _insert_line_items_standalone(
                 isinstance(insert_params.get("mapped_product_id"), UUID),
             )
 
+            # Universal datetime normalization — coerce ALL datetime/date
+            # params to UTC-aware before SQL execution.
+            insert_params = normalize_all_datetimes(insert_params)
             await db.execute(text(line_insert_stmt), insert_params)
             inserted += 1
 
@@ -1575,6 +1659,11 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 update_params.get("updated_at"),
                                 type(update_params.get("updated_at")),
                             )
+                            # Universal datetime normalization — coerce ALL datetime/date
+                            # params to UTC-aware before SQL execution, not just the known
+                            # operational fields. Prevents "can't subtract offset-naive and
+                            # offset-aware datetimes" from any LeafLink payload field.
+                            update_params = normalize_all_datetimes(update_params)
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -1690,6 +1779,11 @@ INSERT INTO orders (
                                 insert_params.get("updated_at"),
                                 type(insert_params.get("updated_at")),
                             )
+                            # Universal datetime normalization — coerce ALL datetime/date
+                            # params to UTC-aware before SQL execution, not just the known
+                            # operational fields. Prevents "can't subtract offset-naive and
+                            # offset-aware datetimes" from any LeafLink payload field.
+                            insert_params = normalize_all_datetimes(insert_params)
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
@@ -2230,6 +2324,9 @@ async def sync_leaflink_line_items(
                     isinstance(insert_params.get("mapped_product_id"), str),
                     isinstance(insert_params.get("mapped_product_id"), UUID),
                 )
+                # Universal datetime normalization — coerce ALL datetime/date
+                # params to UTC-aware before SQL execution.
+                insert_params = normalize_all_datetimes(insert_params)
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
