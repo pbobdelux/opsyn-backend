@@ -793,6 +793,29 @@ async def _insert_line_items_standalone(
             if enabled_columns.get("total_price_cents", False):
                 insert_params["total_price_cents"] = item.get("total_price_cents")
 
+
+
+            # FINAL validation — enforce coercion directly into params dict
+            # immediately before execute() so no mutation after coercion can slip through.
+            if "mapped_product_id" in insert_params:
+                insert_params["mapped_product_id"] = safe_uuid_mapped_product(insert_params.get("mapped_product_id"))
+            assert (
+                insert_params.get("mapped_product_id") is None
+                or isinstance(insert_params.get("mapped_product_id"), (str, UUID))
+            ), (
+                f"mapped_product_id must be None, str, or UUID, "
+                f"got {type(insert_params.get('mapped_product_id'))}"
+            )
+            logger.error(
+                "[FINAL_SQL_PARAMS_AUDIT] mapped_product_id=%s type=%s is_none=%s is_str=%s is_uuid=%s"
+                " function=_insert_line_items_for_order",
+                insert_params.get("mapped_product_id"),
+                type(insert_params.get("mapped_product_id")).__name__,
+                insert_params.get("mapped_product_id") is None,
+                isinstance(insert_params.get("mapped_product_id"), str),
+                isinstance(insert_params.get("mapped_product_id"), UUID),
+            )
+
             await db.execute(text(line_insert_stmt), insert_params)
             inserted += 1
 
@@ -1096,6 +1119,23 @@ async def sync_leaflink_orders(
                         _mapped_product_id_raw,
                         type(_mapped_product_id_raw),
                     )
+                    _mapped_product_id_coerced = safe_uuid_mapped_product(_mapped_product_id_raw)
+                    assert (
+                        _mapped_product_id_coerced is None
+                        or isinstance(_mapped_product_id_coerced, (str, UUID))
+                    ), (
+                        f"mapped_product_id must be None, str, or UUID, "
+                        f"got {type(_mapped_product_id_coerced)}"
+                    )
+                    logger.error(
+                        "[FINAL_SQL_PARAMS_AUDIT] mapped_product_id=%s type=%s is_none=%s is_str=%s is_uuid=%s"
+                        " function=sync_leaflink_orders",
+                        _mapped_product_id_coerced,
+                        type(_mapped_product_id_coerced).__name__,
+                        _mapped_product_id_coerced is None,
+                        isinstance(_mapped_product_id_coerced, str),
+                        isinstance(_mapped_product_id_coerced, UUID),
+                    )
                     db.add(
                         OrderLine(
                             order_id=order_row.id,
@@ -1106,7 +1146,7 @@ async def sync_leaflink_orders(
                             total_price=item.get("total_price"),
                             unit_price_cents=item.get("unit_price_cents"),
                             total_price_cents=item.get("total_price_cents"),
-                            mapped_product_id=safe_uuid_for_db(_mapped_product_id_raw, "mapped_product_id"),
+                            mapped_product_id=_mapped_product_id_coerced,
                             mapping_status=item.get("mapping_status"),
                             mapping_issue=item.get("mapping_issue"),
                             raw_payload=make_json_safe(item.get("raw_payload")),
@@ -2114,6 +2154,13 @@ async def sync_leaflink_line_items(
                 # immediately before execute() so no mutation after coercion can slip through.
                 if "mapped_product_id" in insert_params:
                     insert_params["mapped_product_id"] = safe_uuid_mapped_product(insert_params.get("mapped_product_id"))
+                assert (
+                    insert_params.get("mapped_product_id") is None
+                    or isinstance(insert_params.get("mapped_product_id"), (str, UUID))
+                ), (
+                    f"mapped_product_id must be None, str, or UUID, "
+                    f"got {type(insert_params.get('mapped_product_id'))}"
+                )
                 logger.error(
                     "[FINAL_SQL_PARAMS] org_id=%s org_type=%s brand_id=%s brand_type=%s"
                     " mapped_product_id=%s mapped_type=%s order_id=%s sku=%s function=_upsert_line_items",
@@ -2125,6 +2172,15 @@ async def sync_leaflink_line_items(
                     type(insert_params.get("mapped_product_id")).__name__,
                     order_id_val,
                     sku,
+                )
+                logger.error(
+                    "[FINAL_SQL_PARAMS_AUDIT] mapped_product_id=%s type=%s is_none=%s is_str=%s is_uuid=%s"
+                    " function=_upsert_line_items",
+                    insert_params.get("mapped_product_id"),
+                    type(insert_params.get("mapped_product_id")).__name__,
+                    insert_params.get("mapped_product_id") is None,
+                    isinstance(insert_params.get("mapped_product_id"), str),
+                    isinstance(insert_params.get("mapped_product_id"), UUID),
                 )
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
