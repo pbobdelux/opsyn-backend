@@ -85,7 +85,7 @@ async def _update_sync_health_phase1(
         async with AsyncSessionLocal() as db:
             _phase1_params = normalize_uuid_fields(
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                {"brand_id": brand_id, "now": ensure_utc(utc_now()), "count": (orders_count or 0)}
+                {\"brand_id\": brand_id, \"now\": ensure_utc(utc_now(), \"now\"), \"count\": (orders_count or 0)}
             )
             _phase1_params = normalize_datetime_fields(_phase1_params)
             logger.info(
@@ -125,7 +125,7 @@ async def _update_sync_health_phase2(
         async with AsyncSessionLocal() as db:
             _phase2_params = normalize_uuid_fields(
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                {"brand_id": brand_id, "now": ensure_utc(utc_now()), "count": line_items_count}
+                {\"brand_id\": brand_id, \"now\": ensure_utc(utc_now(), \"now\"), \"count\": line_items_count}
             )
             _phase2_params = normalize_datetime_fields(_phase2_params)
             logger.info(
@@ -163,7 +163,7 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
         async with AsyncSessionLocal() as db:
             _sync_error_params = normalize_uuid_fields(
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                {"brand_id": brand_id, "error": str(error)[:500], "now": ensure_utc(utc_now())}
+                {\"brand_id\": brand_id, \"error\": str(error)[:500], \"now\": ensure_utc(utc_now(), \"now\")}
             )
             _sync_error_params = normalize_datetime_fields(_sync_error_params)
             logger.info(
@@ -195,7 +195,7 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
     try:
         async with AsyncSessionLocal() as db:
             _retryable_params = normalize_uuid_fields(
-                {"brand_id": brand_id, "error": error_msg[:500], "now": ensure_utc(utc_now())}
+                {\"brand_id\": brand_id, \"error\": error_msg[:500], \"now\": ensure_utc(utc_now(), \"now\")}
             )
             _retryable_params = normalize_datetime_fields(_retryable_params)
             logger.info(
@@ -248,11 +248,11 @@ async def _dead_letter_line_item(
                 "raw_payload": raw_payload_str,
                 "reason": failure_reason[:500],
                 "count": failure_count,
-                "now": ensure_utc(utc_now()),
+                "now": ensure_utc(utc_now(), "now"),
             })
             # Restore 'now' if sanitize_sql_params removed it (it's not in the operational whitelist)
             if "now" not in _dead_letter_params:
-                _dead_letter_params["now"] = ensure_utc(utc_now())
+                _dead_letter_params["now"] = ensure_utc(utc_now(), "now")
             _dead_letter_params = normalize_uuid_fields(_dead_letter_params)
             _dead_letter_params = normalize_datetime_fields(_dead_letter_params)
             logger.info(
@@ -330,7 +330,7 @@ async def _write_sync_dead_letter(
                 if raw_payload is not None
                 else json.dumps({})
             )
-            now = ensure_utc(utc_now())
+            now = ensure_utc(utc_now(), "now")
             # Build params dict and sanitize to remove provider dates
             params = sanitize_sql_params({
                 "source": source,
@@ -345,7 +345,7 @@ async def _write_sync_dead_letter(
             })
             # Restore 'now' if sanitize_sql_params removed it (it's not in the operational whitelist)
             if "now" not in params:
-                params["now"] = ensure_utc(utc_now())
+                params["now"] = ensure_utc(utc_now(), "now")
             # FINAL coercion — apply safe_uuid_for_db() directly into the params
             # dict immediately before execute() so no mutation after coercion can
             # slip through.
@@ -445,30 +445,47 @@ def normalize_datetime(dt: Any) -> datetime | None:
     return None
 
 
-def ensure_utc(dt: Any) -> "datetime | None":
+def ensure_utc(dt: Any, field_name: str = "unknown") -> "datetime | None":
     """Ensure a datetime is timezone-aware UTC.
 
     Handles:
     - None → None
     - Naive datetime → assume UTC and make aware
     - Aware datetime → convert to UTC
-    - Invalid input → None
+    - Invalid input → passed through unchanged (not a datetime)
 
     ALWAYS returns either UTC-aware datetime or None.
     Never returns naive datetimes.
+
+    Logs [DATETIME_NORMALIZED] for every conversion that changes the value.
     """
     if dt is None:
         return None
 
     if not isinstance(dt, datetime):
-        return None
+        return dt  # type: ignore[return-value]
 
     # If naive, assume UTC and make aware
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
+        normalized = dt.replace(tzinfo=timezone.utc)
+        logger.info(
+            "[DATETIME_NORMALIZED] field=%s original=%s (naive) normalized=%s (UTC-aware)",
+            field_name,
+            dt.isoformat(),
+            normalized.isoformat(),
+        )
+        return normalized
 
     # If aware, convert to UTC
-    return dt.astimezone(timezone.utc)
+    normalized = dt.astimezone(timezone.utc)
+    if normalized != dt:
+        logger.info(
+            "[DATETIME_NORMALIZED] field=%s original=%s (aware) normalized=%s (UTC)",
+            field_name,
+            dt.isoformat(),
+            normalized.isoformat(),
+        )
+    return normalized
 
 
 def get_allowed_model_fields(model_class) -> set:
@@ -787,8 +804,10 @@ def normalize_uuid_fields(params: dict) -> dict:
     return normalized
 
 
-def normalize_datetime_fields(params: dict) -> dict:
-    """Normalize all datetime values in SQL parameters to UTC-aware.
+def normalize_datetime_fields(params: dict, field_prefix: str = "") -> dict:
+    """Recursively normalize all datetime values in SQL parameters to UTC-aware.
+
+    Walks dicts and lists to find and normalize nested datetimes.
 
     For any datetime value:
     - None stays None
@@ -797,26 +816,26 @@ def normalize_datetime_fields(params: dict) -> dict:
 
     Returns normalized params dict.
     """
-    normalized = dict(params)
+    normalized = {}
 
     for key, value in params.items():
-        if not isinstance(value, datetime):
-            continue
+        field_name = f"{field_prefix}.{key}" if field_prefix else key
 
-        tzinfo_before = value.tzinfo
-        is_aware = tzinfo_before is not None
-
-        if not is_aware:
-            normalized[key] = value.replace(tzinfo=timezone.utc)
+        if isinstance(value, datetime):
+            normalized[key] = ensure_utc(value, field_name)
+        elif isinstance(value, dict):
+            # Recursively normalize nested dict
+            normalized[key] = normalize_datetime_fields(value, field_name)
+        elif isinstance(value, list):
+            # Recursively normalize list items
+            normalized[key] = [
+                ensure_utc(item, f"{field_name}[{i}]") if isinstance(item, datetime)
+                else normalize_datetime_fields(item, f"{field_name}[{i}]") if isinstance(item, dict)
+                else item
+                for i, item in enumerate(value)
+            ]
         else:
-            normalized[key] = value.astimezone(timezone.utc)
-
-        logger.info(
-            "[DATETIME_NORMALIZED] field=%s tzinfo=%s aware=%s",
-            key,
-            tzinfo_before,
-            is_aware,
-        )
+            normalized[key] = value
 
     return normalized
 
@@ -1018,10 +1037,9 @@ async def _insert_line_items_standalone(
                 if raw_payload_val is not None
                 else None
             )
-
             # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-            created_at_val = ensure_utc(utc_now())
-            updated_at_val = ensure_utc(utc_now())
+            created_at_val = ensure_utc(utc_now(), "created_at")
+            updated_at_val = ensure_utc(utc_now(), "updated_at")
 
             insert_params: dict[str, Any] = {
                 "order_id": order_id,
@@ -1260,10 +1278,7 @@ async def sync_leaflink_orders(
             if unit_count == 0:
                 unit_count = sum(item.get("quantity", 0) or 0 for item in normalized_line_items)
 
-            review_status = derive_review_status(normalized_line_items)
-
-            # Opsyn-owned timestamps — always NOW(), never from LeafLink
-            now = ensure_utc(utc_now())
+            now = ensure_utc(utc_now(), "synced_at")
 
             # Always save raw payload first (core resilience principle)
             raw_payload = o.get("raw_payload") if isinstance(o.get("raw_payload"), dict) else o
@@ -1426,7 +1441,7 @@ async def sync_leaflink_orders(
                 """
 
                 # Use server time for line item timestamps — bulletproof mode
-                line_now = ensure_utc(utc_now())
+                line_now = ensure_utc(utc_now(), "created_at")
                 for item in normalized_line_items:
                     _mapped_product_id_raw = item.get("mapped_product_id")
                     logger.error(
@@ -1777,7 +1792,7 @@ async def sync_leaflink_orders_headers_only(
                           # Use server time for all DB timestamp columns — bulletproof mode.
                           # LeafLink date fields (created_on, paid_date, etc.) are stored
                           # inside raw_payload JSONB exactly as received from the API.
-                          now = ensure_utc(utc_now())
+                          now = ensure_utc(utc_now(), "synced_at")
 
                           # raw_payload stores the full LeafLink order dict (including all date fields)
                           raw_payload = (
@@ -1877,9 +1892,9 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
                             logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
                             # Coerce all datetime params to UTC-aware immediately before SQL execution
-                            update_params["synced_at"] = ensure_utc(update_params.get("synced_at")) or utc_now()
-                            update_params["last_synced_at"] = ensure_utc(update_params.get("last_synced_at")) or utc_now()
-                            update_params["updated_at"] = ensure_utc(update_params.get("updated_at")) or utc_now()
+                            update_params["synced_at"] = ensure_utc(update_params.get("synced_at"), "synced_at") or utc_now()
+                            update_params["last_synced_at"] = ensure_utc(update_params.get("last_synced_at"), "last_synced_at") or utc_now()
+                            update_params["updated_at"] = ensure_utc(update_params.get("updated_at"), "updated_at") or utc_now()
                             logger.error(
                                 "[DATETIME_FINAL_PARAMS] synced_at=%s type=%s last_synced_at=%s type=%s updated_at=%s type=%s",
                                 update_params.get("synced_at"),
@@ -2004,10 +2019,10 @@ INSERT INTO orders (
                             logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
                             logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
                             # Coerce all datetime params to UTC-aware immediately before SQL execution
-                            insert_params["synced_at"] = ensure_utc(insert_params.get("synced_at")) or utc_now()
-                            insert_params["last_synced_at"] = ensure_utc(insert_params.get("last_synced_at")) or utc_now()
-                            insert_params["created_at"] = ensure_utc(insert_params.get("created_at")) or utc_now()
-                            insert_params["updated_at"] = ensure_utc(insert_params.get("updated_at")) or utc_now()
+                            insert_params["synced_at"] = ensure_utc(insert_params.get("synced_at"), "synced_at") or utc_now()
+                            insert_params["last_synced_at"] = ensure_utc(insert_params.get("last_synced_at"), "last_synced_at") or utc_now()
+                            insert_params["created_at"] = ensure_utc(insert_params.get("created_at"), "created_at") or utc_now()
+                            insert_params["updated_at"] = ensure_utc(insert_params.get("updated_at"), "updated_at") or utc_now()
                             logger.error(
                                 "[DATETIME_FINAL_PARAMS] synced_at=%s type=%s last_synced_at=%s type=%s updated_at=%s type=%s",
                                 insert_params.get("synced_at"),
@@ -2506,13 +2521,12 @@ async def sync_leaflink_line_items(
                     else None
                 )
 
-
                 # Defensive null checks — ensure required numeric fields have defaults
                 quantity = item.get("quantity") or 0
                 unit_price = item.get("unit_price") or 0
                 total_price = item.get("total_price") or 0
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                now_val = ensure_utc(utc_now())
+                now_val = ensure_utc(utc_now(), "created_at")
 
                 insert_params: dict[str, Any] = {
                     "order_id": order_id_val,
