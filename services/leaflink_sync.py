@@ -1345,6 +1345,43 @@ async def sync_leaflink_orders(
                     delete(OrderLine).where(OrderLine.order_id == order_row.id)
                 )
 
+                # Build raw SQL INSERT with explicit CAST(:mapped_product_id AS UUID)
+                # so PostgreSQL never infers the parameter type as character varying.
+                # Using raw SQL instead of ORM avoids the ORM model's String(120)
+                # type annotation overriding the actual UUID column type in the DB.
+                _li_optional_columns = [
+                    "packed_qty", "unit_price_cents", "total_price_cents",
+                    "mapped_product_id", "mapping_status", "mapping_issue",
+                    "raw_payload", "created_at", "updated_at",
+                ]
+                _li_enabled: dict[str, bool] = {
+                    col: has_column("order_lines", col) for col in _li_optional_columns
+                }
+                _li_insert_columns = [
+                    "order_id", "sku", "product_name", "quantity",
+                    "unit_price", "total_price",
+                ]
+                for _col in _li_optional_columns:
+                    if _li_enabled.get(_col, False):
+                        _li_insert_columns.append(_col)
+
+                # UUID columns that require explicit CAST in the SQL VALUES clause
+                _li_uuid_columns = {"mapped_product_id"}
+
+                _li_columns_str = ", ".join(_li_insert_columns)
+                _li_placeholders = ", ".join(
+                    f"CAST(:{col} AS UUID)" if col in _li_uuid_columns else f":{col}"
+                    for col in _li_insert_columns
+                )
+                logger.info(
+                    "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders columns=%s",
+                    ",".join(col for col in _li_insert_columns if col in _li_uuid_columns),
+                )
+                _li_insert_stmt = f"""
+                    INSERT INTO public.order_lines ({_li_columns_str})
+                    VALUES ({_li_placeholders})
+                """
+
                 # Use server time for line item timestamps — bulletproof mode
                 line_now = ensure_utc(utc_now())
                 for item in normalized_line_items:
@@ -1371,24 +1408,43 @@ async def sync_leaflink_orders(
                         isinstance(_mapped_product_id_coerced, str),
                         isinstance(_mapped_product_id_coerced, UUID),
                     )
-                    db.add(
-                        OrderLine(
-                            order_id=order_row.id,
-                            sku=item.get("sku"),
-                            product_name=item.get("product_name"),
-                            quantity=item.get("quantity"),
-                            unit_price=item.get("unit_price"),
-                            total_price=item.get("total_price"),
-                            unit_price_cents=item.get("unit_price_cents"),
-                            total_price_cents=item.get("total_price_cents"),
-                            mapped_product_id=_mapped_product_id_coerced,
-                            mapping_status=item.get("mapping_status"),
-                            mapping_issue=item.get("mapping_issue"),
-                            raw_payload=make_json_safe(item.get("raw_payload")),
-                            created_at=line_now,
-                            updated_at=line_now,
-                        )
+
+                    _raw_payload_val = item.get("raw_payload")
+                    _raw_payload_str = (
+                        json.dumps(make_json_safe(_raw_payload_val))
+                        if _raw_payload_val is not None
+                        else None
                     )
+
+                    _li_params: dict[str, Any] = {
+                        "order_id": order_row.id,
+                        "sku": item.get("sku"),
+                        "product_name": item.get("product_name"),
+                        "quantity": item.get("quantity"),
+                        "unit_price": item.get("unit_price"),
+                        "total_price": item.get("total_price"),
+                    }
+                    if _li_enabled.get("mapped_product_id", False):
+                        _li_params["mapped_product_id"] = _mapped_product_id_coerced
+                    if _li_enabled.get("mapping_status", False):
+                        _li_params["mapping_status"] = item.get("mapping_status")
+                    if _li_enabled.get("mapping_issue", False):
+                        _li_params["mapping_issue"] = item.get("mapping_issue")
+                    if _li_enabled.get("raw_payload", False):
+                        _li_params["raw_payload"] = _raw_payload_str
+                    if _li_enabled.get("created_at", False):
+                        _li_params["created_at"] = line_now
+                    if _li_enabled.get("updated_at", False):
+                        _li_params["updated_at"] = line_now
+                    if _li_enabled.get("packed_qty", False):
+                        _li_params["packed_qty"] = 0
+                    if _li_enabled.get("unit_price_cents", False):
+                        _li_params["unit_price_cents"] = item.get("unit_price_cents")
+                    if _li_enabled.get("total_price_cents", False):
+                        _li_params["total_price_cents"] = item.get("total_price_cents")
+
+                    _li_params = normalize_uuid_fields(_li_params)
+                    await db.execute(text(_li_insert_stmt), _li_params)
 
                 total_lines_written += len(normalized_line_items)
 

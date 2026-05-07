@@ -154,8 +154,19 @@ async def replay_dead_letter_item(
         if enabled_columns.get(col, False):
             insert_columns.append(col)
 
+    # UUID columns that require explicit CAST in the SQL VALUES clause so
+    # PostgreSQL never infers the parameter type as character varying.
+    _uuid_columns = {"mapped_product_id"}
+
     columns_str = ", ".join(insert_columns)
-    placeholders = ", ".join([f":{col}" for col in insert_columns])
+    placeholders = ", ".join(
+        f"CAST(:{col} AS UUID)" if col in _uuid_columns else f":{col}"
+        for col in insert_columns
+    )
+    logger.info(
+        "[UUID_SQL_CAST_APPLIED] statement=replay_dead_letter_item columns=%s",
+        ",".join(col for col in insert_columns if col in _uuid_columns),
+    )
 
     update_set_clauses = [
         "quantity = EXCLUDED.quantity",
