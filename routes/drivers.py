@@ -1,70 +1,92 @@
 import logging
+import random
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+import bcrypt
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
-from models import Driver
-from services.tenant_auth import get_authenticated_org, verify_tenant_access
-from services.twin_events import send_driver_event
+from models.driver import Driver
+from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("drivers")
 
 router = APIRouter(prefix="/drivers", tags=["drivers"])
-
-# Org metadata used in Twin event payloads.  Extend as needed.
-_ORG_META: dict[str, dict] = {
-    "org_onboarding": {"name": "Opsyn Onboarding", "code": "org_onboarding"},
-}
-
-
-def _org_name(org_id: str) -> str:
-    return _ORG_META.get(org_id, {}).get("name", org_id)
-
-
-def _org_code(org_id: str) -> str:
-    return _ORG_META.get(org_id, {}).get("code", org_id)
 
 
 # =============================================================================
 # Schemas
 # =============================================================================
 
+
 class DriverCreate(BaseModel):
     name: str
-    # Email is required for new drivers and must be a valid format.
-    email: str
-    # PIN is required for new drivers and must be exactly 4 numeric digits.
-    # The client (Opsyn Brand app) is solely responsible for generating and
-    # supplying the PIN — the backend never generates one.
-    pin: str
+    email: Optional[str] = None
     phone: Optional[str] = None
     license_plate: Optional[str] = None
-    status: Optional[str] = "available"
+    vehicle_type: Optional[str] = None
+    notes: Optional[str] = None
+    preferences: Optional[dict] = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("name is required")
+        if len(v) > 255:
+            raise ValueError("name must be 255 characters or fewer")
+        return v
 
     @field_validator("email")
     @classmethod
-    def validate_email(cls, v: str) -> str:
+    def validate_email(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
         v = v.strip()
-        if len(v) < 5 or len(v) > 254:
-            raise ValueError("Email must be between 5 and 254 characters")
-        if "@" not in v:
-            raise ValueError("Email must contain '@'")
-        local, _, domain = v.partition("@")
-        if not local or not domain or "." not in domain:
-            raise ValueError("Email must be a valid address (e.g. user@example.com)")
+        if len(v) > 255:
+            raise ValueError("email must be 255 characters or fewer")
         return v
 
-    @field_validator("pin")
+    @field_validator("phone")
     @classmethod
-    def validate_pin(cls, v: str) -> str:
-        if len(v) != 4 or not v.isdigit():
-            logger.warning("DriverCreate PIN validation failed: must be exactly 4 numeric digits")
-            raise ValueError("PIN must be exactly 4 numeric digits")
+    def validate_phone(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if len(v) > 50:
+            raise ValueError("phone must be 50 characters or fewer")
+        return v
+
+    @field_validator("license_plate")
+    @classmethod
+    def validate_license_plate(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if len(v) > 50:
+            raise ValueError("license_plate must be 50 characters or fewer")
+        return v
+
+    @field_validator("vehicle_type")
+    @classmethod
+    def validate_vehicle_type(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if len(v) > 50:
+            raise ValueError("vehicle_type must be 50 characters or fewer")
+        return v
+
+    @field_validator("preferences")
+    @classmethod
+    def validate_preferences(cls, v: Optional[Any]) -> Optional[dict]:
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError("preferences must be a JSON object")
         return v
 
 
@@ -73,8 +95,22 @@ class DriverUpdate(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     license_plate: Optional[str] = None
+    vehicle_type: Optional[str] = None
+    notes: Optional[str] = None
+    preferences: Optional[dict] = None
     status: Optional[str] = None
-    pin: Optional[str] = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            raise ValueError("name cannot be empty")
+        if len(v) > 255:
+            raise ValueError("name must be 255 characters or fewer")
+        return v
 
     @field_validator("email")
     @classmethod
@@ -82,264 +118,451 @@ class DriverUpdate(BaseModel):
         if v is None:
             return v
         v = v.strip()
-        if len(v) < 5 or len(v) > 254:
-            raise ValueError("Email must be between 5 and 254 characters")
-        if "@" not in v:
-            raise ValueError("Email must contain '@'")
-        local, _, domain = v.partition("@")
-        if not local or not domain or "." not in domain:
-            raise ValueError("Email must be a valid address (e.g. user@example.com)")
+        if len(v) > 255:
+            raise ValueError("email must be 255 characters or fewer")
         return v
 
-    @field_validator("pin")
+    @field_validator("phone")
     @classmethod
-    def validate_pin(cls, v: Optional[str]) -> Optional[str]:
+    def validate_phone(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
             return v
-        if len(v) != 4 or not v.isdigit():
-            logger.warning("DriverUpdate PIN validation failed: must be exactly 4 numeric digits")
-            raise ValueError("PIN must be exactly 4 numeric digits")
+        if len(v) > 50:
+            raise ValueError("phone must be 50 characters or fewer")
+        return v
+
+    @field_validator("license_plate")
+    @classmethod
+    def validate_license_plate(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if len(v) > 50:
+            raise ValueError("license_plate must be 50 characters or fewer")
+        return v
+
+    @field_validator("vehicle_type")
+    @classmethod
+    def validate_vehicle_type(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if len(v) > 50:
+            raise ValueError("vehicle_type must be 50 characters or fewer")
+        return v
+
+    @field_validator("preferences")
+    @classmethod
+    def validate_preferences(cls, v: Optional[Any]) -> Optional[dict]:
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError("preferences must be a JSON object")
+        return v
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if v not in ("active", "inactive"):
+            raise ValueError("status must be 'active' or 'inactive'")
+        return v
+
+
+class PasscodeReset(BaseModel):
+    passcode: str
+
+    @field_validator("passcode")
+    @classmethod
+    def validate_passcode(cls, v: str) -> str:
+        if not v.isdigit():
+            raise ValueError("passcode must contain only numeric digits (0-9)")
+        if len(v) < 4 or len(v) > 8:
+            raise ValueError("passcode must be between 4 and 8 digits")
         return v
 
 
 # =============================================================================
-# Serialization
+# Helpers
 # =============================================================================
 
-def serialize_driver(driver: Driver) -> dict:
+
+def _serialize_driver(driver: Driver) -> dict:
     """
-    Convert a Driver ORM instance to a plain dict.
+    Convert a Driver ORM instance to a JSON-safe dict.
 
-    All attribute accesses use getattr with safe defaults so that legacy rows
-    missing newer columns (e.g. email) never cause a 500.
+    NEVER includes passcode_hash — that field is intentionally omitted.
+    Uses make_json_safe() to handle UUID and datetime serialization.
     """
-    created_at = getattr(driver, "created_at", None)
-    updated_at = getattr(driver, "updated_at", None)
-    return {
-        "id": getattr(driver, "id", None),
-        "org_id": getattr(driver, "org_id", None),
-        "name": getattr(driver, "name", None) or "",
-        "email": getattr(driver, "email", None),
-        "phone": getattr(driver, "phone", None),
-        "license_plate": getattr(driver, "license_plate", None),
-        "status": getattr(driver, "status", None) or "available",
-        "pin": getattr(driver, "pin", None),
-        "created_at": created_at.isoformat() if created_at else None,
-        "updated_at": updated_at.isoformat() if updated_at else None,
-    }
+    deactivated_at = getattr(driver, "deactivated_at", None)
+    return make_json_safe({
+        "id": driver.id,
+        "org_id": driver.org_id,
+        "name": driver.name or "",
+        "email": driver.email,
+        "phone": driver.phone,
+        "status": driver.status or "active",
+        "license_plate": driver.license_plate,
+        "vehicle_type": driver.vehicle_type,
+        "notes": driver.notes,
+        "preferences": driver.preferences if driver.preferences is not None else {},
+        "created_at": driver.created_at,
+        "updated_at": driver.updated_at,
+        "deactivated_at": deactivated_at,
+    })
 
 
-def _safe_serialize(driver: Driver) -> dict:
-    """Serialize a driver, returning a minimal safe dict on any error.
+def _hash_passcode(plain: str) -> str:
+    """Hash a plain-text passcode with bcrypt (cost=12). Never logs the plain value."""
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt(rounds=12)).decode()
 
-    Guaranteed to never raise — any exception is caught, logged with the
-    driver_id (no sensitive data), and a complete fallback dict is returned
-    so the caller can always include this driver in the response.
+
+async def _get_org_from_header(
+    x_opsyn_org: Optional[str],
+    x_opsyn_secret: Optional[str],
+    db: AsyncSession,
+) -> str:
     """
-    driver_id = getattr(driver, "id", None)
-    try:
-        return serialize_driver(driver)
-    except Exception as exc:
-        logger.error("driver_id=%s serialization failed: %s", driver_id, exc)
-        return {
-            "id": driver_id,
-            "org_id": getattr(driver, "org_id", None),
-            "name": getattr(driver, "name", None) or "",
-            "email": None,
-            "phone": None,
-            "license_plate": None,
-            "status": "available",
-            "pin": None,
-            "created_at": None,
-            "updated_at": None,
-        }
+    Resolve and authenticate the org from X-OPSYN-ORG / X-OPSYN-SECRET headers.
+
+    Returns the authenticated org_id string.
+    Raises HTTP 401 if the header is missing or credentials are invalid.
+    """
+    from services.tenant_auth import get_authenticated_org
+
+    if not x_opsyn_org:
+        raise HTTPException(status_code=401, detail="X-OPSYN-ORG header is required")
+
+    # get_authenticated_org validates both headers against the DB.
+    # Pass x_opsyn_org as the path org_id so the grace-period logic works.
+    return await get_authenticated_org(x_opsyn_org, x_opsyn_secret, x_opsyn_org, db)
+
+
+async def _get_driver_or_404(db: AsyncSession, driver_id: str, org_id: str) -> Driver:
+    """Fetch a driver by ID scoped to org_id, or raise 404."""
+    result = await db.execute(
+        select(Driver).where(
+            Driver.id == driver_id,
+            Driver.org_id == org_id,
+        )
+    )
+    driver = result.scalar_one_or_none()
+    if driver is None:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    return driver
 
 
 # =============================================================================
 # Endpoints
 # =============================================================================
 
+
+@router.get("")
+async def list_drivers(
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    status: Optional[str] = Query(default="active", description="Filter by status"),
+    search: Optional[str] = Query(default=None, description="Search name, email, or phone"),
+    limit: int = Query(default=100, ge=1, le=1000, description="Pagination limit"),
+    offset: int = Query(default=0, ge=0, description="Pagination offset"),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all drivers for the org with optional filtering and pagination."""
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+
+    query = select(Driver).where(Driver.org_id == org_id)
+
+    if status:
+        query = query.where(Driver.status == status)
+
+    if search:
+        term = f"%{search}%"
+        query = query.where(
+            or_(
+                Driver.name.ilike(term),
+                Driver.email.ilike(term),
+                Driver.phone.ilike(term),
+            )
+        )
+
+    # Total count (before pagination)
+    count_query = select(func.count()).select_from(query.subquery())
+    total_result = await db.execute(count_query)
+    total = total_result.scalar_one()
+
+    # Paginated results
+    query = query.order_by(Driver.created_at.desc()).offset(offset).limit(limit)
+    result = await db.execute(query)
+    drivers = result.scalars().all()
+
+    serialized = [_serialize_driver(d) for d in drivers]
+
+    return {
+        "ok": True,
+        "org_id": org_id,
+        "drivers": serialized,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 @router.post("")
 async def create_driver(
-    org_id: str,
     body: DriverCreate,
     x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
     x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
-    verify_tenant_access(authenticated_org, org_id)
+    """Create a new driver scoped to the org."""
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
 
     driver = Driver(
-        org_id=authenticated_org,
+        org_id=org_id,
         name=body.name,
-        email=body.email,
-        phone=body.phone,
-        license_plate=body.license_plate,
-        status=body.status or "available",
-        pin=body.pin,
+        email=body.email or None,
+        phone=body.phone or None,
+        license_plate=body.license_plate or None,
+        vehicle_type=body.vehicle_type or None,
+        notes=body.notes or None,
+        preferences=body.preferences if body.preferences is not None else {},
+        status="active",
     )
     db.add(driver)
-    await db.commit()
-    await db.refresh(driver)
 
-    logger.info("driver_id=%s created with PIN set", driver.id)
+    try:
+        await db.commit()
+        await db.refresh(driver)
+    except IntegrityError as exc:
+        await db.rollback()
+        err = str(exc).lower()
+        if "uq_drivers_org_email" in err or "unique" in err and "email" in err:
+            raise HTTPException(
+                status_code=409,
+                detail="A driver with this email already exists in your organization",
+            )
+        logger.error("[DRIVER_CREATED] db_integrity_error org_id=%s error=%s", org_id, exc)
+        raise HTTPException(status_code=400, detail="Could not create driver due to a data conflict")
+    except Exception as exc:
+        await db.rollback()
+        logger.error("[DRIVER_CREATED] unexpected_error org_id=%s error=%s", org_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Unexpected error creating driver")
 
-    serialized = _safe_serialize(driver)
-
-    # Fire Twin event (fire-and-forget — never raises)
-    await send_driver_event(
-        event_type="driver_created",
-        org_id=authenticated_org,
-        org_name=_org_name(authenticated_org),
-        org_code=_org_code(authenticated_org),
-        driver_id=driver.id,
-        driver_name=driver.name,
-        driver_email=driver.email,
-        driver_phone=driver.phone,
-        driver_pin=driver.pin,
+    logger.info(
+        "[DRIVER_CREATED] org_id=%s driver_id=%s name=%s",
+        org_id,
+        driver.id,
+        driver.name,
     )
 
-    return {"ok": True, "driver": serialized}
-
-
-@router.get("")
-async def list_drivers(
-    org_id: str,
-    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
-    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
-    db: AsyncSession = Depends(get_db),
-):
-    """List all drivers for an organisation.
-
-    This endpoint is designed to be bulletproof:
-    - A failed database query returns an empty drivers list (never a 500).
-    - A driver row that fails to serialize is skipped with an error log;
-      all other drivers are still returned.
-    - Null / missing fields on legacy rows are handled by _safe_serialize.
-    - The response shape ``{"ok": true, "org_id": ..., "count": N, "drivers": [...]}``
-      is guaranteed regardless of what goes wrong.
-    """
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
-    verify_tenant_access(authenticated_org, org_id)
-
-    logger.info("list_drivers called for org_id=%s", authenticated_org)
-
-    # ------------------------------------------------------------------
-    # 1. Fetch rows — isolate DB errors so they never propagate as 500s.
-    # ------------------------------------------------------------------
-    raw_drivers: list = []
-    try:
-        result = await db.execute(
-            select(Driver).where(Driver.org_id == authenticated_org).order_by(Driver.created_at.desc())
-        )
-        raw_drivers = list(result.scalars().all())
-    except Exception as exc:
-        logger.error("list_drivers database error for org_id=%s: %s", authenticated_org, exc)
-        # Return a valid empty response — do not re-raise.
-        return {"ok": True, "org_id": authenticated_org, "count": 0, "drivers": []}
-
-    # ------------------------------------------------------------------
-    # 2. Serialize each driver individually so one bad row can't abort
-    #    the entire response.
-    # ------------------------------------------------------------------
-    serialized: list[dict] = []
-    for driver in raw_drivers:
-        driver_id = getattr(driver, "id", None)
-        try:
-            serialized.append(_safe_serialize(driver))
-        except Exception as exc:
-            # _safe_serialize itself should never raise, but guard anyway.
-            logger.error("driver_id=%s serialization failed: %s", driver_id, exc)
-
-    # ------------------------------------------------------------------
-    # 3. Always return the guaranteed response shape.
-    # ------------------------------------------------------------------
-    logger.info("list_drivers returning count=%d for org_id=%s", len(serialized), authenticated_org)
-    return {
-        "ok": True,
-        "org_id": authenticated_org,
-        "count": len(serialized),
-        "drivers": serialized,
-    }
+    return {"ok": True, "driver": _serialize_driver(driver)}
 
 
 @router.get("/{driver_id}")
 async def get_driver(
-    org_id: str,
-    driver_id: int,
+    driver_id: str,
     x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
     x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
-    verify_tenant_access(authenticated_org, org_id)
+    """Get a single driver by ID, scoped to the org."""
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+    driver = await _get_driver_or_404(db, driver_id, org_id)
 
-    result = await db.execute(
-        select(Driver).where(Driver.id == driver_id, Driver.org_id == authenticated_org)
-    )
-    driver = result.scalar_one_or_none()
-    if not driver:
-        raise HTTPException(status_code=404, detail="Driver not found")
-    return {"ok": True, "driver": _safe_serialize(driver)}
+    logger.info("[DRIVER_FETCHED] org_id=%s driver_id=%s", org_id, driver_id)
+
+    return {"ok": True, "driver": _serialize_driver(driver)}
 
 
 @router.patch("/{driver_id}")
 async def update_driver(
-    org_id: str,
-    driver_id: int,
+    driver_id: str,
     body: DriverUpdate,
     x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
     x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
-    authenticated_org = await get_authenticated_org(x_opsyn_org, x_opsyn_secret, org_id, db)
-    verify_tenant_access(authenticated_org, org_id)
+    """Update driver fields. Only provided fields are changed."""
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+    driver = await _get_driver_or_404(db, driver_id, org_id)
 
-    result = await db.execute(
-        select(Driver).where(Driver.id == driver_id, Driver.org_id == authenticated_org)
-    )
-    driver = result.scalar_one_or_none()
-    if not driver:
-        raise HTTPException(status_code=404, detail="Driver not found")
-
-    pin_changed = body.pin is not None and body.pin != driver.pin
+    updated_fields: list[str] = []
 
     if body.name is not None:
         driver.name = body.name
+        updated_fields.append("name")
+
     if body.email is not None:
+        # Check email uniqueness within org before applying
+        if body.email != driver.email:
+            existing = await db.execute(
+                select(Driver).where(
+                    Driver.org_id == org_id,
+                    Driver.email == body.email,
+                    Driver.id != driver.id,
+                )
+            )
+            if existing.scalar_one_or_none() is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A driver with this email already exists in your organization",
+                )
         driver.email = body.email
+        updated_fields.append("email")
+
     if body.phone is not None:
         driver.phone = body.phone
+        updated_fields.append("phone")
+
     if body.license_plate is not None:
         driver.license_plate = body.license_plate
+        updated_fields.append("license_plate")
+
+    if body.vehicle_type is not None:
+        driver.vehicle_type = body.vehicle_type
+        updated_fields.append("vehicle_type")
+
+    if body.notes is not None:
+        driver.notes = body.notes
+        updated_fields.append("notes")
+
+    if body.preferences is not None:
+        driver.preferences = body.preferences
+        updated_fields.append("preferences")
+
     if body.status is not None:
         driver.status = body.status
-    if body.pin is not None:
-        driver.pin = body.pin
+        updated_fields.append("status")
+        if body.status == "inactive":
+            driver.deactivated_at = datetime.now(timezone.utc)
+        elif body.status == "active":
+            driver.deactivated_at = None
 
     driver.updated_at = datetime.now(timezone.utc)
-    await db.commit()
-    await db.refresh(driver)
 
-    if pin_changed:
-        logger.info("driver_id=%s PIN updated", driver.id)
+    try:
+        await db.commit()
+        await db.refresh(driver)
+    except IntegrityError as exc:
+        await db.rollback()
+        err = str(exc).lower()
+        if "uq_drivers_org_email" in err or "unique" in err and "email" in err:
+            raise HTTPException(
+                status_code=409,
+                detail="A driver with this email already exists in your organization",
+            )
+        logger.error("[DRIVER_UPDATED] db_integrity_error org_id=%s driver_id=%s error=%s", org_id, driver_id, exc)
+        raise HTTPException(status_code=400, detail="Could not update driver due to a data conflict")
+    except Exception as exc:
+        await db.rollback()
+        logger.error("[DRIVER_UPDATED] unexpected_error org_id=%s driver_id=%s error=%s", org_id, driver_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Unexpected error updating driver")
 
-    serialized = _safe_serialize(driver)
+    logger.info(
+        "[DRIVER_UPDATED] org_id=%s driver_id=%s fields=%s",
+        org_id,
+        driver_id,
+        ",".join(updated_fields) if updated_fields else "none",
+    )
 
-    # Fire Twin event only when the PIN was actually changed
-    if pin_changed:
-        await send_driver_event(
-            event_type="driver_pin_reset",
-            org_id=authenticated_org,
-            org_name=_org_name(authenticated_org),
-            org_code=_org_code(authenticated_org),
-            driver_id=driver.id,
-            driver_name=driver.name,
-            driver_email=driver.email,
-            driver_phone=driver.phone,
-            driver_pin=driver.pin,
+    return {"ok": True, "driver": _serialize_driver(driver)}
+
+
+@router.delete("/{driver_id}")
+async def delete_driver(
+    driver_id: str,
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Soft-delete a driver by setting status=inactive and deactivated_at=now()."""
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+    driver = await _get_driver_or_404(db, driver_id, org_id)
+
+    driver.status = "inactive"
+    driver.deactivated_at = datetime.now(timezone.utc)
+    driver.updated_at = datetime.now(timezone.utc)
+
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        logger.error("[DRIVER_DELETED] unexpected_error org_id=%s driver_id=%s error=%s", org_id, driver_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Unexpected error deleting driver")
+
+    logger.info("[DRIVER_DELETED] org_id=%s driver_id=%s", org_id, driver_id)
+
+    return {"ok": True, "driver_id": driver_id, "status": "inactive"}
+
+
+@router.post("/{driver_id}/generate-passcode")
+async def generate_passcode(
+    driver_id: str,
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Generate a random 6-digit numeric passcode, hash it with bcrypt, and store it.
+
+    The plain passcode is returned ONCE in the response and is NEVER logged.
+    """
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+    driver = await _get_driver_or_404(db, driver_id, org_id)
+
+    # Generate a cryptographically random 6-digit passcode (000000–999999)
+    plain_passcode = f"{random.SystemRandom().randint(0, 999999):06d}"
+
+    # Hash with bcrypt cost=12 — never store or log the plain value
+    driver.passcode_hash = _hash_passcode(plain_passcode)
+    driver.updated_at = datetime.now(timezone.utc)
+
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        logger.error(
+            "[DRIVER_PASSCODE] action=generate_failed org_id=%s driver_id=%s error=%s",
+            org_id, driver_id, exc, exc_info=True,
         )
-        logger.info("driver_id=%s PIN updated, Twin event fired", driver.id)
+        raise HTTPException(status_code=500, detail="Unexpected error generating passcode")
 
-    return {"ok": True, "driver": serialized}
+    # Log generation — NEVER log the plain passcode
+    logger.info("[DRIVER_PASSCODE] action=generated org_id=%s driver_id=%s", org_id, driver_id)
+
+    return {"ok": True, "passcode": plain_passcode}
+
+
+@router.post("/{driver_id}/reset-passcode")
+async def reset_passcode(
+    driver_id: str,
+    body: PasscodeReset,
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Admin sets a new passcode manually.
+
+    The passcode is hashed with bcrypt and stored. It is NEVER returned or logged.
+    """
+    org_id = await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+    driver = await _get_driver_or_404(db, driver_id, org_id)
+
+    # Hash with bcrypt cost=12 — never store or log the plain value
+    driver.passcode_hash = _hash_passcode(body.passcode)
+    driver.updated_at = datetime.now(timezone.utc)
+
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        logger.error(
+            "[DRIVER_PASSCODE] action=reset_failed org_id=%s driver_id=%s error=%s",
+            org_id, driver_id, exc, exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Unexpected error resetting passcode")
+
+    # Log reset — NEVER log the plain passcode
+    logger.info("[DRIVER_PASSCODE] action=reset org_id=%s driver_id=%s", org_id, driver_id)
+
+    return {"ok": True}
