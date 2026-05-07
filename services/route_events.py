@@ -41,7 +41,7 @@ async def log_route_event(
     event_type: str,
     actor_type: str,
     actor_id: UUID,
-    metadata: Optional[dict] = None,
+    event_metadata: Optional[dict] = None,
 ) -> RouteEvent:
     """
     Log a route event for audit trail.
@@ -50,14 +50,14 @@ async def log_route_event(
     The caller must commit the session for the event to be persisted.
 
     Args:
-        db:         Active async database session.
-        route_id:   UUID of the route this event belongs to.
-        org_id:     UUID of the organization (for multi-tenant scoping).
-        event_type: One of: published, driver_assigned, stop_status_changed,
-                    collection_recorded, stops_reordered, route_completed.
-        actor_type: Either 'admin' or 'driver'.
-        actor_id:   UUID of the admin user or driver performing the action.
-        metadata:   Optional dict of additional context (stop_id, status, etc.).
+        db:             Active async database session.
+        route_id:       UUID of the route this event belongs to.
+        org_id:         UUID of the organization (for multi-tenant scoping).
+        event_type:     One of: published, driver_assigned, stop_status_changed,
+                        collection_recorded, stops_reordered, route_completed.
+        actor_type:     Either 'admin' or 'driver'.
+        actor_id:       UUID of the admin user or driver performing the action.
+        event_metadata: Optional dict of additional context (stop_id, status, etc.).
 
     Returns:
         The newly created RouteEvent ORM instance (not yet committed).
@@ -83,7 +83,7 @@ async def log_route_event(
         event_type=event_type,
         actor_type=actor_type,
         actor_id=actor_id,
-        metadata=metadata,
+        event_metadata=event_metadata,
     )
     db.add(event)
 

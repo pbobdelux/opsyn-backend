@@ -706,6 +706,7 @@ async def update_stop_status(
         logger.error("[DRIVER_STOP_UPDATE] uuid_parse_error error=%s", exc)
         raise HTTPException(status_code=500, detail="Internal ID format error")
 
+
     # Log stop_status_changed event
     await log_route_event(
         db=db,
@@ -714,7 +715,7 @@ async def update_stop_status(
         event_type="stop_status_changed",
         actor_type="driver",
         actor_id=driver_uuid,
-        metadata={
+        event_metadata={
             "stop_id": str(stop_uuid),
             "old_status": old_status,
             "new_status": body.status,
@@ -748,7 +749,7 @@ async def update_stop_status(
                 event_type="route_completed",
                 actor_type="driver",
                 actor_id=driver_uuid,
-                metadata={"total_stops": len(all_stops)},
+                event_metadata={"total_stops": len(all_stops)},
             )
 
     try:
@@ -795,6 +796,7 @@ async def record_collection(
     Increments route.version and updates route.updated_at.
     """
     # Verify route belongs to this driver
+
     route_result = await db.execute(
         select(Route).where(
             Route.id == route_id,

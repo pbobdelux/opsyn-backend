@@ -319,7 +319,7 @@ async def update_and_publish_route(
             event_type="driver_assigned",
             actor_type="admin",
             actor_id=actor_id,
-            metadata={"assigned_driver_id": str(body.assigned_driver_id)},
+            event_metadata={"assigned_driver_id": str(body.assigned_driver_id)},
         )
 
     if stops_reordered:
@@ -330,7 +330,7 @@ async def update_and_publish_route(
             event_type="stops_reordered",
             actor_type="admin",
             actor_id=actor_id,
-            metadata={"stop_ids": body.stops_reorder},
+            event_metadata={"stop_ids": body.stops_reorder},
         )
 
     await log_route_event(
@@ -340,12 +340,13 @@ async def update_and_publish_route(
         event_type="published",
         actor_type="admin",
         actor_id=actor_id,
-        metadata={
+        event_metadata={
             "version": route.version,
             "assigned_driver_id": str(route.assigned_driver_id) if route.assigned_driver_id else None,
             "stops_reordered": stops_reordered,
         },
     )
+
 
     try:
         await db.commit()
@@ -814,11 +815,12 @@ async def get_route_changelog(
             "event_type": event.event_type,
             "actor_type": event.actor_type,
             "actor_id": str(event.actor_id),
-            "metadata": event.metadata,
+            "metadata": event.event_metadata,
             "created_at": event.created_at,
         })
         for event in events
     ]
+
 
     logger.info(
         "[ROUTE_CHANGELOG] org_id=%s route_id=%s event_count=%s",
@@ -1050,7 +1052,7 @@ async def get_route_events(
             "event_type": event.event_type,
             "actor_type": event.actor_type,
             "actor_id": event.actor_id,
-            "metadata": event.metadata,
+            "metadata": event.event_metadata,
             "created_at": event.created_at,
         })
         for event in events
