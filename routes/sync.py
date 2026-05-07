@@ -304,26 +304,38 @@ async def replay_dead_letter_item(
             params.get("sku"),
             params.get("product_name"),
         )
-        # Sanitize SQL params: remove provider dates, keep only operational timestamps
-        params = sanitize_sql_params(params)
-        # Sanitize SQL params: remove provider dates, keep only operational timestamps
-        params = sanitize_sql_params(params)
-        
+        # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
+        params = sanitize_sql_params(params, statement="replay_dead_letter_item")
+
         # === DATETIME + UUID NORMALIZATION (CRITICAL) ===
         params = normalize_datetime_fields(params)
         params = normalize_uuid_fields(params)
 
+        # [ORDER_LINES_FINAL_DATETIME] Fail-fast assertions before execute
+        if "created_at" in params:
+            _ca = params["created_at"]
+            logger.info(
+                "[ORDER_LINES_FINAL_DATETIME] created_at=%s tzinfo=%s aware=%s",
+                _ca, _ca.tzinfo if isinstance(_ca, datetime) else "N/A",
+                isinstance(_ca, datetime) and _ca.tzinfo is not None,
+            )
+            assert isinstance(_ca, datetime) and _ca.tzinfo is not None and _ca.tzinfo.utcoffset(_ca) is not None, (
+                f"[FAIL_FAST] created_at is naive or not a datetime: {_ca!r}"
+            )
+        if "updated_at" in params:
+            _ua = params["updated_at"]
+            logger.info(
+                "[ORDER_LINES_FINAL_DATETIME] updated_at=%s tzinfo=%s aware=%s",
+                _ua, _ua.tzinfo if isinstance(_ua, datetime) else "N/A",
+                isinstance(_ua, datetime) and _ua.tzinfo is not None,
+            )
+            assert isinstance(_ua, datetime) and _ua.tzinfo is not None and _ua.tzinfo.utcoffset(_ua) is not None, (
+                f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
+            )
+
         await db.execute(text(upsert_stmt), params)
         await db.commit()
 
-        logger.info(
-            "[REPLAY_UPSERT_SUCCESS] item_id=%s order_id=%s sku=%s",
-            item_id,
-            params.get("order_id"),
-            params.get("sku"),
-        )
-        await db.execute(text(upsert_stmt), params)
-        await db.commit()
         logger.info(
             "[REPLAY_UPSERT_SUCCESS] item_id=%s order_id=%s sku=%s",
             item_id,
