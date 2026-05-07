@@ -380,7 +380,7 @@ async def _write_sync_dead_letter(
             # slip through.
             params["org_id"] = safe_uuid_for_db(params.get("org_id"), "org_id")
             params["brand_id"] = safe_uuid_for_db(params.get("brand_id"), "brand_id") or params.get("brand_id")
-            logger.error(
+            logger.debug(
                 "[DEAD_LETTER_FINAL_TYPES] org_id=%s org_type=%s brand_id=%s brand_type=%s",
                 params.get("org_id"),
                 type(params.get("org_id")),
@@ -806,7 +806,7 @@ def final_sanitize_order_lines_params(params: dict) -> dict:
             else:
                 sanitized_val = value.astimezone(timezone.utc)
                 action = "aware_datetime_to_utc"
-            logger.error(
+            logger.debug(
                 "[FINAL_SANITIZE_ORDER_LINES] field=%s type=%s action=%s",
                 field,
                 type(value).__name__,
@@ -817,7 +817,7 @@ def final_sanitize_order_lines_params(params: dict) -> dict:
         elif isinstance(value, date):
             # date but NOT datetime (datetime is a subclass of date)
             sanitized_val = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
-            logger.error(
+            logger.debug(
                 "[FINAL_SANITIZE_ORDER_LINES] field=%s type=%s action=%s",
                 field,
                 type(value).__name__,
@@ -827,7 +827,7 @@ def final_sanitize_order_lines_params(params: dict) -> dict:
 
         elif isinstance(value, (dict, list, tuple)):
             sanitized_val = _sanitize_json_value(value, field)
-            logger.error(
+            logger.debug(
                 "[FINAL_SANITIZE_ORDER_LINES] field=%s type=%s action=%s",
                 field,
                 type(value).__name__,
@@ -1335,7 +1335,7 @@ async def _insert_line_items_standalone(
 
 
             _mapped_product_id_raw = item.get("mapped_product_id")
-            logger.error(
+            logger.debug(
                 "[MAPPED_PRODUCT_ID_BEFORE_SQL] value=%s type=%s",
                 _mapped_product_id_raw,
                 type(_mapped_product_id_raw),
@@ -1372,7 +1372,7 @@ async def _insert_line_items_standalone(
                 f"mapped_product_id must be None, str, or UUID, "
                 f"got {type(insert_params.get('mapped_product_id'))}"
             )
-            logger.error(
+            logger.info(
                 "[FINAL_SQL_PARAMS_AUDIT] mapped_product_id=%s type=%s is_none=%s is_str=%s is_uuid=%s"
                 " function=_insert_line_items_for_order",
                 insert_params.get("mapped_product_id"),
@@ -1422,7 +1422,7 @@ async def _insert_line_items_standalone(
 
             # Log every parameter in final order with position
             for idx, (k, v) in enumerate(insert_params.items(), start=1):
-                logger.error(
+                logger.info(
                     "[ORDER_LINES_PARAM_POSITION] idx=%s key=%s type=%s value=%r tzinfo=%s aware=%s",
                     idx,
                     k,
@@ -1446,7 +1446,7 @@ async def _insert_line_items_standalone(
                 insert_params["updated_at"] = to_utc_naive(insert_params["updated_at"])
 
             # Log the final bind values
-            logger.error(
+            logger.debug(
                 "[ORDER_LINES_FINAL_DATETIME_BIND] created_at=%s type=%s tzinfo=%s updated_at=%s type=%s tzinfo=%s column_type=TIMESTAMP",
                 insert_params.get("created_at"),
                 type(insert_params.get("created_at")).__name__,
@@ -1456,8 +1456,8 @@ async def _insert_line_items_standalone(
                 getattr(insert_params.get("updated_at"), "tzinfo", None) if isinstance(insert_params.get("updated_at"), datetime) else "N/A",
             )
             await db.execute(text(line_insert_stmt), insert_params)
-            logger.error(
-                "[ORDER_LINES_UPSERT] action=insert order_id=%s sku=%s",
+            logger.info(
+                "[ORDER_LINES_UPSERT_OK] order_id=%s sku=%s action=insert",
                 insert_params.get("order_id"),
                 insert_params.get("sku"),
             )
@@ -1471,6 +1471,12 @@ async def _insert_line_items_standalone(
             except Exception:
                 pass
 
+            logger.error(
+                "[ORDER_LINES_UPSERT_FAIL] order_id=%s sku=%s error=%s",
+                order_id,
+                sku,
+                str(line_error)[:200],
+            )
             logger.error(
                 "[LINE_ITEM_INSERT_FAILED] order_id=%s line_number=%s error=%s",
                 order_id,
@@ -1842,7 +1848,7 @@ async def sync_leaflink_orders(
                 line_now = ensure_utc(utc_now(), "created_at")
                 for item in normalized_line_items:
                     _mapped_product_id_raw = item.get("mapped_product_id")
-                    logger.error(
+                    logger.debug(
                         "[MAPPED_PRODUCT_ID_BEFORE_SQL] value=%s type=%s",
                         _mapped_product_id_raw,
                         type(_mapped_product_id_raw),
@@ -1855,7 +1861,7 @@ async def sync_leaflink_orders(
                         f"mapped_product_id must be None, str, or UUID, "
                         f"got {type(_mapped_product_id_coerced)}"
                     )
-                    logger.error(
+                    logger.info(
                         "[FINAL_SQL_PARAMS_AUDIT] mapped_product_id=%s type=%s is_none=%s is_str=%s is_uuid=%s"
                         " function=sync_leaflink_orders",
                         _mapped_product_id_coerced,
@@ -1934,7 +1940,7 @@ async def sync_leaflink_orders(
 
                     # Log every parameter in final order with position
                     for idx, (k, v) in enumerate(_li_params.items(), start=1):
-                        logger.error(
+                        logger.info(
                             "[ORDER_LINES_PARAM_POSITION] idx=%s key=%s type=%s value=%r tzinfo=%s aware=%s",
                             idx,
                             k,
@@ -1958,7 +1964,7 @@ async def sync_leaflink_orders(
                         _li_params["updated_at"] = to_utc_naive(_li_params["updated_at"])
 
                     # Log the final bind values
-                    logger.error(
+                    logger.debug(
                         "[ORDER_LINES_FINAL_DATETIME_BIND] created_at=%s type=%s tzinfo=%s updated_at=%s type=%s tzinfo=%s column_type=TIMESTAMP",
                         _li_params.get("created_at"),
                         type(_li_params.get("created_at")).__name__,
@@ -1968,11 +1974,12 @@ async def sync_leaflink_orders(
                         getattr(_li_params.get("updated_at"), "tzinfo", None) if isinstance(_li_params.get("updated_at"), datetime) else "N/A",
                     )
                     await db.execute(text(_li_insert_stmt), _li_params)
-                    logger.error(
-                        "[ORDER_LINES_UPSERT] action=insert order_id=%s sku=%s",
+                    logger.info(
+                        "[ORDER_LINES_UPSERT_OK] order_id=%s sku=%s action=insert",
                         _li_params.get("order_id"),
                         _li_params.get("sku"),
                     )
+
 
                 total_lines_written += len(normalized_line_items)
 
@@ -2349,7 +2356,7 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             # immediately before execute() so no mutation after coercion can slip through.
                             update_params["org_id"] = safe_uuid_for_db(update_params.get("org_id"), "org_id")
                             update_params["brand_id"] = safe_uuid_for_db(update_params.get("brand_id"), "brand_id") or update_params.get("brand_id")
-                            logger.error(
+                            logger.debug(
                                 "[FINAL_SQL_PARAMS] org_id=%s org_type=%s brand_id=%s brand_type=%s"
                                 " external_id=%s action=update function=sync_leaflink_orders_headers_only",
                                 update_params.get("org_id"),
@@ -2358,13 +2365,14 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 type(update_params.get("brand_id")).__name__,
                                 external_id,
                             )
+
                             logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
                             logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
                             # Coerce all datetime params to UTC-aware immediately before SQL execution
                             update_params["synced_at"] = ensure_utc(update_params.get("synced_at"), "synced_at") or utc_now()
                             update_params["last_synced_at"] = ensure_utc(update_params.get("last_synced_at"), "last_synced_at") or utc_now()
                             update_params["updated_at"] = ensure_utc(update_params.get("updated_at"), "updated_at") or utc_now()
-                            logger.error(
+                            logger.debug(
                                 "[DATETIME_FINAL_PARAMS] synced_at=%s type=%s last_synced_at=%s type=%s updated_at=%s type=%s",
                                 update_params.get("synced_at"),
                                 type(update_params.get("synced_at")),
@@ -2373,7 +2381,7 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 update_params.get("updated_at"),
                                 type(update_params.get("updated_at")),
                             )
-                            # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
+
                             update_params = sanitize_sql_params(update_params, statement="sync_leaflink_orders_headers_only_update")
                             logger.info(
                                 "[RAW_FIRST_INGESTION] action=update order_id=%s brand_id=%s external_order_id=%s",
@@ -2482,7 +2490,7 @@ INSERT INTO orders (
                             # immediately before execute() so no mutation after coercion can slip through.
                             insert_params["org_id"] = safe_uuid_for_db(insert_params.get("org_id"), "org_id")
                             insert_params["brand_id"] = safe_uuid_for_db(insert_params.get("brand_id"), "brand_id") or insert_params.get("brand_id")
-                            logger.error(
+                            logger.debug(
                                 "[FINAL_SQL_PARAMS] org_id=%s org_type=%s brand_id=%s brand_type=%s"
                                 " external_id=%s action=insert function=sync_leaflink_orders_headers_only",
                                 insert_params.get("org_id"),
@@ -2498,7 +2506,7 @@ INSERT INTO orders (
                             insert_params["last_synced_at"] = ensure_utc(insert_params.get("last_synced_at"), "last_synced_at") or utc_now()
                             insert_params["created_at"] = ensure_utc(insert_params.get("created_at"), "created_at") or utc_now()
                             insert_params["updated_at"] = ensure_utc(insert_params.get("updated_at"), "updated_at") or utc_now()
-                            logger.error(
+                            logger.debug(
                                 "[DATETIME_FINAL_PARAMS] synced_at=%s type=%s last_synced_at=%s type=%s updated_at=%s type=%s",
                                 insert_params.get("synced_at"),
                                 type(insert_params.get("synced_at")),
@@ -3026,7 +3034,7 @@ async def sync_leaflink_line_items(
                 }
 
                 _mapped_product_id_raw = item.get("mapped_product_id")
-                logger.error(
+                logger.debug(
                     "[MAPPED_PRODUCT_ID_BEFORE_SQL] value=%s type=%s",
                     _mapped_product_id_raw,
                     type(_mapped_product_id_raw),
@@ -3061,7 +3069,7 @@ async def sync_leaflink_line_items(
                     f"mapped_product_id must be None, str, or UUID, "
                     f"got {type(insert_params.get('mapped_product_id'))}"
                 )
-                logger.error(
+                logger.debug(
                     "[FINAL_SQL_PARAMS] org_id=%s org_type=%s brand_id=%s brand_type=%s"
                     " mapped_product_id=%s mapped_type=%s order_id=%s sku=%s function=_upsert_line_items",
                     org_id_value,
@@ -3073,7 +3081,7 @@ async def sync_leaflink_line_items(
                     order_id_val,
                     sku,
                 )
-                logger.error(
+                logger.info(
                     "[FINAL_SQL_PARAMS_AUDIT] mapped_product_id=%s type=%s is_none=%s is_str=%s is_uuid=%s"
                     " function=_upsert_line_items",
                     insert_params.get("mapped_product_id"),
@@ -3122,7 +3130,7 @@ async def sync_leaflink_line_items(
 
                 # Log every parameter in final order with position
                 for idx, (k, v) in enumerate(insert_params.items(), start=1):
-                    logger.error(
+                    logger.info(
                         "[ORDER_LINES_PARAM_POSITION] idx=%s key=%s type=%s value=%r tzinfo=%s aware=%s",
                         idx,
                         k,
@@ -3143,7 +3151,7 @@ async def sync_leaflink_line_items(
                     insert_params["updated_at"] = to_utc_naive(insert_params["updated_at"])
 
                 # Log the final bind values
-                logger.error(
+                logger.debug(
                     "[ORDER_LINES_FINAL_DATETIME_BIND] created_at=%s type=%s tzinfo=%s updated_at=%s type=%s tzinfo=%s column_type=TIMESTAMP",
                     insert_params.get("created_at"),
                     type(insert_params.get("created_at")).__name__,
@@ -3154,8 +3162,8 @@ async def sync_leaflink_line_items(
                 )
 
                 await db.execute(text(line_upsert_stmt), insert_params)
-                logger.error(
-                    "[ORDER_LINES_UPSERT] action=insert order_id=%s sku=%s",
+                logger.info(
+                    "[ORDER_LINES_UPSERT_OK] order_id=%s sku=%s action=insert",
                     insert_params.get("order_id"),
                     insert_params.get("sku"),
                 )
@@ -3169,6 +3177,12 @@ async def sync_leaflink_line_items(
                 except Exception:
                     pass
 
+                logger.error(
+                    "[ORDER_LINES_UPSERT_FAIL] order_id=%s sku=%s error=%s",
+                    order_id_val,
+                    sku,
+                    str(line_error)[:200],
+                )
                 logger.error(
                     "[LINE_ITEM_INSERT_FAILED] order_id=%s line_number=%s sku=%s error=%s",
                     order_id_val,
