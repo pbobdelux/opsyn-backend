@@ -1,4 +1,5 @@
-"""Unit tests for sanitize_sql_params() and _sanitize_json_value().
+"""Unit tests for sanitize_sql_params(), _sanitize_json_value(),
+assert_no_naive_datetimes(), and final_sanitize_order_lines_params().
 
 Run with:
     python -m pytest tests/test_sanitize_sql_params.py -v
@@ -15,7 +16,14 @@ from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal
 from uuid import UUID
 
-from services.leaflink_sync import sanitize_sql_params, _sanitize_json_value
+import pytest
+
+from services.leaflink_sync import (
+    sanitize_sql_params,
+    _sanitize_json_value,
+    assert_no_naive_datetimes,
+    final_sanitize_order_lines_params,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -315,3 +323,143 @@ class TestOrderLinesParamsIntegration:
         ua = result["updated_at"]
         assert isinstance(ca, datetime) and ca.tzinfo is not None and ca.tzinfo.utcoffset(ca) is not None
         assert isinstance(ua, datetime) and ua.tzinfo is not None and ua.tzinfo.utcoffset(ua) is not None
+
+
+# ---------------------------------------------------------------------------
+# assert_no_naive_datetimes
+# ---------------------------------------------------------------------------
+
+class TestAssertNoNaiveDatetimes:
+    def test_passes_for_aware_datetime(self):
+        dt = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        # Should not raise
+        assert_no_naive_datetimes({"created_at": dt}, "params")
+
+    def test_raises_for_naive_datetime_top_level(self):
+        naive = datetime(2024, 1, 1)
+        with pytest.raises(AssertionError, match="NAIVE_DATETIME_FOUND"):
+            assert_no_naive_datetimes({"created_at": naive}, "params")
+
+    def test_raises_for_naive_datetime_nested_in_dict(self):
+        naive = datetime(2024, 5, 7, 16, 3, 51)
+        payload = {"line_items": [{"created_at": naive}]}
+        with pytest.raises(AssertionError, match="NAIVE_DATETIME_FOUND"):
+            assert_no_naive_datetimes({"raw_payload": payload}, "params")
+
+    def test_raises_for_naive_datetime_in_list(self):
+        naive = datetime(2024, 3, 1)
+        with pytest.raises(AssertionError, match="NAIVE_DATETIME_FOUND"):
+            assert_no_naive_datetimes([naive], "params")
+
+    def test_passes_for_non_datetime_values(self):
+        # Should not raise for strings, ints, None, Decimal, UUID
+        assert_no_naive_datetimes(
+            {
+                "sku": "ABC",
+                "quantity": 3,
+                "unit_price": Decimal("9.99"),
+                "mapped_product_id": None,
+                "brand_id": str(UUID("12345678-1234-5678-1234-567812345678")),
+            },
+            "params",
+        )
+
+    def test_passes_for_empty_dict(self):
+        assert_no_naive_datetimes({}, "params")
+
+    def test_passes_for_empty_list(self):
+        assert_no_naive_datetimes([], "params")
+
+    def test_path_included_in_error_message(self):
+        naive = datetime(2024, 1, 1)
+        with pytest.raises(AssertionError) as exc_info:
+            assert_no_naive_datetimes({"raw_payload": {"created_at": naive}}, "params")
+        assert "params.raw_payload.created_at" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# final_sanitize_order_lines_params
+# ---------------------------------------------------------------------------
+
+class TestFinalSanitizeOrderLinesParams:
+    def test_naive_datetime_becomes_utc_aware(self):
+        naive = datetime(2024, 6, 1, 12, 0, 0)
+        result = final_sanitize_order_lines_params({"created_at": naive})
+        out = result["created_at"]
+        assert isinstance(out, datetime)
+        assert out.tzinfo is not None
+        assert out.tzinfo.utcoffset(out) is not None
+        assert out.year == 2024 and out.month == 6 and out.day == 1
+
+    def test_aware_datetime_converted_to_utc(self):
+        eastern = timezone(timedelta(hours=-5))
+        aware = datetime(2024, 5, 10, 7, 0, 0, tzinfo=eastern)
+        result = final_sanitize_order_lines_params({"updated_at": aware})
+        out = result["updated_at"]
+        assert out.tzinfo == timezone.utc
+        assert out.hour == 12  # 07:00 EST == 12:00 UTC
+
+    def test_date_becomes_midnight_utc_datetime(self):
+        d = date(2024, 6, 15)
+        result = final_sanitize_order_lines_params({"ship_date": d})
+        out = result["ship_date"]
+        assert isinstance(out, datetime)
+        assert out.tzinfo == timezone.utc
+        assert out.year == 2024 and out.month == 6 and out.day == 15
+        assert out.hour == 0 and out.minute == 0
+
+    def test_dict_value_json_sanitized(self):
+        naive = datetime(2024, 1, 1)
+        payload = {"created_at": naive, "name": "test"}
+        result = final_sanitize_order_lines_params({"raw_payload": payload})
+        out = result["raw_payload"]
+        # dict values become JSON-safe strings via _sanitize_json_value
+        assert isinstance(out, dict)
+        assert isinstance(out["created_at"], str)
+        assert out["name"] == "test"
+
+    def test_list_value_json_sanitized(self):
+        uid = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        result = final_sanitize_order_lines_params({"items": [uid, "hello"]})
+        out = result["items"]
+        assert isinstance(out, list)
+        assert out[0] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        assert out[1] == "hello"
+
+    def test_passthrough_primitives(self):
+        params = {
+            "sku": "ABC",
+            "quantity": 3,
+            "unit_price": Decimal("9.99"),
+            "mapped_product_id": None,
+        }
+        result = final_sanitize_order_lines_params(params)
+        assert result["sku"] == "ABC"
+        assert result["quantity"] == 3
+        assert result["unit_price"] == Decimal("9.99")
+        assert result["mapped_product_id"] is None
+
+    def test_all_keys_preserved(self):
+        naive = datetime(2024, 1, 1)
+        params = {
+            "order_id": 42,
+            "sku": "SKU-X",
+            "created_at": naive,
+            "updated_at": naive,
+            "raw_payload": {"note": "test"},
+            "mapped_product_id": None,
+        }
+        result = final_sanitize_order_lines_params(params)
+        assert set(result.keys()) == set(params.keys())
+
+    def test_result_passes_assert_no_naive_datetimes(self):
+        naive = datetime(2024, 6, 1, 12, 0, 0)
+        params = {
+            "created_at": naive,
+            "updated_at": naive,
+            "raw_payload": {"nested_dt": naive},
+            "sku": "TEST",
+        }
+        result = final_sanitize_order_lines_params(params)
+        # After final sanitization, assert_no_naive_datetimes must pass
+        assert_no_naive_datetimes(result, "params")

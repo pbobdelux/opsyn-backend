@@ -730,6 +730,101 @@ def sanitize_sql_params(params: dict, statement: str = "unknown") -> dict:
     return sanitized
 
 
+# ---------------------------------------------------------------------------
+# Final-barrier helpers — catch every naive datetime before asyncpg sees it
+# ---------------------------------------------------------------------------
+
+def assert_no_naive_datetimes(value: Any, path: str = "params") -> None:
+    """Recursively walk *value* and raise AssertionError on any naive datetime.
+
+    Logs [NAIVE_DATETIME_FOUND] with the full dotted path and the offending
+    value before raising so the caller can see it in production logs even if
+    the AssertionError is caught upstream.
+
+    Examples of logged paths:
+        params.raw_payload.line_items.0.created_at
+        params.created_at
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            logger.error(
+                "[NAIVE_DATETIME_FOUND] path=%s value=%s",
+                path,
+                value,
+            )
+            raise AssertionError(
+                f"[NAIVE_DATETIME_FOUND] path={path} value={value!r}"
+            )
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            assert_no_naive_datetimes(v, f"{path}.{k}")
+    elif isinstance(value, (list, tuple)):
+        for i, item in enumerate(value):
+            assert_no_naive_datetimes(item, f"{path}.{i}")
+
+
+def final_sanitize_order_lines_params(params: dict) -> dict:
+    """Hard final sanitizer applied immediately before every order_lines execute().
+
+    Walks the entire params dict recursively and:
+    - datetime (naive)  → replace(tzinfo=timezone.utc)
+    - datetime (aware)  → astimezone(timezone.utc)
+    - date (not datetime) → midnight UTC datetime
+    - dict/list/tuple   → recursively JSON-sanitized via _sanitize_json_value
+                          (datetime/date/UUID/Decimal → strings)
+
+    Logs [FINAL_SANITIZE_ORDER_LINES] for every field that is touched.
+
+    Returns a new sanitized params dict.
+    """
+    if not isinstance(params, dict):
+        return params
+
+    result: dict = {}
+
+    for field, value in params.items():
+        if isinstance(value, datetime):
+            if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+                sanitized_val = value.replace(tzinfo=timezone.utc)
+                action = "naive_datetime_to_utc"
+            else:
+                sanitized_val = value.astimezone(timezone.utc)
+                action = "aware_datetime_to_utc"
+            logger.error(
+                "[FINAL_SANITIZE_ORDER_LINES] field=%s type=%s action=%s",
+                field,
+                type(value).__name__,
+                action,
+            )
+            result[field] = sanitized_val
+
+        elif isinstance(value, date):
+            # date but NOT datetime (datetime is a subclass of date)
+            sanitized_val = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+            logger.error(
+                "[FINAL_SANITIZE_ORDER_LINES] field=%s type=%s action=%s",
+                field,
+                type(value).__name__,
+                "date_to_midnight_utc",
+            )
+            result[field] = sanitized_val
+
+        elif isinstance(value, (dict, list, tuple)):
+            sanitized_val = _sanitize_json_value(value, field)
+            logger.error(
+                "[FINAL_SANITIZE_ORDER_LINES] field=%s type=%s action=%s",
+                field,
+                type(value).__name__,
+                "json_sanitized",
+            )
+            result[field] = sanitized_val
+
+        else:
+            result[field] = value
+
+    return result
+
+
 def safe_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -1269,6 +1364,25 @@ async def _insert_line_items_standalone(
                     f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
                 )
 
+            # Log every parameter in final order with position
+            for idx, (k, v) in enumerate(insert_params.items(), start=1):
+                logger.error(
+                    "[ORDER_LINES_PARAM_POSITION] idx=%s key=%s type=%s value=%r tzinfo=%s aware=%s",
+                    idx,
+                    k,
+                    type(v).__name__,
+                    v if not isinstance(v, (dict, list)) else f"<{type(v).__name__} len={len(v)}>",
+                    getattr(v, "tzinfo", None) if isinstance(v, datetime) else "N/A",
+                    bool(getattr(v, "tzinfo", None) and getattr(v, "tzinfo", None).utcoffset(v))
+                    if isinstance(v, datetime) else None,
+                )
+
+            # Apply final hard sanitization
+            insert_params = final_sanitize_order_lines_params(insert_params)
+
+            # Assert no naive datetimes remain anywhere
+            assert_no_naive_datetimes(insert_params, "params")
+
             await db.execute(text(line_insert_stmt), insert_params)
             inserted += 1
 
@@ -1700,6 +1814,25 @@ async def sync_leaflink_orders(
                         assert isinstance(_ua, datetime) and _ua.tzinfo is not None and _ua.tzinfo.utcoffset(_ua) is not None, (
                             f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
                         )
+
+                    # Log every parameter in final order with position
+                    for idx, (k, v) in enumerate(_li_params.items(), start=1):
+                        logger.error(
+                            "[ORDER_LINES_PARAM_POSITION] idx=%s key=%s type=%s value=%r tzinfo=%s aware=%s",
+                            idx,
+                            k,
+                            type(v).__name__,
+                            v if not isinstance(v, (dict, list)) else f"<{type(v).__name__} len={len(v)}>",
+                            getattr(v, "tzinfo", None) if isinstance(v, datetime) else "N/A",
+                            bool(getattr(v, "tzinfo", None) and getattr(v, "tzinfo", None).utcoffset(v))
+                            if isinstance(v, datetime) else None,
+                        )
+
+                    # Apply final hard sanitization
+                    _li_params = final_sanitize_order_lines_params(_li_params)
+
+                    # Assert no naive datetimes remain anywhere
+                    assert_no_naive_datetimes(_li_params, "params")
 
                     await db.execute(text(_li_insert_stmt), _li_params)
 
@@ -2841,6 +2974,25 @@ async def sync_leaflink_line_items(
                     assert isinstance(_ua, datetime) and _ua.tzinfo is not None and _ua.tzinfo.utcoffset(_ua) is not None, (
                         f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
                     )
+
+                # Log every parameter in final order with position
+                for idx, (k, v) in enumerate(insert_params.items(), start=1):
+                    logger.error(
+                        "[ORDER_LINES_PARAM_POSITION] idx=%s key=%s type=%s value=%r tzinfo=%s aware=%s",
+                        idx,
+                        k,
+                        type(v).__name__,
+                        v if not isinstance(v, (dict, list)) else f"<{type(v).__name__} len={len(v)}>",
+                        getattr(v, "tzinfo", None) if isinstance(v, datetime) else "N/A",
+                        bool(getattr(v, "tzinfo", None) and getattr(v, "tzinfo", None).utcoffset(v))
+                        if isinstance(v, datetime) else None,
+                    )
+
+                # Apply final hard sanitization
+                insert_params = final_sanitize_order_lines_params(insert_params)
+
+                # Assert no naive datetimes remain anywhere
+                assert_no_naive_datetimes(insert_params, "params")
 
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
