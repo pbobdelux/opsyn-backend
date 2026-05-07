@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db, has_column
 from models import Order, SyncRequest, SyncRun
 from models.sync_health import DeadLetterLineItem, SyncHealth
-from services.leaflink_sync import safe_uuid_for_db, safe_uuid_mapped_product
+from services.leaflink_sync import safe_uuid_for_db, safe_uuid_mapped_product, sanitize_sql_params
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("sync_routes")
@@ -283,6 +283,8 @@ async def replay_dead_letter_item(
             params.get("sku"),
             params.get("product_name"),
         )
+        # Sanitize SQL params: remove provider dates, keep only operational timestamps
+        params = sanitize_sql_params(params)
         await db.execute(text(upsert_stmt), params)
         await db.commit()
         logger.info(

@@ -209,6 +209,20 @@ async def _dead_letter_line_item(
                 if raw_payload is not None
                 else None
             )
+            _dead_letter_params = sanitize_sql_params({
+                "brand_id": brand_id,
+                "external_order_id": external_order_id,
+                "order_id": order_id,
+                "sku": sku or "unknown",
+                "product_name": product_name,
+                "raw_payload": raw_payload_str,
+                "reason": failure_reason[:500],
+                "count": failure_count,
+                "now": ensure_utc(utc_now()),
+            })
+            # Restore 'now' if sanitize_sql_params removed it (it's not in the operational whitelist)
+            if "now" not in _dead_letter_params:
+                _dead_letter_params["now"] = ensure_utc(utc_now())
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -223,18 +237,7 @@ async def _dead_letter_line_item(
                         last_failed_at = :now,
                         raw_payload = CAST(:raw_payload AS jsonb)
                 """),
-                {
-                    "brand_id": brand_id,
-                    "external_order_id": external_order_id,
-                    "order_id": order_id,
-                    "sku": sku or "unknown",
-                    "product_name": product_name,
-                    "raw_payload": raw_payload_str,
-                    "reason": failure_reason[:500],
-                    "count": failure_count,
-                    # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                    "now": ensure_utc(utc_now()),
-                },
+                _dead_letter_params,
             )
             await db.commit()
         logger.warning(
@@ -293,9 +296,8 @@ async def _write_sync_dead_letter(
                 else json.dumps({})
             )
             now = ensure_utc(utc_now())
-            # Build params dict first so final coercion can be applied directly
-            # into it immediately before execute() — belt-and-suspenders guard.
-            params = {
+            # Build params dict and sanitize to remove provider dates
+            params = sanitize_sql_params({
                 "source": source,
                 "brand_id": safe_uuid_for_db(brand_id, "brand_id") or brand_id,
                 "org_id": safe_uuid_for_db(org_id, "org_id"),
@@ -305,12 +307,13 @@ async def _write_sync_dead_letter(
                 "error_stage": error_stage,
                 "error_message": error_message[:2000],
                 "now": now,
-            }
+            })
+            # Restore 'now' if sanitize_sql_params removed it (it's not in the operational whitelist)
+            if "now" not in params:
+                params["now"] = ensure_utc(utc_now())
             # FINAL coercion — apply safe_uuid_for_db() directly into the params
             # dict immediately before execute() so no mutation after coercion can
-            # slip through.  This is the last line of defence against the
-            # "column org_id is of type uuid but expression is of type character
-            # varying" error.
+            # slip through.
             params["org_id"] = safe_uuid_for_db(params.get("org_id"), "org_id")
             params["brand_id"] = safe_uuid_for_db(params.get("brand_id"), "brand_id") or params.get("brand_id")
             logger.error(
@@ -320,21 +323,6 @@ async def _write_sync_dead_letter(
                 params.get("brand_id"),
                 type(params.get("brand_id")),
             )
-            logger.error(
-                "[FINAL_SQL_PARAMS] org_id=%s type=%s brand_id=%s type=%s function=_write_sync_dead_letter",
-                _sql_org_id,
-                type(_sql_org_id).__name__,
-                _sql_brand_id,
-                type(_sql_brand_id).__name__,
-            )
-            assert (
-                _sql_org_id is None
-                or isinstance(_sql_org_id, (str, UUID))
-            ), f"org_id must be None, str, or UUID, got {type(_sql_org_id)}"
-            assert (
-                _sql_brand_id is None
-                or isinstance(_sql_brand_id, (str, UUID))
-            ), f"brand_id must be None, str, or UUID, got {type(_sql_brand_id)}"
             await db.execute(
                 text("""
                     INSERT INTO sync_dead_letters
@@ -443,59 +431,120 @@ def ensure_utc(dt: Any) -> "datetime | None":
     return dt.astimezone(timezone.utc)
 
 
-def strip_provider_dates_from_params(params: dict, timestamp_field_names: list[str] = None) -> dict:
-    """Remove all provider-sourced date fields from SQL params.
-
-    Keeps only server-owned operational timestamps:
-    - created_at (set to utc_now())
-    - updated_at (set to utc_now())
-    - synced_at (set to utc_now())
-    - last_synced_at (set to utc_now())
-
-    Removes all external/provider dates:
-    - external_created_at → NULL
-    - external_updated_at → NULL
-    - Any other *_date, *_at, *_time field from provider payload
+def get_allowed_model_fields(model_class) -> set:
+    """Get the set of valid column names for a SQLAlchemy model.
 
     Args:
-        params: SQL parameters dict
-        timestamp_field_names: Optional list of field names to treat as timestamps
+        model_class: SQLAlchemy model class (Order, OrderLine, etc.)
 
     Returns:
-        Cleaned params dict with only server timestamps
+        Set of valid column names that can be passed to the model constructor
     """
-    if timestamp_field_names is None:
-        timestamp_field_names = [
-            'external_created_at', 'external_updated_at', 'paid_date', 'ship_date',
-            'approved_at', 'fulfilled_at', 'cancelled_at', 'delivery_date',
-            'expected_delivery_date', 'shipped_date', 'order_date', 'placed_at'
-        ]
+    if not hasattr(model_class, '__table__'):
+        return set()
+    return set(model_class.__table__.columns.keys())
 
-    # Remove all provider date fields
-    for field in timestamp_field_names:
-        if field in params:
-            del params[field]
-            logger.info(
-                "[STRIP_PROVIDER_DATE] field=%s reason=removed_from_sql_params",
-                field,
+
+def filter_model_kwargs(model_class, kwargs: dict) -> dict:
+    """Filter kwargs to only include valid columns for a model.
+
+    Removes any kwargs that don't correspond to actual model columns.
+    Logs removed fields for debugging.
+
+    Args:
+        model_class: SQLAlchemy model class
+        kwargs: Dictionary of potential constructor arguments
+
+    Returns:
+        Filtered dictionary with only valid model columns
+    """
+    allowed_fields = get_allowed_model_fields(model_class)
+    filtered = {}
+
+    for key, value in kwargs.items():
+        if key in allowed_fields:
+            filtered[key] = value
+        else:
+            logger.warning(
+                "[ORM_KWARG_FILTERED] model=%s field=%s reason=not_in_model",
+                model_class.__name__,
+                key,
             )
 
-    # Ensure operational timestamps are server UTC
-    now = utc_now()
-    params['created_at'] = now
-    params['updated_at'] = now
-    params['synced_at'] = now
-    params['last_synced_at'] = now
+    return filtered
 
+
+def sanitize_sql_params(params: dict) -> dict:
+    """Remove provider dates and unknown fields from SQL params.
+
+    Keeps ONLY:
+    - Operational timestamps: synced_at, created_at, updated_at, last_synced_at
+    - Non-date fields: strings, ints, bools, etc.
+
+    Removes:
+    - Any datetime/date object unless key is in operational whitelist
+    - Any key containing: date, time, paid, ship, delivery, created, modified, updated
+      (unless it's in the operational whitelist)
+
+    Args:
+        params: SQL parameters dictionary
+
+    Returns:
+        Sanitized params dictionary
+    """
+    operational_timestamp_whitelist = {
+        'synced_at', 'created_at', 'updated_at', 'last_synced_at'
+    }
+
+    date_related_keywords = {
+        'date', 'time', 'paid', 'ship', 'delivery', 'created', 'modified', 'updated'
+    }
+
+    sanitized = {}
+    removed_fields = []
+
+    for key, value in params.items():
+        # Always allow operational timestamps
+        if key in operational_timestamp_whitelist:
+            # Ensure they're UTC-aware datetimes
+            if isinstance(value, datetime):
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                else:
+                    value = value.astimezone(timezone.utc)
+            sanitized[key] = value
+            continue
+
+        # Remove any datetime/date object not in whitelist
+        if isinstance(value, (datetime, date)):
+            removed_fields.append((key, 'datetime/date_object'))
+            continue
+
+        # Remove any field with date-related keywords (unless whitelisted)
+        if any(keyword in key.lower() for keyword in date_related_keywords):
+            removed_fields.append((key, 'date_related_keyword'))
+            continue
+
+        # Keep everything else
+        sanitized[key] = value
+
+    # Log removed fields
+    for field, reason in removed_fields:
+        logger.info(
+            "[SQL_PARAM_REMOVED] field=%s reason=%s",
+            field,
+            reason,
+        )
+
+    # Log final allowed params (non-sensitive fields only)
+    allowed_keys = [k for k in sanitized.keys() if k not in {'raw_payload', 'error_message'}]
     logger.info(
-        "[OPERATIONAL_TIMESTAMPS_SET] created_at=%s updated_at=%s synced_at=%s last_synced_at=%s",
-        now,
-        now,
-        now,
-        now,
+        "[SQL_PARAM_ALLOWED] fields=%s count=%s",
+        ','.join(allowed_keys),
+        len(sanitized),
     )
 
-    return params
+    return sanitized
 
 
 def safe_str(value: Any) -> str | None:
@@ -874,8 +923,8 @@ async def _insert_line_items_standalone(
                 isinstance(insert_params.get("mapped_product_id"), UUID),
             )
 
-            # Raw-first ingestion: strip all provider dates, use only server UTC
-            insert_params = strip_provider_dates_from_params(insert_params)
+            # Raw-first ingestion: sanitize SQL params to remove provider dates, keep only server UTC
+            insert_params = sanitize_sql_params(insert_params)
             logger.info(
                 "[RAW_FIRST_INGESTION] action=insert_line_item order_id=%s sku=%s",
                 insert_params.get('order_id'),
@@ -1106,26 +1155,30 @@ async def sync_leaflink_orders(
                     order_row = existing
                     updated += 1
                 else:
-                    order_row = Order(
-                        org_id=_write_org_id,
-                        brand_id=_write_brand_id,
-                        external_order_id=external_id,
-                        order_number=order_number,
-                        customer_name=customer_name,
-                        status=status,
-                        total_cents=total_cents,
-                        amount=amount_decimal,
-                        item_count=item_count,
-                        unit_count=unit_count,
-                        line_items_json=make_json_safe(normalized_line_items),
-                        raw_payload=make_json_safe(raw_payload),
-                        source="leaflink",
-                        review_status=review_status,
-                        sync_status="ok",
+                    # Filter kwargs to only include valid Order model columns
+                    order_kwargs = filter_model_kwargs(Order, {
+                        'org_id': _write_org_id,
+                        'brand_id': _write_brand_id,
+                        'external_order_id': external_id,
+                        'order_number': order_number,
+                        'customer_name': customer_name,
+                        'status': status,
+                        'total_cents': total_cents,
+                        'amount': amount_decimal,
+                        'item_count': item_count,
+                        'unit_count': unit_count,
+                        'line_items_json': make_json_safe(normalized_line_items),
+                        'raw_payload': make_json_safe(raw_payload),
+                        'source': 'leaflink',
+                        'review_status': review_status,
+                        'sync_status': 'ok',
+                        'external_created_at': None,  # Never use provider dates
+                        'external_updated_at': None,  # Never use provider dates
                         # Use server timestamps for all DB columns — bulletproof mode
-                        synced_at=now,
-                        last_synced_at=now,
-                    )
+                        'synced_at': now,
+                        'last_synced_at': now,
+                    })
+                    order_row = Order(**order_kwargs)
                     db.add(order_row)
                     # Flush to get the auto-generated order_row.id before writing lines.
                     await db.flush()
@@ -1619,8 +1672,8 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 update_params.get("updated_at"),
                                 type(update_params.get("updated_at")),
                             )
-                            # Raw-first ingestion: strip all provider dates, use only server UTC
-                            update_params = strip_provider_dates_from_params(update_params)
+                            # Raw-first ingestion: sanitize SQL params to remove provider dates, keep only server UTC
+                            update_params = sanitize_sql_params(update_params)
                             logger.info(
                                 "[RAW_FIRST_INGESTION] action=update order_id=%s brand_id=%s external_order_id=%s",
                                 update_params.get('id'),
@@ -1742,8 +1795,8 @@ INSERT INTO orders (
                                 insert_params.get("updated_at"),
                                 type(insert_params.get("updated_at")),
                             )
-                            # Raw-first ingestion: strip all provider dates, use only server UTC
-                            insert_params = strip_provider_dates_from_params(insert_params)
+                            # Raw-first ingestion: sanitize SQL params to remove provider dates, keep only server UTC
+                            insert_params = sanitize_sql_params(insert_params)
                             logger.info(
                                 "[RAW_FIRST_INGESTION] action=insert brand_id=%s external_order_id=%s",
                                 insert_params.get('brand_id'),
@@ -2289,8 +2342,8 @@ async def sync_leaflink_line_items(
                     isinstance(insert_params.get("mapped_product_id"), str),
                     isinstance(insert_params.get("mapped_product_id"), UUID),
                 )
-                # Raw-first ingestion: strip all provider dates, use only server UTC
-                insert_params = strip_provider_dates_from_params(insert_params)
+                # Raw-first ingestion: sanitize SQL params to remove provider dates, keep only server UTC
+                insert_params = sanitize_sql_params(insert_params)
                 logger.info(
                     "[RAW_FIRST_INGESTION] action=upsert_line_item order_id=%s sku=%s",
                     insert_params.get('order_id'),
