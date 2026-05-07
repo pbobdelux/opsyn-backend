@@ -87,9 +87,16 @@ async def _update_sync_health_phase1(
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
                 {"brand_id": brand_id, "now": ensure_utc(utc_now()), "count": (orders_count or 0)}
             )
+            _phase1_params = normalize_datetime_fields(_phase1_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase1 columns=brand_id"
             )
+            for _k, _v in _phase1_params.items():
+                if isinstance(_v, datetime):
+                    logger.info(
+                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                    )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, updated_at)
@@ -126,9 +133,16 @@ async def _update_sync_health_phase2(
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
                 {"brand_id": brand_id, "now": ensure_utc(utc_now()), "count": line_items_count}
             )
+            _phase2_params = normalize_datetime_fields(_phase2_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase2 columns=brand_id"
             )
+            for _k, _v in _phase2_params.items():
+                if isinstance(_v, datetime):
+                    logger.info(
+                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                    )
             await db.execute(
                 text("""
                     UPDATE sync_health SET
@@ -163,9 +177,16 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
                 {"brand_id": brand_id, "error": str(error)[:500], "now": ensure_utc(utc_now())}
             )
+            _sync_error_params = normalize_datetime_fields(_sync_error_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_record_sync_error columns=brand_id"
             )
+            for _k, _v in _sync_error_params.items():
+                if isinstance(_v, datetime):
+                    logger.info(
+                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                    )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
@@ -193,9 +214,16 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
             _retryable_params = normalize_uuid_fields(
                 {"brand_id": brand_id, "error": error_msg[:500], "now": ensure_utc(utc_now())}
             )
+            _retryable_params = normalize_datetime_fields(_retryable_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_record_retryable_error columns=brand_id"
             )
+            for _k, _v in _retryable_params.items():
+                if isinstance(_v, datetime):
+                    logger.info(
+                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                    )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
@@ -248,9 +276,16 @@ async def _dead_letter_line_item(
             if "now" not in _dead_letter_params:
                 _dead_letter_params["now"] = ensure_utc(utc_now())
             _dead_letter_params = normalize_uuid_fields(_dead_letter_params)
+            _dead_letter_params = normalize_datetime_fields(_dead_letter_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_dead_letter_line_item columns=brand_id"
             )
+            for _k, _v in _dead_letter_params.items():
+                if isinstance(_v, datetime):
+                    logger.info(
+                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                    )
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -352,9 +387,16 @@ async def _write_sync_dead_letter(
                 type(params.get("brand_id")),
             )
             params = normalize_uuid_fields(params)
+            params = normalize_datetime_fields(params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_write_sync_dead_letter columns=brand_id,org_id"
             )
+            for _k, _v in params.items():
+                if isinstance(_v, datetime):
+                    logger.info(
+                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                    )
             await db.execute(
                 text("""
                     INSERT INTO sync_dead_letters
@@ -779,6 +821,45 @@ def normalize_uuid_fields(params: dict) -> dict:
     return normalized
 
 
+def normalize_datetime_fields(params: dict) -> dict:
+    """Normalize all datetime values in SQL parameters to UTC-aware.
+
+    For any datetime value:
+    - None stays None
+    - Naive datetime → UTC-aware with replace(tzinfo=timezone.utc)
+    - Aware datetime → normalized to UTC with astimezone(timezone.utc)
+
+    Returns normalized params dict.
+    """
+    normalized = dict(params)
+
+    for key, value in params.items():
+        if not isinstance(value, datetime):
+            continue
+
+        tzinfo_before = value.tzinfo
+        is_aware_before = tzinfo_before is not None
+
+        if not is_aware_before:
+            # Naive → UTC-aware
+            normalized[key] = value.replace(tzinfo=timezone.utc)
+            logger.info(
+                "[DATETIME_NORMALIZED] field=%s was_naive=True tzinfo_before=%s final_type=UTC-aware",
+                key,
+                tzinfo_before,
+            )
+        else:
+            # Aware → ensure UTC
+            normalized[key] = value.astimezone(timezone.utc)
+            logger.info(
+                "[DATETIME_NORMALIZED] field=%s was_naive=False tzinfo_before=%s final_type=UTC",
+                key,
+                tzinfo_before,
+            )
+
+    return normalized
+
+
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None or value == "":
@@ -1047,6 +1128,13 @@ async def _insert_line_items_standalone(
                 insert_params.get('sku'),
             )
             insert_params = normalize_uuid_fields(insert_params)
+            insert_params = normalize_datetime_fields(insert_params)
+            for _k, _v in insert_params.items():
+                if isinstance(_v, datetime):
+                    logger.info(
+                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                    )
             await db.execute(text(line_insert_stmt), insert_params)
             inserted += 1
 
@@ -1444,6 +1532,13 @@ async def sync_leaflink_orders(
                         _li_params["total_price_cents"] = item.get("total_price_cents")
 
                     _li_params = normalize_uuid_fields(_li_params)
+                    _li_params = normalize_datetime_fields(_li_params)
+                    for _k, _v in _li_params.items():
+                        if isinstance(_v, datetime):
+                            logger.info(
+                                "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                                _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                            )
                     await db.execute(text(_li_insert_stmt), _li_params)
 
                 total_lines_written += len(normalized_line_items)
@@ -1854,9 +1949,16 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 update_params.get('external_order_id'),
                             )
                             update_params = normalize_uuid_fields(update_params)
+                            update_params = normalize_datetime_fields(update_params)
                             logger.info(
                                 "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders_headers_only_update columns=org_id,brand_id"
                             )
+                            for _k, _v in update_params.items():
+                                if isinstance(_v, datetime):
+                                    logger.info(
+                                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                                    )
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -1980,9 +2082,16 @@ INSERT INTO orders (
                                 insert_params.get('external_order_id'),
                             )
                             insert_params = normalize_uuid_fields(insert_params)
+                            insert_params = normalize_datetime_fields(insert_params)
                             logger.info(
                                 "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders_headers_only_insert columns=org_id,brand_id"
                             )
+                            for _k, _v in insert_params.items():
+                                if isinstance(_v, datetime):
+                                    logger.info(
+                                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                                    )
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
@@ -2542,6 +2651,13 @@ async def sync_leaflink_line_items(
                     insert_params.get('sku'),
                 )
                 insert_params = normalize_uuid_fields(insert_params)
+                insert_params = normalize_datetime_fields(insert_params)
+                for _k, _v in insert_params.items():
+                    if isinstance(_v, datetime):
+                        logger.info(
+                            "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                            _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                        )
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
