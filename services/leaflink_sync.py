@@ -1562,6 +1562,19 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             )
                             logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
                             logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
+                            # Coerce all datetime params to UTC-aware immediately before SQL execution
+                            update_params["synced_at"] = ensure_utc(update_params.get("synced_at")) or utc_now()
+                            update_params["last_synced_at"] = ensure_utc(update_params.get("last_synced_at")) or utc_now()
+                            update_params["updated_at"] = ensure_utc(update_params.get("updated_at")) or utc_now()
+                            logger.error(
+                                "[DATETIME_FINAL_PARAMS] synced_at=%s type=%s last_synced_at=%s type=%s updated_at=%s type=%s",
+                                update_params.get("synced_at"),
+                                type(update_params.get("synced_at")),
+                                update_params.get("last_synced_at"),
+                                type(update_params.get("last_synced_at")),
+                                update_params.get("updated_at"),
+                                type(update_params.get("updated_at")),
+                            )
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -1663,6 +1676,20 @@ INSERT INTO orders (
                             )
                             logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
                             logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
+                            # Coerce all datetime params to UTC-aware immediately before SQL execution
+                            insert_params["synced_at"] = ensure_utc(insert_params.get("synced_at")) or utc_now()
+                            insert_params["last_synced_at"] = ensure_utc(insert_params.get("last_synced_at")) or utc_now()
+                            insert_params["created_at"] = ensure_utc(insert_params.get("created_at")) or utc_now()
+                            insert_params["updated_at"] = ensure_utc(insert_params.get("updated_at")) or utc_now()
+                            logger.error(
+                                "[DATETIME_FINAL_PARAMS] synced_at=%s type=%s last_synced_at=%s type=%s updated_at=%s type=%s",
+                                insert_params.get("synced_at"),
+                                type(insert_params.get("synced_at")),
+                                insert_params.get("last_synced_at"),
+                                type(insert_params.get("last_synced_at")),
+                                insert_params.get("updated_at"),
+                                type(insert_params.get("updated_at")),
+                            )
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
