@@ -1461,10 +1461,18 @@ async def orders_sync(
                 # Phase 1 upsert: headers only, batched commits of 25 orders
                 logger.info("[OrdersSync] phase=1 db_upsert_start count=%s", len(orders_from_leaflink))
 
+                # Log brand_id immediately before passing to the DB write function
+                from services.leaflink_sync import safe_uuid_for_db as _safe_uuid_for_db
+                _pre_sql_brand_id = _safe_uuid_for_db(_resolved_brand_id, "brand_id") or _resolved_brand_id
+                logger.info(
+                    "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s function=sync_orders_leaflink->sync_leaflink_orders_headers_only",
+                    _pre_sql_brand_id,
+                )
+
                 try:
                     sync_result = await asyncio.wait_for(
                         sync_leaflink_orders_headers_only(
-                            _resolved_brand_id,
+                            _pre_sql_brand_id,
                             orders_from_leaflink,
                             pages_fetched=pages_fetched_phase1,
                         ),

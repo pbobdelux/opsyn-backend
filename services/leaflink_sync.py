@@ -293,6 +293,17 @@ async def _write_sync_dead_letter(
                 else json.dumps({})
             )
             now = ensure_utc(utc_now())
+            # Re-coerce immediately before SQL to guarantee no raw value slips through
+            _sql_brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id
+            _sql_org_id = safe_uuid_for_db(org_id, "org_id")
+            logger.info(
+                "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s function=_write_sync_dead_letter",
+                _sql_brand_id,
+            )
+            logger.info(
+                "[ORG_ID_BEFORE_SQL] field=org_id value=%s function=_write_sync_dead_letter",
+                _sql_org_id,
+            )
             await db.execute(
                 text("""
                     INSERT INTO sync_dead_letters
@@ -306,8 +317,8 @@ async def _write_sync_dead_letter(
                 """),
                 {
                     "source": source,
-                    "brand_id": brand_id,
-                    "org_id": org_id,
+                    "brand_id": _sql_brand_id,
+                    "org_id": _sql_org_id,
                     "external_id": external_id,
                     "order_number": order_number,
                     "raw_payload": raw_payload_str,
@@ -965,6 +976,19 @@ async def sync_leaflink_orders(
             # On failure: write to sync_dead_letters, continue to next order.
             # ----------------------------------------------------------
             try:
+                # Re-coerce immediately before every DB write — belt-and-suspenders guard
+                _write_org_id = safe_uuid_for_db(org_id, "org_id")
+                _write_brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id
+                logger.info(
+                    "[ORG_ID_BEFORE_SQL] field=org_id value=%s external_id=%s function=sync_leaflink_orders",
+                    _write_org_id,
+                    external_id,
+                )
+                logger.info(
+                    "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s external_id=%s function=sync_leaflink_orders",
+                    _write_brand_id,
+                    external_id,
+                )
                 if existing:
                     existing.customer_name = customer_name
                     existing.status = status
@@ -981,14 +1005,14 @@ async def sync_leaflink_orders(
                     existing.synced_at = now
                     existing.last_synced_at = now
                     # Always stamp org_id so existing rows get backfilled on re-sync
-                    if org_id:
-                        existing.org_id = org_id
+                    if _write_org_id:
+                        existing.org_id = _write_org_id
                     order_row = existing
                     updated += 1
                 else:
                     order_row = Order(
-                        org_id=org_id,
-                        brand_id=brand_id,
+                        org_id=_write_org_id,
+                        brand_id=_write_brand_id,
                         external_order_id=external_id,
                         order_number=order_number,
                         customer_name=customer_name,
@@ -1413,9 +1437,23 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             synced_at_val = now
                             updated_at_val = now
 
+                            # Re-coerce immediately before SQL params — belt-and-suspenders guard
+                            _sql_org_id = safe_uuid_for_db(org_id_value, "org_id")
+                            _sql_brand_id = safe_uuid_for_db(brand_id_value, "brand_id") or brand_id_value
+                            logger.info(
+                                "[ORG_ID_BEFORE_SQL] field=org_id value=%s external_id=%s function=sync_leaflink_orders_headers_only action=update",
+                                _sql_org_id,
+                                external_id,
+                            )
+                            logger.info(
+                                "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s external_id=%s function=sync_leaflink_orders_headers_only action=update",
+                                _sql_brand_id,
+                                external_id,
+                            )
+
                             update_params = {
-                                "org_id": org_id_value,
-                                "brand_id": brand_id_value,
+                                "org_id": _sql_org_id,
+                                "brand_id": _sql_brand_id,
                                 "external_order_id": external_id,
                                 "customer_name": customer_name,
                                 "status": status,
@@ -1483,9 +1521,23 @@ INSERT INTO orders (
                             created_at_val = now
                             synced_at_val = now
 
+                            # Re-coerce immediately before SQL params — belt-and-suspenders guard
+                            _sql_org_id = safe_uuid_for_db(org_id_value, "org_id")
+                            _sql_brand_id = safe_uuid_for_db(brand_id_value, "brand_id") or brand_id_value
+                            logger.info(
+                                "[ORG_ID_BEFORE_SQL] field=org_id value=%s external_id=%s function=sync_leaflink_orders_headers_only action=insert",
+                                _sql_org_id,
+                                external_id,
+                            )
+                            logger.info(
+                                "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s external_id=%s function=sync_leaflink_orders_headers_only action=insert",
+                                _sql_brand_id,
+                                external_id,
+                            )
+
                             insert_params = {
-                                "org_id": org_id_value,
-                                "brand_id": brand_id_value,
+                                "org_id": _sql_org_id,
+                                "brand_id": _sql_brand_id,
                                 "external_order_id": external_id,
                                 "order_number": order_number,
                                 "customer_name": customer_name,
@@ -1821,6 +1873,15 @@ async def sync_leaflink_line_items(
     # preventing "column is of type uuid but expression is of type character varying" errors.
     brand_id_value = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
     org_id_value = safe_uuid_for_db(org_id, "org_id") if org_id else None
+
+    logger.info(
+        "[ORG_ID_BEFORE_SQL] field=org_id value=%s function=sync_leaflink_line_items",
+        org_id_value,
+    )
+    logger.info(
+        "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s function=sync_leaflink_line_items",
+        brand_id_value,
+    )
 
     try:
         async with AsyncSessionLocal() as check_db:
