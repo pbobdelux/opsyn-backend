@@ -852,29 +852,6 @@ def normalize_datetime_fields(params: dict, field_prefix: str = "") -> dict:
 
     Returns normalized params dict.
     """
-    normalized = {}
-
-    for key, value in params.items():
-from datetime import datetime, timezone
-
-def ensure_utc(dt: any) -> any:
-    """Convert any datetime to UTC-aware."""
-    if not isinstance(dt, datetime):
-        return dt
-    if dt.tzinfo is None:
-        # Naive -> UTC
-        normalized = dt.replace(tzinfo=timezone.utc)
-        logger.info("[DATETIME_NORMALIZED] field=... was_naive=True → %s", normalized)
-        return normalized
-    else:
-        # Aware -> normalize to UTC
-        normalized = dt.astimezone(timezone.utc)
-        logger.info("[DATETIME_NORMALIZED] field=... was_naive=False → %s", normalized)
-        return normalized
-
-
-def normalize_datetime_fields(params: dict, field_prefix: str = "") -> dict:
-    """Recursively normalize all datetimes in params (including nested dicts/lists)."""
     if not isinstance(params, dict):
         return params
 
@@ -902,7 +879,7 @@ def normalize_datetime_fields(params: dict, field_prefix: str = "") -> dict:
         else:
             normalized[key] = value
 
-    return normalized    return normalized
+    return normalized
 
 
 def safe_int(value: Any, default: int = 0) -> int:
