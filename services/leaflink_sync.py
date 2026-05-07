@@ -1150,25 +1150,11 @@ async def _insert_line_items_standalone(
             )
             insert_params = normalize_uuid_fields(insert_params)
             insert_params = normalize_datetime_fields(insert_params)
-        logger.info(
-            "[RAW_FIRST_INGESTION] action=insert_line_item order_id=%s sku=%s",
-            insert_params.get('order_id'),
-            insert_params.get('sku'),
-        )
 
-        # === NORMALIZATION (UUID + DATETIME) ===
-        insert_params = normalize_uuid_fields(insert_params)
-        insert_params = normalize_datetime_fields(insert_params)
-
-        await db.execute(text(line_insert_stmt), insert_params)
-        inserted += 1
-
-        await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
             await db.execute(text(line_insert_stmt), insert_params)
             inserted += 1
 
             await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
-
 
         except Exception as line_error:
             try:
@@ -1559,12 +1545,6 @@ async def sync_leaflink_orders(
 
                     _li_params = normalize_uuid_fields(_li_params)
                     _li_params = normalize_datetime_fields(_li_params)
-        li_params = normalize_uuid_fields(li_params)
-        li_params = normalize_datetime_fields(li_params)
-
-        await db.execute(text(li_insert_stmt), li_params)
-
-        total_lines_written += len(normalized_line_items)
                     await db.execute(text(_li_insert_stmt), _li_params)
 
                 total_lines_written += len(normalized_line_items)
@@ -2677,14 +2657,6 @@ async def sync_leaflink_line_items(
                 )
                 insert_params = normalize_uuid_fields(insert_params)
                 insert_params = normalize_datetime_fields(insert_params)
-        # === NORMALIZATION (UUID + DATETIME) ===
-        insert_params = normalize_uuid_fields(insert_params)
-        insert_params = normalize_datetime_fields(insert_params)
-
-        await db.execute(text(line_upsert_stmt), insert_params)
-        inserted += 1
-
-        await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
