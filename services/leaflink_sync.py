@@ -720,6 +720,20 @@ async def sync_leaflink_orders(
             brand_id,
         )
 
+    # [LEAFLINK_TIMESTAMP_STRATEGY] All DB operational timestamps are server-owned UTC.
+    # LeafLink provider dates (created_on, modified, paid_date, ship_date, etc.) are
+    # stored as raw strings in raw_payload JSONB only — never parsed or compared here.
+    logger.info(
+        "[LEAFLINK_TIMESTAMP_STRATEGY] using=server_time_only reason=provider_dates_unreliable brand_id=%s",
+        brand_id,
+    )
+    # [LEAFLINK_FILTER_DISABLED] No freshness/date-based filtering during ingestion.
+    # All orders pass through regardless of their LeafLink dates.
+    logger.info(
+        "[LEAFLINK_FILTER_DISABLED] filter_type=freshness reason=provider_dates_unreliable brand_id=%s",
+        brand_id,
+    )
+
     created = 0
     updated = 0
     skipped = 0
@@ -728,6 +742,7 @@ async def sync_leaflink_orders(
     total_lines_written = 0
     errors: list[str] = []
     newest_order_date: datetime | None = None
+
 
     # ------------------------------------------------------------------
     # Upsert orders and write line items using the caller's session.
@@ -1092,9 +1107,17 @@ async def sync_leaflink_orders_headers_only(
         len(batches),
     )
 
-    # [LEAFLINK_TIMESTAMP_STRATEGY] Use server time for all DB columns — bulletproof mode
+    # [LEAFLINK_TIMESTAMP_STRATEGY] All DB operational timestamps are server-owned UTC.
+    # LeafLink provider dates (created_on, modified, paid_date, ship_date, etc.) are
+    # stored as raw strings in raw_payload JSONB only — never parsed or compared here.
     logger.info(
-        "[LEAFLINK_TIMESTAMP_STRATEGY] using=server_time reason=bulletproof_mode brand_id=%s",
+        "[LEAFLINK_TIMESTAMP_STRATEGY] using=server_time_only reason=provider_dates_unreliable brand_id=%s",
+        brand_id_value,
+    )
+    # [LEAFLINK_FILTER_DISABLED] No freshness/date-based filtering during ingestion.
+    # All orders pass through regardless of their LeafLink dates.
+    logger.info(
+        "[LEAFLINK_FILTER_DISABLED] filter_type=freshness reason=provider_dates_unreliable brand_id=%s",
         brand_id_value,
     )
     # [LEAFLINK_UPSERT_KEY] Upsert by stable LeafLink identifier only — no date keys
@@ -2497,19 +2520,21 @@ async def sync_leaflink_background_continuous(
                 brand_id,
             )
 
-            # [SYNC_FILTER_DISABLED] All filters are disabled — passing all orders through
+            # [SYNC_FILTER_DISABLED] All filters are disabled — passing all orders through.
+            # Provider dates are unreliable (may be naive/offset-naive); no date comparison
+            # is performed during ingestion. Raw dates are preserved in raw_payload JSONB.
             logger.info(
                 "[SYNC_FILTER_DISABLED] filter_type=status reason=debug_mode brand_id=%s page=%s",
                 brand_id,
                 current_page,
             )
             logger.info(
-                "[SYNC_FILTER_DISABLED] filter_type=freshness reason=debug_mode brand_id=%s page=%s",
+                "[SYNC_FILTER_DISABLED] filter_type=freshness reason=provider_dates_unreliable brand_id=%s page=%s",
                 brand_id,
                 current_page,
             )
             logger.info(
-                "[SYNC_FILTER_DISABLED] filter_type=date reason=debug_mode brand_id=%s page=%s",
+                "[SYNC_FILTER_DISABLED] filter_type=date reason=provider_dates_unreliable brand_id=%s page=%s",
                 brand_id,
                 current_page,
             )
