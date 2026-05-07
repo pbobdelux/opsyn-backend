@@ -3139,30 +3139,41 @@ async def sync_orders_leaflink(
         # Stage 7: Build and return structured success response               #
         # ------------------------------------------------------------------ #
         duration = round(_time.monotonic() - sync_wall_start, 2)
-        created_count = sync_result.get("created", 0)
-        updated_count = sync_result.get("updated", 0)
-        skipped_count = sync_result.get("skipped", 0)
+        fetched_count = sync_result.get("fetched_count", len(orders))
+        inserted_count = sync_result.get("inserted_count", sync_result.get("created", 0))
+        updated_count = sync_result.get("updated_count", sync_result.get("updated", 0))
+        partial_count = sync_result.get("partial_count", 0)
+        skipped_count = sync_result.get("skipped_count", sync_result.get("skipped", 0))
+        dead_letter_count = sync_result.get("dead_letter_count", 0)
         error_count = sync_result.get("error_count", 0)
         result_errors = sync_result.get("errors", [])
-        fetched_count = len(orders)
+        has_warning = sync_result.get("warning", False) or error_count > 0 or dead_letter_count > 0 or partial_count > 0
         ok = sync_result.get("ok", True)
 
         logger.info(
-            "[Sync] complete org_id=%s brand_id=%s run_id=%s fetched=%s created=%s updated=%s skipped=%s errors=%s duration_seconds=%s",
-            org_id, brand_id, sync_run_id, fetched_count, created_count, updated_count,
-            skipped_count, error_count, duration,
+            "[Sync] complete org_id=%s brand_id=%s run_id=%s fetched=%s inserted=%s updated=%s partial=%s skipped=%s dead_letter=%s errors=%s duration_seconds=%s",
+            org_id, brand_id, sync_run_id, fetched_count, inserted_count, updated_count,
+            partial_count, skipped_count, dead_letter_count, error_count, duration,
+        )
+        logger.info(
+            "[SYNC_FINAL_REPORT] fetched=%s inserted=%s updated=%s partial=%s skipped=%s dead_letter=%s error=%s brand_id=%s run_id=%s",
+            fetched_count, inserted_count, updated_count, partial_count,
+            skipped_count, dead_letter_count, error_count, brand_id, sync_run_id,
         )
 
         if ok:
             return make_json_safe({
                 "ok": True,
+                "warning": has_warning,
                 "org_id": org_id,
                 "brand_id": brand_id,
                 "sync_run_id": sync_run_id,
                 "fetched_count": fetched_count,
-                "created_count": created_count,
+                "inserted_count": inserted_count,
                 "updated_count": updated_count,
+                "partial_count": partial_count,
                 "skipped_count": skipped_count,
+                "dead_letter_count": dead_letter_count,
                 "error_count": error_count,
                 "errors": result_errors[:5],
                 "duration_seconds": duration,
@@ -3181,14 +3192,17 @@ async def sync_orders_leaflink(
                     pass
             return make_json_safe({
                 "ok": False,
+                "warning": True,
                 "stage": "db_upsert",
                 "org_id": org_id,
                 "brand_id": brand_id,
                 "sync_run_id": sync_run_id,
                 "fetched_count": fetched_count,
-                "created_count": created_count,
+                "inserted_count": inserted_count,
                 "updated_count": updated_count,
+                "partial_count": partial_count,
                 "skipped_count": skipped_count,
+                "dead_letter_count": dead_letter_count,
                 "error_count": error_count,
                 "error": f"All {fetched_count} orders failed to upsert",
                 "errors": result_errors[:5],
