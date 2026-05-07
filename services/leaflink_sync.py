@@ -1250,9 +1250,37 @@ async def _insert_line_items_standalone(
         "[UUID_SQL_CAST_APPLIED] statement=_insert_line_items_standalone columns=%s",
         ",".join(col for col in insert_columns if col in _uuid_columns),
     )
+
+    # Build the ON CONFLICT DO UPDATE clause — only include columns that exist
+    _standalone_update_clauses = [
+        "quantity = EXCLUDED.quantity",
+        "unit_price = EXCLUDED.unit_price",
+        "total_price = EXCLUDED.total_price",
+    ]
+    if enabled_columns.get("packed_qty", False):
+        _standalone_update_clauses.append("packed_qty = EXCLUDED.packed_qty")
+    if enabled_columns.get("unit_price_cents", False):
+        _standalone_update_clauses.append("unit_price_cents = EXCLUDED.unit_price_cents")
+    if enabled_columns.get("total_price_cents", False):
+        _standalone_update_clauses.append("total_price_cents = EXCLUDED.total_price_cents")
+    if enabled_columns.get("mapped_product_id", False):
+        _standalone_update_clauses.append("mapped_product_id = EXCLUDED.mapped_product_id")
+    if enabled_columns.get("mapping_status", False):
+        _standalone_update_clauses.append("mapping_status = EXCLUDED.mapping_status")
+    if enabled_columns.get("mapping_issue", False):
+        _standalone_update_clauses.append("mapping_issue = EXCLUDED.mapping_issue")
+    if enabled_columns.get("raw_payload", False):
+        _standalone_update_clauses.append("raw_payload = EXCLUDED.raw_payload")
+    if enabled_columns.get("updated_at", False):
+        _standalone_update_clauses.append("updated_at = EXCLUDED.updated_at")
+    _standalone_update_set_str = ",\n        ".join(_standalone_update_clauses)
+
     line_insert_stmt = f"""
         INSERT INTO public.order_lines ({columns_str})
         VALUES ({placeholders})
+        ON CONFLICT (order_id, sku, product_name)
+        DO UPDATE SET
+        {_standalone_update_set_str}
     """
 
 
@@ -1422,6 +1450,11 @@ async def _insert_line_items_standalone(
                 getattr(insert_params.get("updated_at"), "tzinfo", None) if isinstance(insert_params.get("updated_at"), datetime) else "N/A",
             )
             await db.execute(text(line_insert_stmt), insert_params)
+            logger.error(
+                "[ORDER_LINES_UPSERT] action=insert order_id=%s sku=%s",
+                insert_params.get("order_id"),
+                insert_params.get("sku"),
+            )
             inserted += 1
 
             await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
@@ -1758,9 +1791,37 @@ async def sync_leaflink_orders(
                     "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders columns=%s",
                     ",".join(col for col in _li_insert_columns if col in _li_uuid_columns),
                 )
+
+                # Build the ON CONFLICT DO UPDATE clause — only include columns that exist
+                _li_update_clauses = [
+                    "quantity = EXCLUDED.quantity",
+                    "unit_price = EXCLUDED.unit_price",
+                    "total_price = EXCLUDED.total_price",
+                ]
+                if _li_enabled.get("packed_qty", False):
+                    _li_update_clauses.append("packed_qty = EXCLUDED.packed_qty")
+                if _li_enabled.get("unit_price_cents", False):
+                    _li_update_clauses.append("unit_price_cents = EXCLUDED.unit_price_cents")
+                if _li_enabled.get("total_price_cents", False):
+                    _li_update_clauses.append("total_price_cents = EXCLUDED.total_price_cents")
+                if _li_enabled.get("mapped_product_id", False):
+                    _li_update_clauses.append("mapped_product_id = EXCLUDED.mapped_product_id")
+                if _li_enabled.get("mapping_status", False):
+                    _li_update_clauses.append("mapping_status = EXCLUDED.mapping_status")
+                if _li_enabled.get("mapping_issue", False):
+                    _li_update_clauses.append("mapping_issue = EXCLUDED.mapping_issue")
+                if _li_enabled.get("raw_payload", False):
+                    _li_update_clauses.append("raw_payload = EXCLUDED.raw_payload")
+                if _li_enabled.get("updated_at", False):
+                    _li_update_clauses.append("updated_at = EXCLUDED.updated_at")
+                _li_update_set_str = ",\n                    ".join(_li_update_clauses)
+
                 _li_insert_stmt = f"""
                     INSERT INTO public.order_lines ({_li_columns_str})
                     VALUES ({_li_placeholders})
+                    ON CONFLICT (order_id, sku, product_name)
+                    DO UPDATE SET
+                    {_li_update_set_str}
                 """
 
 
@@ -1894,6 +1955,11 @@ async def sync_leaflink_orders(
                         getattr(_li_params.get("updated_at"), "tzinfo", None) if isinstance(_li_params.get("updated_at"), datetime) else "N/A",
                     )
                     await db.execute(text(_li_insert_stmt), _li_params)
+                    logger.error(
+                        "[ORDER_LINES_UPSERT] action=insert order_id=%s sku=%s",
+                        _li_params.get("order_id"),
+                        _li_params.get("sku"),
+                    )
 
                 total_lines_written += len(normalized_line_items)
 
@@ -2862,6 +2928,12 @@ async def sync_leaflink_line_items(
         "unit_price = EXCLUDED.unit_price",
         "total_price = EXCLUDED.total_price",
     ]
+    if enabled_columns.get("packed_qty", False):
+        update_set_clauses.append("packed_qty = EXCLUDED.packed_qty")
+    if enabled_columns.get("unit_price_cents", False):
+        update_set_clauses.append("unit_price_cents = EXCLUDED.unit_price_cents")
+    if enabled_columns.get("total_price_cents", False):
+        update_set_clauses.append("total_price_cents = EXCLUDED.total_price_cents")
     if enabled_columns.get("mapped_product_id", False):
         update_set_clauses.append("mapped_product_id = EXCLUDED.mapped_product_id")
     if enabled_columns.get("mapping_status", False):
@@ -2872,10 +2944,6 @@ async def sync_leaflink_line_items(
         update_set_clauses.append("raw_payload = EXCLUDED.raw_payload")
     if enabled_columns.get("updated_at", False):
         update_set_clauses.append("updated_at = EXCLUDED.updated_at")
-    if enabled_columns.get("unit_price_cents", False):
-        update_set_clauses.append("unit_price_cents = EXCLUDED.unit_price_cents")
-    if enabled_columns.get("total_price_cents", False):
-        update_set_clauses.append("total_price_cents = EXCLUDED.total_price_cents")
 
     update_set_str = ",\n        ".join(update_set_clauses)
 
@@ -3073,6 +3141,11 @@ async def sync_leaflink_line_items(
                 )
 
                 await db.execute(text(line_upsert_stmt), insert_params)
+                logger.error(
+                    "[ORDER_LINES_UPSERT] action=insert order_id=%s sku=%s",
+                    insert_params.get("order_id"),
+                    insert_params.get("sku"),
+                )
                 inserted += 1
 
                 await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
