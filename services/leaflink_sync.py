@@ -91,6 +91,12 @@ async def _update_sync_health_phase1(
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase1 columns=brand_id"
             )
+            for _k, _v in _phase1_params.items():
+                if isinstance(_v, datetime):
+                    logger.info(
+                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                    )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, updated_at)
@@ -131,6 +137,12 @@ async def _update_sync_health_phase2(
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase2 columns=brand_id"
             )
+            for _k, _v in _phase2_params.items():
+                if isinstance(_v, datetime):
+                    logger.info(
+                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                    )
             await db.execute(
                 text("""
                     UPDATE sync_health SET
@@ -169,6 +181,12 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_record_sync_error columns=brand_id"
             )
+            for _k, _v in _sync_error_params.items():
+                if isinstance(_v, datetime):
+                    logger.info(
+                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                    )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
@@ -201,6 +219,12 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_record_retryable_error columns=brand_id"
             )
+            for _k, _v in _retryable_params.items():
+                if isinstance(_v, datetime):
+                    logger.info(
+                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                    )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
@@ -258,6 +282,12 @@ async def _dead_letter_line_item(
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_dead_letter_line_item columns=brand_id"
             )
+            for _k, _v in _dead_letter_params.items():
+                if isinstance(_v, datetime):
+                    logger.info(
+                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                    )
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -363,6 +393,12 @@ async def _write_sync_dead_letter(
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_write_sync_dead_letter columns=brand_id,org_id"
             )
+            for _k, _v in params.items():
+                if isinstance(_v, datetime):
+                    logger.info(
+                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                    )
             await db.execute(
                 text("""
                     INSERT INTO sync_dead_letters
@@ -819,25 +855,54 @@ def normalize_datetime_fields(params: dict, field_prefix: str = "") -> dict:
     normalized = {}
 
     for key, value in params.items():
+from datetime import datetime, timezone
+
+def ensure_utc(dt: any) -> any:
+    """Convert any datetime to UTC-aware."""
+    if not isinstance(dt, datetime):
+        return dt
+    if dt.tzinfo is None:
+        # Naive -> UTC
+        normalized = dt.replace(tzinfo=timezone.utc)
+        logger.info("[DATETIME_NORMALIZED] field=... was_naive=True → %s", normalized)
+        return normalized
+    else:
+        # Aware -> normalize to UTC
+        normalized = dt.astimezone(timezone.utc)
+        logger.info("[DATETIME_NORMALIZED] field=... was_naive=False → %s", normalized)
+        return normalized
+
+
+def normalize_datetime_fields(params: dict, field_prefix: str = "") -> dict:
+    """Recursively normalize all datetimes in params (including nested dicts/lists)."""
+    if not isinstance(params, dict):
+        return params
+
+    normalized = dict(params)
+
+    for key, value in list(params.items()):
         field_name = f"{field_prefix}.{key}" if field_prefix else key
 
         if isinstance(value, datetime):
-            normalized[key] = ensure_utc(value, field_name)
+            normalized[key] = ensure_utc(value)
+
         elif isinstance(value, dict):
-            # Recursively normalize nested dict
             normalized[key] = normalize_datetime_fields(value, field_name)
+
         elif isinstance(value, list):
-            # Recursively normalize list items
-            normalized[key] = [
-                ensure_utc(item, f"{field_name}[{i}]") if isinstance(item, datetime)
-                else normalize_datetime_fields(item, f"{field_name}[{i}]") if isinstance(item, dict)
-                else item
-                for i, item in enumerate(value)
-            ]
+            normalized[key] = []
+            for i, item in enumerate(value):
+                if isinstance(item, datetime):
+                    normalized[key].append(ensure_utc(item))
+                elif isinstance(item, dict):
+                    normalized[key].append(normalize_datetime_fields(item, f"{field_name}[{i}]"))
+                else:
+                    normalized[key].append(item)
+
         else:
             normalized[key] = value
 
-    return normalized
+    return normalized    return normalized
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -1108,6 +1173,20 @@ async def _insert_line_items_standalone(
             )
             insert_params = normalize_uuid_fields(insert_params)
             insert_params = normalize_datetime_fields(insert_params)
+        logger.info(
+            "[RAW_FIRST_INGESTION] action=insert_line_item order_id=%s sku=%s",
+            insert_params.get('order_id'),
+            insert_params.get('sku'),
+        )
+
+        # === NORMALIZATION (UUID + DATETIME) ===
+        insert_params = normalize_uuid_fields(insert_params)
+        insert_params = normalize_datetime_fields(insert_params)
+
+        await db.execute(text(line_insert_stmt), insert_params)
+        inserted += 1
+
+        await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
             await db.execute(text(line_insert_stmt), insert_params)
             inserted += 1
 
@@ -1503,6 +1582,12 @@ async def sync_leaflink_orders(
 
                     _li_params = normalize_uuid_fields(_li_params)
                     _li_params = normalize_datetime_fields(_li_params)
+        li_params = normalize_uuid_fields(li_params)
+        li_params = normalize_datetime_fields(li_params)
+
+        await db.execute(text(li_insert_stmt), li_params)
+
+        total_lines_written += len(normalized_line_items)
                     await db.execute(text(_li_insert_stmt), _li_params)
 
                 total_lines_written += len(normalized_line_items)
@@ -1917,6 +2002,12 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             logger.info(
                                 "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders_headers_only_update columns=org_id,brand_id"
                             )
+                            for _k, _v in update_params.items():
+                                if isinstance(_v, datetime):
+                                    logger.info(
+                                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                                    )
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -2044,6 +2135,12 @@ INSERT INTO orders (
                             logger.info(
                                 "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders_headers_only_insert columns=org_id,brand_id"
                             )
+                            for _k, _v in insert_params.items():
+                                if isinstance(_v, datetime):
+                                    logger.info(
+                                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
+                                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                                    )
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
@@ -2603,6 +2700,14 @@ async def sync_leaflink_line_items(
                 )
                 insert_params = normalize_uuid_fields(insert_params)
                 insert_params = normalize_datetime_fields(insert_params)
+        # === NORMALIZATION (UUID + DATETIME) ===
+        insert_params = normalize_uuid_fields(insert_params)
+        insert_params = normalize_datetime_fields(insert_params)
+
+        await db.execute(text(line_upsert_stmt), insert_params)
+        inserted += 1
+
+        await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 

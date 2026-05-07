@@ -31,6 +31,9 @@ from services.leaflink_sync import (
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("sync_routes")
+from utils.json_utils import make_json_safe
+
+logger = logging.getLogger("sync_routes")
 
 router = APIRouter(prefix="/orders/sync", tags=["sync"])
 
@@ -303,8 +306,22 @@ async def replay_dead_letter_item(
         )
         # Sanitize SQL params: remove provider dates, keep only operational timestamps
         params = sanitize_sql_params(params)
-        params = normalize_uuid_fields(params)
+        # Sanitize SQL params: remove provider dates, keep only operational timestamps
+        params = sanitize_sql_params(params)
+        
+        # === DATETIME + UUID NORMALIZATION (CRITICAL) ===
         params = normalize_datetime_fields(params)
+        params = normalize_uuid_fields(params)
+
+        await db.execute(text(upsert_stmt), params)
+        await db.commit()
+
+        logger.info(
+            "[REPLAY_UPSERT_SUCCESS] item_id=%s order_id=%s sku=%s",
+            item_id,
+            params.get("order_id"),
+            params.get("sku"),
+        )
         await db.execute(text(upsert_stmt), params)
         await db.commit()
         logger.info(
