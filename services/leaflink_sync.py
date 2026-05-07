@@ -1275,7 +1275,19 @@ async def _insert_line_items_standalone(
         _standalone_update_clauses.append("updated_at = EXCLUDED.updated_at")
     _standalone_update_set_str = ",\n        ".join(_standalone_update_clauses)
 
-    line_insert_stmt = f\"\"\"\n        INSERT INTO public.order_lines ({columns_str})\n        VALUES ({placeholders})\n        ON CONFLICT (order_id, sku, product_name)\n        WHERE sku IS NOT NULL AND product_name IS NOT NULL\n        DO UPDATE SET\n        {_standalone_update_set_str}\n    \"\"\"
+    # Build conflict clause separately to avoid nested braces in f-string
+    _standalone_conflict_clause = (
+        "ON CONFLICT (order_id, sku, product_name) "
+        "WHERE sku IS NOT NULL AND product_name IS NOT NULL "
+        "DO UPDATE SET "
+    )
+
+    # Build the full SQL statement using safe string concatenation
+    line_insert_stmt = (
+        f"INSERT INTO public.order_lines ({columns_str}) "
+        f"VALUES ({placeholders}) "
+        f"{_standalone_conflict_clause}{_standalone_update_set_str}"
+    )
 
 
     # Delete stale line items before inserting fresh ones
@@ -1810,7 +1822,20 @@ async def sync_leaflink_orders(
                     _li_update_clauses.append("updated_at = EXCLUDED.updated_at")
                 _li_update_set_str = ",\n                    ".join(_li_update_clauses)
 
-                _li_insert_stmt = f\"\"\"\n                    INSERT INTO public.order_lines ({_li_columns_str})\n                    VALUES ({_li_placeholders})\n                    ON CONFLICT (order_id, sku, product_name)\n                    WHERE sku IS NOT NULL AND product_name IS NOT NULL\n                    DO UPDATE SET\n                    {_li_update_set_str}\n                \"\"\"
+                # Build conflict clause separately to avoid nested braces in f-string
+                _li_conflict_clause = (
+                    "ON CONFLICT (order_id, sku, product_name) "
+                    "WHERE sku IS NOT NULL AND product_name IS NOT NULL "
+                    "DO UPDATE SET "
+                )
+
+                # Build the full SQL statement using safe string concatenation
+                _li_insert_stmt = (
+                    f"INSERT INTO public.order_lines ({_li_columns_str}) "
+                    f"VALUES ({_li_placeholders}) "
+                    f"{_li_conflict_clause}{_li_update_set_str}"
+                )
+
 
 
                 # Use server time for line item timestamps — bulletproof mode
