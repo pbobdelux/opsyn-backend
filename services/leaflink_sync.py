@@ -767,8 +767,14 @@ async def _insert_line_items_standalone(
                 "total_price": item.get("total_price"),
             }
 
+
             if enabled_columns.get("mapped_product_id", False):
-                insert_params["mapped_product_id"] = safe_uuid_mapped_product(item.get("mapped_product_id"))
+                logger.error(
+                    "[MAPPED_PRODUCT_ID_BEFORE_SQL] value=%s type=%s",
+                    item.get("mapped_product_id"),
+                    type(item.get("mapped_product_id")),
+                )
+                insert_params["mapped_product_id"] = safe_uuid_for_db(item.get("mapped_product_id"), "mapped_product_id")
             if enabled_columns.get("mapping_status", False):
                 insert_params["mapping_status"] = item.get("mapping_status")
             if enabled_columns.get("mapping_issue", False):
@@ -790,6 +796,7 @@ async def _insert_line_items_standalone(
             inserted += 1
 
             await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
+
 
         except Exception as line_error:
             try:
@@ -1082,6 +1089,12 @@ async def sync_leaflink_orders(
                 # Use server time for line item timestamps — bulletproof mode
                 line_now = ensure_utc(utc_now())
                 for item in normalized_line_items:
+                    _mapped_product_id_raw = item.get("mapped_product_id")
+                    logger.error(
+                        "[MAPPED_PRODUCT_ID_BEFORE_SQL] value=%s type=%s",
+                        _mapped_product_id_raw,
+                        type(_mapped_product_id_raw),
+                    )
                     db.add(
                         OrderLine(
                             order_id=order_row.id,
@@ -1092,7 +1105,7 @@ async def sync_leaflink_orders(
                             total_price=item.get("total_price"),
                             unit_price_cents=item.get("unit_price_cents"),
                             total_price_cents=item.get("total_price_cents"),
-                            mapped_product_id=safe_uuid_mapped_product(item.get("mapped_product_id")),
+                            mapped_product_id=safe_uuid_for_db(_mapped_product_id_raw, "mapped_product_id"),
                             mapping_status=item.get("mapping_status"),
                             mapping_issue=item.get("mapping_issue"),
                             raw_payload=make_json_safe(item.get("raw_payload")),
@@ -1106,6 +1119,7 @@ async def sync_leaflink_orders(
             except Exception as line_exc:
                 # Line item failure — save header with sync_status='partial', log, continue
                 line_err_msg = str(line_exc)[:500]
+
                 logger.error(
                     "[SYNC_PARTIAL_SUCCESS] external_id=%s brand_id=%s header_saved=true line_items_failed=true error=%s",
                     external_id,
@@ -2045,7 +2059,12 @@ async def sync_leaflink_line_items(
                 }
 
                 if enabled_columns.get("mapped_product_id", False):
-                    insert_params["mapped_product_id"] = safe_uuid_mapped_product(item.get("mapped_product_id"))
+                    logger.error(
+                        "[MAPPED_PRODUCT_ID_BEFORE_SQL] value=%s type=%s",
+                        item.get("mapped_product_id"),
+                        type(item.get("mapped_product_id")),
+                    )
+                    insert_params["mapped_product_id"] = safe_uuid_for_db(item.get("mapped_product_id"), "mapped_product_id")
                 if enabled_columns.get("mapping_status", False):
                     insert_params["mapping_status"] = item.get("mapping_status")
                 if enabled_columns.get("mapping_issue", False):
@@ -2063,8 +2082,6 @@ async def sync_leaflink_line_items(
                 if enabled_columns.get("total_price_cents", False):
                     insert_params["total_price_cents"] = item.get("total_price_cents")
 
-                logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
-                logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
