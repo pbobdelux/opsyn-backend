@@ -83,10 +83,11 @@ async def _update_sync_health_phase1(
     """Record that Phase 1 started/completed for this brand."""
     try:
         async with AsyncSessionLocal() as db:
-            _phase1_params = normalize_uuid_fields(
-                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                {"brand_id": brand_id, "now": ensure_utc(utc_now(), "now"), "count": (orders_count or 0)}
+            _phase1_params = sanitize_sql_params(
+                {"brand_id": brand_id, "now": ensure_utc(utc_now(), "now"), "count": (orders_count or 0)},
+                statement="_update_sync_health_phase1",
             )
+            _phase1_params = normalize_uuid_fields(_phase1_params)
             _phase1_params = normalize_datetime_fields(_phase1_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase1 columns=brand_id"
@@ -129,10 +130,11 @@ async def _update_sync_health_phase2(
     """Record that Phase 2 completed successfully for this brand."""
     try:
         async with AsyncSessionLocal() as db:
-            _phase2_params = normalize_uuid_fields(
-                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                {"brand_id": brand_id, "now": ensure_utc(utc_now(), "now"), "count": line_items_count}
+            _phase2_params = sanitize_sql_params(
+                {"brand_id": brand_id, "now": ensure_utc(utc_now(), "now"), "count": line_items_count},
+                statement="_update_sync_health_phase2",
             )
+            _phase2_params = normalize_uuid_fields(_phase2_params)
             _phase2_params = normalize_datetime_fields(_phase2_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase2 columns=brand_id"
@@ -173,10 +175,11 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
     """Increment consecutive_failures and record the last error message."""
     try:
         async with AsyncSessionLocal() as db:
-            _sync_error_params = normalize_uuid_fields(
-                # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
-                {"brand_id": brand_id, "error": str(error)[:500], "now": ensure_utc(utc_now(), "now")}
+            _sync_error_params = sanitize_sql_params(
+                {"brand_id": brand_id, "error": str(error)[:500], "now": ensure_utc(utc_now(), "now")},
+                statement="_record_sync_error",
             )
+            _sync_error_params = normalize_uuid_fields(_sync_error_params)
             _sync_error_params = normalize_datetime_fields(_sync_error_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_record_sync_error columns=brand_id"
@@ -212,9 +215,11 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
     """Record a retryable (transient) sync error in sync_health without incrementing consecutive_failures."""
     try:
         async with AsyncSessionLocal() as db:
-            _retryable_params = normalize_uuid_fields(
-                {"brand_id": brand_id, "error": error_msg[:500], "now": ensure_utc(utc_now(), "now")}
+            _retryable_params = sanitize_sql_params(
+                {"brand_id": brand_id, "error": error_msg[:500], "now": ensure_utc(utc_now(), "now")},
+                statement="_record_retryable_error",
             )
+            _retryable_params = normalize_uuid_fields(_retryable_params)
             _retryable_params = normalize_datetime_fields(_retryable_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_record_retryable_error columns=brand_id"
@@ -273,10 +278,7 @@ async def _dead_letter_line_item(
                 "reason": failure_reason[:500],
                 "count": failure_count,
                 "now": ensure_utc(utc_now(), "now"),
-            })
-            # Restore 'now' if sanitize_sql_params removed it (it's not in the operational whitelist)
-            if "now" not in _dead_letter_params:
-                _dead_letter_params["now"] = ensure_utc(utc_now(), "now")
+            }, statement="_dead_letter_line_item")
             _dead_letter_params = normalize_uuid_fields(_dead_letter_params)
             _dead_letter_params = normalize_datetime_fields(_dead_letter_params)
             logger.info(
@@ -361,7 +363,7 @@ async def _write_sync_dead_letter(
                 else json.dumps({})
             )
             now = ensure_utc(utc_now(), "now")
-            # Build params dict and sanitize to remove provider dates
+            # Build params dict and sanitize — centralized sanitizer handles all type coercions
             params = sanitize_sql_params({
                 "source": source,
                 "brand_id": safe_uuid_for_db(brand_id, "brand_id") or brand_id,
@@ -372,10 +374,7 @@ async def _write_sync_dead_letter(
                 "error_stage": error_stage,
                 "error_message": error_message[:2000],
                 "now": now,
-            })
-            # Restore 'now' if sanitize_sql_params removed it (it's not in the operational whitelist)
-            if "now" not in params:
-                params["now"] = ensure_utc(utc_now(), "now")
+            }, statement="_write_sync_dead_letter")
             # FINAL coercion — apply safe_uuid_for_db() directly into the params
             # dict immediately before execute() so no mutation after coercion can
             # slip through.
@@ -567,75 +566,166 @@ def filter_model_kwargs(model_class, kwargs: dict) -> dict:
     return filtered
 
 
-def sanitize_sql_params(params: dict) -> dict:
-    """Remove provider dates and unknown fields from SQL params.
+def _sanitize_json_value(value: Any, path: str = "") -> Any:
+    """Recursively convert a value to be JSON-safe for raw_payload / JSONB columns.
 
-    Keeps ONLY:
-    - Operational timestamps: synced_at, created_at, updated_at, last_synced_at
-    - Non-date fields: strings, ints, bools, etc.
+    Rules applied inside JSON/JSONB payloads:
+    - datetime  → ISO string (always, regardless of tz-awareness)
+    - date       → ISO string
+    - UUID       → str
+    - Decimal    → str  (preserves precision; float would lose it)
+    - dict       → recursively sanitized
+    - list/tuple → recursively sanitized list
+    - Everything else → passed through unchanged
 
-    Removes:
-    - Any datetime/date object unless key is in operational whitelist
-    - Any key containing: date, time, paid, ship, delivery, created, modified, updated
-      (unless it's in the operational whitelist)
+    This is intentionally different from the SQL-param rules: inside a JSONB
+    column we always want strings, never Python objects.
+    """
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _sanitize_json_value(v, f"{path}.{k}" if path else k) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_value(item, f"{path}[{i}]") for i, item in enumerate(value)]
+    return value
+
+
+def sanitize_sql_params(params: dict, statement: str = "unknown") -> dict:
+    """Centralized SQL parameter sanitizer — runs immediately before every execute().
+
+    Guarantees that no naive datetime, raw date, incompatible UUID, or
+    non-JSON-safe value ever reaches asyncpg.
+
+    Rules applied to every key/value pair:
+
+    datetime (including subclasses):
+      - Naive  → replace(tzinfo=timezone.utc)   [assume UTC]
+      - Aware  → astimezone(timezone.utc)        [normalise to UTC]
+      Never passes a naive datetime to asyncpg.
+
+    date (but NOT datetime):
+      - Converted to datetime at midnight UTC so it binds to TIMESTAMPTZ columns.
+      - If the field name contains 'payload' or 'json', converted to ISO string
+        instead (safe for JSONB / text columns).
+
+    UUID:
+      - Kept as uuid.UUID for SQL params targeting UUID columns (asyncpg accepts
+        uuid.UUID natively and it avoids CAST ambiguity).
+      - Inside raw_payload / JSON fields, converted to str by _sanitize_json_value.
+
+    Decimal:
+      - Passed through unchanged for numeric SQL columns (asyncpg handles Decimal).
+      - Inside raw_payload / JSON fields, converted to str by _sanitize_json_value.
+
+    str / int / float / bool / None:
+      - Passed through unchanged.
+
+    dict / list / tuple:
+      - If the key is a JSON/payload field (contains 'payload', 'json', or
+        'message'), recursively sanitized via _sanitize_json_value so the
+        resulting string is safe to CAST as JSONB.
+      - Otherwise passed through unchanged (e.g. SQLAlchemy may handle them).
+
+    Audit logging:
+      Every field that is mutated emits [SQL_PARAMS_SANITIZED] at INFO level.
+      For datetime fields the log includes tzinfo and is_aware.
 
     Args:
-        params: SQL parameters dictionary
+        params:    SQL parameters dictionary (modified copy is returned).
+        statement: Short name of the calling SQL statement for log context.
 
     Returns:
-        Sanitized params dictionary
+        New dict with all values safe for asyncpg / PostgreSQL.
     """
-    operational_timestamp_whitelist = {
-        'synced_at', 'created_at', 'updated_at', 'last_synced_at'
-    }
+    if not isinstance(params, dict):
+        return params
 
-    date_related_keywords = {
-        'date', 'time', 'paid', 'ship', 'delivery', 'created', 'modified', 'updated'
-    }
+    sanitized: dict = {}
 
-    sanitized = {}
-    removed_fields = []
+    _json_field_keywords = {"payload", "json", "message"}
 
     for key, value in params.items():
-        # Always allow operational timestamps
-        if key in operational_timestamp_whitelist:
-            # Ensure they're UTC-aware datetimes
-            if isinstance(value, datetime):
-                if value.tzinfo is None:
-                    value = value.replace(tzinfo=timezone.utc)
-                else:
-                    value = value.astimezone(timezone.utc)
-            sanitized[key] = value
-            continue
+        original_value = value
+        mutated = False
 
-        # Remove any datetime/date object not in whitelist
-        if isinstance(value, (datetime, date)):
-            removed_fields.append((key, 'datetime/date_object'))
-            continue
+        # ------------------------------------------------------------------ #
+        # datetime (covers datetime subclasses — check before date)           #
+        # ------------------------------------------------------------------ #
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+                mutated = True
+            else:
+                utc_val = value.astimezone(timezone.utc)
+                if utc_val != value:
+                    mutated = True
+                value = utc_val
 
-        # Remove any field with date-related keywords (unless whitelisted)
-        if any(keyword in key.lower() for keyword in date_related_keywords):
-            removed_fields.append((key, 'date_related_keyword'))
-            continue
+            if mutated:
+                logger.info(
+                    "[SQL_PARAMS_SANITIZED] statement=%s field=%s type=datetime"
+                    " tzinfo=%s is_aware=%s",
+                    statement, key,
+                    value.tzinfo,
+                    value.tzinfo is not None,
+                )
 
-        # Keep everything else
+        # ------------------------------------------------------------------ #
+        # date (but NOT datetime — datetime is a subclass of date)            #
+        # ------------------------------------------------------------------ #
+        elif isinstance(value, date):
+            key_lower = key.lower()
+            is_json_field = any(kw in key_lower for kw in _json_field_keywords)
+            if is_json_field:
+                value = value.isoformat()
+            else:
+                # Bind to TIMESTAMPTZ column as midnight UTC datetime
+                value = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+            mutated = True
+            logger.info(
+                "[SQL_PARAMS_SANITIZED] statement=%s field=%s type=date"
+                " converted_to=%s",
+                statement, key, type(value).__name__,
+            )
+
+        # ------------------------------------------------------------------ #
+        # UUID                                                                 #
+        # ------------------------------------------------------------------ #
+        elif isinstance(value, UUID):
+            # Keep as uuid.UUID for SQL params — asyncpg accepts it natively.
+            # No mutation needed; log for audit trail.
+            logger.info(
+                "[SQL_PARAMS_SANITIZED] statement=%s field=%s type=UUID action=kept_as_uuid",
+                statement, key,
+            )
+
+        # ------------------------------------------------------------------ #
+        # dict / list / tuple — sanitize if it's a JSON/payload field         #
+        # ------------------------------------------------------------------ #
+        elif isinstance(value, (dict, list, tuple)):
+            key_lower = key.lower()
+            is_json_field = any(kw in key_lower for kw in _json_field_keywords)
+            if is_json_field:
+                value = _sanitize_json_value(value, key)
+                if value is not original_value:
+                    mutated = True
+                    logger.info(
+                        "[SQL_PARAMS_SANITIZED] statement=%s field=%s type=%s"
+                        " action=json_sanitized",
+                        statement, key, type(original_value).__name__,
+                    )
+
+        # ------------------------------------------------------------------ #
+        # Everything else (str, int, float, bool, None, Decimal) — pass through
+        # ------------------------------------------------------------------ #
+
         sanitized[key] = value
-
-    # Log removed fields
-    for field, reason in removed_fields:
-        logger.info(
-            "[SQL_PARAM_REMOVED] field=%s reason=%s",
-            field,
-            reason,
-        )
-
-    # Log final allowed params (non-sensitive fields only)
-    allowed_keys = [k for k in sanitized.keys() if k not in {'raw_payload', 'error_message'}]
-    logger.info(
-        "[SQL_PARAM_ALLOWED] fields=%s count=%s",
-        ','.join(allowed_keys),
-        len(sanitized),
-    )
 
     return sanitized
 
@@ -1141,8 +1231,8 @@ async def _insert_line_items_standalone(
                 isinstance(insert_params.get("mapped_product_id"), UUID),
             )
 
-            # Raw-first ingestion: sanitize SQL params to remove provider dates, keep only server UTC
-            insert_params = sanitize_sql_params(insert_params)
+            # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
+            insert_params = sanitize_sql_params(insert_params, statement="_insert_line_items_standalone")
             logger.info(
                 "[RAW_FIRST_INGESTION] action=insert_line_item order_id=%s sku=%s",
                 insert_params.get('order_id'),
@@ -1156,6 +1246,28 @@ async def _insert_line_items_standalone(
                 insert_params["created_at"] = ensure_utc(insert_params["created_at"], "created_at") or utc_now()
             if "updated_at" in insert_params:
                 insert_params["updated_at"] = ensure_utc(insert_params["updated_at"], "updated_at") or utc_now()
+
+            # [ORDER_LINES_FINAL_DATETIME] Fail-fast assertions before execute
+            if "created_at" in insert_params:
+                _ca = insert_params["created_at"]
+                logger.info(
+                    "[ORDER_LINES_FINAL_DATETIME] created_at=%s tzinfo=%s aware=%s",
+                    _ca, _ca.tzinfo if isinstance(_ca, datetime) else "N/A",
+                    isinstance(_ca, datetime) and _ca.tzinfo is not None,
+                )
+                assert isinstance(_ca, datetime) and _ca.tzinfo is not None and _ca.tzinfo.utcoffset(_ca) is not None, (
+                    f"[FAIL_FAST] created_at is naive or not a datetime: {_ca!r}"
+                )
+            if "updated_at" in insert_params:
+                _ua = insert_params["updated_at"]
+                logger.info(
+                    "[ORDER_LINES_FINAL_DATETIME] updated_at=%s tzinfo=%s aware=%s",
+                    _ua, _ua.tzinfo if isinstance(_ua, datetime) else "N/A",
+                    isinstance(_ua, datetime) and _ua.tzinfo is not None,
+                )
+                assert isinstance(_ua, datetime) and _ua.tzinfo is not None and _ua.tzinfo.utcoffset(_ua) is not None, (
+                    f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
+                )
 
             await db.execute(text(line_insert_stmt), insert_params)
             inserted += 1
@@ -1556,6 +1668,8 @@ async def sync_leaflink_orders(
                     if _li_enabled.get("total_price_cents", False):
                         _li_params["total_price_cents"] = item.get("total_price_cents")
 
+                    # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
+                    _li_params = sanitize_sql_params(_li_params, statement="sync_leaflink_orders_line_items")
                     _li_params = normalize_uuid_fields(_li_params)
                     _li_params = normalize_datetime_fields(_li_params)
                     # Belt-and-suspenders: explicitly ensure created_at/updated_at are UTC-aware
@@ -1564,6 +1678,29 @@ async def sync_leaflink_orders(
                         _li_params["created_at"] = ensure_utc(_li_params["created_at"], "created_at") or utc_now()
                     if "updated_at" in _li_params:
                         _li_params["updated_at"] = ensure_utc(_li_params["updated_at"], "updated_at") or utc_now()
+
+                    # [ORDER_LINES_FINAL_DATETIME] Fail-fast assertions before execute
+                    if "created_at" in _li_params:
+                        _ca = _li_params["created_at"]
+                        logger.info(
+                            "[ORDER_LINES_FINAL_DATETIME] created_at=%s tzinfo=%s aware=%s",
+                            _ca, _ca.tzinfo if isinstance(_ca, datetime) else "N/A",
+                            isinstance(_ca, datetime) and _ca.tzinfo is not None,
+                        )
+                        assert isinstance(_ca, datetime) and _ca.tzinfo is not None and _ca.tzinfo.utcoffset(_ca) is not None, (
+                            f"[FAIL_FAST] created_at is naive or not a datetime: {_ca!r}"
+                        )
+                    if "updated_at" in _li_params:
+                        _ua = _li_params["updated_at"]
+                        logger.info(
+                            "[ORDER_LINES_FINAL_DATETIME] updated_at=%s tzinfo=%s aware=%s",
+                            _ua, _ua.tzinfo if isinstance(_ua, datetime) else "N/A",
+                            isinstance(_ua, datetime) and _ua.tzinfo is not None,
+                        )
+                        assert isinstance(_ua, datetime) and _ua.tzinfo is not None and _ua.tzinfo.utcoffset(_ua) is not None, (
+                            f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
+                        )
+
                     await db.execute(text(_li_insert_stmt), _li_params)
 
                 total_lines_written += len(normalized_line_items)
@@ -1965,8 +2102,8 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 update_params.get("updated_at"),
                                 type(update_params.get("updated_at")),
                             )
-                            # Raw-first ingestion: sanitize SQL params to remove provider dates, keep only server UTC
-                            update_params = sanitize_sql_params(update_params)
+                            # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
+                            update_params = sanitize_sql_params(update_params, statement="sync_leaflink_orders_headers_only_update")
                             logger.info(
                                 "[RAW_FIRST_INGESTION] action=update order_id=%s brand_id=%s external_order_id=%s",
                                 update_params.get('id'),
@@ -2099,8 +2236,8 @@ INSERT INTO orders (
                                 insert_params.get("updated_at"),
                                 type(insert_params.get("updated_at")),
                             )
-                            # Raw-first ingestion: sanitize SQL params to remove provider dates, keep only server UTC
-                            insert_params = sanitize_sql_params(insert_params)
+                            # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
+                            insert_params = sanitize_sql_params(insert_params, statement="sync_leaflink_orders_headers_only_insert")
                             logger.info(
                                 "[RAW_FIRST_INGESTION] action=insert brand_id=%s external_order_id=%s",
                                 insert_params.get('brand_id'),
@@ -2667,8 +2804,8 @@ async def sync_leaflink_line_items(
                     isinstance(insert_params.get("mapped_product_id"), str),
                     isinstance(insert_params.get("mapped_product_id"), UUID),
                 )
-                # Raw-first ingestion: sanitize SQL params to remove provider dates, keep only server UTC
-                insert_params = sanitize_sql_params(insert_params)
+                # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
+                insert_params = sanitize_sql_params(insert_params, statement="_upsert_line_items")
                 logger.info(
                     "[RAW_FIRST_INGESTION] action=upsert_line_item order_id=%s sku=%s",
                     insert_params.get('order_id'),
@@ -2682,6 +2819,29 @@ async def sync_leaflink_line_items(
                     insert_params["created_at"] = ensure_utc(insert_params["created_at"], "created_at") or utc_now()
                 if "updated_at" in insert_params:
                     insert_params["updated_at"] = ensure_utc(insert_params["updated_at"], "updated_at") or utc_now()
+
+                # [ORDER_LINES_FINAL_DATETIME] Fail-fast assertions before execute
+                if "created_at" in insert_params:
+                    _ca = insert_params["created_at"]
+                    logger.info(
+                        "[ORDER_LINES_FINAL_DATETIME] created_at=%s tzinfo=%s aware=%s",
+                        _ca, _ca.tzinfo if isinstance(_ca, datetime) else "N/A",
+                        isinstance(_ca, datetime) and _ca.tzinfo is not None,
+                    )
+                    assert isinstance(_ca, datetime) and _ca.tzinfo is not None and _ca.tzinfo.utcoffset(_ca) is not None, (
+                        f"[FAIL_FAST] created_at is naive or not a datetime: {_ca!r}"
+                    )
+                if "updated_at" in insert_params:
+                    _ua = insert_params["updated_at"]
+                    logger.info(
+                        "[ORDER_LINES_FINAL_DATETIME] updated_at=%s tzinfo=%s aware=%s",
+                        _ua, _ua.tzinfo if isinstance(_ua, datetime) else "N/A",
+                        isinstance(_ua, datetime) and _ua.tzinfo is not None,
+                    )
+                    assert isinstance(_ua, datetime) and _ua.tzinfo is not None and _ua.tzinfo.utcoffset(_ua) is not None, (
+                        f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
+                    )
+
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
