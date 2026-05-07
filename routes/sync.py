@@ -21,6 +21,7 @@ from database import get_db, has_column
 from models import Order, SyncRequest, SyncRun
 from models.sync_health import DeadLetterLineItem, SyncHealth
 from services.leaflink_sync import (
+    ensure_utc,
     normalize_datetime_fields,
     normalize_uuid_fields,
     safe_uuid_for_db,
@@ -203,7 +204,7 @@ async def replay_dead_letter_item(
         {update_set_str}
     """
 
-    now = datetime.now(timezone.utc)
+    now = ensure_utc(datetime.now(timezone.utc), "created_at")
 
     # Extract values from raw_payload if available
     raw = item.raw_payload or {}
