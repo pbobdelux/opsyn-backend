@@ -989,7 +989,7 @@ async def orders_api_freshness(
             "freshness": {
                 "latest_order_date": serialized_orders[0]["updated_at"] if serialized_orders else None,
                 "latest_external_updated_at": latest_external_updated_at.isoformat() if latest_external_updated_at else None,
-                "orders_are_fresh": latest_updated_at is not None and (datetime.now(timezone.utc) - latest_updated_at).total_seconds() < 3600,  # Within 1 hour
+                "orders_are_fresh": latest_updated_at is not None and (datetime.now(timezone.utc) - (latest_updated_at if latest_updated_at.tzinfo is not None else latest_updated_at.replace(tzinfo=timezone.utc))).total_seconds() < 3600,  # Within 1 hour — ensure UTC-aware before subtraction
             },
             "data_quality": {
                 "orders_missing_customer": orders_missing_customer,
