@@ -1320,6 +1320,8 @@ async def sync_leaflink_orders(
             if unit_count == 0:
                 unit_count = sum(item.get("quantity", 0) or 0 for item in normalized_line_items)
 
+            review_status = derive_review_status(normalized_line_items)
+
             now = ensure_utc(utc_now(), "synced_at")
 
             # Always save raw payload first (core resilience principle)
@@ -1361,6 +1363,11 @@ async def sync_leaflink_orders(
                     existing.unit_count = unit_count
                     existing.line_items_json = make_json_safe(normalized_line_items)
                     existing.raw_payload = make_json_safe(raw_payload)
+                    logger.info(
+                        "[REVIEW_STATUS_RESOLVED] value=%s source=derive_review_status external_id=%s",
+                        review_status,
+                        external_id,
+                    )
                     existing.review_status = review_status
                     existing.sync_status = "ok"
                     # Use server timestamps for all DB columns — bulletproof mode
