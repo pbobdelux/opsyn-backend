@@ -9,6 +9,7 @@ import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, List, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, field_validator
@@ -21,6 +22,7 @@ from models import Order
 from models.driver import Driver
 from models.route import Route
 from models.route_stop import RouteStop
+from services.route_events import log_route_event
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("routes")
@@ -675,6 +677,26 @@ async def assign_driver(
     route.version = (route.version or 1) + 1
     route.updated_at = datetime.now(timezone.utc)
 
+    # Log driver_assigned event (within same transaction)
+    try:
+        route_uuid = UUID(str(route.id))
+        org_uuid = UUID(str(org_id))
+        driver_uuid = UUID(str(body.driver_id))
+        await log_route_event(
+            db=db,
+            route_id=route_uuid,
+            org_id=org_uuid,
+            event_type="driver_assigned",
+            actor_type="admin",
+            actor_id=org_uuid,
+            metadata={"assigned_driver_id": str(driver_uuid)},
+        )
+    except Exception as event_exc:
+        logger.warning(
+            "[ROUTE_DRIVER_ASSIGNED] event_log_failed route_id=%s error=%s",
+            route_id, event_exc,
+        )
+
     try:
         await db.commit()
         await db.refresh(route)
@@ -1048,6 +1070,25 @@ async def reorder_stops(
 
     route.version = (route.version or 1) + 1
     route.updated_at = datetime.now(timezone.utc)
+
+    # Log stops_reordered event (within same transaction)
+    try:
+        route_uuid = UUID(str(route.id))
+        org_uuid = UUID(str(org_id))
+        await log_route_event(
+            db=db,
+            route_id=route_uuid,
+            org_id=org_uuid,
+            event_type="stops_reordered",
+            actor_type="admin",
+            actor_id=org_uuid,
+            metadata={"stop_ids": provided_ids},
+        )
+    except Exception as event_exc:
+        logger.warning(
+            "[ROUTE_STOPS_REORDERED] event_log_failed route_id=%s error=%s",
+            route_id, event_exc,
+        )
 
     try:
         await db.commit()

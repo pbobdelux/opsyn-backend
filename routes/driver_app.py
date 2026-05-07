@@ -19,10 +19,11 @@ import os
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
+from uuid import UUID
 
 import bcrypt
 import jwt
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +33,7 @@ from models.auth_models import Organization
 from models.driver import Driver
 from models.route import Route
 from models.route_stop import RouteStop
+from services.route_events import log_route_event
 from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("driver_app")
@@ -500,6 +502,84 @@ async def list_driver_routes(
 
 
 # =============================================================================
+# Endpoint: GET /driver/routes/poll
+# =============================================================================
+
+
+@router.get("/routes/poll")
+async def poll_driver_routes(
+    since: Optional[str] = Query(
+        default=None,
+        description="ISO 8601 timestamp of last poll. Returns routes updated after this time.",
+    ),
+    driver: Driver = Depends(get_current_driver),
+    db: AsyncSession = Depends(get_db),
+    response: Response = None,
+):
+    """
+    Lightweight polling endpoint for route updates.
+
+    Returns only routes assigned to the current driver that have been
+    updated since the provided `since` timestamp.  If `since` is omitted,
+    returns all active routes for the driver.
+
+    Response headers:
+      X-Route-Version: version of the most recently updated route in the response.
+    """
+    # Parse the `since` timestamp if provided
+    since_dt: Optional[datetime] = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid `since` timestamp. Use ISO 8601 format, e.g. 2026-05-20T12:00:00Z",
+            )
+
+    cutoff_date = date.today() - timedelta(days=7)
+
+    query = select(Route).where(
+        Route.assigned_driver_id == driver.id,
+        Route.route_date >= cutoff_date,
+    )
+
+    if since_dt is not None:
+        query = query.where(Route.updated_at > since_dt)
+
+    result = await db.execute(query.order_by(Route.updated_at.desc()))
+    routes = result.scalars().all()
+
+    has_updates = len(routes) > 0
+
+    updates = [
+        make_json_safe({
+            "route_id": str(r.id),
+            "version": r.version,
+            "updated_at": r.updated_at,
+            "status": r.status,
+        })
+        for r in routes
+    ]
+
+    # Set X-Route-Version header to the version of the most recently updated route
+    if routes and response is not None:
+        response.headers["X-Route-Version"] = str(routes[0].version)
+
+    logger.info(
+        "[DRIVER_POLL] driver_id=%s since=%s has_updates=%s count=%s",
+        driver.id, since, has_updates, len(updates),
+    )
+
+    return make_json_safe({
+        "updates": updates,
+        "has_updates": has_updates,
+    })
+
+
+# =============================================================================
 # Endpoint: GET /driver/routes/{route_id}
 # =============================================================================
 
@@ -509,12 +589,16 @@ async def get_driver_route(
     route_id: str,
     driver: Driver = Depends(get_current_driver),
     db: AsyncSession = Depends(get_db),
+    response: Response = None,
 ):
     """
     Return a single route with all stops, scoped to the current driver.
 
     Returns 404 if the route is not assigned to this driver.
     Stops are ordered by stop_order ASC.
+
+    Response headers:
+      X-Route-Version: current version of the route.
     """
     logger.info("[DRIVER_ROUTE_DETAIL] driver_id=%s route_id=%s", driver.id, route_id)
 
@@ -536,6 +620,10 @@ async def get_driver_route(
     )
     stops = stops_result.scalars().all()
 
+    # Set X-Route-Version response header
+    if response is not None:
+        response.headers["X-Route-Version"] = str(route.version)
+
     return {
         "ok": True,
         "route": _serialize_route_detail(route, stops),
@@ -545,6 +633,9 @@ async def get_driver_route(
 # =============================================================================
 # Endpoint: PATCH /driver/routes/{route_id}/stops/{stop_id}/status
 # =============================================================================
+
+# Stop statuses that count as "done" for auto-complete check
+_DONE_STOP_STATUSES = {"completed", "failed", "skipped"}
 
 
 @router.patch("/routes/{route_id}/stops/{stop_id}/status")
@@ -561,6 +652,12 @@ async def update_stop_status(
     Validates that the stop belongs to a route assigned to this driver.
     Sets completed_at=now() for terminal statuses (completed, failed, skipped).
     Increments route.version and updates route.updated_at.
+
+    Auto-completes the route when all stops reach a terminal status
+    (completed / failed / skipped).
+
+    Creates route_events for: stop_status_changed, and route_completed
+    if the route auto-completes.
     """
     # Verify route belongs to this driver
     route_result = await db.execute(
@@ -585,6 +682,7 @@ async def update_stop_status(
         raise HTTPException(status_code=404, detail="Stop not found")
 
     now = datetime.now(timezone.utc)
+    old_status = stop.status
 
     # Update stop
     stop.status = body.status
@@ -598,6 +696,61 @@ async def update_stop_status(
     route.version = (route.version or 1) + 1
     route.updated_at = now
 
+    # Resolve UUIDs for event logging
+    try:
+        route_uuid = UUID(str(route.id))
+        org_uuid = UUID(str(route.org_id))
+        driver_uuid = UUID(str(driver.id))
+        stop_uuid = UUID(str(stop.id))
+    except (ValueError, AttributeError) as exc:
+        logger.error("[DRIVER_STOP_UPDATE] uuid_parse_error error=%s", exc)
+        raise HTTPException(status_code=500, detail="Internal ID format error")
+
+    # Log stop_status_changed event
+    await log_route_event(
+        db=db,
+        route_id=route_uuid,
+        org_id=org_uuid,
+        event_type="stop_status_changed",
+        actor_type="driver",
+        actor_id=driver_uuid,
+        metadata={
+            "stop_id": str(stop_uuid),
+            "old_status": old_status,
+            "new_status": body.status,
+        },
+    )
+
+    # --- Auto-complete: check if all stops are now in a terminal state ---
+    route_completed = False
+    if body.status in _DONE_STOP_STATUSES and route.status not in ("completed", "cancelled"):
+        all_stops_result = await db.execute(
+            select(RouteStop).where(RouteStop.route_id == route.id)
+        )
+        all_stops = all_stops_result.scalars().all()
+
+        # A stop is "done" if it is the stop we just updated OR already terminal
+        all_done = all(
+            (str(s.id) == str(stop.id) and body.status in _DONE_STOP_STATUSES)
+            or s.status in _DONE_STOP_STATUSES
+            for s in all_stops
+        )
+
+        if all_done and all_stops:
+            route.status = "completed"
+            route.updated_at = now
+            route_completed = True
+
+            await log_route_event(
+                db=db,
+                route_id=route_uuid,
+                org_id=org_uuid,
+                event_type="route_completed",
+                actor_type="driver",
+                actor_id=driver_uuid,
+                metadata={"total_stops": len(all_stops)},
+            )
+
     try:
         await db.commit()
         await db.refresh(stop)
@@ -610,13 +763,14 @@ async def update_stop_status(
         raise HTTPException(status_code=500, detail="Unexpected error updating stop status")
 
     logger.info(
-        "[DRIVER_STOP_UPDATE] driver_id=%s route_id=%s stop_id=%s status=%s",
-        driver.id, route_id, stop_id, body.status,
+        "[DRIVER_STOP_UPDATE] driver_id=%s route_id=%s stop_id=%s status=%s route_completed=%s",
+        driver.id, route_id, stop_id, body.status, route_completed,
     )
 
     return {
         "ok": True,
         "stop": _serialize_route_stop(stop),
+        "route_completed": route_completed,
     }
 
 
