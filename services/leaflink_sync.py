@@ -768,13 +768,14 @@ async def _insert_line_items_standalone(
             }
 
 
+            _mapped_product_id_raw = item.get("mapped_product_id")
+            logger.error(
+                "[MAPPED_PRODUCT_ID_BEFORE_SQL] value=%s type=%s",
+                _mapped_product_id_raw,
+                type(_mapped_product_id_raw),
+            )
             if enabled_columns.get("mapped_product_id", False):
-                logger.error(
-                    "[MAPPED_PRODUCT_ID_BEFORE_SQL] value=%s type=%s",
-                    item.get("mapped_product_id"),
-                    type(item.get("mapped_product_id")),
-                )
-                insert_params["mapped_product_id"] = safe_uuid_for_db(item.get("mapped_product_id"), "mapped_product_id")
+                insert_params["mapped_product_id"] = safe_uuid_for_db(_mapped_product_id_raw, "mapped_product_id")
             if enabled_columns.get("mapping_status", False):
                 insert_params["mapping_status"] = item.get("mapping_status")
             if enabled_columns.get("mapping_issue", False):
@@ -2058,13 +2059,14 @@ async def sync_leaflink_line_items(
                     "total_price": total_price,
                 }
 
+                _mapped_product_id_raw = item.get("mapped_product_id")
+                logger.error(
+                    "[MAPPED_PRODUCT_ID_BEFORE_SQL] value=%s type=%s",
+                    _mapped_product_id_raw,
+                    type(_mapped_product_id_raw),
+                )
                 if enabled_columns.get("mapped_product_id", False):
-                    logger.error(
-                        "[MAPPED_PRODUCT_ID_BEFORE_SQL] value=%s type=%s",
-                        item.get("mapped_product_id"),
-                        type(item.get("mapped_product_id")),
-                    )
-                    insert_params["mapped_product_id"] = safe_uuid_for_db(item.get("mapped_product_id"), "mapped_product_id")
+                    insert_params["mapped_product_id"] = safe_uuid_for_db(_mapped_product_id_raw, "mapped_product_id")
                 if enabled_columns.get("mapping_status", False):
                     insert_params["mapping_status"] = item.get("mapping_status")
                 if enabled_columns.get("mapping_issue", False):
