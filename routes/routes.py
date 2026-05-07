@@ -689,8 +689,9 @@ async def assign_driver(
             event_type="driver_assigned",
             actor_type="admin",
             actor_id=org_uuid,
-            metadata={"assigned_driver_id": str(driver_uuid)},
+            event_metadata={"assigned_driver_id": str(driver_uuid)},
         )
+
     except Exception as event_exc:
         logger.warning(
             "[ROUTE_DRIVER_ASSIGNED] event_log_failed route_id=%s error=%s",
@@ -1074,7 +1075,6 @@ async def reorder_stops(
     # Log stops_reordered event (within same transaction)
     try:
         route_uuid = UUID(str(route.id))
-        org_uuid = UUID(str(org_id))
         await log_route_event(
             db=db,
             route_id=route_uuid,
@@ -1082,13 +1082,14 @@ async def reorder_stops(
             event_type="stops_reordered",
             actor_type="admin",
             actor_id=org_uuid,
-            metadata={"stop_ids": provided_ids},
+            event_metadata={"stop_ids": provided_ids},
         )
     except Exception as event_exc:
         logger.warning(
             "[ROUTE_STOPS_REORDERED] event_log_failed route_id=%s error=%s",
             route_id, event_exc,
         )
+
 
     try:
         await db.commit()

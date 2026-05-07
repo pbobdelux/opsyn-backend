@@ -50,7 +50,7 @@ class RouteEvent(Base):
         PG_UUID(as_uuid=True),
         nullable=False,
     )
-    metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    event_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True, server_default="{}")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
