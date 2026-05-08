@@ -4722,6 +4722,7 @@ async def sync_leaflink_background_continuous(
             cursor: Optional[str],
             page: int,
             total_pages_val: Optional[int] = None,
+            total_orders_available: Optional[int] = None,
         ) -> None:
             """Persist progress to SyncRun (if sync_run_id set) and BackgroundSyncManager."""
             if sync_run_id:
@@ -5013,6 +5014,23 @@ async def sync_leaflink_background_continuous(
 
                     raise
 
+            # Log raw page-1 response structure BEFORE any extraction
+            if pages_processed == 0:  # First page only
+                _response_keys = list(fetch_result.keys()) if isinstance(fetch_result, dict) else []
+                _count_val = fetch_result.get("total_count") if isinstance(fetch_result, dict) else None
+                _next_val = fetch_result.get("next_url") if isinstance(fetch_result, dict) else None
+                _results_len = len(fetch_result.get("orders", [])) if isinstance(fetch_result, dict) else 0
+
+                logger.info(
+                    "[PAGE1_RESPONSE_KEYS] top_level_keys=%s count=%s next_present=%s next_value=%s results_len=%s response_type=%s",
+                    _response_keys,
+                    _count_val,
+                    _next_val is not None,
+                    _next_val[:50] if _next_val else None,
+                    _results_len,
+                    type(fetch_result).__name__,
+                )
+
             batch_orders = fetch_result.get("orders", [])
             pages_fetched_this_batch = fetch_result.get("pages_fetched", batch_size)
             next_cursor = fetch_result.get("next_url")
@@ -5022,6 +5040,16 @@ async def sync_leaflink_background_continuous(
             # Update pagination tracking state
             if _total_count_from_api is not None:
                 leaflink_total_count = _total_count_from_api
+
+            # [PAGINATION_EXTRACT] Log extracted pagination fields after every page
+            logger.info(
+                "[PAGINATION_EXTRACT] page=%s count=%s next_present=%s next_value=%s results_len=%s",
+                pages_processed,
+                leaflink_total_count,
+                next_cursor is not None,
+                next_cursor[:50] if next_cursor else None,
+                len(batch_orders),
+            )
 
             # [SYNC_PAGE_FETCHED] Log raw and parsed counts for this batch
             _orders_count = len(batch_orders)
@@ -5305,9 +5333,10 @@ async def sync_leaflink_background_continuous(
                 cursor=next_cursor,
                 page=last_completed_page,
                 total_pages_val=total_pages,
+                total_orders_available=leaflink_total_count,
             )
 
-            # Persist last_next_url to SyncRun for resume capability
+            # Persist last_next_url, total_orders_available, and current_page to SyncRun
             if sync_run_id:
                 try:
                     async with AsyncSessionLocal() as _url_db:
@@ -5317,12 +5346,14 @@ async def sync_leaflink_background_continuous(
                                     UPDATE sync_runs
                                     SET last_next_url = :next_url,
                                         total_orders_available = COALESCE(:total_count, total_orders_available),
+                                        current_page = :page,
                                         last_progress_at = :now
                                     WHERE id = :run_id
                                 """),
                                 {
                                     "next_url": next_cursor,
                                     "total_count": leaflink_total_count,
+                                    "page": pages_processed,
                                     "now": datetime.now(timezone.utc),
                                     "run_id": sync_run_id,
                                 },
