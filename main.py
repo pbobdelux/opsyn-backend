@@ -677,10 +677,14 @@ from routes.assistant import router as assistant_router  # noqa: E402
 from routes.ingest import router as ingest_router  # noqa: E402
 from routes.watchdog import router as watchdog_router  # noqa: E402
 
+# Core assistant/watchdog routers
 app.include_router(assistant_router)
 app.include_router(ingest_router)
 app.include_router(watchdog_router)
 
+# ---------------------------------------------------------------------------
+# Middleware
+# ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -690,34 +694,62 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Routers
+# API ROUTERS
 # ---------------------------------------------------------------------------
+
+# Core system
+app.include_router(health_router)
+app.include_router(auth_router)
+app.include_router(admin_router)
+app.include_router(debug_router)
+app.include_router(diagnostics_router)
+
+# AI / CRM / Voice
 app.include_router(ai_router, prefix="/ai")
 app.include_router(crm_router)
-app.include_router(health_router)
-app.include_router(integrations_router)
-app.include_router(integrations_health_router)
-app.include_router(leaflink_orders_router)
-app.include_router(leaflink_debug_router, prefix="/leaflink")
-app.include_router(orders_router)
 app.include_router(voice_router)
 app.include_router(voice_brain_router)
-app.include_router(debug_router)
-app.include_router(admin_router)
-app.include_router(auth_router)
-app.include_router(webhooks_router)
+
+# Integrations
+app.include_router(integrations_router)
+app.include_router(integrations_health_router)
+
+# Existing LeafLink routes
+app.include_router(leaflink_orders_router)
+
+# IMPORTANT:
+# Mount Orders API under /api/leaflink
+# This creates:
+# /api/leaflink/orders
+# /api/leaflink/orders/full-resync
+# /api/leaflink/orders/sync-metrics
+# /api/leaflink/orders/queues
+# /api/leaflink/orders/sync-status
+app.include_router(orders_router, prefix="/api/leaflink")
+
+# LeafLink debug
+app.include_router(leaflink_debug_router, prefix="/leaflink")
+
+# Sync / Webhooks
 app.include_router(sync_router)
-app.include_router(diagnostics_router)
+app.include_router(webhooks_router)
+
+# Drivers / Routes
 app.include_router(drivers_router)
 app.include_router(routes_router)
 app.include_router(driver_app_router)
-logger.info("[Routes] registered debug routes")
 
+logger.info("[Routes] registered all routers")
+
+# Startup route dump
 logger.error("[STARTUP DEBUG] Registered routes:")
 for route in app.routes:
-    if hasattr(route, 'path') and hasattr(route, 'methods'):
-        logger.error("[STARTUP DEBUG] %s %s", route.methods, route.path)
-
+    if hasattr(route, "path") and hasattr(route, "methods"):
+        logger.error(
+            "[STARTUP DEBUG] %s %s",
+            route.methods,
+            route.path,
+        )
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
