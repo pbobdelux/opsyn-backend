@@ -89,6 +89,9 @@ class Order(Base):
         UniqueConstraint("brand_id", "external_order_id", name="uq_brand_external_order"),
         Index("ix_orders_brand_id", "brand_id"),
         Index("ix_orders_order_number", "order_number"),
+        # Multi-tenant isolation indexes — org_id is the primary tenant discriminator
+        Index("ix_orders_org_id", "org_id"),
+        Index("ix_orders_org_brand", "org_id", "brand_id"),
         # Dispatch / AR indexes
         Index("ix_orders_assigned_driver", "assigned_driver_id"),
         Index("ix_orders_delivery_status", "delivery_status"),
@@ -475,6 +478,12 @@ class SyncRequest(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     brand_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    org_id: Mapped[Optional[str]] = mapped_column(
+        String(120),
+        nullable=True,
+        default=None,
+        comment="Organization UUID — propagated to order inserts so org_id is never NULL",
+    )
     status: Mapped[str] = mapped_column(String(50), default="pending")  # pending, processing, complete, error
     start_page: Mapped[int] = mapped_column(Integer, default=1)
     total_pages: Mapped[int | None] = mapped_column(Integer, nullable=True)

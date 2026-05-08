@@ -1609,12 +1609,35 @@ async def orders_sync(
                     _pre_sql_brand_id,
                 )
 
+                # Resolve org_id from request header for this sync call
+                _sync_org_id: Optional[str] = None
+                _raw_org_header = request.headers.get("x-opsyn-org") or request.headers.get("x-org-id")
+                if _raw_org_header:
+                    try:
+                        from services.organization_service import lookup_organization as _lookup_org_sync
+                        _org_res = await _lookup_org_sync(db, _raw_org_header)
+                        if _org_res.get("ok"):
+                            _sync_org_id = str(_org_res["organization"].id)
+                            logger.info(
+                                "[ORG_CONTEXT] stage=get_sync_phase1_resolve org_id=%s brand_id=%s"
+                                " external_order_id=N/A",
+                                _sync_org_id,
+                                _pre_sql_brand_id,
+                            )
+                    except Exception as _org_sync_exc:
+                        logger.warning(
+                            "[OrdersSync] phase1_org_resolve_error x_opsyn_org=%s error=%s",
+                            _raw_org_header,
+                            str(_org_sync_exc)[:200],
+                        )
+
                 try:
                     sync_result = await asyncio.wait_for(
                         sync_leaflink_orders_headers_only(
                             _pre_sql_brand_id,
                             orders_from_leaflink,
                             pages_fetched=pages_fetched_phase1,
+                            org_id=_sync_org_id,
                         ),
                         timeout=DB_TIMEOUT_SECONDS,
                     )
@@ -1655,9 +1678,10 @@ async def orders_sync(
 
                 _li_brand_id = _resolved_brand_id
                 _li_orders = orders_from_leaflink
+                _li_org_id = _sync_org_id
 
                 async def _background_line_items():
-                    await sync_leaflink_line_items(_li_brand_id, _li_orders)
+                    await sync_leaflink_line_items(_li_brand_id, _li_orders, org_id=_li_org_id)
 
                 try:
                     asyncio.create_task(_background_line_items())
@@ -3516,11 +3540,40 @@ async def api_orders_incremental_sync(
             "timestamp": timestamp,
         })
 
+
     api_key = cred_row[4]
     company_id = cred_row[3]
     auth_scheme = cred_row[9] if len(cred_row) > 9 and cred_row[9] else "Token"
     base_url = cred_row[8] if len(cred_row) > 8 else None
     resolved_brand_id = cred_row[1]
+
+    # Resolve org_id from X-OPSYN-ORG header so orders are inserted with the
+    # correct org_id and are visible through GET /orders (which filters by org_id).
+    resolved_org_id: Optional[str] = None
+    if x_opsyn_org:
+        try:
+            from services.organization_service import lookup_organization
+            _org_lookup = await lookup_organization(db, x_opsyn_org)
+            if _org_lookup.get("ok"):
+                resolved_org_id = str(_org_lookup["organization"].id)
+                logger.info(
+                    "[ORG_CONTEXT] stage=incremental_sync_resolve org_id=%s brand_id=%s"
+                    " external_order_id=N/A",
+                    resolved_org_id,
+                    resolved_brand_id,
+                )
+            else:
+                logger.warning(
+                    "[OrdersAPI] incremental_sync org_lookup_failed x_opsyn_org=%s error=%s",
+                    x_opsyn_org,
+                    _org_lookup.get("error"),
+                )
+        except Exception as _org_exc:
+            logger.warning(
+                "[OrdersAPI] incremental_sync org_resolve_error x_opsyn_org=%s error=%s",
+                x_opsyn_org,
+                str(_org_exc)[:200],
+            )
 
     # Create SyncRun
     sync_run_id = None
@@ -3542,7 +3595,9 @@ async def api_orders_incremental_sync(
             auth_scheme=auth_scheme,
             base_url=base_url,
             sync_run_id=sync_run_id,
+            org_id=resolved_org_id,
         )
+
 
         if sync_run_id:
             try:
@@ -3621,6 +3676,35 @@ async def api_orders_full_resync(
 
     resolved_brand_id = cred_row[1]
 
+    # Resolve org_id from X-OPSYN-ORG header — stored in SyncRequest so the
+    # background worker can propagate it to every order INSERT, ensuring
+    # org_id is never NULL and orders are visible through GET /orders.
+    resolved_org_id: Optional[str] = None
+    if x_opsyn_org:
+        try:
+            from services.organization_service import lookup_organization
+            _org_lookup = await lookup_organization(db, x_opsyn_org)
+            if _org_lookup.get("ok"):
+                resolved_org_id = str(_org_lookup["organization"].id)
+                logger.info(
+                    "[ORG_CONTEXT] stage=full_resync_enqueue_resolve org_id=%s brand_id=%s"
+                    " external_order_id=N/A",
+                    resolved_org_id,
+                    resolved_brand_id,
+                )
+            else:
+                logger.warning(
+                    "[OrdersAPI] full_resync org_lookup_failed x_opsyn_org=%s error=%s",
+                    x_opsyn_org,
+                    _org_lookup.get("error"),
+                )
+        except Exception as _org_exc:
+            logger.warning(
+                "[OrdersAPI] full_resync org_resolve_error x_opsyn_org=%s error=%s",
+                x_opsyn_org,
+                str(_org_exc)[:200],
+            )
+
     # Create SyncRun record (own transaction, committed immediately)
     sync_run_id = None
     try:
@@ -3652,12 +3736,15 @@ async def api_orders_full_resync(
         logger.warning("[OrdersAPI] full_resync run_create_error error=%s", run_exc)
         # Non-fatal — proceed without a SyncRun record
 
-    # Enqueue background SyncRequest — worker picks this up and runs the full resync
+    # Enqueue background SyncRequest — worker picks this up and runs the full resync.
+    # org_id is stored in the SyncRequest row so the worker can propagate it to
+    # every order INSERT without needing to re-resolve the org from the header.
     try:
         async with AsyncSessionLocal() as _enq_db:
             async with _enq_db.begin():
                 _enq_db.add(SyncRequest(
                     brand_id=resolved_brand_id,
+                    org_id=resolved_org_id,
                     status="pending",
                     start_page=1,
                     total_pages=None,
@@ -4715,6 +4802,188 @@ async def api_orders_runtime_health(
 # =============================================================================
 
 
+@router.get("/db-debug")
+async def orders_db_debug(
+    brand_id: Optional[str] = Query(None, description="Optional brand_id filter"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Diagnostic endpoint: raw database state for orders, order_lines, and sync_dead_letters.
+
+    Returns counts by org_id and brand_id so operators can identify whether
+    orders are being inserted with org_id=NULL (which makes them invisible to
+    GET /orders, which filters by org_id).
+
+    Does NOT require X-OPSYN-ORG — intentionally unscoped for diagnostics.
+
+    Returns:
+        {
+            "ok": true,
+            "raw_counts": { "total_orders", "total_order_lines", "total_dead_letters" },
+            "counts_by_org_id": [{"org_id": "...", "count": N}],
+            "counts_by_brand_id": [{"brand_id": "...", "count": N}],
+            "latest_inserted_row": { "id", "org_id", "brand_id", "external_order_id", "created_at" },
+            "latest_committed_timestamp": "...",
+            "sync_metrics_snapshot": {...}
+        }
+    """
+    from sqlalchemy import text as _text_debug
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    try:
+        # 1. Raw total counts
+        _total_orders_res = await db.execute(_text_debug("SELECT COUNT(*) FROM orders"))
+        total_orders = _total_orders_res.scalar() or 0
+
+        _total_lines_res = await db.execute(_text_debug("SELECT COUNT(*) FROM order_lines"))
+        total_order_lines = _total_lines_res.scalar() or 0
+
+        _total_dl_res = await db.execute(_text_debug("SELECT COUNT(*) FROM sync_dead_letters"))
+        total_dead_letters = _total_dl_res.scalar() or 0
+
+        # 2. Counts by org_id (NULL org_id is the key diagnostic signal)
+        _by_org_query = "SELECT org_id::text, COUNT(*) as cnt FROM orders GROUP BY org_id ORDER BY cnt DESC LIMIT 20"
+        if brand_id:
+            _by_org_query = (
+                "SELECT org_id::text, COUNT(*) as cnt FROM orders "
+                "WHERE brand_id = :brand_id GROUP BY org_id ORDER BY cnt DESC LIMIT 20"
+            )
+        _by_org_res = await db.execute(
+            _text_debug(_by_org_query),
+            {"brand_id": brand_id} if brand_id else {},
+        )
+        counts_by_org_id = [
+            {"org_id": row[0], "count": row[1]}
+            for row in _by_org_res.fetchall()
+        ]
+
+        # 3. Counts by brand_id
+        _by_brand_query = "SELECT brand_id::text, COUNT(*) as cnt FROM orders GROUP BY brand_id ORDER BY cnt DESC LIMIT 20"
+        _by_brand_res = await db.execute(_text_debug(_by_brand_query))
+        counts_by_brand_id = [
+            {"brand_id": row[0], "count": row[1]}
+            for row in _by_brand_res.fetchall()
+        ]
+
+        # 4. Latest inserted row
+        _latest_query = (
+            "SELECT id, org_id::text, brand_id::text, external_order_id, created_at "
+            "FROM orders ORDER BY id DESC LIMIT 1"
+        )
+        if brand_id:
+            _latest_query = (
+                "SELECT id, org_id::text, brand_id::text, external_order_id, created_at "
+                "FROM orders WHERE brand_id = :brand_id ORDER BY id DESC LIMIT 1"
+            )
+        _latest_res = await db.execute(
+            _text_debug(_latest_query),
+            {"brand_id": brand_id} if brand_id else {},
+        )
+        _latest_row = _latest_res.fetchone()
+        latest_inserted_row = None
+        latest_committed_timestamp = None
+        if _latest_row:
+            latest_inserted_row = {
+                "id": _latest_row[0],
+                "org_id": _latest_row[1],
+                "brand_id": _latest_row[2],
+                "external_order_id": _latest_row[3],
+                "created_at": _latest_row[4].isoformat() if _latest_row[4] and hasattr(_latest_row[4], "isoformat") else str(_latest_row[4]),
+            }
+            latest_committed_timestamp = latest_inserted_row["created_at"]
+
+        # 5. Null org_id count (critical diagnostic)
+        _null_org_query = "SELECT COUNT(*) FROM orders WHERE org_id IS NULL"
+        if brand_id:
+            _null_org_query = "SELECT COUNT(*) FROM orders WHERE org_id IS NULL AND brand_id = :brand_id"
+        _null_org_res = await db.execute(
+            _text_debug(_null_org_query),
+            {"brand_id": brand_id} if brand_id else {},
+        )
+        null_org_id_count = _null_org_res.scalar() or 0
+
+        # 6. Sync metrics snapshot (latest per brand)
+        _snap_query = (
+            "SELECT brand_id::text, sync_run_id, total_local_orders, pages_processed, "
+            "records_processed, updated_at "
+            "FROM sync_metrics_snapshots ORDER BY updated_at DESC LIMIT 5"
+        )
+        if brand_id:
+            _snap_query = (
+                "SELECT brand_id::text, sync_run_id, total_local_orders, pages_processed, "
+                "records_processed, updated_at "
+                "FROM sync_metrics_snapshots WHERE brand_id = :brand_id "
+                "ORDER BY updated_at DESC LIMIT 5"
+            )
+        try:
+            _snap_res = await db.execute(
+                _text_debug(_snap_query),
+                {"brand_id": brand_id} if brand_id else {},
+            )
+            sync_metrics_snapshot = [
+                {
+                    "brand_id": row[0],
+                    "sync_run_id": row[1],
+                    "total_local_orders": row[2],
+                    "pages_processed": row[3],
+                    "records_processed": row[4],
+                    "updated_at": row[5].isoformat() if row[5] and hasattr(row[5], "isoformat") else str(row[5]),
+                }
+                for row in _snap_res.fetchall()
+            ]
+        except Exception as _snap_exc:
+            sync_metrics_snapshot = {"error": str(_snap_exc)[:200]}
+
+        logger.info(
+            "[OrdersAPI][DB_DEBUG] total_orders=%s null_org_id=%s brand_id_filter=%s"
+            " counts_by_org=%s",
+            total_orders,
+            null_org_id_count,
+            brand_id,
+            counts_by_org_id,
+        )
+
+        return make_json_safe({
+            "ok": True,
+            "brand_id_filter": brand_id,
+            "timestamp": timestamp,
+            "raw_counts": {
+                "total_orders": total_orders,
+                "total_order_lines": total_order_lines,
+                "total_dead_letters": total_dead_letters,
+            },
+            "null_org_id_count": null_org_id_count,
+            "counts_by_org_id": counts_by_org_id,
+            "counts_by_brand_id": counts_by_brand_id,
+            "latest_inserted_row": latest_inserted_row,
+            "latest_committed_timestamp": latest_committed_timestamp,
+            "sync_metrics_snapshot": sync_metrics_snapshot,
+            "diagnosis": (
+                "CRITICAL: orders have org_id=NULL — they are invisible to GET /orders "
+                "which filters by org_id. Trigger a new sync with X-OPSYN-ORG header set."
+                if null_org_id_count > 0 and null_org_id_count == total_orders
+                else (
+                    f"WARNING: {null_org_id_count} of {total_orders} orders have org_id=NULL"
+                    if null_org_id_count > 0
+                    else "OK: all orders have org_id set"
+                )
+            ),
+        })
+
+    except Exception as exc:
+        logger.error("[OrdersAPI][DB_DEBUG] error=%s", str(exc)[:300], exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        return make_json_safe({
+            "ok": False,
+            "error": str(exc)[:300],
+            "timestamp": timestamp,
+        })
+
+
 @router.post("/{order_id}/resync")
 async def api_order_resync(
     order_id: str,
@@ -4806,11 +5075,21 @@ async def api_order_resync(
                 break
 
         if target_order:
-            # Re-upsert the specific order
+            # Re-upsert the specific order — resolve org_id from header if available
+            _resync_org_id: Optional[str] = None
+            if x_opsyn_org:
+                try:
+                    from services.organization_service import lookup_organization as _lookup_org_resync
+                    _resync_org_res = await _lookup_org_resync(db, x_opsyn_org)
+                    if _resync_org_res.get("ok"):
+                        _resync_org_id = str(_resync_org_res["organization"].id)
+                except Exception:
+                    pass
             await sync_leaflink_orders_headers_only(
                 brand_id=resolved_brand_id,
                 orders=[target_order],
                 pages_fetched=1,
+                org_id=_resync_org_id,
             )
             logger.info(
                 "[OrdersAPI] order_resync_from_leaflink order_id=%s external_id=%s",

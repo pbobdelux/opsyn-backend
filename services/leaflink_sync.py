@@ -2569,11 +2569,19 @@ async def sync_leaflink_orders_headers_only(
 
     Returns a summary dict compatible with the existing sync_result contract.
     """
-    logger.info("[ORDER_SAVE_START] entering order save function brand=%s fetched=%s", brand_id, len(orders))
+    logger.info("[ORDER_SAVE_START] entering order save function brand=%s fetched=%s org_id=%s", brand_id, len(orders), org_id)
     logger.info(
-        "[SYNC_PHASE_1_START] brand_id=%s orders_to_fetch=%s",
+        "[ORG_CONTEXT] stage=headers_only_entry org_id=%s brand_id=%s"
+        " external_order_id=N/A orders_count=%s",
+        org_id,
         brand_id,
         len(orders),
+    )
+    logger.info(
+        "[SYNC_PHASE_1_START] brand_id=%s orders_to_fetch=%s org_id=%s",
+        brand_id,
+        len(orders),
+        org_id,
     )
 
     sync_start = time.monotonic()
@@ -2672,6 +2680,13 @@ async def sync_leaflink_orders_headers_only(
                             batch_skipped += 1
                             continue
 
+                          logger.info(
+                              "[ORG_CONTEXT] stage=order_processing org_id=%s brand_id=%s"
+                              " external_order_id=%s",
+                              org_id_value,
+                              brand_id_value,
+                              external_id,
+                          )
                           logger.info(
                               "[SYNC_ORDER_PROCESSING] external_id=%s order_number=%s brand_id=%s batch=%s/%s",
                               external_id,
@@ -2976,6 +2991,16 @@ INSERT INTO orders (
                             _sh_status_ins = "partial" if _sh_missing_ins else "ok"
                             _sh_missing_json_ins = json.dumps(_sh_missing_ins) if _sh_missing_ins else None
 
+                            logger.info(
+                                "[ORDER_INSERT_PREP] org_id=%s brand_id=%s external_order_id=%s"
+                                " customer=%s amount=%s status=%s",
+                                _sql_org_id,
+                                _sql_brand_id,
+                                external_id,
+                                customer_name,
+                                amount_decimal,
+                                status,
+                            )
                             insert_params = {
                                 "org_id": _sql_org_id,
                                 "brand_id": _sql_brand_id,
@@ -3064,6 +3089,13 @@ INSERT INTO orders (
                                 "created",
                             )
                             logger.info(
+                                "[ORDER_INSERT_COMMIT] org_id=%s brand_id=%s external_order_id=%s"
+                                " order_id=pending rows_affected=1",
+                                insert_params.get("org_id"),
+                                insert_params.get("brand_id"),
+                                external_id,
+                            )
+                            logger.info(
                                 "[SYNC_HEADER_SAVED] external_id=%s order_number=%s brand_id=%s action=created",
                                 external_id,
                                 order_number,
@@ -3087,6 +3119,14 @@ INSERT INTO orders (
                                 "[ORDER_TRANSFORM_SKIPPED] external_id=%s reason=%s",
                                 _order_ext_id_for_log,
                                 _err_reason,
+                            )
+                            logger.error(
+                                "[ORDER_INSERT_ROLLBACK] org_id=%s brand_id=%s external_order_id=%s"
+                                " error=%s stage=header_insert",
+                                org_id_value,
+                                brand_id_value,
+                                _order_ext_id_for_log,
+                                _err_reason[:200],
                             )
                             logger.error(
                                 "[SYNC_HEADER_INSERT_FAILED] external_id=%s order_number=%s brand_id=%s batch=%s/%s error=%s",
@@ -3124,7 +3164,27 @@ INSERT INTO orders (
                                 )
                             continue
                 # Explicit commit guarantee
+                logger.info(
+                    "[ORDER_SAVE_COMMIT] stage=pre_commit brand_id=%s org_id=%s"
+                    " batch=%s/%s created=%s updated=%s",
+                    brand_id_value,
+                    org_id_value,
+                    batch_num,
+                    len(batches),
+                    batch_created,
+                    batch_updated,
+                )
                 await db.commit()
+                logger.info(
+                    "[ORDER_SAVE_COMMIT] stage=post_commit brand_id=%s org_id=%s"
+                    " batch=%s/%s created=%s updated=%s",
+                    brand_id_value,
+                    org_id_value,
+                    batch_num,
+                    len(batches),
+                    batch_created,
+                    batch_updated,
+                )
 
             # Batch committed successfully (async with db.begin() exited cleanly)
             batch_duration = round(time.monotonic() - batch_start, 2)
@@ -3141,7 +3201,7 @@ INSERT INTO orders (
                 batch_num,
                 len(batches),
             )
-            logger.info("[ORDER_SAVE_COMMIT] brand_id=%s created=%s updated=%s batch=%s/%s", brand_id_value, batch_created, batch_updated, batch_num, len(batches))
+            logger.info("[ORDER_SAVE_COMMIT] brand_id=%s org_id=%s created=%s updated=%s batch=%s/%s", brand_id_value, org_id_value, batch_created, batch_updated, batch_num, len(batches))
             logger.info(
                 "[OrdersSync] batch_committed batch=%s/%s brand=%s created=%s updated=%s skipped=%s dead_letter=%s duration=%ss",
                 batch_num,
@@ -3161,6 +3221,14 @@ INSERT INTO orders (
         except Exception as batch_exc:
             batch_duration = round(time.monotonic() - batch_start, 2)
             err_msg = str(batch_exc)
+            logger.error(
+                "[ORDER_INSERT_ROLLBACK] org_id=%s brand_id=%s external_order_id=batch_%s"
+                " error=%s stage=batch_commit",
+                org_id_value,
+                brand_id_value,
+                batch_num,
+                err_msg[:200],
+            )
             logger.error(
                 "[OrdersSync] batch_failed batch=%s/%s brand=%s batch_size=%s error=%s duration=%ss",
                 batch_num,
@@ -4228,11 +4296,18 @@ async def sync_leaflink_full_resync(
 
     logger.info(
         "[LEAFLINK_SYNC_DEBUG] full_resync_start brand_id=%s api_key_len=%s"
-        " auth_scheme=%s base_url=%s",
+        " auth_scheme=%s base_url=%s org_id=%s",
         brand_id,
         len(api_key) if api_key else 0,
         auth_scheme,
         base_url or "canonical",
+        org_id,
+    )
+    logger.info(
+        "[ORG_CONTEXT] stage=full_resync_start org_id=%s brand_id=%s"
+        " external_order_id=N/A",
+        org_id,
+        brand_id,
     )
 
     try:
@@ -4498,6 +4573,7 @@ async def sync_leaflink_background_continuous(
     sync_run_id: Optional[int] = None,
     auth_scheme: str = "Token",
     base_url: Optional[str] = None,
+    org_id: Optional[str] = None,
 ) -> None:
     """
     Fetch all remaining LeafLink pages in adaptive batches and upsert to DB.
@@ -4524,6 +4600,9 @@ async def sync_leaflink_background_continuous(
         total_orders_available: Total orders reported by LeafLink (for progress display).
         sync_run_id:            Optional SyncRun.id to persist progress against.
         base_url:               LeafLink base URL (from DB credential, required).
+        org_id:                 Organization UUID for multi-tenant isolation. MUST be set so
+                                orders are inserted with the correct org_id and are visible
+                                through the GET /orders endpoint which filters by org_id.
     """
     from services.leaflink_client import LeafLinkClient
     from services.sync_run_manager import (
@@ -4536,11 +4615,18 @@ async def sync_leaflink_background_continuous(
     # [SYNC_ENTRY] Log entry into the background continuous sync function
     logger.info(
         "[SYNC_ENTRY] sync_leaflink_background_continuous entered brand_id=%s"
-        " start_page=%s total_pages=%s sync_run_id=%s",
+        " start_page=%s total_pages=%s sync_run_id=%s org_id=%s",
         brand_id,
         start_page,
         total_pages if total_pages is not None else "cursor_based",
         sync_run_id,
+        org_id,
+    )
+    logger.info(
+        "[ORG_CONTEXT] stage=bg_continuous_entry org_id=%s brand_id=%s"
+        " external_order_id=N/A",
+        org_id,
+        brand_id,
     )
 
     try:
@@ -5018,10 +5104,19 @@ async def sync_leaflink_background_continuous(
                         )
 
                 try:
+                    logger.info(
+                        "[ORG_CONTEXT] stage=bg_continuous_before_upsert org_id=%s brand_id=%s"
+                        " external_order_id=N/A batch_size=%s page=%s",
+                        org_id,
+                        brand_id,
+                        len(batch_orders),
+                        current_page,
+                    )
                     persist_result = await sync_leaflink_orders_headers_only(
                         brand_id=brand_id,
                         orders=batch_orders,
                         pages_fetched=pages_fetched_this_batch,
+                        org_id=org_id,
                     )
                     # Line items are deferred inside sync_leaflink_orders_headers_only
                     # via asyncio.create_task — no need to spawn a second task here.
@@ -5031,12 +5126,13 @@ async def sync_leaflink_background_continuous(
                     _transformed = persist_result.get("created", 0) + persist_result.get("updated", 0) if persist_result else 0
                     _skipped = persist_result.get("skipped", 0) if persist_result else 0
                     logger.info(
-                        "[SYNC_TRANSFORM_RESULT] page=%s input_count=%s transformed=%s skipped=%s brand_id=%s",
+                        "[SYNC_TRANSFORM_RESULT] page=%s input_count=%s transformed=%s skipped=%s brand_id=%s org_id=%s",
                         current_page,
                         _input_count,
                         _transformed,
                         _skipped,
                         brand_id,
+                        org_id,
                     )
 
                 except Exception as upsert_exc:
