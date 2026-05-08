@@ -4412,3 +4412,327 @@ async def api_orders_dead_letter_analysis(
         "sample_failures": sample_rows,
         "timestamp": timestamp,
     })
+
+
+# =============================================================================
+# Sync Status Debug Endpoint
+# =============================================================================
+
+
+@router.get("/api/leaflink/orders/sync-status-debug")
+async def api_orders_sync_status_debug(
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    org_id: Optional[str] = Query(None, description="Organization ID (UUID)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Lightweight admin/debug endpoint that returns a comprehensive snapshot of
+    the current sync state for a brand without requiring multiple API calls.
+
+    Includes:
+    - Current sync state and active run details
+    - Progress (pages, cursor, records/sec)
+    - Order counts by sync_status
+    - Dead-letter count
+    - Last completed sync details
+    - Failure category breakdown
+    - Health determination with warnings and errors
+    """
+    from datetime import timedelta
+    from services.sync_run_manager import detect_stalled
+    from services.leaflink_sync import categorize_sync_failure as _categorize
+    from sqlalchemy import text as _text
+
+    now = datetime.now(timezone.utc)
+    timestamp = now.isoformat()
+    logger.info("[OrdersAPI] sync_status_debug brand_id=%s org_id=%s", brand_id, org_id)
+
+    # ------------------------------------------------------------------ #
+    # Active sync run                                                      #
+    # ------------------------------------------------------------------ #
+    try:
+        active_run = await SyncRun.get_active_run(db, brand_id)
+    except Exception:
+        await db.rollback()
+        active_run = None
+
+    # ------------------------------------------------------------------ #
+    # Last completed sync run                                              #
+    # ------------------------------------------------------------------ #
+    try:
+        last_completed = await SyncRun.get_last_completed_run(db, brand_id)
+    except Exception:
+        await db.rollback()
+        last_completed = None
+
+    # ------------------------------------------------------------------ #
+    # Determine current state                                              #
+    # ------------------------------------------------------------------ #
+    is_stalled = detect_stalled(active_run) if active_run else False
+
+    if active_run and not is_stalled:
+        current_state = "syncing"
+    elif is_stalled:
+        current_state = "stalled"
+    elif last_completed:
+        current_state = "completed"
+    elif active_run and active_run.status == "failed":
+        current_state = "failed"
+    else:
+        current_state = "idle"
+
+    # ------------------------------------------------------------------ #
+    # Sync state block                                                     #
+    # ------------------------------------------------------------------ #
+    active_run_id = active_run.id if active_run else None
+    started_at = None
+    elapsed_seconds = None
+    estimated_completion_seconds = None
+
+    if active_run:
+        started_at = active_run.started_at.isoformat() if active_run.started_at else None
+        if active_run.started_at:
+            elapsed_seconds = round((now - active_run.started_at).total_seconds(), 1)
+
+        # Estimate completion: remaining pages × avg seconds/page
+        if (
+            active_run.status == "syncing"
+            and not is_stalled
+            and active_run.total_pages
+            and active_run.pages_synced
+            and elapsed_seconds
+            and elapsed_seconds > 0
+        ):
+            avg_secs_per_page = elapsed_seconds / active_run.pages_synced
+            remaining_pages = max(0, active_run.total_pages - active_run.pages_synced)
+            estimated_completion_seconds = round(remaining_pages * avg_secs_per_page, 1)
+
+    sync_state = {
+        "current_state": current_state,
+        "active_sync_run_id": active_run_id,
+        "started_at": started_at,
+        "elapsed_seconds": elapsed_seconds,
+        "estimated_completion_seconds": estimated_completion_seconds,
+    }
+
+    # ------------------------------------------------------------------ #
+    # Progress block — use active run if present, else last completed      #
+    # ------------------------------------------------------------------ #
+    ref_run = active_run or last_completed
+    pages_processed = ref_run.pages_synced if ref_run else 0
+    records_processed = ref_run.orders_loaded_this_run if ref_run else 0
+    current_page = ref_run.current_page if ref_run else None
+    current_cursor = ref_run.current_cursor if ref_run else None
+    total_pages_estimate = ref_run.total_pages if ref_run else None
+
+    records_per_second = None
+    if ref_run and ref_run.started_at:
+        ref_elapsed = None
+        if active_run and active_run.started_at:
+            ref_elapsed = (now - active_run.started_at).total_seconds()
+        elif last_completed and last_completed.started_at and last_completed.completed_at:
+            ref_elapsed = (last_completed.completed_at - last_completed.started_at).total_seconds()
+        if ref_elapsed and ref_elapsed > 0 and records_processed:
+            records_per_second = round(records_processed / ref_elapsed, 1)
+
+    progress = {
+        "pages_processed": pages_processed,
+        "records_processed": records_processed,
+        "records_per_second": records_per_second,
+        "current_page": current_page,
+        "current_cursor": current_cursor,
+        "total_pages_estimate": total_pages_estimate,
+    }
+
+    # ------------------------------------------------------------------ #
+    # Order counts by sync_status                                          #
+    # ------------------------------------------------------------------ #
+    try:
+        total_res = await db.execute(
+            select(func.count(Order.id)).where(Order.brand_id == brand_id)
+        )
+        total_local_orders = total_res.scalar_one() or 0
+    except Exception:
+        await db.rollback()
+        total_local_orders = 0
+
+    try:
+        ok_res = await db.execute(
+            select(func.count(Order.id)).where(
+                Order.brand_id == brand_id,
+                Order.sync_status == "ok",
+            )
+        )
+        total_ok = ok_res.scalar_one() or 0
+    except Exception:
+        await db.rollback()
+        total_ok = 0
+
+    try:
+        partial_res = await db.execute(
+            select(func.count(Order.id)).where(
+                Order.brand_id == brand_id,
+                Order.sync_status == "partial",
+            )
+        )
+        total_partial = partial_res.scalar_one() or 0
+    except Exception:
+        await db.rollback()
+        total_partial = 0
+
+    try:
+        failed_res = await db.execute(
+            select(func.count(Order.id)).where(
+                Order.brand_id == brand_id,
+                Order.sync_status == "failed",
+            )
+        )
+        total_failed = failed_res.scalar_one() or 0
+    except Exception:
+        await db.rollback()
+        total_failed = 0
+
+    # ------------------------------------------------------------------ #
+    # Dead-letter count                                                    #
+    # ------------------------------------------------------------------ #
+    try:
+        dl_res = await db.execute(
+            _text(
+                "SELECT COUNT(*) FROM sync_dead_letters "
+                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL"
+            ),
+            {"brand_id": brand_id},
+        )
+        dead_letter_count = dl_res.scalar() or 0
+    except Exception:
+        await db.rollback()
+        dead_letter_count = 0
+
+    counts = {
+        "total_local_orders": total_local_orders,
+        "total_ok": total_ok,
+        "total_partial": total_partial,
+        "total_failed": total_failed,
+        "dead_letter_count": dead_letter_count,
+    }
+
+    # ------------------------------------------------------------------ #
+    # Last sync details (from last completed run)                          #
+    # ------------------------------------------------------------------ #
+    last_sync: dict = {}
+    if last_completed:
+        lc_duration = None
+        if last_completed.started_at and last_completed.completed_at:
+            lc_duration = round(
+                (last_completed.completed_at - last_completed.started_at).total_seconds(), 1
+            )
+        last_sync = {
+            "completed_at": last_completed.completed_at.isoformat() if last_completed.completed_at else None,
+            "duration_seconds": lc_duration,
+            "orders_synced": last_completed.orders_loaded_this_run or 0,
+            # SyncRun does not track inserted/updated/failed separately;
+            # use orders_loaded_this_run as synced and derive best-effort values
+            # from current order counts as a proxy.
+            "orders_inserted": None,
+            "orders_updated": None,
+            "orders_failed": total_failed,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Failure category breakdown from dead-letter error messages           #
+    # ------------------------------------------------------------------ #
+    _all_categories = [
+        "duplicate_key", "missing_field", "malformed", "line_item_issue",
+        "fk_issue", "timeout", "rate_limit", "validation", "unknown",
+    ]
+    failure_summary: dict[str, int] = {cat: 0 for cat in _all_categories}
+
+    try:
+        fc_res = await db.execute(
+            _text(
+                "SELECT error_message FROM sync_dead_letters "
+                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL "
+                "LIMIT 500"
+            ),
+            {"brand_id": brand_id},
+        )
+        for (err_msg,) in fc_res.fetchall():
+            try:
+                cat = _categorize(Exception(err_msg or ""))
+                failure_summary[cat] = failure_summary.get(cat, 0) + 1
+            except Exception:
+                failure_summary["unknown"] = failure_summary.get("unknown", 0) + 1
+    except Exception:
+        await db.rollback()
+
+    # ------------------------------------------------------------------ #
+    # Health determination                                                 #
+    # ------------------------------------------------------------------ #
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    # Dead-letter thresholds
+    if dead_letter_count > 200:
+        errors.append(f"Dead-letter count critically high: {dead_letter_count} (threshold: 200)")
+    elif dead_letter_count > 50:
+        warnings.append(f"Dead-letter count elevated: {dead_letter_count} (threshold: 50)")
+
+    # Failed order thresholds
+    if total_failed > 200:
+        errors.append(f"Failed order count critically high: {total_failed} (threshold: 200)")
+    elif total_failed > 50:
+        warnings.append(f"Failed order count elevated: {total_failed} (threshold: 50)")
+
+    # Stall detection
+    if is_stalled and active_run and active_run.last_progress_at:
+        stall_seconds = round((now - active_run.last_progress_at).total_seconds(), 1)
+        if stall_seconds > 300:
+            errors.append(f"Sync stalled for {stall_seconds}s (threshold: 300s)")
+        elif stall_seconds > 90:
+            warnings.append(f"Sync stalled for {stall_seconds}s (threshold: 90s)")
+
+    # Last successful sync recency
+    if last_completed is None:
+        errors.append("No successful sync has ever completed for this brand")
+    elif last_completed.completed_at:
+        age_seconds = (now - last_completed.completed_at).total_seconds()
+        if age_seconds > 3600:
+            warnings.append(
+                f"Last successful sync completed {round(age_seconds / 60, 1)} minutes ago (threshold: 60 min)"
+            )
+
+    is_healthy = len(errors) == 0
+
+    health = {
+        "is_healthy": is_healthy,
+        "warnings": warnings,
+        "errors": errors,
+    }
+
+    logger.info(
+        "[OrdersAPI] sync_status_debug brand_id=%s state=%s elapsed=%s pages=%s records=%s "
+        "dead_letter=%s failed=%s healthy=%s warnings=%s errors=%s",
+        brand_id,
+        current_state,
+        elapsed_seconds,
+        pages_processed,
+        records_processed,
+        dead_letter_count,
+        total_failed,
+        is_healthy,
+        len(warnings),
+        len(errors),
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "brand_id": brand_id,
+        "org_id": org_id,
+        "timestamp": timestamp,
+        "sync_state": sync_state,
+        "progress": progress,
+        "counts": counts,
+        "last_sync": last_sync,
+        "failure_summary": failure_summary,
+        "health": health,
+    })
