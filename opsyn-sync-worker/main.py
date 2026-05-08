@@ -187,12 +187,16 @@ async def process_sync_requests() -> None:
                     total_pages,
                 )
 
+                # IMPORTANT: pass total_pages=None when not known so the
+                # background sync loops until LeafLink returns no next_url.
+                # Using `total_pages or 1` was a bug that stopped pagination
+                # after page 1 when total_pages was None (cursor-based mode).
                 await sync_leaflink_background_continuous(
                     brand_id=brand_id,
                     api_key=api_key,
                     company_id=company_id,
                     start_page=start_page,
-                    total_pages=total_pages or 1,
+                    total_pages=total_pages,  # None = cursor-based, loop until no next_url
                     manager=None,  # Worker uses DB-only progress tracking
                     total_orders_available=total_orders_available,
                     base_url=base_url,

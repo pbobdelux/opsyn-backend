@@ -119,9 +119,20 @@ def build_line_items(order: Order) -> list[dict[str, Any]]:
     return []
 
 
-def derive_blockers(line_items: list[dict[str, Any]]) -> list[dict[str, str]]:
+def derive_blockers(line_items: list[dict[str, Any]], order: "Order | None" = None) -> list[dict[str, str]]:
+    """Derive real blockers for an order.
+
+    Only returns blockers when there is a genuine issue:
+    - Line items with unknown/unmapped SKUs or unresolved mapping issues
+    - Missing customer name (if order object provided)
+    - Missing totals (if order object provided)
+
+    Does NOT flag every order as blocked. An order with fully mapped line
+    items and complete data returns an empty list.
+    """
     blockers: list[dict[str, str]] = []
 
+    # Only flag lines that have an actual mapping problem
     unknown_lines = [
         item for item in line_items
         if (
@@ -134,19 +145,67 @@ def derive_blockers(line_items: list[dict[str, Any]]) -> list[dict[str, str]]:
     if unknown_lines:
         blockers.append({
             "type": "mapping_issue",
-            "message": "Unknown SKU",
+            "message": f"Unknown SKU on {len(unknown_lines)} line item(s)",
         })
+
+    if order is not None:
+        # Missing customer is a real blocker
+        if not getattr(order, "customer_name", None):
+            blockers.append({
+                "type": "missing_customer",
+                "message": "Missing customer/account name",
+            })
+
+        # Missing totals on a non-zero order is a real blocker
+        amount = getattr(order, "amount", None)
+        total_cents = getattr(order, "total_cents", None)
+        if amount is None and total_cents is None:
+            blockers.append({
+                "type": "missing_total",
+                "message": "Missing order total",
+            })
+
+        # Sync health failure is a real blocker
+        sync_status = getattr(order, "sync_status", None)
+        if sync_status in ("partial", "failed", "error"):
+            blockers.append({
+                "type": "sync_health",
+                "message": f"Sync status: {sync_status}",
+            })
 
     return blockers
 
 
-def derive_review_status(line_items: list[dict[str, Any]], blockers: list[dict[str, str]], order: Order) -> str:
-    if order.review_status:
+def derive_review_status(line_items: list[dict[str, Any]], blockers: list[dict[str, str]], order: "Order | None" = None) -> str:
+    """Derive review status for an order.
+
+    Rules (in priority order):
+    1. If the order has an explicit review_status stored in DB, use it.
+    2. If there are real blockers (mapping issues, missing data, sync failures), return "blocked".
+    3. If the order has no line items at all AND is not in a terminal status, return "needs_review".
+    4. Otherwise return "ready".
+
+    An order is NOT "needs_review" just because it exists — only when it
+    genuinely lacks required data.
+    """
+    if order is not None and getattr(order, "review_status", None):
         return order.review_status
+
     if blockers:
         return "blocked"
+
+    # Only flag as needs_review when line items are truly missing AND the order
+    # is in an active (non-terminal) status that should have line items.
     if not line_items:
-        return "needs_review"
+        if order is not None:
+            status = (getattr(order, "status", None) or "").lower()
+            # Terminal statuses don't need line items reviewed
+            terminal_statuses = {"cancelled", "canceled", "rejected", "voided", "void"}
+            if status not in terminal_statuses:
+                return "needs_review"
+        else:
+            return "needs_review"
+
     return "ready"
 
 
@@ -170,8 +229,36 @@ def serialize_order(order: Order) -> dict[str, Any]:
     if unit_count is None:
         unit_count = sum((item.get("quantity") or 0) for item in line_items)
 
-    blockers = derive_blockers(line_items)
+    blockers = derive_blockers(line_items, order)
     review_status = derive_review_status(line_items, blockers, order)
+
+    # Build sync_health object per order
+    _sync_status = order.sync_status or "ok"
+    _last_synced = order.last_synced_at or order.synced_at
+    _missing_fields: list[str] = []
+    if not order.customer_name:
+        _missing_fields.append("customer_name")
+    if order.amount is None and order.total_cents is None:
+        _missing_fields.append("amount")
+    if not line_items:
+        _missing_fields.append("line_items")
+    if not order.status:
+        _missing_fields.append("status")
+
+    # Determine sync_health status: partial if required fields missing, failed if sync failed
+    if _sync_status in ("failed", "error"):
+        _health_status = "failed"
+    elif _missing_fields:
+        _health_status = "partial"
+    else:
+        _health_status = "ok"
+
+    sync_health = {
+        "status": _health_status,
+        "missing_fields": _missing_fields,
+        "last_synced_at": _last_synced,
+        "last_error": None,
+    }
 
     return {
         "id": order.id,
@@ -185,8 +272,9 @@ def serialize_order(order: Order) -> dict[str, Any]:
         "line_items": line_items,
         "review_status": review_status,
         "blockers": blockers,
-        "sync_status": order.sync_status or "ok",
-        "last_synced_at": order.last_synced_at or order.synced_at,
+        "sync_status": _sync_status,
+        "sync_health": sync_health,
+        "last_synced_at": _last_synced,
         "source": order.source,
         "external_created_at": order.external_created_at,
         "external_updated_at": order.external_updated_at,
@@ -329,7 +417,7 @@ async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
     item_count = order.item_count if order.item_count is not None else len(line_items)
     unit_count = order.unit_count if order.unit_count is not None else sum((item.get("quantity") or 0) for item in line_items)
 
-    blockers = derive_blockers(line_items)
+    blockers = derive_blockers(line_items, order)
     review_status = derive_review_status(line_items, blockers, order)
 
     logger.info(

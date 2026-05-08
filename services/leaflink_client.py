@@ -1020,6 +1020,7 @@ class LeafLinkClient:
         modified__lte: Optional[str] = None,
         status: Optional[str] = None,
         skip_date_filters: bool = False,
+        extra_params: Optional[Dict[str, Any]] = None,
     ) -> Any:
         # ---------------------------------------------------------------------------
         # ENDPOINT CHOICE — LeafLink v2 API docs
@@ -1088,6 +1089,15 @@ class LeafLinkClient:
 
         if status:
             params["status"] = status
+
+        # Merge any extra query parameters (e.g. {"id": external_order_id} for single-order resync)
+        if extra_params:
+            params.update(extra_params)
+            logger.info(
+                "[LEAFLINK_REQUEST] extra_params=%s brand_id=%s",
+                list(extra_params.keys()),
+                self.brand_id,
+            )
 
         # Log all query parameters being sent
         logger.info(
