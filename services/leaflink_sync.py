@@ -619,6 +619,7 @@ def ensure_utc(dt: Any, field_name: str = "unknown") -> "datetime | None":
 
     Handles:
     - None → None
+    - str  → parsed via datetime.fromisoformat (Z suffix normalised to +00:00)
     - Naive datetime → assume UTC and make aware
     - Aware datetime → convert to UTC
     - Invalid input → passed through unchanged (not a datetime)
@@ -630,6 +631,21 @@ def ensure_utc(dt: Any, field_name: str = "unknown") -> "datetime | None":
     """
     if dt is None:
         return None
+
+    # Handle ISO datetime strings before the isinstance(dt, datetime) check
+    if isinstance(dt, str):
+        if not dt:
+            return None
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+            # Fall through to the datetime normalisation logic below
+        except (ValueError, TypeError):
+            logger.warning(
+                "[DATETIME_PARSE_FAILED] field=%s value=%r — not a valid ISO datetime string",
+                field_name,
+                dt[:100] if len(dt) > 100 else dt,
+            )
+            return None
 
     if not isinstance(dt, datetime):
         return dt  # type: ignore[return-value]
