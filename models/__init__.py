@@ -613,3 +613,68 @@ class SyncDeadLetter(Base):
         DateTime(timezone=True), nullable=True
     )
 
+
+# =============================================================================
+# Sync Metrics Snapshot Model — cached sync state for non-blocking endpoints
+# =============================================================================
+
+class SyncMetricsSnapshot(Base):
+    """
+    Lightweight snapshot of current sync state for a brand.
+
+    Written periodically during sync (after each batch of records).
+    Read by /sync-metrics, /sync-status, and /runtime-health endpoints
+    so they never perform full DB scans or dead-letter aggregations inline.
+
+    The UNIQUE(brand_id, sync_run_id) constraint means each sync run has
+    exactly one snapshot row per brand. Upsert on conflict to update in place.
+    """
+
+    __tablename__ = "sync_metrics_snapshots"
+    __table_args__ = (
+        UniqueConstraint("brand_id", "sync_run_id", name="uq_sync_metrics_brand_run"),
+        Index("ix_sync_metrics_snapshots_brand_id", "brand_id"),
+        Index("ix_sync_metrics_snapshots_brand_updated", "brand_id", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    brand_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    sync_run_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+
+    # Cached order counts
+    total_local_orders: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    total_ok: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    total_partial: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    total_failed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Cached dead-letter count
+    dead_letter_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Failure category breakdown (JSONB map: category -> count)
+    count_by_failure_category: Mapped[Optional[dict]] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="JSONB map of failure_category -> count",
+    )
+
+    # Sync progress
+    pages_processed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    records_processed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Performance metrics
+    sync_rate: Mapped[Optional[float]] = mapped_column(
+        Numeric(10, 2),
+        nullable=True,
+        comment="Records per second (rolling average)",
+    )
+    estimated_completion: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # Timestamps
+    last_successful_sync_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )

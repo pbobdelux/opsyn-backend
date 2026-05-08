@@ -4018,6 +4018,173 @@ async def sync_leaflink_line_items(
     }
 
 
+async def upsert_sync_metrics_snapshot(
+    brand_id: str,
+    sync_run_id: Optional[int] = None,
+    pages_processed: Optional[int] = None,
+    records_processed: Optional[int] = None,
+    sync_rate: Optional[float] = None,
+    estimated_completion: Optional[datetime] = None,
+    last_successful_sync_at: Optional[datetime] = None,
+) -> None:
+    """Write a lightweight sync metrics snapshot for a brand.
+
+    Called after each batch of records during sync so that /sync-metrics,
+    /sync-status, and /runtime-health can read cached values instead of
+    performing full DB scans inline.
+
+    Uses a raw SQL UPSERT (INSERT … ON CONFLICT DO UPDATE) so the operation
+    is a single round-trip and never blocks the sync loop for more than a
+    few milliseconds.
+
+    Order counts (total_local_orders, total_ok, total_partial, total_failed)
+    and dead_letter_count are computed here from the DB so the snapshot is
+    always accurate at write time.  These counts are cheap because they use
+    indexed columns.
+    """
+    try:
+        from sqlalchemy import func as _func_snap, text as _text_snap
+        from models import Order as _Order
+
+        now = datetime.now(timezone.utc)
+        _run_id_str = str(sync_run_id) if sync_run_id is not None else None
+
+        async with AsyncSessionLocal() as _snap_db:
+            # Gather counts in a single session (no transaction needed for reads)
+            try:
+                _total_res = await _snap_db.execute(
+                    select(_func_snap.count(_Order.id)).where(_Order.brand_id == brand_id)
+                )
+                total_local = _total_res.scalar() or 0
+            except Exception:
+                total_local = None
+
+            try:
+                _ok_res = await _snap_db.execute(
+                    select(_func_snap.count(_Order.id)).where(
+                        _Order.brand_id == brand_id,
+                        _Order.sync_status == "ok",
+                    )
+                )
+                total_ok = _ok_res.scalar() or 0
+            except Exception:
+                total_ok = None
+
+            try:
+                _partial_res = await _snap_db.execute(
+                    select(_func_snap.count(_Order.id)).where(
+                        _Order.brand_id == brand_id,
+                        _Order.sync_status == "partial",
+                    )
+                )
+                total_partial = _partial_res.scalar() or 0
+            except Exception:
+                total_partial = None
+
+            try:
+                _failed_res = await _snap_db.execute(
+                    select(_func_snap.count(_Order.id)).where(
+                        _Order.brand_id == brand_id,
+                        _Order.sync_status == "failed",
+                    )
+                )
+                total_failed = _failed_res.scalar() or 0
+            except Exception:
+                total_failed = None
+
+            try:
+                _dl_res = await _snap_db.execute(
+                    _text_snap(
+                        "SELECT COUNT(*) FROM sync_dead_letters "
+                        "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL"
+                    ),
+                    {"brand_id": brand_id},
+                )
+                dead_letter_count = _dl_res.scalar() or 0
+            except Exception:
+                dead_letter_count = None
+
+            # Upsert the snapshot row
+            try:
+                import json as _json_snap
+                _cat_json = None  # category breakdown not computed here (expensive)
+
+                await _snap_db.execute(
+                    _text_snap("""
+                        INSERT INTO sync_metrics_snapshots
+                            (brand_id, sync_run_id,
+                             total_local_orders, total_ok, total_partial, total_failed,
+                             dead_letter_count, count_by_failure_category,
+                             pages_processed, records_processed,
+                             sync_rate, estimated_completion,
+                             last_successful_sync_at, updated_at)
+                        VALUES
+                            (:brand_id, :sync_run_id,
+                             :total_local_orders, :total_ok, :total_partial, :total_failed,
+                             :dead_letter_count, CAST(:count_by_failure_category AS jsonb),
+                             :pages_processed, :records_processed,
+                             :sync_rate, :estimated_completion,
+                             :last_successful_sync_at, :updated_at)
+                        ON CONFLICT (brand_id, sync_run_id) DO UPDATE SET
+                            total_local_orders      = EXCLUDED.total_local_orders,
+                            total_ok                = EXCLUDED.total_ok,
+                            total_partial           = EXCLUDED.total_partial,
+                            total_failed            = EXCLUDED.total_failed,
+                            dead_letter_count       = EXCLUDED.dead_letter_count,
+                            pages_processed         = EXCLUDED.pages_processed,
+                            records_processed       = EXCLUDED.records_processed,
+                            sync_rate               = EXCLUDED.sync_rate,
+                            estimated_completion    = EXCLUDED.estimated_completion,
+                            last_successful_sync_at = COALESCE(EXCLUDED.last_successful_sync_at,
+                                                               sync_metrics_snapshots.last_successful_sync_at),
+                            updated_at              = EXCLUDED.updated_at
+                    """),
+                    {
+                        "brand_id": brand_id,
+                        "sync_run_id": _run_id_str,
+                        "total_local_orders": total_local,
+                        "total_ok": total_ok,
+                        "total_partial": total_partial,
+                        "total_failed": total_failed,
+                        "dead_letter_count": dead_letter_count,
+                        "count_by_failure_category": _cat_json,
+                        "pages_processed": pages_processed,
+                        "records_processed": records_processed,
+                        "sync_rate": sync_rate,
+                        "estimated_completion": estimated_completion,
+                        "last_successful_sync_at": last_successful_sync_at,
+                        "updated_at": now,
+                    },
+                )
+                await _snap_db.commit()
+                logger.info(
+                    "[SyncMetricsSnapshot] upserted brand_id=%s run_id=%s"
+                    " total=%s ok=%s partial=%s failed=%s dl=%s pages=%s records=%s",
+                    brand_id,
+                    _run_id_str,
+                    total_local,
+                    total_ok,
+                    total_partial,
+                    total_failed,
+                    dead_letter_count,
+                    pages_processed,
+                    records_processed,
+                )
+            except Exception as upsert_exc:
+                logger.warning(
+                    "[SyncMetricsSnapshot] upsert_error brand_id=%s error=%s",
+                    brand_id,
+                    str(upsert_exc)[:200],
+                )
+    except Exception as outer_exc:
+        # Never let snapshot writes crash the sync loop
+        logger.warning(
+            "[SyncMetricsSnapshot] outer_error brand_id=%s error=%s",
+            brand_id,
+            str(outer_exc)[:200],
+        )
+
+
 async def sync_leaflink_full_resync(
     brand_id: str,
     api_key: str,
@@ -4204,6 +4371,23 @@ async def sync_leaflink_full_resync(
                     prog_exc,
                 )
 
+        # Write metrics snapshot after each batch so endpoints can read cached values
+        # Fire-and-forget: never let snapshot errors block the sync loop
+        try:
+            _elapsed = time.monotonic() - resync_start
+            _snap_rate = round(total_fetched / _elapsed, 1) if _elapsed > 0 and total_fetched > 0 else None
+            asyncio.create_task(
+                upsert_sync_metrics_snapshot(
+                    brand_id=brand_id,
+                    sync_run_id=sync_run_id,
+                    pages_processed=pages_synced,
+                    records_processed=total_fetched,
+                    sync_rate=_snap_rate,
+                )
+            )
+        except Exception:
+            pass  # snapshot is best-effort
+
         # Stop if no more pages
         if not next_url or not batch_orders:
             logger.info(
@@ -4246,6 +4430,23 @@ async def sync_leaflink_full_resync(
         duration,
         total_local_orders,
     )
+
+    # Write final snapshot marking sync as complete
+    try:
+        _final_rate = round(total_fetched / duration, 1) if duration > 0 and total_fetched > 0 else None
+        _last_sync_at = datetime.now(timezone.utc)
+        asyncio.create_task(
+            upsert_sync_metrics_snapshot(
+                brand_id=brand_id,
+                sync_run_id=sync_run_id,
+                pages_processed=pages_synced,
+                records_processed=total_fetched,
+                sync_rate=_final_rate,
+                last_successful_sync_at=_last_sync_at if len(errors) == 0 else None,
+            )
+        )
+    except Exception:
+        pass  # snapshot is best-effort
 
     return {
         "ok": len(errors) == 0,
