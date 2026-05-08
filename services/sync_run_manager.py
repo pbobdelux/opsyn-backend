@@ -318,6 +318,24 @@ async def reset_run(
 # Stall detection
 # ---------------------------------------------------------------------------
 
+def _ensure_utc_for_compare(dt: datetime, field_name: str = "unknown") -> datetime:
+    """Normalize a datetime to UTC-aware before arithmetic/comparison.
+
+    Handles naive datetimes (assumes UTC) and aware datetimes (converts to UTC).
+    Logs [DATETIME_NORMALIZED] when a conversion is applied.
+    """
+    if dt.tzinfo is None:
+        normalized = dt.replace(tzinfo=timezone.utc)
+        logger.info(
+            "[DATETIME_NORMALIZED] field=%s original=%s (naive) normalized=%s (UTC-aware)",
+            field_name,
+            dt.isoformat(),
+            normalized.isoformat(),
+        )
+        return normalized
+    return dt.astimezone(timezone.utc)
+
+
 def detect_stalled(sync_run: SyncRun, stall_threshold_seconds: int = STALL_THRESHOLD_SECONDS) -> bool:
     """
     Return True if the sync run has not made progress for stall_threshold_seconds.
@@ -330,9 +348,35 @@ def detect_stalled(sync_run: SyncRun, stall_threshold_seconds: int = STALL_THRES
         return False
     if sync_run.last_progress_at is None:
         # No progress recorded yet — check if started_at is old
-        elapsed = (_utc_now() - sync_run.started_at).total_seconds()
+        try:
+            a = _utc_now()
+            b = _ensure_utc_for_compare(sync_run.started_at, "started_at")
+            elapsed = (a - b).total_seconds()
+        except TypeError as e:
+            logger.error(
+                "[DATETIME_COMPARE_ERROR] a=%s tz_a=%s b=%s tz_b=%s error=%s",
+                a,
+                getattr(a, "tzinfo", None),
+                sync_run.started_at,
+                getattr(sync_run.started_at, "tzinfo", None),
+                str(e),
+            )
+            raise
         return elapsed > stall_threshold_seconds
-    elapsed = (_utc_now() - sync_run.last_progress_at).total_seconds()
+    try:
+        a = _utc_now()
+        b = _ensure_utc_for_compare(sync_run.last_progress_at, "last_progress_at")
+        elapsed = (a - b).total_seconds()
+    except TypeError as e:
+        logger.error(
+            "[DATETIME_COMPARE_ERROR] a=%s tz_a=%s b=%s tz_b=%s error=%s",
+            a,
+            getattr(a, "tzinfo", None),
+            sync_run.last_progress_at,
+            getattr(sync_run.last_progress_at, "tzinfo", None),
+            str(e),
+        )
+        raise
     return elapsed > stall_threshold_seconds
 
 
