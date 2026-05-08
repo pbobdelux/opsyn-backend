@@ -385,17 +385,55 @@ class SyncRun(Base):
         percent = (self.pages_synced / self.total_pages) * 100
         return min(100.0, max(0.0, percent))  # Clamp 0-100
 
+    @staticmethod
+    def _ensure_utc(dt: datetime, field_name: str = "unknown") -> datetime:
+        """Normalize a datetime to UTC-aware before arithmetic/comparison.
+
+        Handles naive datetimes (assumes UTC) and aware datetimes (converts to UTC).
+        This prevents 'can't subtract offset-naive and offset-aware datetimes' errors
+        when DB columns return naive datetimes and we compare against UTC-aware now().
+        """
+        import logging as _logging
+        _log = _logging.getLogger("sync_run_model")
+        if dt.tzinfo is None:
+            normalized = dt.replace(tzinfo=timezone.utc)
+            _log.info(
+                "[DATETIME_NORMALIZED] field=%s original=%s (naive) normalized=%s (UTC-aware)",
+                field_name,
+                dt.isoformat(),
+                normalized.isoformat(),
+            )
+            return normalized
+        return dt.astimezone(timezone.utc)
+
     def is_stalled(self, stall_threshold_seconds: int = 90) -> bool:
         """Check if sync is stalled (no progress for threshold seconds)."""
+        import logging as _logging
+        _log = _logging.getLogger("sync_run_model")
         if self.status not in ["syncing", "queued"]:
             return False
         if self.last_progress_at is None:
             return False
-        elapsed = (datetime.now(timezone.utc) - self.last_progress_at).total_seconds()
+        try:
+            a = datetime.now(timezone.utc)
+            b = self._ensure_utc(self.last_progress_at, "last_progress_at")
+            elapsed = (a - b).total_seconds()
+        except TypeError as e:
+            _log.error(
+                "[DATETIME_COMPARE_ERROR] a=%s tz_a=%s b=%s tz_b=%s error=%s",
+                a,
+                getattr(a, "tzinfo", None),
+                self.last_progress_at,
+                getattr(self.last_progress_at, "tzinfo", None),
+                str(e),
+            )
+            raise
         return elapsed > stall_threshold_seconds
 
     def estimated_completion_minutes(self) -> float | None:
         """Estimate completion time based on current progress."""
+        import logging as _logging
+        _log = _logging.getLogger("sync_run_model")
         if self.status != "syncing" or self.is_stalled():
             return None
         if self.total_pages is None or self.total_pages == 0:
@@ -404,7 +442,20 @@ class SyncRun(Base):
             return None
 
         # Calculate average time per page
-        elapsed_seconds = (datetime.now(timezone.utc) - self.started_at).total_seconds()
+        try:
+            a = datetime.now(timezone.utc)
+            b = self._ensure_utc(self.started_at, "started_at")
+            elapsed_seconds = (a - b).total_seconds()
+        except TypeError as e:
+            _log.error(
+                "[DATETIME_COMPARE_ERROR] a=%s tz_a=%s b=%s tz_b=%s error=%s",
+                a,
+                getattr(a, "tzinfo", None),
+                self.started_at,
+                getattr(self.started_at, "tzinfo", None),
+                str(e),
+            )
+            raise
         if elapsed_seconds < 1:
             return None
 
