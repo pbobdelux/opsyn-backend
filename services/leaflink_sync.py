@@ -384,10 +384,19 @@ async def _dead_letter_line_item(
             )
             for _k, _v in _dead_letter_params.items():
                 if isinstance(_v, datetime):
+                    if _v.tzinfo is None:
+                        _dead_letter_params[_k] = _v.replace(tzinfo=timezone.utc)
+                    else:
+                        _dead_letter_params[_k] = _v.astimezone(timezone.utc)
                     logger.info(
                         "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                        _k, _dead_letter_params[_k].isoformat(), _dead_letter_params[_k].tzinfo, _dead_letter_params[_k].tzinfo is not None,
                     )
+            # CAST(:brand_id AS UUID) in SQL requires a str, not a uuid.UUID object.
+            # normalize_uuid_fields() converts strings to UUID objects, so we must
+            # convert back to str immediately before execute().
+            if isinstance(_dead_letter_params.get("brand_id"), UUID):
+                _dead_letter_params["brand_id"] = str(_dead_letter_params["brand_id"])
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -492,10 +501,21 @@ async def _write_sync_dead_letter(
             )
             for _k, _v in params.items():
                 if isinstance(_v, datetime):
+                    if _v.tzinfo is None:
+                        params[_k] = _v.replace(tzinfo=timezone.utc)
+                    else:
+                        params[_k] = _v.astimezone(timezone.utc)
                     logger.info(
                         "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                        _k, params[_k].isoformat(), params[_k].tzinfo, params[_k].tzinfo is not None,
                     )
+            # CAST(:brand_id AS uuid) and CAST(:org_id AS uuid) in SQL require str values,
+            # not uuid.UUID objects. normalize_uuid_fields() converts strings to UUID objects,
+            # so we must convert back to str immediately before execute().
+            if isinstance(params.get("brand_id"), UUID):
+                params["brand_id"] = str(params["brand_id"])
+            if isinstance(params.get("org_id"), UUID):
+                params["org_id"] = str(params["org_id"])
             await db.execute(
                 text("""
                     INSERT INTO sync_dead_letters
