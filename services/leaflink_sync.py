@@ -24,6 +24,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger("leaflink_sync")
 
 
+def ensure_db_datetime(value):
+    """Ensure a datetime value is timezone-aware UTC for DB binding.
+
+    asyncpg requires native Python datetime objects (not strings) for timestamptz columns.
+    This helper normalizes any datetime input to a UTC-aware datetime object.
+
+    Args:
+        value: datetime object, ISO string, or None
+
+    Returns:
+        UTC-aware datetime object, or None
+
+    Raises:
+        ValueError if value is a string for a timestamp column (should have been parsed earlier)
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        # Parse ISO string to datetime
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            # Naive datetime — assume UTC
+            return value.replace(tzinfo=timezone.utc)
+        # Already aware — convert to UTC
+        return value.astimezone(timezone.utc)
+    return value
+
+
 def _cursor_hash(cursor: Optional[str]) -> Optional[str]:
     """Return a short hash of a cursor for safe logging."""
     if not cursor:
@@ -2776,9 +2805,9 @@ UPDATE orders SET
     sync_status = :sync_status,
     sync_health_status = :sync_health_status,
     sync_health_missing_fields = CAST(:sync_health_missing_fields AS jsonb),
-    synced_at = CAST(:synced_at AS timestamptz),
-    last_synced_at = CAST(:last_synced_at AS timestamptz),
-    updated_at = CAST(:updated_at AS timestamptz)
+    synced_at = :synced_at,
+    last_synced_at = :last_synced_at,
+    updated_at = :updated_at
 WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :external_order_id
 """
 
@@ -2881,17 +2910,24 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             update_params = normalize_uuid_fields(update_params)
                             update_params = normalize_datetime_fields(update_params)
                             update_params = apply_uuid_str_to_params(update_params)
-                            # Final guard: convert ALL datetime params to ISO strings before execute.
-                            # asyncpg cannot bind Python datetime objects directly — must use ISO strings
-                            # with CAST(:col AS timestamptz) in the SQL.
-                            for _param_key, _param_val in list(update_params.items()):
-                                if isinstance(_param_val, datetime):
-                                    update_params[_param_key] = _param_val.astimezone(timezone.utc).isoformat()
-                            # Assertion: block execution if any datetime object still remains
+                            # Convert datetime params to UTC-aware Python datetime objects (not strings).
+                            # asyncpg requires native datetime objects for timestamptz columns.
+                            datetime_fields = ['synced_at', 'last_synced_at', 'updated_at', 'created_at',
+                                               'external_created_at', 'external_updated_at', 'due_date', 'route_date', 'delivered_at']
+                            for _field in datetime_fields:
+                                if _field in update_params and update_params[_field] is not None:
+                                    update_params[_field] = ensure_db_datetime(update_params[_field])
+                            # Assertion: datetime params must be UTC-aware Python objects, not strings
                             for _param_key, _param_val in update_params.items():
-                                if isinstance(_param_val, datetime):
-                                    logger.error("[DATETIME_BIND_ASSERTION_FAILED] field=%s type=%s", _param_key, type(_param_val))
-                                    raise ValueError(f"Datetime object still in params at execute time: {_param_key}")
+                                if _param_key in datetime_fields:
+                                    if isinstance(_param_val, str):
+                                        logger.error("[DATETIME_BIND_ASSERTION_FAILED] field=%s is string (should be datetime)", _param_key)
+                                        raise ValueError(f"Datetime param {_param_key} is string, not datetime object")
+                                    if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
+                                        logger.error("[DATETIME_BIND_ASSERTION_FAILED] field=%s is naive datetime", _param_key)
+                                        raise ValueError(f"Datetime param {_param_key} is naive (not UTC-aware)")
+                                    if isinstance(_param_val, datetime):
+                                        logger.debug("[DATETIME_BIND_READY] field=%s type=datetime tz=UTC", _param_key)
                             # Hard block: never execute UPDATE with org_id=None
                             if update_params.get("org_id") is None:
                                 logger.error(
@@ -2952,8 +2988,8 @@ INSERT INTO orders (
     :customer_name, :status, :total_cents, :amount, :item_count, :unit_count,
     :line_items_json, :raw_payload, :source, :review_status, :sync_status,
     :sync_health_status, CAST(:sync_health_missing_fields AS jsonb),
-    CAST(:synced_at AS timestamptz), CAST(:last_synced_at AS timestamptz),
-    CAST(:created_at AS timestamptz), CAST(:updated_at AS timestamptz)
+    :synced_at, :last_synced_at,
+    :created_at, :updated_at
 )
 """
 
@@ -3068,17 +3104,24 @@ INSERT INTO orders (
                             insert_params = normalize_uuid_fields(insert_params)
                             insert_params = normalize_datetime_fields(insert_params)
                             insert_params = apply_uuid_str_to_params(insert_params)
-                            # Final guard: convert ALL datetime params to ISO strings before execute.
-                            # asyncpg cannot bind Python datetime objects directly — must use ISO strings
-                            # with CAST(:col AS timestamptz) in the SQL.
-                            for _param_key, _param_val in list(insert_params.items()):
-                                if isinstance(_param_val, datetime):
-                                    insert_params[_param_key] = _param_val.astimezone(timezone.utc).isoformat()
-                            # Assertion: block execution if any datetime object still remains
+                            # Convert datetime params to UTC-aware Python datetime objects (not strings).
+                            # asyncpg requires native datetime objects for timestamptz columns.
+                            datetime_fields = ['synced_at', 'last_synced_at', 'created_at', 'updated_at',
+                                               'external_created_at', 'external_updated_at', 'due_date', 'route_date', 'delivered_at']
+                            for _field in datetime_fields:
+                                if _field in insert_params and insert_params[_field] is not None:
+                                    insert_params[_field] = ensure_db_datetime(insert_params[_field])
+                            # Assertion: datetime params must be UTC-aware Python objects, not strings
                             for _param_key, _param_val in insert_params.items():
-                                if isinstance(_param_val, datetime):
-                                    logger.error("[DATETIME_BIND_ASSERTION_FAILED] field=%s type=%s", _param_key, type(_param_val))
-                                    raise ValueError(f"Datetime object still in params at execute time: {_param_key}")
+                                if _param_key in datetime_fields:
+                                    if isinstance(_param_val, str):
+                                        logger.error("[DATETIME_BIND_ASSERTION_FAILED] field=%s is string (should be datetime)", _param_key)
+                                        raise ValueError(f"Datetime param {_param_key} is string, not datetime object")
+                                    if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
+                                        logger.error("[DATETIME_BIND_ASSERTION_FAILED] field=%s is naive datetime", _param_key)
+                                        raise ValueError(f"Datetime param {_param_key} is naive (not UTC-aware)")
+                                    if isinstance(_param_val, datetime):
+                                        logger.debug("[DATETIME_BIND_READY] field=%s type=datetime tz=UTC", _param_key)
 
                             # Hard block: never execute INSERT with org_id=None
                             if insert_params.get("org_id") is None:
