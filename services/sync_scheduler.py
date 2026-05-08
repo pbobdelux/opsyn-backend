@@ -381,11 +381,44 @@ async def poll_and_execute() -> None:
 
         logger.info("[SyncWorker] sync_complete id=%s brand=%s", sync_run_id, brand_id)
 
-    except Exception as sync_exc:
-        logger.error(
-            "[SyncWorker] sync_error id=%s brand=%s error=%s",
+    except asyncio.CancelledError:
+        logger.warning(
+            "[SyncWorker] sync_cancelled id=%s brand=%s",
             sync_run_id,
             brand_id,
+        )
+        raise
+    except asyncio.TimeoutError as sync_exc:
+        logger.error(
+            "[SyncWorker] sync_timeout id=%s brand=%s error=%s",
+            sync_run_id,
+            brand_id,
+            str(sync_exc)[:500],
+        )
+        # Mark as incomplete on timeout
+        try:
+            async with AsyncSessionLocal() as err_db:
+                err_result = await err_db.execute(
+                    select(SyncRun).where(SyncRun.id == sync_run_id)
+                )
+                err_run = err_result.scalar_one_or_none()
+                if err_run:
+                    err_run.status = "incomplete"
+                    err_run.last_error = "sync_timeout"
+                    err_run.completed_at = datetime.now(timezone.utc)
+                    await err_db.commit()
+        except Exception as mark_exc:
+            logger.error(
+                "[SyncWorker] failed_to_mark_timeout id=%s error=%s",
+                sync_run_id,
+                str(mark_exc)[:200],
+            )
+    except Exception as sync_exc:
+        logger.error(
+            "[SyncWorker] sync_error id=%s brand=%s exception_type=%s error=%s",
+            sync_run_id,
+            brand_id,
+            type(sync_exc).__name__,
             str(sync_exc)[:500],
             exc_info=True,
         )

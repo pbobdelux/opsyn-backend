@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -824,7 +825,7 @@ def ensure_utc(dt: Any, field_name: str = "unknown") -> "datetime | None":
     # If naive, assume UTC and make aware
     if dt.tzinfo is None:
         normalized = dt.replace(tzinfo=timezone.utc)
-        logger.info(
+        logger.debug(
             "[DATETIME_NORMALIZED] field=%s original=%s (naive) normalized=%s (UTC-aware)",
             field_name,
             dt.isoformat(),
@@ -835,7 +836,7 @@ def ensure_utc(dt: Any, field_name: str = "unknown") -> "datetime | None":
     # If aware, convert to UTC
     normalized = dt.astimezone(timezone.utc)
     if normalized != dt:
-        logger.info(
+        logger.debug(
             "[DATETIME_NORMALIZED] field=%s original=%s (aware) normalized=%s (UTC)",
             field_name,
             dt.isoformat(),
@@ -989,7 +990,7 @@ def sanitize_sql_params(params: dict, statement: str = "unknown") -> dict:
                 value = utc_val
 
             if mutated:
-                logger.info(
+                logger.debug(
                     "[SQL_PARAMS_SANITIZED] statement=%s field=%s type=datetime"
                     " tzinfo=%s is_aware=%s",
                     statement, key,
@@ -1009,7 +1010,7 @@ def sanitize_sql_params(params: dict, statement: str = "unknown") -> dict:
                 # Bind to TIMESTAMPTZ column as midnight UTC datetime
                 value = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
             mutated = True
-            logger.info(
+            logger.debug(
                 "[SQL_PARAMS_SANITIZED] statement=%s field=%s type=date"
                 " converted_to=%s",
                 statement, key, type(value).__name__,
@@ -1021,7 +1022,7 @@ def sanitize_sql_params(params: dict, statement: str = "unknown") -> dict:
         elif isinstance(value, UUID):
             # Keep as uuid.UUID for SQL params — asyncpg accepts it natively.
             # No mutation needed; log for audit trail.
-            logger.info(
+            logger.debug(
                 "[SQL_PARAMS_SANITIZED] statement=%s field=%s type=UUID action=kept_as_uuid",
                 statement, key,
             )
@@ -1036,7 +1037,7 @@ def sanitize_sql_params(params: dict, statement: str = "unknown") -> dict:
                 value = _sanitize_json_value(value, key)
                 if value is not original_value:
                     mutated = True
-                    logger.info(
+                    logger.debug(
                         "[SQL_PARAMS_SANITIZED] statement=%s field=%s type=%s"
                         " action=json_sanitized",
                         statement, key, type(original_value).__name__,
@@ -1239,7 +1240,7 @@ def safe_uuid_for_db(value: Any, field_name: str = "uuid_field") -> str | None:
 
     if isinstance(value, UUID):
         coerced = str(value)
-        logger.info(
+        logger.debug(
             "[ORG_UUID_COERCED] field=%s original_type=UUID coerced=%s",
             field_name,
             coerced,
@@ -1250,7 +1251,7 @@ def safe_uuid_for_db(value: Any, field_name: str = "uuid_field") -> str | None:
         try:
             coerced = str(UUID(value))
             if coerced != value:
-                logger.info(
+                logger.debug(
                     "[ORG_UUID_COERCED] field=%s original=%s coerced=%s",
                     field_name,
                     value[:100],
@@ -1308,7 +1309,7 @@ def normalize_uuid_fields(params: dict) -> dict:
 
         if value == "":
             normalized[key] = None
-            logger.info(
+            logger.debug(
                 "[UUID_PARAM_NORMALIZED] key=%s original_type=%s final_type=%s reason=empty_string_to_null",
                 key,
                 original_type,
@@ -1318,7 +1319,7 @@ def normalize_uuid_fields(params: dict) -> dict:
 
         if isinstance(value, UUID):
             # Already a UUID object — pass through as-is (asyncpg accepts uuid.UUID)
-            logger.info(
+            logger.debug(
                 "[UUID_PARAM_NORMALIZED] key=%s original_type=UUID final_type=UUID",
                 key,
             )
@@ -1327,7 +1328,7 @@ def normalize_uuid_fields(params: dict) -> dict:
         if isinstance(value, str):
             try:
                 normalized[key] = UUID(value)
-                logger.info(
+                logger.debug(
                     "[UUID_PARAM_NORMALIZED] key=%s original_type=str final_type=UUID",
                     key,
                 )
@@ -1365,7 +1366,7 @@ def ensure_uuid_str(value: Any) -> Optional[str]:
         return None
     if isinstance(value, UUID):
         converted = str(value)
-        logger.info(
+        logger.debug(
             "[UUID_NORMALIZED] key=<direct_call> original_type=UUID final_type=str value=%s",
             converted,
         )
@@ -1396,7 +1397,7 @@ def apply_uuid_str_to_params(params: dict) -> dict:
     for key, value in params.items():
         if isinstance(value, UUID):
             converted = str(value)
-            logger.info(
+            logger.debug(
                 "[UUID_NORMALIZED] key=%s original_type=%s final_type=%s",
                 key,
                 type(value).__name__,
@@ -1625,7 +1626,7 @@ async def _insert_line_items_standalone(
         else f":{col}"
         for col in insert_columns
     )
-    logger.info(
+    logger.debug(
         "[UUID_SQL_CAST_APPLIED] statement=_insert_line_items_standalone columns=%s",
         ",".join(col for col in insert_columns if col in _uuid_columns),
     )
@@ -1892,7 +1893,7 @@ async def sync_leaflink_orders(
     org_id = safe_uuid_for_db(org_id, "org_id")
     brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
 
-    logger.info(
+    logger.debug(
         "[SYNC_ENTRY] sync_leaflink_orders brand_id=%s org_id=%s order_count=%s pages_fetched=%s",
         brand_id,
         org_id,
@@ -1907,16 +1908,13 @@ async def sync_leaflink_orders(
             brand_id,
         )
 
-    # [LEAFLINK_TIMESTAMP_STRATEGY] All DB operational timestamps are server-owned UTC.
-    # LeafLink provider dates (created_on, modified, paid_date, ship_date, etc.) are
-    # stored as raw strings in raw_payload JSONB only — never parsed or compared here.
-    logger.info(
+    # [LEAFLINK_TIMESTAMP_STRATEGY] debug only
+    logger.debug(
         "[LEAFLINK_TIMESTAMP_STRATEGY] using=server_time_only reason=provider_dates_unreliable brand_id=%s",
         brand_id,
     )
-    # [LEAFLINK_FILTER_DISABLED] No freshness/date-based filtering during ingestion.
-    # All orders pass through regardless of their LeafLink dates.
-    logger.info(
+    # [LEAFLINK_FILTER_DISABLED] debug only
+    logger.debug(
         "[LEAFLINK_FILTER_DISABLED] filter_type=freshness reason=provider_dates_unreliable brand_id=%s",
         brand_id,
     )
@@ -1955,7 +1953,7 @@ async def sync_leaflink_orders(
                 skipped += 1
                 continue
 
-            logger.info(
+            logger.debug(
                 "[SYNC_ORDER_PROCESSING] external_id=%s order_number=%s brand_id=%s",
                 external_id,
                 order_number_for_log,
@@ -2031,12 +2029,12 @@ async def sync_leaflink_orders(
                 # Re-coerce immediately before every DB write — belt-and-suspenders guard
                 _write_org_id = safe_uuid_for_db(org_id, "org_id")
                 _write_brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id
-                logger.info(
+                logger.debug(
                     "[ORG_ID_BEFORE_SQL] field=org_id value=%s external_id=%s function=sync_leaflink_orders",
                     _write_org_id,
                     external_id,
                 )
-                logger.info(
+                logger.debug(
                     "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s external_id=%s function=sync_leaflink_orders",
                     _write_brand_id,
                     external_id,
@@ -2051,7 +2049,7 @@ async def sync_leaflink_orders(
                     existing.unit_count = unit_count
                     existing.line_items_json = make_json_safe(normalized_line_items)
                     existing.raw_payload = make_json_safe(raw_payload)
-                    logger.info(
+                    logger.debug(
                         "[REVIEW_STATUS_RESOLVED] value=%s source=derive_review_status external_id=%s",
                         review_status,
                         external_id,
@@ -2126,7 +2124,7 @@ async def sync_leaflink_orders(
                     await db.flush()
                     created += 1
 
-                logger.info(
+                logger.debug(
                     "[SYNC_HEADER_SAVED] external_id=%s order_number=%s brand_id=%s action=%s",
                     external_id,
                     order_number,
@@ -2217,7 +2215,7 @@ async def sync_leaflink_orders(
                     else f":{col}"
                     for col in _li_insert_columns
                 )
-                logger.info(
+                logger.debug(
                     "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders columns=%s",
                     ",".join(col for col in _li_insert_columns if col in _li_uuid_columns),
                 )
@@ -2486,12 +2484,12 @@ async def sync_leaflink_orders(
         sync_duration,
         brand_id,
     )
-    logger.info(
+    logger.debug(
         "[LEAFLINK_FETCH_OK] raw_count=%s brand_id=%s",
         fetched_count,
         brand_id,
     )
-    logger.info(
+    logger.debug(
         "[LEAFLINK_DB_WRITE_OK] inserted=%s updated=%s skipped=%s errors=%s brand_id=%s",
         created, updated, skipped, error_count, brand_id,
     )
@@ -2544,8 +2542,8 @@ async def sync_leaflink_orders_headers_only(
 
     Returns a summary dict compatible with the existing sync_result contract.
     """
-    logger.info("[ORDER_SAVE_START] entering order save function brand=%s fetched=%s org_id=%s", brand_id, len(orders), org_id)
-    logger.info(
+    logger.debug("[ORDER_SAVE_START] entering order save function brand=%s fetched=%s org_id=%s", brand_id, len(orders), org_id)
+    logger.debug(
         "[ORG_CONTEXT] stage=headers_only_entry org_id=%s brand_id=%s"
         " external_order_id=N/A orders_count=%s",
         org_id,
@@ -2603,21 +2601,18 @@ async def sync_leaflink_orders_headers_only(
         len(batches),
     )
 
-    # [LEAFLINK_TIMESTAMP_STRATEGY] All DB operational timestamps are server-owned UTC.
-    # LeafLink provider dates (created_on, modified, paid_date, ship_date, etc.) are
-    # stored as raw strings in raw_payload JSONB only — never parsed or compared here.
-    logger.info(
+    # [LEAFLINK_TIMESTAMP_STRATEGY] debug only — suppress from production logs
+    logger.debug(
         "[LEAFLINK_TIMESTAMP_STRATEGY] using=server_time_only reason=provider_dates_unreliable brand_id=%s",
         brand_id_value,
     )
-    # [LEAFLINK_FILTER_DISABLED] No freshness/date-based filtering during ingestion.
-    # All orders pass through regardless of their LeafLink dates.
-    logger.info(
+    # [LEAFLINK_FILTER_DISABLED] debug only
+    logger.debug(
         "[LEAFLINK_FILTER_DISABLED] filter_type=freshness reason=provider_dates_unreliable brand_id=%s",
         brand_id_value,
     )
-    # [LEAFLINK_UPSERT_KEY] Upsert by stable LeafLink identifier only — no date keys
-    logger.info("[LEAFLINK_UPSERT_KEY] key=external_id brand_id=%s", brand_id_value)
+    # [LEAFLINK_UPSERT_KEY] debug only
+    logger.debug("[LEAFLINK_UPSERT_KEY] key=external_id brand_id=%s", brand_id_value)
 
     # ------------------------------------------------------------------
     # Phase 1: Upsert all order headers and commit each batch before
@@ -2668,14 +2663,14 @@ async def sync_leaflink_orders_headers_only(
                             batch_skipped += 1
                             continue
 
-                          logger.info(
+                          logger.debug(
                               "[ORG_CONTEXT] stage=order_processing org_id=%s brand_id=%s"
                               " external_order_id=%s",
                               org_id_value,
                               brand_id_value,
                               external_id,
                           )
-                          logger.info(
+                          logger.debug(
                               "[SYNC_ORDER_PROCESSING] external_id=%s order_number=%s brand_id=%s batch=%s/%s",
                               external_id,
                               _order_number_for_log,
@@ -2689,7 +2684,7 @@ async def sync_leaflink_orders_headers_only(
                           # Logged only when the payload carries a company_id or source field.
                           _payload_company_id = o.get("company_id") or o.get("source")
                           if _payload_company_id:
-                            logger.info(
+                            logger.debug(
                                 "[COMPANY_ID_MISMATCH] brand_id=%s external_order_id=%s payload_company_id=%s note=compare_with_BRAND_CONFIG_AUDIT_for_credential_company_id",
                                 brand_id_value,
                                 external_id,
@@ -2801,12 +2796,12 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             # Re-coerce immediately before SQL params — belt-and-suspenders guard
                             _sql_org_id = safe_uuid_for_db(org_id_value, "org_id")
                             _sql_brand_id = safe_uuid_for_db(brand_id_value, "brand_id") or brand_id_value
-                            logger.info(
+                            logger.debug(
                                 "[ORG_ID_BEFORE_SQL] field=org_id value=%s external_id=%s function=sync_leaflink_orders_headers_only action=update",
                                 _sql_org_id,
                                 external_id,
                             )
-                            logger.info(
+                            logger.debug(
                                 "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s external_id=%s function=sync_leaflink_orders_headers_only action=update",
                                 _sql_brand_id,
                                 external_id,
@@ -2863,8 +2858,8 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 external_id,
                             )
 
-                            logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
-                            logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
+                            logger.debug("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
+                            logger.debug("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
                             # Coerce all datetime params to UTC-aware immediately before SQL execution
                             update_params["synced_at"] = ensure_utc(update_params.get("synced_at"), "synced_at") or utc_now()
                             update_params["last_synced_at"] = ensure_utc(update_params.get("last_synced_at"), "last_synced_at") or utc_now()
@@ -2967,12 +2962,12 @@ INSERT INTO orders (
                             # Re-coerce immediately before SQL params — belt-and-suspenders guard
                             _sql_org_id = safe_uuid_for_db(org_id_value, "org_id")
                             _sql_brand_id = safe_uuid_for_db(brand_id_value, "brand_id") or brand_id_value
-                            logger.info(
+                            logger.debug(
                                 "[ORG_ID_BEFORE_SQL] field=org_id value=%s external_id=%s function=sync_leaflink_orders_headers_only action=insert",
                                 _sql_org_id,
                                 external_id,
                             )
-                            logger.info(
+                            logger.debug(
                                 "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s external_id=%s function=sync_leaflink_orders_headers_only action=insert",
                                 _sql_brand_id,
                                 external_id,
@@ -3040,8 +3035,8 @@ INSERT INTO orders (
                                 type(insert_params.get("brand_id")).__name__,
                                 external_id,
                             )
-                            logger.info("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
-                            logger.info("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
+                            logger.debug("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
+                            logger.debug("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
                             # Coerce all datetime params to UTC-aware immediately before SQL execution
                             insert_params["synced_at"] = ensure_utc(insert_params.get("synced_at"), "synced_at") or utc_now()
                             insert_params["last_synced_at"] = ensure_utc(insert_params.get("last_synced_at"), "last_synced_at") or utc_now()
@@ -3526,11 +3521,11 @@ async def sync_leaflink_line_items(
     brand_id_value = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
     org_id_value = safe_uuid_for_db(org_id, "org_id") if org_id else None
 
-    logger.info(
+    logger.debug(
         "[ORG_ID_BEFORE_SQL] field=org_id value=%s function=sync_leaflink_line_items",
         org_id_value,
     )
-    logger.info(
+    logger.debug(
         "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s function=sync_leaflink_line_items",
         brand_id_value,
     )
@@ -3613,7 +3608,7 @@ async def sync_leaflink_line_items(
         else f":{col}"
         for col in insert_columns
     )
-    logger.info(
+    logger.debug(
         "[UUID_SQL_CAST_APPLIED] statement=_upsert_line_items columns=%s",
         ",".join(col for col in insert_columns if col in _uuid_columns),
     )
@@ -3940,12 +3935,12 @@ async def sync_leaflink_line_items(
                         db, order_row, normalized_line_items
                     )
 
-                    logger.info(
+                    logger.debug(
                         "[LINE_ITEM_UPSERT_COMMIT] brand_id=%s inserted=%s updated=0 duration=0s",
                         brand_id_value,
                         inserted_count,
                     )
-                    logger.info(
+                    logger.debug(
                         "[LINE_ITEM_BATCH_RESULT] order_id=%s total=%s inserted=%s skipped=%s failed=%s retried=0",
                         order_id_val,
                         len(normalized_line_items),
@@ -4044,12 +4039,12 @@ async def sync_leaflink_line_items(
                         db, order_row, normalized_line_items
                     )
 
-                    logger.info(
+                    logger.debug(
                         "[LINE_ITEM_UPSERT_COMMIT] brand_id=%s inserted=%s updated=0 duration=0s",
                         brand_id_value,
                         inserted_count,
                     )
-                    logger.info(
+                    logger.debug(
                         "[LINE_ITEM_BATCH_RESULT] order_id=%s total=%s inserted=%s skipped=%s failed=%s retried=1",
                         order_id_val,
                         len(normalized_line_items),
@@ -4116,7 +4111,7 @@ async def sync_leaflink_line_items(
         bg_duration,
         len(errors),
     )
-    logger.info(
+    logger.debug(
         "[UUID_NORMALIZATION_COMPLETE] brand_id=%s orders_processed=%s",
         brand_id_value,
         total_orders,
@@ -4429,7 +4424,8 @@ async def sync_leaflink_full_resync(
         total_count_from_api = fetch_result.get("total_count")
         pages_fetched_this_batch = fetch_result.get("pages_fetched", 1)
 
-        logger.info(
+
+        logger.debug(
             "[LEAFLINK_SYNC_DEBUG] page=%s count=%s running_total=%s has_next=%s"
             " total_available=%s brand_id=%s",
             current_page,
@@ -4455,7 +4451,7 @@ async def sync_leaflink_full_resync(
                 total_updated += _updated
                 failed_count += _errors
 
-                logger.info(
+                logger.debug(
                     "[LEAFLINK_SYNC_DEBUG] page=%s count=%s running_total=%s"
                     " inserted=%s updated=%s errors=%s brand_id=%s",
                     current_page,
@@ -4596,6 +4592,14 @@ async def sync_leaflink_full_resync(
 # Background continuous sync (Phase 2)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Safe-mode configuration — reduce resource usage during instability
+# ---------------------------------------------------------------------------
+
+# Safe-mode: smaller batches, sequential line item processing
+SAFE_MODE_BATCH_SIZE = 25  # Down from 100
+SAFE_MODE_SEQUENTIAL_LINE_ITEMS = True  # No concurrent processing
+
 # Batch size bounds for adaptive pacing
 _BG_BATCH_MIN = 3
 _BG_BATCH_MAX = 5
@@ -4688,7 +4692,7 @@ async def sync_leaflink_background_continuous(
             brand_id,
         )
     else:
-        logger.info(
+        logger.debug(
             "[ORG_CONTEXT] stage=bg_continuous_entry org_id=%s brand_id=%s"
             " external_order_id=N/A",
             org_id,
@@ -4701,6 +4705,33 @@ async def sync_leaflink_background_continuous(
         brand_id,
         id(asyncio.current_task()),
     )
+    # Initialize tracking variables before try block so exception handlers can reference them
+    pages_processed = 0
+    records_seen_from_leaflink = 0
+    next_cursor: Optional[str] = last_next_url
+
+    # ---------------------------------------------------------------------------
+    # Watchdog heartbeat — logs every 30s to confirm event loop is alive
+    # ---------------------------------------------------------------------------
+    async def _heartbeat_task() -> None:
+        while True:
+            try:
+                await asyncio.sleep(30)
+                logger.info(
+                    "[SYNC_HEARTBEAT] run_id=%s page=%s records_seen=%s "
+                    "last_progress_at=%s event_loop_alive=true",
+                    sync_run_id,
+                    pages_processed,
+                    records_seen_from_leaflink,
+                    datetime.now(timezone.utc).isoformat(),
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as _hb_exc:
+                logger.warning("[HEARTBEAT_ERROR] error=%s", str(_hb_exc)[:200])
+
+    _heartbeat = asyncio.create_task(_heartbeat_task())
+
     try:
         bg_start = time.monotonic()
         current_page = start_page
@@ -4710,11 +4741,8 @@ async def sync_leaflink_background_continuous(
         resume_url: Optional[str] = last_next_url
         _prev_cursor: Optional[str] = None  # for cursor-loop detection
         # Pagination tracking for [SYNC_PAGE_SUMMARY] and completion logic
-        pages_processed = 0
-        records_seen_from_leaflink = 0
+        last_progress_at = datetime.now(timezone.utc)
         leaflink_total_count: Optional[int] = total_orders_available
-        # Initialize next_cursor so completion logic works even if loop never runs
-        next_cursor: Optional[str] = last_next_url
 
         async def _persist_run_progress(
             pages_synced: int,
@@ -4900,11 +4928,35 @@ async def sync_leaflink_background_continuous(
             # ------------------------------------------------------------------ #
             # Fetch a batch of pages from LeafLink (with retry on transient err) #
             # ------------------------------------------------------------------ #
-            try:
-                fetch_result = await _fetch_with_retry(
-                    start_page=current_page,
-                    num_pages=batch_size,
+
+            # No-progress detection
+            if (datetime.now(timezone.utc) - last_progress_at).total_seconds() > 30:
+                logger.warning(
+                    "[NO_PROGRESS] page=%s last_progress=%s",
+                    pages_processed,
+                    last_progress_at.isoformat(),
                 )
+
+            try:
+                fetch_start = time.monotonic()
+                try:
+                    fetch_result = await asyncio.wait_for(
+                        _fetch_with_retry(
+                            start_page=current_page,
+                            num_pages=batch_size,
+                        ),
+                        timeout=60,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("[FETCH_TIMEOUT] page=%s", pages_processed)
+                    break
+                fetch_duration = time.monotonic() - fetch_start
+                if fetch_duration > 5:
+                    logger.warning(
+                        "[SLOW_FETCH] page=%s duration=%.1fs",
+                        pages_processed,
+                        fetch_duration,
+                    )
             except Exception as fetch_exc:
                 error_code = getattr(fetch_exc, "status_code", None)
                 is_transient = error_code in TRANSIENT_ERROR_CODES
@@ -5021,7 +5073,7 @@ async def sync_leaflink_background_continuous(
                 _next_val = fetch_result.get("next_url") if isinstance(fetch_result, dict) else None
                 _results_len = len(fetch_result.get("orders", [])) if isinstance(fetch_result, dict) else 0
 
-                logger.info(
+                logger.debug(
                     "[PAGE1_RESPONSE_KEYS] top_level_keys=%s count=%s next_present=%s next_value=%s results_len=%s response_type=%s",
                     _response_keys,
                     _count_val,
@@ -5041,8 +5093,8 @@ async def sync_leaflink_background_continuous(
             if _total_count_from_api is not None:
                 leaflink_total_count = _total_count_from_api
 
-            # [PAGINATION_EXTRACT] Log extracted pagination fields after every page
-            logger.info(
+            # [PAGINATION_EXTRACT] Log extracted pagination fields after every page (debug only)
+            logger.debug(
                 "[PAGINATION_EXTRACT] page=%s count=%s next_present=%s next_value=%s results_len=%s",
                 pages_processed,
                 leaflink_total_count,
@@ -5051,10 +5103,10 @@ async def sync_leaflink_background_continuous(
                 len(batch_orders),
             )
 
-            # [SYNC_PAGE_FETCHED] Log raw and parsed counts for this batch
+            # [SYNC_PAGE_FETCHED] Log raw and parsed counts for this batch (debug only)
             _orders_count = len(batch_orders)
             _resp_type = "list" if isinstance(batch_orders, list) else type(batch_orders).__name__
-            logger.info(
+            logger.debug(
                 "[SYNC_PAGE_FETCHED] page=%s raw_count=%s parsed_count=%s pages_in_batch=%s brand_id=%s",
                 current_page,
                 _orders_count,
@@ -5062,8 +5114,8 @@ async def sync_leaflink_background_continuous(
                 pages_fetched_this_batch,
                 brand_id,
             )
-            # [LEAFLINK_SYNC_DEBUG] Structured debug log per page
-            logger.info(
+            # [LEAFLINK_SYNC_DEBUG] Structured debug log per page (debug only)
+            logger.debug(
                 "[LEAFLINK_SYNC_DEBUG] page=%s count=%s running_total=%s has_next=%s"
                 " total_available=%s brand_id=%s",
                 current_page,
@@ -5074,35 +5126,33 @@ async def sync_leaflink_background_continuous(
                 brand_id,
             )
 
-            # [SYNC_FILTER_DISABLED] All filters are disabled — passing all orders through.
-            # Provider dates are unreliable (may be naive/offset-naive); no date comparison
-            # is performed during ingestion. Raw dates are preserved in raw_payload JSONB.
-            logger.info(
+            # [SYNC_FILTER_DISABLED] debug only — suppress from production logs
+            logger.debug(
                 "[SYNC_FILTER_DISABLED] filter_type=status reason=debug_mode brand_id=%s page=%s",
                 brand_id,
                 current_page,
             )
-            logger.info(
+            logger.debug(
                 "[SYNC_FILTER_DISABLED] filter_type=freshness reason=provider_dates_unreliable brand_id=%s page=%s",
                 brand_id,
                 current_page,
             )
-            logger.info(
+            logger.debug(
                 "[SYNC_FILTER_DISABLED] filter_type=date reason=provider_dates_unreliable brand_id=%s page=%s",
                 brand_id,
                 current_page,
             )
 
-            # [SYNC_AFTER_FILTERS] No filters applied — all fetched orders pass through
-            logger.info(
+            # [SYNC_AFTER_FILTERS] debug only
+            logger.debug(
                 "[SYNC_AFTER_FILTERS] remaining=%s reason=no_filters_applied page=%s brand_id=%s",
                 _orders_count,
                 current_page,
                 brand_id,
             )
 
-            # [LEAFLINK_SYNC_RESPONSE] Log what list_orders returned
-            logger.info(
+            # [LEAFLINK_SYNC_RESPONSE] debug only
+            logger.debug(
                 "[LEAFLINK_SYNC_RESPONSE] brand_id=%s orders_count=%s response_type=%s"
                 " pages_fetched=%s next_cursor=%s",
                 brand_id,
@@ -5112,8 +5162,8 @@ async def sync_leaflink_background_continuous(
                 "present" if next_cursor else "none",
             )
 
-            # [SYNC_PAGINATION] Log pagination state for this batch
-            logger.info(
+            # [SYNC_PAGINATION] debug only
+            logger.debug(
                 "[SYNC_PAGINATION] page=%s has_next=%s next_url=%s brand_id=%s",
                 current_page,
                 "true" if next_cursor else "false",
@@ -5216,7 +5266,7 @@ async def sync_leaflink_background_continuous(
                         )
 
                 try:
-                    logger.info(
+                    logger.debug(
                         "[ORG_CONTEXT] stage=bg_continuous_before_upsert org_id=%s brand_id=%s"
                         " external_order_id=N/A batch_size=%s page=%s",
                         org_id,
@@ -5224,20 +5274,29 @@ async def sync_leaflink_background_continuous(
                         len(batch_orders),
                         current_page,
                     )
+                    tx_start = time.monotonic()
                     persist_result = await sync_leaflink_orders_headers_only(
                         brand_id=brand_id,
                         orders=batch_orders,
                         pages_fetched=pages_fetched_this_batch,
                         org_id=org_id,
+                        batch_size=SAFE_MODE_BATCH_SIZE,
                     )
+                    tx_duration = time.monotonic() - tx_start
+                    if tx_duration > 10:
+                        logger.warning(
+                            "[SLOW_TRANSACTION] page=%s duration=%.1fs",
+                            pages_processed,
+                            tx_duration,
+                        )
                     # Line items are deferred inside sync_leaflink_orders_headers_only
                     # via asyncio.create_task — no need to spawn a second task here.
 
-                    # [SYNC_TRANSFORM_RESULT] Log transformation results from headers-only upsert
+                    # [SYNC_TRANSFORM_RESULT] Log transformation results (debug only)
                     _input_count = len(batch_orders)
                     _transformed = persist_result.get("created", 0) + persist_result.get("updated", 0) if persist_result else 0
                     _skipped = persist_result.get("skipped", 0) if persist_result else 0
-                    logger.info(
+                    logger.debug(
                         "[SYNC_TRANSFORM_RESULT] page=%s input_count=%s transformed=%s skipped=%s brand_id=%s org_id=%s",
                         current_page,
                         _input_count,
@@ -5260,7 +5319,7 @@ async def sync_leaflink_background_continuous(
                     _inserted = persist_result.get("inserted_count", persist_result.get("created", 0)) if persist_result else 0
                     _updated = persist_result.get("updated_count", persist_result.get("updated", 0)) if persist_result else 0
                     _errors = persist_result.get("error_count", 0) if persist_result else 0
-                    logger.info(
+                    logger.debug(
                         "[LEAFLINK_SYNC_DEBUG] page=%s count=%s running_total=%s"
                         " inserted=%s updated=%s errors=%s brand_id=%s",
                         current_page,
@@ -5275,21 +5334,37 @@ async def sync_leaflink_background_continuous(
             total_orders_synced += len(batch_orders)
             pages_processed += 1
             records_seen_from_leaflink += _orders_count
+            last_progress_at = datetime.now(timezone.utc)
 
-            # [SYNC_ACCUMULATOR] Log running total after each batch
-            logger.info(
+            # [SYNC_ACCUMULATOR] debug only
+            logger.debug(
                 "[SYNC_ACCUMULATOR] total_fetched=%s after_page=%s brand_id=%s",
                 total_orders_synced,
                 current_page,
                 brand_id,
             )
 
+            # Memory diagnostics every 10 pages
+            if pages_processed % 10 == 0:
+                try:
+                    import psutil as _psutil
+                    _process = _psutil.Process(os.getpid())
+                    _rss_mb = _process.memory_info().rss / 1024 / 1024
+                    logger.info(
+                        "[SYNC_MEMORY] page=%s records_seen=%s rss_mb=%.1f",
+                        pages_processed,
+                        records_seen_from_leaflink,
+                        _rss_mb,
+                    )
+                except Exception as _mem_exc:
+                    logger.warning("[MEMORY_CHECK_ERROR] error=%s", str(_mem_exc)[:200])
+
             # When total_pages is None (cursor-based), fall back to current_page
             last_completed_page = (next_page - 1) if next_page else (total_pages or current_page)
 
-            # [SYNC_PAGE_COMPLETE] Structured per-page completion log
+            # [SYNC_PAGE_COMPLETE] debug only
             _page_elapsed = round(time.monotonic() - batch_start, 2)
-            logger.info(
+            logger.debug(
                 "[SYNC_PAGE_COMPLETE] page=%s count=%s running_total=%s has_next=%s"
                 " next_cursor=%s elapsed=%ss brand_id=%s",
                 current_page,
@@ -5365,9 +5440,9 @@ async def sync_leaflink_background_continuous(
                         _url_exc,
                     )
 
-            # Log sampled progress every 10 pages
+            # Log sampled progress every 10 pages (debug only — heartbeat covers this)
             if pages_processed % 10 == 0:
-                logger.info(
+                logger.debug(
                     "[LeafLinkSync] progress id=%s page=%s orders_seen=%s leaflink_total=%s",
                     sync_run_id,
                     pages_processed,
@@ -5533,30 +5608,57 @@ async def sync_leaflink_background_continuous(
             completion_percent,
         )
 
-    except Exception as e:
+    except asyncio.CancelledError:
+        logger.warning("[SYNC_CANCELLED] run_id=%s brand_id=%s", sync_run_id, brand_id)
+        raise
+    except asyncio.TimeoutError as e:
         logger.error(
-            "[SYNC_SESSION_ABORT] run_id=%s brand_id=%s task_id=%s error=%s",
+            "[SYNC_TIMEOUT] run_id=%s brand_id=%s error=%s",
             sync_run_id,
             brand_id,
-            id(asyncio.current_task()),
             str(e)[:200],
         )
+        # Persist timeout state
+        try:
+            async with AsyncSessionLocal() as _timeout_db:
+                await _timeout_db.execute(
+                    text("UPDATE sync_runs SET status='incomplete', last_error=:err WHERE id=:id"),
+                    {"err": "timeout", "id": sync_run_id},
+                )
+                await _timeout_db.commit()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
         logger.error(
-            "[LeafLinkSync] FATAL ERROR id=%s error=%s",
+            "[FATAL_SYNC_EXCEPTION] run_id=%s brand_id=%s exception_type=%s message=%s "
+            "current_page=%s records_seen=%s next_url_present=%s",
             sync_run_id,
-            str(e)[:500],
+            brand_id,
+            type(e).__name__,
+            str(e)[:300],
+            pages_processed,
+            records_seen_from_leaflink,
+            next_cursor is not None,
             exc_info=True,
         )
+        # Persist final state
         try:
-            pass  # No shared session to rollback — each sub-operation uses its own session
+            async with AsyncSessionLocal() as _exc_db:
+                await _exc_db.execute(
+                    text("UPDATE sync_runs SET status='failed', last_error=:err WHERE id=:id"),
+                    {"err": str(e)[:500], "id": sync_run_id},
+                )
+                await _exc_db.commit()
         except Exception:
             pass
         sys.stdout.flush()
         raise
     finally:
-        logger.info(
-            "[SYNC_SESSION_END] run_id=%s brand_id=%s task_id=%s",
-            sync_run_id,
-            brand_id,
-            id(asyncio.current_task()),
-        )
+        # Cancel heartbeat task
+        _heartbeat.cancel()
+        try:
+            await _heartbeat
+        except asyncio.CancelledError:
+            pass
+        logger.info("[SYNC_SESSION_END] run_id=%s brand_id=%s", sync_run_id, brand_id)
