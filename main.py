@@ -717,15 +717,9 @@ app.include_router(integrations_health_router)
 # Existing LeafLink routes
 app.include_router(leaflink_orders_router)
 
-# IMPORTANT:
-# Mount Orders API under /api/leaflink
-# This creates:
-# /api/leaflink/orders
-# /api/leaflink/orders/full-resync
-# /api/leaflink/orders/sync-metrics
-# /api/leaflink/orders/queues
-# /api/leaflink/orders/sync-status
-app.include_router(orders_router, prefix="/api/leaflink")
+# Orders API — router owns its full prefix (/api/leaflink/orders/...)
+# Do NOT add a prefix here; the router definition already includes it.
+app.include_router(orders_router)
 
 # LeafLink debug
 app.include_router(leaflink_debug_router, prefix="/leaflink")
