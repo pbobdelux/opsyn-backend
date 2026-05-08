@@ -5262,6 +5262,79 @@ async def api_order_resync(
     })
 
 
+@router.get("/pagination-debug")
+async def pagination_debug(
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Diagnostic endpoint for pagination issues.
+
+    Returns:
+    - latest sync run id
+    - LeafLink reported count
+    - last offset/page processed
+    - has_next/next_url_present
+    - records_seen
+    - local DB count
+    - gap_to_leaflink_count
+    - completion_percent
+    - reason if stopped early
+    """
+    # Query latest SyncRun for this brand
+    result = await db.execute(
+        select(SyncRun)
+        .where(SyncRun.brand_id == brand_id)
+        .order_by(SyncRun.started_at.desc())
+        .limit(1)
+    )
+    latest_run = result.scalar_one_or_none()
+
+    # Count local orders for this brand
+    local_count_result = await db.execute(
+        select(func.count(Order.id))
+        .where(Order.brand_id == brand_id)
+    )
+    local_count = local_count_result.scalar() or 0
+
+    if not latest_run:
+        return {
+            "ok": False,
+            "error": "No sync runs found for this brand",
+            "brand_id": brand_id,
+            "local_db_count": local_count,
+        }
+
+    leaflink_total = latest_run.total_orders_available or 0
+    pages_done = latest_run.current_page or 0
+    records_seen = pages_done * 100
+    gap = leaflink_total - local_count
+    completion_percent = (records_seen / leaflink_total * 100) if leaflink_total > 0 else 0
+    last_next_url = getattr(latest_run, "last_next_url", None)
+
+    return {
+        "ok": True,
+        "brand_id": brand_id,
+        "latest_sync_run_id": str(latest_run.id),
+        "leaflink_reported_count": leaflink_total,
+        "last_page_processed": pages_done,
+        "has_next": last_next_url is not None,
+        "next_url_present": last_next_url is not None,
+        "records_seen_from_leaflink": records_seen,
+        "local_db_count": local_count,
+        "gap_to_leaflink_count": gap,
+        "completion_percent": round(completion_percent, 1),
+        "sync_status": latest_run.status,
+        "stopped_early_reason": latest_run.last_error if latest_run.status in ("incomplete", "stalled", "failed") else None,
+        "pages_synced": latest_run.pages_synced,
+        "orders_loaded_this_run": latest_run.orders_loaded_this_run,
+        "started_at": latest_run.started_at.isoformat() if latest_run.started_at else None,
+        "completed_at": latest_run.completed_at.isoformat() if latest_run.completed_at else None,
+        "last_progress_at": latest_run.last_progress_at.isoformat() if latest_run.last_progress_at else None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @router.get("/{order_id}")
 async def get_order(
     order_id: str,

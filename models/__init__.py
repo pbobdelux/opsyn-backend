@@ -334,6 +334,8 @@ class SyncRun(Base):
     current_page: Mapped[int | None] = mapped_column(Integer, nullable=True, default=1)
     last_successful_cursor: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_successful_page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # LeafLink cursor URL for resume capability — persisted after every page
+    last_next_url: Mapped[str | None] = mapped_column(Text, nullable=True, comment="LeafLink next cursor URL for pagination resume")
 
     # Timing
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)

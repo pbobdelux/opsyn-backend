@@ -4644,6 +4644,7 @@ async def sync_leaflink_background_continuous(
     auth_scheme: str = "Token",
     base_url: Optional[str] = None,
     org_id: Optional[str] = None,
+    last_next_url: Optional[str] = None,
 ) -> None:
     """
     Fetch all remaining LeafLink pages in adaptive batches and upsert to DB.
@@ -4673,6 +4674,7 @@ async def sync_leaflink_background_continuous(
         org_id:                 Organization UUID for multi-tenant isolation. MUST be set so
                                 orders are inserted with the correct org_id and are visible
                                 through the GET /orders endpoint which filters by org_id.
+        last_next_url:          LeafLink cursor URL to resume from (from a previous interrupted run).
     """
     from services.leaflink_client import LeafLinkClient
     from services.sync_run_manager import (
@@ -4685,12 +4687,13 @@ async def sync_leaflink_background_continuous(
     # [SYNC_ENTRY] Log entry into the background continuous sync function
     logger.info(
         "[SYNC_ENTRY] sync_leaflink_background_continuous entered brand_id=%s"
-        " start_page=%s total_pages=%s sync_run_id=%s org_id=%s",
+        " start_page=%s total_pages=%s sync_run_id=%s org_id=%s resuming=%s",
         brand_id,
         start_page,
         total_pages if total_pages is not None else "cursor_based",
         sync_run_id,
         org_id,
+        last_next_url is not None,
     )
     if org_id is None:
         logger.warning(
@@ -4711,8 +4714,15 @@ async def sync_leaflink_background_continuous(
         current_page = start_page
         batch_size = _BG_BATCH_DEFAULT
         total_orders_synced = 0
-        resume_url: Optional[str] = None
+        # Resume from last_next_url if provided (worker restart recovery)
+        resume_url: Optional[str] = last_next_url
         _prev_cursor: Optional[str] = None  # for cursor-loop detection
+        # Pagination tracking for [SYNC_PAGE_SUMMARY] and completion logic
+        pages_processed = 0
+        records_seen_from_leaflink = 0
+        leaflink_total_count: Optional[int] = total_orders_available
+        # Initialize next_cursor so completion logic works even if loop never runs
+        next_cursor: Optional[str] = last_next_url
 
         async def _persist_run_progress(
             pages_synced: int,
@@ -5017,6 +5027,10 @@ async def sync_leaflink_background_continuous(
             next_page = fetch_result.get("next_page")
             _total_count_from_api = fetch_result.get("total_count")
 
+            # Update pagination tracking state
+            if _total_count_from_api is not None:
+                leaflink_total_count = _total_count_from_api
+
             # [SYNC_PAGE_FETCHED] Log raw and parsed counts for this batch
             _orders_count = len(batch_orders)
             _resp_type = "list" if isinstance(batch_orders, list) else type(batch_orders).__name__
@@ -5153,6 +5167,7 @@ async def sync_leaflink_background_continuous(
             # ------------------------------------------------------------------ #
             # Upsert order headers (headers-only, line items deferred)            #
             # ------------------------------------------------------------------ #
+            persist_result: Optional[dict] = None
             if batch_orders:
                 # [LEAFLINK_COMPANY_ROLE] Infer company role from first order on first page
                 if current_page == start_page and len(batch_orders) > 0:
@@ -5238,6 +5253,8 @@ async def sync_leaflink_background_continuous(
                     )
 
             total_orders_synced += len(batch_orders)
+            pages_processed += 1
+            records_seen_from_leaflink += _orders_count
 
             # [SYNC_ACCUMULATOR] Log running total after each batch
             logger.info(
@@ -5264,6 +5281,26 @@ async def sync_leaflink_background_continuous(
                 brand_id,
             )
 
+            # [SYNC_PAGE_SUMMARY] Structured per-page summary for observability
+            _batch_upserted = (persist_result.get("created", 0) + persist_result.get("updated", 0)) if batch_orders and persist_result else 0
+            _batch_skipped = persist_result.get("skipped", 0) if batch_orders and persist_result else 0
+            _batch_failed = persist_result.get("failed_count", 0) if batch_orders and persist_result else 0
+            logger.info(
+                "[SYNC_PAGE_SUMMARY] run_id=%s page=%s offset=%s fetched_count=%s "
+                "upserted_headers=%s skipped=%s failed=%s total_seen_so_far=%s "
+                "leaflink_total_count=%s has_next=%s",
+                sync_run_id,
+                pages_processed,
+                (current_page - 1) * 100,
+                _orders_count,
+                _batch_upserted,
+                _batch_skipped,
+                _batch_failed,
+                records_seen_from_leaflink,
+                leaflink_total_count,
+                next_cursor is not None,
+            )
+
             # ------------------------------------------------------------------ #
             # Persist progress to DB (SyncRun) and update in-memory state        #
             # ------------------------------------------------------------------ #
@@ -5278,14 +5315,41 @@ async def sync_leaflink_background_continuous(
                 total_pages_val=total_pages,
             )
 
+            # Persist last_next_url to SyncRun for resume capability
+            if sync_run_id:
+                try:
+                    async with AsyncSessionLocal() as _url_db:
+                        async with _url_db.begin():
+                            await _url_db.execute(
+                                text("""
+                                    UPDATE sync_runs
+                                    SET last_next_url = :next_url,
+                                        total_orders_available = COALESCE(:total_count, total_orders_available),
+                                        last_progress_at = :now
+                                    WHERE id = :run_id
+                                """),
+                                {
+                                    "next_url": next_cursor,
+                                    "total_count": leaflink_total_count,
+                                    "now": datetime.now(timezone.utc),
+                                    "run_id": sync_run_id,
+                                },
+                            )
+                except Exception as _url_exc:
+                    logger.error(
+                        "[OrdersSync] last_next_url_persist_error run_id=%s error=%s",
+                        sync_run_id,
+                        _url_exc,
+                    )
+
             # Log sampled progress every 10 pages
-            if total_pages and last_completed_page % 10 == 0:
+            if pages_processed % 10 == 0:
                 logger.info(
-                    "[LeafLinkSync] progress id=%s page=%s/%s orders=%s",
+                    "[LeafLinkSync] progress id=%s page=%s orders_seen=%s leaflink_total=%s",
                     sync_run_id,
-                    last_completed_page,
-                    total_pages,
-                    total_orders_synced,
+                    pages_processed,
+                    records_seen_from_leaflink,
+                    leaflink_total_count,
                 )
 
             # ------------------------------------------------------------------ #
@@ -5297,23 +5361,28 @@ async def sync_leaflink_background_continuous(
             elif batch_seconds > _BG_BATCH_SLOW_THRESHOLD:
                 batch_size = max(batch_size - 1, _BG_BATCH_MIN)
 
-            # Advance page pointer
-            if next_page:
-                current_page = next_page
+            # Advance page pointer — continue while LeafLink returns a next URL
+            if next_cursor:
+                resume_url = next_cursor
+                if next_page:
+                    current_page = next_page
+                else:
+                    current_page += pages_fetched_this_batch
             else:
-                # No more pages
-                break
-
-            if not resume_url:
-                # LeafLink returned no next URL — we've reached the end
+                # next_cursor is None — all pages fetched
                 break
 
         # ---------------------------------------------------------------------- #
-        # Sync complete                                                           #
+        # Sync complete — determine completion status                            #
         # ---------------------------------------------------------------------- #
         total_duration = round(time.monotonic() - bg_start, 1)
         # When total_pages is None (cursor-based), final_page is simply the last page visited
-        final_page = (current_page - 1) if total_pages is None else min(current_page - 1, total_pages)
+        final_page = pages_processed
+
+        # Calculate completion percentage
+        completion_percent = 0.0
+        if leaflink_total_count and leaflink_total_count > 0:
+            completion_percent = (records_seen_from_leaflink / leaflink_total_count) * 100
 
         # CRITICAL: Do NOT mark completed if next_cursor exists — pagination is incomplete.
         # A non-None next_cursor means LeafLink has more pages; the loop exited early
@@ -5341,13 +5410,14 @@ async def sync_leaflink_background_continuous(
                         sync_run_id,
                         _stall_exc,
                     )
-        else:
-            # No next cursor — pagination complete, safe to mark completed
+        elif completion_percent >= 95:
+            # No next cursor and >= 95% complete — pagination complete
             logger.info(
-                "[LeafLinkSync] completed_no_cursor id=%s brand=%s total_loaded=%s",
-                sync_run_id,
-                brand_id,
-                total_orders_synced,
+                "[SYNC_COMPLETE] run_id=%s brand_id=%s org_id=%s "
+                "pages_processed=%s records_seen=%s leaflink_total=%s completion_percent=%.1f%%",
+                sync_run_id, brand_id, org_id,
+                pages_processed, records_seen_from_leaflink, leaflink_total_count,
+                completion_percent,
             )
             if sync_run_id:
                 try:
@@ -5360,28 +5430,49 @@ async def sync_leaflink_background_continuous(
                         sync_run_id,
                         _done_exc,
                     )
+        else:
+            # No next cursor but < 95% complete — mark as incomplete
+            _incomplete_reason = f"pagination_stopped_early: {completion_percent:.1f}% complete"
+            logger.warning(
+                "[SYNC_INCOMPLETE] run_id=%s brand_id=%s org_id=%s "
+                "pages_processed=%s records_seen=%s leaflink_total=%s completion_percent=%.1f%% "
+                "has_next=%s",
+                sync_run_id, brand_id, org_id,
+                pages_processed, records_seen_from_leaflink, leaflink_total_count,
+                completion_percent, next_cursor is not None,
+            )
+            if sync_run_id:
+                try:
+                    from models import SyncRun as _SyncRun
+                    async with AsyncSessionLocal() as _incomplete_db:
+                        async with _incomplete_db.begin():
+                            _inc_result = await _incomplete_db.execute(
+                                select(_SyncRun).where(_SyncRun.id == sync_run_id)
+                            )
+                            _inc_run = _inc_result.scalar_one_or_none()
+                            if _inc_run:
+                                _inc_run.status = "incomplete"
+                                _inc_run.last_error = _incomplete_reason
+                                _inc_run.completed_at = datetime.now(timezone.utc)
+                except Exception as _inc_exc:
+                    logger.error(
+                        "[LeafLinkSync] mark_incomplete_error id=%s error=%s",
+                        sync_run_id,
+                        _inc_exc,
+                    )
 
         # [SYNC_FINAL_COUNTS] Log final summary for the entire sync run
         logger.info(
             "[SYNC_FINAL_COUNTS] fetched=%s created=deferred updated=deferred skipped=deferred errors=0"
-            " final_page=%s total_pages=%s duration=%ss brand_id=%s sync_run_id=%s",
+            " final_page=%s total_pages=%s duration=%ss brand_id=%s sync_run_id=%s"
+            " completion_percent=%.1f%%",
             total_orders_synced,
             final_page,
             total_pages,
             total_duration,
             brand_id,
             sync_run_id,
-        )
-
-        # [SYNC_COMPLETE] Structured end-of-sync summary log
-        logger.info(
-            "[SYNC_COMPLETE] total_pages=%s total_fetched=%s total_inserted=deferred"
-            " total_updated=deferred total_failed=unknown duration=%ss brand_id=%s sync_run_id=%s",
-            final_page,
-            total_orders_synced,
-            total_duration,
-            brand_id,
-            sync_run_id,
+            completion_percent,
         )
 
         logger.info(
@@ -5408,13 +5499,15 @@ async def sync_leaflink_background_continuous(
 
         logger.info(
             "[LEAFLINK_SYNC_DEBUG] sync_complete brand_id=%s total_fetched=%s"
-            " final_page=%s total_pages=%s duration=%ss total_local_orders=%s",
+            " final_page=%s total_pages=%s duration=%ss total_local_orders=%s"
+            " completion_percent=%.1f%%",
             brand_id,
             total_orders_synced,
             final_page,
             total_pages if total_pages is not None else "cursor_based",
             total_duration,
             _final_total,
+            completion_percent,
         )
 
     except Exception as e:

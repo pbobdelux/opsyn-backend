@@ -194,6 +194,9 @@ async def poll_and_execute() -> None:
             # cursor termination rather than a page-count bound.
             total_pages = sync_run.total_pages  # May be None
             total_orders_available = sync_run.total_orders_available
+            # Resume cursor: if last_next_url is set, resume from that URL
+            # instead of starting from page 1 (worker restart recovery).
+            last_next_url = getattr(sync_run, "last_next_url", None)
 
             # ------------------------------------------------------------------ #
             # Stall detection: only check jobs that have been claimed            #
@@ -345,12 +348,21 @@ async def poll_and_execute() -> None:
         raise
 
     try:
-        logger.info(
-            "[SyncWorker] sync_start id=%s start_page=%s total_pages=%s",
-            sync_run_id,
-            start_page,
-            total_pages,
-        )
+        if last_next_url:
+            logger.info(
+                "[SyncWorker] resuming_from_cursor id=%s brand=%s last_next_url_present=true start_page=%s",
+                sync_run_id,
+                brand_id,
+                start_page,
+            )
+        else:
+            logger.info(
+                "[SyncWorker] starting_fresh id=%s brand=%s start_page=%s total_pages=%s",
+                sync_run_id,
+                brand_id,
+                start_page,
+                total_pages,
+            )
 
         await sync_leaflink_background_continuous(
             brand_id=brand_id,
@@ -364,6 +376,7 @@ async def poll_and_execute() -> None:
             total_orders_available=total_orders_available,
             base_url=base_url,
             org_id=org_id or None,
+            last_next_url=last_next_url,
         )
 
         logger.info("[SyncWorker] sync_complete id=%s brand=%s", sync_run_id, brand_id)
