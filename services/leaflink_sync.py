@@ -1190,8 +1190,20 @@ def normalize_line_items(raw_line_items: Any) -> list[dict[str, Any]]:
 
 
 def derive_review_status(line_items: list[dict[str, Any]]) -> str:
+    """Derive review_status during sync ingestion.
+
+    During sync, we don't have the full order context (no sync_status yet),
+    so we use a simpler rule:
+    - If line_items is empty: return "ok" (not "needs_review" — sync may still be in progress)
+    - If any line item has an unknown SKU or mapping issue: return "blocked"
+    - Otherwise: return "ready"
+
+    The "needs_review" status is only set post-sync when sync_status="partial" or "failed".
+    """
     if not line_items:
-        return "needs_review"
+        # During ingestion, empty line items is not necessarily a problem.
+        # The sync_health_status field will be set to "partial" if line_items are missing.
+        return "ok"
 
     for item in line_items:
         if (
@@ -1687,7 +1699,20 @@ async def sync_leaflink_orders(
                         external_id,
                     )
                     existing.review_status = review_status
-                    existing.sync_status = "ok"
+                    # Compute sync health
+                    _sh_missing_upd: list[str] = []
+                    if not customer_name or customer_name == "Unknown Customer":
+                        _sh_missing_upd.append("customer_name")
+                    if amount_decimal is None:
+                        _sh_missing_upd.append("amount")
+                    if not normalized_line_items:
+                        _sh_missing_upd.append("line_items")
+                    if not status:
+                        _sh_missing_upd.append("status")
+                    _sh_status_upd = "partial" if _sh_missing_upd else "ok"
+                    existing.sync_status = _sh_status_upd
+                    existing.sync_health_status = _sh_status_upd
+                    existing.sync_health_missing_fields = _sh_missing_upd if _sh_missing_upd else None
                     # Use server timestamps for all DB columns — bulletproof mode
                     existing.synced_at = now
                     existing.last_synced_at = now
@@ -1697,6 +1722,17 @@ async def sync_leaflink_orders(
                     order_row = existing
                     updated += 1
                 else:
+                    # Compute sync health for new order
+                    _sh_missing_new: list[str] = []
+                    if not customer_name or customer_name == "Unknown Customer":
+                        _sh_missing_new.append("customer_name")
+                    if amount_decimal is None:
+                        _sh_missing_new.append("amount")
+                    if not normalized_line_items:
+                        _sh_missing_new.append("line_items")
+                    if not status:
+                        _sh_missing_new.append("status")
+                    _sh_status_new = "partial" if _sh_missing_new else "ok"
                     # Filter kwargs to only include valid Order model columns
                     order_kwargs = filter_model_kwargs(Order, {
                         'org_id': _write_org_id,
@@ -1713,7 +1749,9 @@ async def sync_leaflink_orders(
                         'raw_payload': make_json_safe(raw_payload),
                         'source': 'leaflink',
                         'review_status': review_status,
-                        'sync_status': 'ok',
+                        'sync_status': _sh_status_new,
+                        'sync_health_status': _sh_status_new,
+                        'sync_health_missing_fields': _sh_missing_new if _sh_missing_new else None,
                         'external_created_at': None,  # Never use provider dates
                         'external_updated_at': None,  # Never use provider dates
                         # Use server timestamps for all DB columns — bulletproof mode
@@ -1999,6 +2037,10 @@ async def sync_leaflink_orders(
                 # Mark the order as partial so it can be reprocessed later
                 try:
                     order_row.sync_status = "partial"
+                    order_row.sync_health_status = "partial"
+                    if not hasattr(order_row, "sync_health_missing_fields") or order_row.sync_health_missing_fields is None:
+                        order_row.sync_health_missing_fields = ["line_items"]
+                    order_row.sync_health_last_error = line_err_msg[:500] if line_err_msg else None
                 except Exception:
                     pass
                 partial += 1
@@ -2307,6 +2349,8 @@ UPDATE orders SET
     raw_payload = :raw_payload,
     review_status = :review_status,
     sync_status = :sync_status,
+    sync_health_status = :sync_health_status,
+    sync_health_missing_fields = CAST(:sync_health_missing_fields AS jsonb),
     synced_at = :synced_at,
     last_synced_at = :last_synced_at,
     updated_at = :updated_at
@@ -2335,6 +2379,19 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 external_id,
                             )
 
+                            # Compute sync health for this order
+                            _sh_missing: list[str] = []
+                            if not customer_name or customer_name == "Unknown Customer":
+                                _sh_missing.append("customer_name")
+                            if amount_decimal is None:
+                                _sh_missing.append("amount")
+                            if not normalized_line_items:
+                                _sh_missing.append("line_items")
+                            if not status:
+                                _sh_missing.append("status")
+                            _sh_status = "partial" if _sh_missing else "ok"
+                            _sh_missing_json = json.dumps(_sh_missing) if _sh_missing else None
+
                             update_params = {
                                 "org_id": _sql_org_id,
                                 "brand_id": _sql_brand_id,
@@ -2349,7 +2406,9 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 "line_items_json": line_items_json_str,
                                 "raw_payload": raw_payload_str,
                                 "review_status": review_status,
-                                "sync_status": "ok",
+                                "sync_status": _sh_status,
+                                "sync_health_status": _sh_status,
+                                "sync_health_missing_fields": _sh_missing_json,
                                 "synced_at": synced_at_val,
                                 "last_synced_at": synced_at_val,
                                 "updated_at": updated_at_val,
@@ -2434,12 +2493,14 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
 INSERT INTO orders (
     org_id, brand_id, external_order_id, order_number, customer_name, status,
     total_cents, amount, item_count, unit_count, line_items_json, raw_payload,
-    source, review_status, sync_status, synced_at, last_synced_at,
+    source, review_status, sync_status, sync_health_status, sync_health_missing_fields,
+    synced_at, last_synced_at,
     created_at, updated_at
 ) VALUES (
     CAST(:org_id AS uuid), CAST(:brand_id AS uuid), :external_order_id, :order_number,
     :customer_name, :status, :total_cents, :amount, :item_count, :unit_count,
     :line_items_json, :raw_payload, :source, :review_status, :sync_status,
+    :sync_health_status, CAST(:sync_health_missing_fields AS jsonb),
     :synced_at, :last_synced_at,
     :created_at, :updated_at
 )
@@ -2467,6 +2528,19 @@ INSERT INTO orders (
                                 external_id,
                             )
 
+                            # Compute sync health for insert
+                            _sh_missing_ins: list[str] = []
+                            if not customer_name or customer_name == "Unknown Customer":
+                                _sh_missing_ins.append("customer_name")
+                            if amount_decimal is None:
+                                _sh_missing_ins.append("amount")
+                            if not normalized_line_items:
+                                _sh_missing_ins.append("line_items")
+                            if not status:
+                                _sh_missing_ins.append("status")
+                            _sh_status_ins = "partial" if _sh_missing_ins else "ok"
+                            _sh_missing_json_ins = json.dumps(_sh_missing_ins) if _sh_missing_ins else None
+
                             insert_params = {
                                 "org_id": _sql_org_id,
                                 "brand_id": _sql_brand_id,
@@ -2482,7 +2556,9 @@ INSERT INTO orders (
                                 "raw_payload": raw_payload_str,
                                 "source": "leaflink",
                                 "review_status": review_status,
-                                "sync_status": "ok",
+                                "sync_status": _sh_status_ins,
+                                "sync_health_status": _sh_status_ins,
+                                "sync_health_missing_fields": _sh_missing_json_ins,
                                 "synced_at": synced_at_val,
                                 "last_synced_at": synced_at_val,
                                 "created_at": created_at_val,
@@ -3486,6 +3562,248 @@ async def sync_leaflink_line_items(
     }
 
 
+async def sync_leaflink_full_resync(
+    brand_id: str,
+    api_key: str,
+    company_id: str,
+    auth_scheme: str = "Token",
+    base_url: Optional[str] = None,
+    org_id: Optional[str] = None,
+    sync_run_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """Full backfill/resync of all LeafLink orders for a brand.
+
+    Walks every page from LeafLink until all available orders are stored locally.
+    Uses the same pagination loop as sync_leaflink_background_continuous but
+    runs synchronously (awaited) and returns final counts.
+
+    This is the correct function to call for a full resync — it will fetch
+    ALL pages, not just the first batch.
+
+    Args:
+        brand_id:    Brand UUID.
+        api_key:     LeafLink API key.
+        company_id:  LeafLink company ID.
+        auth_scheme: Auth scheme (Token, Bearer, Raw).
+        base_url:    LeafLink base URL.
+        org_id:      Organization UUID for multi-tenant isolation.
+        sync_run_id: Optional SyncRun.id for progress tracking.
+
+    Returns:
+        dict with total_fetched, total_inserted, total_updated, failed_count,
+        pages_synced, duration_seconds, total_local_orders.
+    """
+    from services.leaflink_client import LeafLinkClient
+
+    resync_start = time.monotonic()
+    total_fetched = 0
+    total_inserted = 0
+    total_updated = 0
+    failed_count = 0
+    pages_synced = 0
+    errors: list[str] = []
+
+    logger.info(
+        "[LEAFLINK_SYNC_DEBUG] full_resync_start brand_id=%s api_key_len=%s"
+        " auth_scheme=%s base_url=%s",
+        brand_id,
+        len(api_key) if api_key else 0,
+        auth_scheme,
+        base_url or "canonical",
+    )
+
+    try:
+        client = LeafLinkClient(
+            api_key=api_key,
+            company_id=company_id,
+            brand_id=brand_id,
+            auth_scheme=auth_scheme,
+            base_url=base_url,
+        )
+    except Exception as client_exc:
+        logger.error(
+            "[LEAFLINK_SYNC_DEBUG] full_resync_client_init_error brand_id=%s error=%s",
+            brand_id,
+            client_exc,
+        )
+        return {
+            "ok": False,
+            "error": str(client_exc)[:300],
+            "total_fetched": 0,
+            "total_inserted": 0,
+            "total_updated": 0,
+            "failed_count": 0,
+            "pages_synced": 0,
+            "duration_seconds": 0,
+            "total_local_orders": 0,
+        }
+
+    loop = asyncio.get_event_loop()
+    current_page = 1
+    resume_url: Optional[str] = None
+    page_size = 100
+
+    while True:
+        try:
+            _capture_page = current_page
+            _capture_url = resume_url
+            fetch_result = await loop.run_in_executor(
+                _leaflink_executor,
+                lambda: client.fetch_orders_page_range(
+                    start_page=_capture_page,
+                    num_pages=1,
+                    page_size=page_size,
+                    normalize=True,
+                    brand=brand_id,
+                    resume_url=_capture_url,
+                ),
+            )
+        except Exception as fetch_exc:
+            err_msg = str(fetch_exc)[:300]
+            logger.error(
+                "[LEAFLINK_SYNC_DEBUG] full_resync_fetch_error brand_id=%s page=%s error=%s",
+                brand_id,
+                current_page,
+                err_msg,
+            )
+            errors.append(f"page={current_page}: {err_msg}")
+            break
+
+        batch_orders = fetch_result.get("orders", [])
+        next_url = fetch_result.get("next_url")
+        next_page = fetch_result.get("next_page")
+        total_count_from_api = fetch_result.get("total_count")
+        pages_fetched_this_batch = fetch_result.get("pages_fetched", 1)
+
+        logger.info(
+            "[LEAFLINK_SYNC_DEBUG] page=%s count=%s running_total=%s has_next=%s"
+            " total_available=%s brand_id=%s",
+            current_page,
+            len(batch_orders),
+            total_fetched + len(batch_orders),
+            "true" if next_url else "false",
+            total_count_from_api or "unknown",
+            brand_id,
+        )
+
+        if batch_orders:
+            try:
+                persist_result = await sync_leaflink_orders_headers_only(
+                    brand_id=brand_id,
+                    orders=batch_orders,
+                    pages_fetched=pages_fetched_this_batch,
+                    org_id=org_id,
+                )
+                _inserted = persist_result.get("inserted_count", persist_result.get("created", 0))
+                _updated = persist_result.get("updated_count", persist_result.get("updated", 0))
+                _errors = persist_result.get("error_count", 0)
+                total_inserted += _inserted
+                total_updated += _updated
+                failed_count += _errors
+
+                logger.info(
+                    "[LEAFLINK_SYNC_DEBUG] page=%s count=%s running_total=%s"
+                    " inserted=%s updated=%s errors=%s brand_id=%s",
+                    current_page,
+                    len(batch_orders),
+                    total_fetched + len(batch_orders),
+                    _inserted,
+                    _updated,
+                    _errors,
+                    brand_id,
+                )
+            except Exception as upsert_exc:
+                err_msg = str(upsert_exc)[:300]
+                logger.error(
+                    "[LEAFLINK_SYNC_DEBUG] full_resync_upsert_error brand_id=%s page=%s error=%s",
+                    brand_id,
+                    current_page,
+                    err_msg,
+                )
+                errors.append(f"upsert page={current_page}: {err_msg}")
+
+        total_fetched += len(batch_orders)
+        pages_synced += pages_fetched_this_batch
+
+        # Update SyncRun progress if we have a run ID
+        if sync_run_id:
+            try:
+                from services.sync_run_manager import update_progress as _srm_update_progress
+                async with AsyncSessionLocal() as _prog_db:
+                    async with _prog_db.begin():
+                        await _srm_update_progress(
+                            _prog_db,
+                            sync_run_id=sync_run_id,
+                            pages_synced=pages_synced,
+                            orders_loaded=total_fetched,
+                            cursor=next_url,
+                            page=current_page,
+                            total_pages=None,
+                            total_orders_available=total_count_from_api,
+                        )
+            except Exception as prog_exc:
+                logger.warning(
+                    "[LEAFLINK_SYNC_DEBUG] full_resync_progress_error run_id=%s error=%s",
+                    sync_run_id,
+                    prog_exc,
+                )
+
+        # Stop if no more pages
+        if not next_url or not batch_orders:
+            logger.info(
+                "[LEAFLINK_SYNC_DEBUG] full_resync_pagination_complete brand_id=%s"
+                " pages=%s total_fetched=%s",
+                brand_id,
+                pages_synced,
+                total_fetched,
+            )
+            break
+
+        resume_url = next_url
+        if next_page:
+            current_page = next_page
+        else:
+            current_page += 1
+
+    duration = round(time.monotonic() - resync_start, 2)
+
+    # Get final local order count
+    try:
+        from sqlalchemy import func as _func_resync
+        async with AsyncSessionLocal() as _count_db:
+            _count_res = await _count_db.execute(
+                select(_func_resync.count()).select_from(Order).where(Order.brand_id == brand_id)
+            )
+            total_local_orders = _count_res.scalar() or 0
+    except Exception:
+        total_local_orders = total_fetched
+
+    logger.info(
+        "[LEAFLINK_SYNC_DEBUG] full_resync_complete brand_id=%s total_fetched=%s"
+        " inserted=%s updated=%s failed=%s pages=%s duration=%ss total_local=%s",
+        brand_id,
+        total_fetched,
+        total_inserted,
+        total_updated,
+        failed_count,
+        pages_synced,
+        duration,
+        total_local_orders,
+    )
+
+    return {
+        "ok": len(errors) == 0,
+        "total_fetched": total_fetched,
+        "total_inserted": total_inserted,
+        "total_updated": total_updated,
+        "failed_count": failed_count,
+        "pages_synced": pages_synced,
+        "duration_seconds": duration,
+        "total_local_orders": total_local_orders,
+        "errors": errors[:10],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Background continuous sync (Phase 2)
 # ---------------------------------------------------------------------------
@@ -3726,6 +4044,16 @@ async def sync_leaflink_background_continuous(
             batch_size,
             sync_run_id,
         )
+        logger.info(
+            "[LEAFLINK_SYNC_DEBUG] sync_start brand_id=%s api_key_len=%s auth_scheme=%s"
+            " base_url=%s start_page=%s total_pages=%s",
+            brand_id,
+            len(api_key) if api_key else 0,
+            auth_scheme,
+            base_url or "canonical",
+            start_page,
+            total_pages if total_pages is not None else "cursor_based",
+        )
 
         # When total_pages is None (cursor-based pagination), loop until the API
         # returns no next_url. When total_pages is known, also enforce the page bound.
@@ -3865,6 +4193,7 @@ async def sync_leaflink_background_continuous(
             pages_fetched_this_batch = fetch_result.get("pages_fetched", batch_size)
             next_cursor = fetch_result.get("next_url")
             next_page = fetch_result.get("next_page")
+            _total_count_from_api = fetch_result.get("total_count")
 
             # [SYNC_PAGE_FETCHED] Log raw and parsed counts for this batch
             _orders_count = len(batch_orders)
@@ -3875,6 +4204,17 @@ async def sync_leaflink_background_continuous(
                 _orders_count,
                 _orders_count,
                 pages_fetched_this_batch,
+                brand_id,
+            )
+            # [LEAFLINK_SYNC_DEBUG] Structured debug log per page
+            logger.info(
+                "[LEAFLINK_SYNC_DEBUG] page=%s count=%s running_total=%s has_next=%s"
+                " total_available=%s brand_id=%s",
+                current_page,
+                _orders_count,
+                total_orders_synced + _orders_count,
+                "true" if next_cursor else "false",
+                _total_count_from_api or "unknown",
                 brand_id,
             )
 
@@ -4048,6 +4388,22 @@ async def sync_leaflink_background_continuous(
                         upsert_exc,
                         exc_info=True,
                     )
+                else:
+                    # Log upsert result in debug format
+                    _inserted = persist_result.get("inserted_count", persist_result.get("created", 0)) if persist_result else 0
+                    _updated = persist_result.get("updated_count", persist_result.get("updated", 0)) if persist_result else 0
+                    _errors = persist_result.get("error_count", 0) if persist_result else 0
+                    logger.info(
+                        "[LEAFLINK_SYNC_DEBUG] page=%s count=%s running_total=%s"
+                        " inserted=%s updated=%s errors=%s brand_id=%s",
+                        current_page,
+                        _orders_count,
+                        total_orders_synced + _orders_count,
+                        _inserted,
+                        _updated,
+                        _errors,
+                        brand_id,
+                    )
 
             total_orders_synced += len(batch_orders)
 
@@ -4171,6 +4527,7 @@ async def sync_leaflink_background_continuous(
             sync_run_id,
         )
 
+
         logger.info(
             "[OrdersSync] bg_sync_complete brand=%s final_page=%s total_pages=%s "
             "total_orders=%s duration_seconds=%s sync_run_id=%s",
@@ -4180,6 +4537,28 @@ async def sync_leaflink_background_continuous(
             total_orders_synced,
             total_duration,
             sync_run_id,
+        )
+
+        # [LEAFLINK_SYNC_DEBUG] Final summary log
+        try:
+            from sqlalchemy import func as _func_final
+            async with AsyncSessionLocal() as _final_count_db:
+                _final_res = await _final_count_db.execute(
+                    select(_func_final.count()).select_from(Order).where(Order.brand_id == brand_id)
+                )
+                _final_total = _final_res.scalar() or 0
+        except Exception:
+            _final_total = total_orders_synced
+
+        logger.info(
+            "[LEAFLINK_SYNC_DEBUG] sync_complete brand_id=%s total_fetched=%s"
+            " final_page=%s total_pages=%s duration=%ss total_local_orders=%s",
+            brand_id,
+            total_orders_synced,
+            final_page,
+            total_pages if total_pages is not None else "cursor_based",
+            total_duration,
+            _final_total,
         )
 
     except Exception as e:

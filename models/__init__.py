@@ -172,6 +172,28 @@ class Order(Base):
     invoice_number: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, default=None)
     ar_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
 
+    # ------------------------------------------------------------------
+    # Sync health fields — per-order sync health tracking
+    # ------------------------------------------------------------------
+    sync_health_status: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        default=None,
+        comment="Per-order sync health: ok | partial | failed",
+    )
+    sync_health_missing_fields: Mapped[Optional[list]] = mapped_column(
+        JSONB,
+        nullable=True,
+        default=None,
+        comment="List of missing required fields for this order",
+    )
+    sync_health_last_error: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        default=None,
+        comment="Last sync error message for this order",
+    )
+
     lines: Mapped[list["OrderLine"]] = relationship(
         "OrderLine",
         back_populates="order",
