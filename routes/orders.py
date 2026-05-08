@@ -5312,6 +5312,19 @@ async def pagination_debug(
     completion_percent = (records_seen / leaflink_total * 100) if leaflink_total > 0 else 0
     last_next_url = getattr(latest_run, "last_next_url", None)
 
+    # Persistence metrics
+    orders_loaded = latest_run.orders_loaded_this_run or 0
+    persistence_ratio = (orders_loaded / leaflink_total) if leaflink_total > 0 else 0
+    visibility_ratio = (local_count / leaflink_total) if leaflink_total > 0 else 0
+    loaded_vs_visible_gap = orders_loaded - local_count
+
+    if persistence_ratio > 0.95:
+        persistence_health = "OK"
+    elif persistence_ratio > 0.80:
+        persistence_health = "DEGRADED"
+    else:
+        persistence_health = "CRITICAL"
+
     return {
         "ok": True,
         "brand_id": brand_id,
@@ -5327,11 +5340,16 @@ async def pagination_debug(
         "sync_status": latest_run.status,
         "stopped_early_reason": latest_run.last_error if latest_run.status in ("incomplete", "stalled", "failed") else None,
         "pages_synced": latest_run.pages_synced,
-        "orders_loaded_this_run": latest_run.orders_loaded_this_run,
+        "orders_loaded_this_run": orders_loaded,
         "started_at": latest_run.started_at.isoformat() if latest_run.started_at else None,
         "completed_at": latest_run.completed_at.isoformat() if latest_run.completed_at else None,
         "last_progress_at": latest_run.last_progress_at.isoformat() if latest_run.last_progress_at else None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        # Persistence health metrics
+        "persistence_ratio": round(persistence_ratio * 100, 1),
+        "visibility_ratio": round(visibility_ratio * 100, 1),
+        "loaded_vs_visible_gap": loaded_vs_visible_gap,
+        "persistence_health": persistence_health,
     }
 
 

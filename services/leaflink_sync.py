@@ -10,7 +10,8 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID
 
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal, get_schema_column_types, has_column
@@ -1762,11 +1763,6 @@ async def _insert_line_items_standalone(
 
             # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
             insert_params = sanitize_sql_params(insert_params, statement="_insert_line_items_standalone")
-            logger.info(
-                "[RAW_FIRST_INGESTION] action=insert_line_item order_id=%s sku=%s",
-                insert_params.get('order_id'),
-                insert_params.get('sku'),
-            )
             insert_params = normalize_uuid_fields(insert_params)
             insert_params = normalize_datetime_fields(insert_params)
             # Belt-and-suspenders: explicitly ensure created_at/updated_at are UTC-aware
@@ -1776,24 +1772,14 @@ async def _insert_line_items_standalone(
             if "updated_at" in insert_params:
                 insert_params["updated_at"] = ensure_utc(insert_params["updated_at"], "updated_at") or utc_now()
 
-            # [ORDER_LINES_FINAL_DATETIME] Fail-fast assertions before execute
+            # Fail-fast assertions before execute
             if "created_at" in insert_params:
                 _ca = insert_params["created_at"]
-                logger.info(
-                    "[ORDER_LINES_FINAL_DATETIME] created_at=%s tzinfo=%s aware=%s",
-                    _ca, _ca.tzinfo if isinstance(_ca, datetime) else "N/A",
-                    isinstance(_ca, datetime) and _ca.tzinfo is not None,
-                )
                 assert isinstance(_ca, datetime) and _ca.tzinfo is not None and _ca.tzinfo.utcoffset(_ca) is not None, (
                     f"[FAIL_FAST] created_at is naive or not a datetime: {_ca!r}"
                 )
             if "updated_at" in insert_params:
                 _ua = insert_params["updated_at"]
-                logger.info(
-                    "[ORDER_LINES_FINAL_DATETIME] updated_at=%s tzinfo=%s aware=%s",
-                    _ua, _ua.tzinfo if isinstance(_ua, datetime) else "N/A",
-                    isinstance(_ua, datetime) and _ua.tzinfo is not None,
-                )
                 assert isinstance(_ua, datetime) and _ua.tzinfo is not None and _ua.tzinfo.utcoffset(_ua) is not None, (
                     f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
                 )
@@ -1837,11 +1823,6 @@ async def _insert_line_items_standalone(
                 getattr(insert_params.get("updated_at"), "tzinfo", None) if isinstance(insert_params.get("updated_at"), datetime) else "N/A",
             )
             await db.execute(text(line_insert_stmt), insert_params)
-            logger.info(
-                "[ORDER_LINES_UPSERT_OK] order_id=%s sku=%s action=insert",
-                insert_params.get("order_id"),
-                insert_params.get("sku"),
-            )
             inserted += 1
 
             await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
@@ -2353,24 +2334,14 @@ async def sync_leaflink_orders(
                     if "updated_at" in _li_params:
                         _li_params["updated_at"] = ensure_utc(_li_params["updated_at"], "updated_at") or utc_now()
 
-                    # [ORDER_LINES_FINAL_DATETIME] Fail-fast assertions before execute
+                    # Fail-fast assertions before execute
                     if "created_at" in _li_params:
                         _ca = _li_params["created_at"]
-                        logger.info(
-                            "[ORDER_LINES_FINAL_DATETIME] created_at=%s tzinfo=%s aware=%s",
-                            _ca, _ca.tzinfo if isinstance(_ca, datetime) else "N/A",
-                            isinstance(_ca, datetime) and _ca.tzinfo is not None,
-                        )
                         assert isinstance(_ca, datetime) and _ca.tzinfo is not None and _ca.tzinfo.utcoffset(_ca) is not None, (
                             f"[FAIL_FAST] created_at is naive or not a datetime: {_ca!r}"
                         )
                     if "updated_at" in _li_params:
                         _ua = _li_params["updated_at"]
-                        logger.info(
-                            "[ORDER_LINES_FINAL_DATETIME] updated_at=%s tzinfo=%s aware=%s",
-                            _ua, _ua.tzinfo if isinstance(_ua, datetime) else "N/A",
-                            isinstance(_ua, datetime) and _ua.tzinfo is not None,
-                        )
                         assert isinstance(_ua, datetime) and _ua.tzinfo is not None and _ua.tzinfo.utcoffset(_ua) is not None, (
                             f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
                         )
@@ -2414,11 +2385,6 @@ async def sync_leaflink_orders(
                         getattr(_li_params.get("updated_at"), "tzinfo", None) if isinstance(_li_params.get("updated_at"), datetime) else "N/A",
                     )
                     await db.execute(text(_li_insert_stmt), _li_params)
-                    logger.info(
-                        "[ORDER_LINES_UPSERT_OK] order_id=%s sku=%s action=insert",
-                        _li_params.get("order_id"),
-                        _li_params.get("sku"),
-                    )
 
 
                 total_lines_written += len(normalized_line_items)
@@ -2609,6 +2575,19 @@ async def sync_leaflink_orders_headers_only(
     errors: list[str] = []
     newest_order_date: datetime | None = None
     fetched_count = len(orders)
+
+    # Persistence counters — track every outcome for [SYNC_FINAL_ACCOUNTING]
+    insert_success = 0
+    update_success = 0
+    insert_rollback = 0
+    update_rollback = 0
+    dead_letter_written = 0
+    skipped_duplicate = 0
+    skipped_validation = 0
+    skipped_org_missing = 0
+    malformed_payload = 0
+    line_item_failure = 0
+    transaction_abort = 0
 
     # Split orders into batches of batch_size
     batches = [
@@ -2901,12 +2880,6 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             )
 
                             update_params = sanitize_sql_params(update_params, statement="sync_leaflink_orders_headers_only_update")
-                            logger.info(
-                                "[RAW_FIRST_INGESTION] action=update order_id=%s brand_id=%s external_order_id=%s",
-                                update_params.get('id'),
-                                update_params.get('brand_id'),
-                                update_params.get('external_order_id'),
-                            )
                             update_params = normalize_uuid_fields(update_params)
                             update_params = normalize_datetime_fields(update_params)
                             update_params = apply_uuid_str_to_params(update_params)
@@ -2953,22 +2926,11 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 text(update_stmt),
                                 update_params,
                             )
-
-                            # [ORDER_DB_WRITE] Log every successful order update
-                            logger.info(
-                                "[ORDER_DB_WRITE] db_order_id=%s external_order_id=%s brand_id=%s org_id=%s customer_name=%s synced_at=%s status=%s",
-                                existing.id,
+                            batch_updated += 1
+                            update_success += 1
+                            logger.debug(
+                                "[ORDER_UPDATE_COMMIT] external_id=%s brand_id=%s",
                                 external_id,
-                                brand_id_value,
-                                org_id_value,
-                                customer_name,
-                                synced_at_val.isoformat() if synced_at_val else None,
-                                "updated",
-                            )
-                            logger.info(
-                                "[SYNC_HEADER_SAVED] external_id=%s order_number=%s brand_id=%s action=updated",
-                                external_id,
-                                order_number,
                                 brand_id_value,
                             )
                           else:
@@ -3096,11 +3058,6 @@ INSERT INTO orders (
                             )
                             # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
                             insert_params = sanitize_sql_params(insert_params, statement="sync_leaflink_orders_headers_only_insert")
-                            logger.info(
-                                "[RAW_FIRST_INGESTION] action=insert brand_id=%s external_order_id=%s",
-                                insert_params.get('brand_id'),
-                                insert_params.get('external_order_id'),
-                            )
                             insert_params = normalize_uuid_fields(insert_params)
                             insert_params = normalize_datetime_fields(insert_params)
                             insert_params = apply_uuid_str_to_params(insert_params)
@@ -3148,31 +3105,56 @@ INSERT INTO orders (
                                 insert_params,
                             )
                             batch_created += 1
-                            # [ORDER_DB_WRITE] Log every successful order insert
-                            logger.info(
-                                "[ORDER_DB_WRITE] db_order_id=pending external_order_id=%s brand_id=%s org_id=%s customer_name=%s synced_at=%s status=%s",
+                            insert_success += 1
+                            logger.debug(
+                                "[ORDER_INSERT_COMMIT] external_id=%s brand_id=%s",
                                 external_id,
                                 brand_id_value,
-                                org_id_value,
-                                customer_name,
-                                synced_at_val.isoformat() if synced_at_val else None,
-                                "created",
                             )
-                            logger.info(
-                                "[ORDER_INSERT_COMMIT] org_id=%s brand_id=%s external_order_id=%s"
-                                " order_id=pending rows_affected=1",
-                                insert_params.get("org_id"),
-                                insert_params.get("brand_id"),
-                                external_id,
+                        except IntegrityError as _order_exc:
+                            # Integrity violation — duplicate key or constraint failure
+                            _err_reason = str(_order_exc)[:300]
+                            insert_rollback += 1
+                            if "duplicate" in _err_reason.lower() or "uq_" in _err_reason.lower():
+                                skipped_duplicate += 1
+                                logger.debug(
+                                    "[ORDER_SKIPPED_DUPLICATE] external_id=%s brand_id=%s",
+                                    _order_ext_id_for_log,
+                                    brand_id_value,
+                                )
+                            else:
+                                logger.error(
+                                    "[ORDER_INSERT_ROLLBACK] external_id=%s error=%s",
+                                    _order_ext_id_for_log,
+                                    _err_reason[:200],
+                                )
+                            batch_dead_letter += 1
+                            batch_skipped += 1
+                            dead_letter_written += 1
+                            _dl_customer = safe_str(o.get("customer_name")) if isinstance(o, dict) else None
+                            asyncio.create_task(
+                                _write_sync_dead_letter(
+                                    brand_id=brand_id_value,
+                                    raw_payload=_raw_payload_ref,
+                                    error_stage="header_insert",
+                                    error_message=_err_reason,
+                                    org_id=org_id_value,
+                                    external_id=_order_ext_id_for_log if _order_ext_id_for_log != "unknown" else None,
+                                    order_number=_order_number_for_log,
+                                    customer_name=_dl_customer,
+                                    failure_stage="header_insert",
+                                    failure_category="duplicate_external_id",
+                                    exception_type=type(_order_exc).__name__,
+                                    exception_message=_err_reason,
+                                )
                             )
-                            logger.info(
-                                "[SYNC_HEADER_SAVED] external_id=%s order_number=%s brand_id=%s action=created",
-                                external_id,
-                                order_number,
-                                brand_id_value,
-                            )
+                            if len(errors) < 10:
+                                errors.append(
+                                    f"integrity_error external_id={_order_ext_id_for_log}: {_err_reason[:200]}"
+                                )
+                            continue
                         except Exception as _order_exc:
-                            # Per-order failure: log with [ORDER_TRANSFORM_SKIPPED], write dead-letter, continue
+                            # Per-order failure — log, write dead-letter, continue
                             _err_reason = str(_order_exc)[:300]
                             _batch_payload_size = len(str(_raw_payload_ref)) if _raw_payload_ref else 0
                             # Extract customer_name for dead-letter metadata (may not be set yet)
@@ -3185,28 +3167,17 @@ INSERT INTO orders (
                                 payload_size=_batch_payload_size,
                                 customer_name=_dl_customer,
                             )
-                            logger.warning(
-                                "[ORDER_TRANSFORM_SKIPPED] external_id=%s reason=%s",
-                                _order_ext_id_for_log,
-                                _err_reason,
-                            )
+                            insert_rollback += 1
+                            transaction_abort += 1
                             logger.error(
-                                "[ORDER_INSERT_ROLLBACK] org_id=%s brand_id=%s external_order_id=%s"
-                                " error=%s stage=header_insert",
-                                org_id_value,
-                                brand_id_value,
+                                "[TRANSACTION_ABORT] external_id=%s error=%s",
                                 _order_ext_id_for_log,
                                 _err_reason[:200],
                             )
                             logger.error(
-                                "[SYNC_HEADER_INSERT_FAILED] external_id=%s order_number=%s brand_id=%s batch=%s/%s error=%s",
+                                "[ORDER_INSERT_ROLLBACK] external_id=%s error=%s stage=header_insert",
                                 _order_ext_id_for_log,
-                                _order_number_for_log,
-                                brand_id_value,
-                                batch_num,
-                                len(batches),
-                                _err_reason,
-                                exc_info=True,
+                                _err_reason[:200],
                             )
                             # Write to dead-letter asynchronously (own session, non-blocking)
                             asyncio.create_task(
@@ -3227,6 +3198,7 @@ INSERT INTO orders (
                                 )
                             )
                             batch_dead_letter += 1
+                            dead_letter_written += 1
                             batch_skipped += 1
                             if len(errors) < 10:
                                 errors.append(
@@ -3234,44 +3206,10 @@ INSERT INTO orders (
                                 )
                             continue
                 # Explicit commit guarantee
-                logger.info(
-                    "[ORDER_SAVE_COMMIT] stage=pre_commit brand_id=%s org_id=%s"
-                    " batch=%s/%s created=%s updated=%s",
-                    brand_id_value,
-                    org_id_value,
-                    batch_num,
-                    len(batches),
-                    batch_created,
-                    batch_updated,
-                )
                 await db.commit()
-                logger.info(
-                    "[ORDER_SAVE_COMMIT] stage=post_commit brand_id=%s org_id=%s"
-                    " batch=%s/%s created=%s updated=%s",
-                    brand_id_value,
-                    org_id_value,
-                    batch_num,
-                    len(batches),
-                    batch_created,
-                    batch_updated,
-                )
 
             # Batch committed successfully (async with db.begin() exited cleanly)
             batch_duration = round(time.monotonic() - batch_start, 2)
-            logger.info(
-                "[ORDER_NORMALIZED] normalized=%s batch=%s/%s",
-                batch_created + batch_updated,
-                batch_num,
-                len(batches),
-            )
-            logger.info(
-                "[ORDER_SAVE_RESULT] inserted=%s updated=%s batch=%s/%s",
-                batch_created,
-                batch_updated,
-                batch_num,
-                len(batches),
-            )
-            logger.info("[ORDER_SAVE_COMMIT] brand_id=%s org_id=%s created=%s updated=%s batch=%s/%s", brand_id_value, org_id_value, batch_created, batch_updated, batch_num, len(batches))
             logger.info(
                 "[OrdersSync] batch_committed batch=%s/%s brand=%s created=%s updated=%s skipped=%s dead_letter=%s duration=%ss",
                 batch_num,
@@ -3288,25 +3226,57 @@ INSERT INTO orders (
             total_skipped += batch_skipped
             total_dead_letter += batch_dead_letter
 
+            # Visibility verification every 25 successful inserts
+            if insert_success > 0 and insert_success % 25 == 0 and org_id_value is not None:
+                try:
+                    async with AsyncSessionLocal() as _vis_db:
+                        _vis_result = await _vis_db.execute(
+                            select(func.count(Order.id))
+                            .where(Order.brand_id == brand_id_value)
+                            .where(Order.org_id == org_id_value)
+                        )
+                        _visible_count = _vis_result.scalar() or 0
+                        if _visible_count < insert_success:
+                            logger.warning(
+                                "[VISIBILITY_GAP] inserted=%s visible=%s gap=%s brand_id=%s",
+                                insert_success,
+                                _visible_count,
+                                insert_success - _visible_count,
+                                brand_id_value,
+                            )
+                        else:
+                            logger.debug(
+                                "[VISIBILITY_OK] inserted=%s visible=%s brand_id=%s",
+                                insert_success,
+                                _visible_count,
+                                brand_id_value,
+                            )
+                except Exception as _vis_exc:
+                    logger.warning(
+                        "[VISIBILITY_CHECK_ERROR] brand_id=%s error=%s",
+                        brand_id_value,
+                        str(_vis_exc)[:200],
+                    )
+
         except Exception as batch_exc:
             batch_duration = round(time.monotonic() - batch_start, 2)
             err_msg = str(batch_exc)
+            insert_rollback += batch_created  # any inserts in this batch are rolled back
+            update_rollback += batch_updated
+            transaction_abort += 1
             logger.error(
-                "[ORDER_INSERT_ROLLBACK] org_id=%s brand_id=%s external_order_id=batch_%s"
-                " error=%s stage=batch_commit",
-                org_id_value,
+                "[TRANSACTION_ABORT] brand_id=%s batch=%s/%s error=%s stage=batch_commit",
                 brand_id_value,
                 batch_num,
+                len(batches),
                 err_msg[:200],
             )
             logger.error(
-                "[OrdersSync] batch_failed batch=%s/%s brand=%s batch_size=%s error=%s duration=%ss",
+                "[ORDER_INSERT_ROLLBACK] brand_id=%s batch=%s/%s error=%s stage=batch_commit",
+                brand_id_value,
                 batch_num,
                 len(batches),
-                brand_id_value,
-                current_batch_size,
-                err_msg,
-                batch_duration,
+                err_msg[:200],
                 exc_info=True,
             )
             errors.append(err_msg)
@@ -3426,6 +3396,51 @@ INSERT INTO orders (
     error_count = len(errors)
     has_warning = error_count > 0 or total_dead_letter > 0
 
+    # [SYNC_FINAL_ACCOUNTING] — final persistence metrics for this batch call
+    _records_seen = fetched_count
+    _persistence_ratio = (insert_success + update_success) / _records_seen if _records_seen > 0 else 0
+    _rollback_ratio = (insert_rollback + update_rollback) / _records_seen if _records_seen > 0 else 0
+    _dead_letter_ratio = dead_letter_written / _records_seen if _records_seen > 0 else 0
+
+    # Query final visible count for this batch's brand+org scope
+    _final_visible_count = 0
+    try:
+        async with AsyncSessionLocal() as _final_db:
+            _final_vis_result = await _final_db.execute(
+                select(func.count(Order.id))
+                .where(Order.brand_id == brand_id_value)
+                .where(Order.org_id == org_id_value)
+            )
+            _final_visible_count = _final_vis_result.scalar() or 0
+    except Exception as _fv_exc:
+        logger.warning(
+            "[SYNC_FINAL_ACCOUNTING] final_visible_query_failed brand_id=%s error=%s",
+            brand_id_value,
+            str(_fv_exc)[:200],
+        )
+
+    logger.info(
+        "[SYNC_FINAL_ACCOUNTING] brand_id=%s org_id=%s "
+        "leaflink_seen=%s headers_inserted=%s headers_updated=%s headers_skipped=%s "
+        "headers_failed=%s db_visible_count=%s dead_letter_count=%s rollback_count=%s "
+        "transaction_failures=%s "
+        "persistence_ratio=%.1f%% rollback_ratio=%.1f%% dead_letter_ratio=%.1f%%",
+        brand_id_value,
+        org_id_value,
+        _records_seen,
+        insert_success,
+        update_success,
+        skipped_duplicate + skipped_validation + skipped_org_missing,
+        malformed_payload,
+        _final_visible_count,
+        dead_letter_written,
+        insert_rollback + update_rollback,
+        transaction_abort,
+        _persistence_ratio * 100,
+        _rollback_ratio * 100,
+        _dead_letter_ratio * 100,
+    )
+
     logger.info(
         "[SYNC_FINAL_REPORT] fetched=%s inserted=%s updated=%s partial=0 skipped=%s dead_letter=%s error=%s duration=%ss brand_id=%s",
         fetched_count,
@@ -3436,15 +3451,6 @@ INSERT INTO orders (
         error_count,
         sync_duration,
         brand_id_value,
-    )
-    logger.info(
-        "[LEAFLINK_FETCH_OK] raw_count=%s brand_id=%s",
-        fetched_count,
-        brand_id_value,
-    )
-    logger.info(
-        "[LEAFLINK_DB_WRITE_OK] inserted=%s updated=%s skipped=%s errors=%s brand_id=%s",
-        total_created, total_updated, total_skipped, error_count, brand_id_value,
     )
     logger.info(
         "[LEAFLINK_SYNC_COMPLETE] fetched=%s inserted=%s updated=%s brand_id=%s",
@@ -3762,11 +3768,6 @@ async def sync_leaflink_line_items(
                 )
                 # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
                 insert_params = sanitize_sql_params(insert_params, statement="_upsert_line_items")
-                logger.info(
-                    "[RAW_FIRST_INGESTION] action=upsert_line_item order_id=%s sku=%s",
-                    insert_params.get('order_id'),
-                    insert_params.get('sku'),
-                )
                 insert_params = normalize_uuid_fields(insert_params)
                 insert_params = normalize_datetime_fields(insert_params)
                 # Belt-and-suspenders: explicitly ensure created_at/updated_at are UTC-aware
@@ -3776,24 +3777,14 @@ async def sync_leaflink_line_items(
                 if "updated_at" in insert_params:
                     insert_params["updated_at"] = ensure_utc(insert_params["updated_at"], "updated_at") or utc_now()
 
-                # [ORDER_LINES_FINAL_DATETIME] Fail-fast assertions before execute
+                # Fail-fast assertions before execute
                 if "created_at" in insert_params:
                     _ca = insert_params["created_at"]
-                    logger.info(
-                        "[ORDER_LINES_FINAL_DATETIME] created_at=%s tzinfo=%s aware=%s",
-                        _ca, _ca.tzinfo if isinstance(_ca, datetime) else "N/A",
-                        isinstance(_ca, datetime) and _ca.tzinfo is not None,
-                    )
                     assert isinstance(_ca, datetime) and _ca.tzinfo is not None and _ca.tzinfo.utcoffset(_ca) is not None, (
                         f"[FAIL_FAST] created_at is naive or not a datetime: {_ca!r}"
                     )
                 if "updated_at" in insert_params:
                     _ua = insert_params["updated_at"]
-                    logger.info(
-                        "[ORDER_LINES_FINAL_DATETIME] updated_at=%s tzinfo=%s aware=%s",
-                        _ua, _ua.tzinfo if isinstance(_ua, datetime) else "N/A",
-                        isinstance(_ua, datetime) and _ua.tzinfo is not None,
-                    )
                     assert isinstance(_ua, datetime) and _ua.tzinfo is not None and _ua.tzinfo.utcoffset(_ua) is not None, (
                         f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
                     )
@@ -3835,11 +3826,6 @@ async def sync_leaflink_line_items(
                 )
 
                 await db.execute(text(line_upsert_stmt), insert_params)
-                logger.info(
-                    "[ORDER_LINES_UPSERT_OK] order_id=%s sku=%s action=insert",
-                    insert_params.get("order_id"),
-                    insert_params.get("sku"),
-                )
                 inserted += 1
 
                 await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
@@ -4709,6 +4695,12 @@ async def sync_leaflink_background_continuous(
             brand_id,
         )
 
+    logger.info(
+        "[SYNC_SESSION_START] run_id=%s brand_id=%s task_id=%s",
+        sync_run_id,
+        brand_id,
+        id(asyncio.current_task()),
+    )
     try:
         bg_start = time.monotonic()
         current_page = start_page
@@ -5512,10 +5504,28 @@ async def sync_leaflink_background_continuous(
 
     except Exception as e:
         logger.error(
+            "[SYNC_SESSION_ABORT] run_id=%s brand_id=%s task_id=%s error=%s",
+            sync_run_id,
+            brand_id,
+            id(asyncio.current_task()),
+            str(e)[:200],
+        )
+        logger.error(
             "[LeafLinkSync] FATAL ERROR id=%s error=%s",
             sync_run_id,
             str(e)[:500],
             exc_info=True,
         )
+        try:
+            pass  # No shared session to rollback — each sub-operation uses its own session
+        except Exception:
+            pass
         sys.stdout.flush()
         raise
+    finally:
+        logger.info(
+            "[SYNC_SESSION_END] run_id=%s brand_id=%s task_id=%s",
+            sync_run_id,
+            brand_id,
+            id(asyncio.current_task()),
+        )
