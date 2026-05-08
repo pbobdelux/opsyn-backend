@@ -4068,3 +4068,347 @@ async def api_orders_queues(
         "ar_queue": ar_queue_count,
         "timestamp": timestamp,
     })
+
+
+# =============================================================================
+# Sync Metrics Endpoint
+# =============================================================================
+
+
+@router.get("/api/leaflink/orders/sync-metrics")
+async def api_orders_sync_metrics(
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    org_id: Optional[str] = Query(None, description="Organization ID (UUID)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns detailed sync metrics for a brand including failure category breakdown,
+    dead-letter counts, and performance statistics.
+
+    Response:
+        {
+          ok, brand_id, org_id,
+          total_local_orders, total_ok, total_partial, total_failed,
+          dead_letter_count, last_full_sync_duration_seconds,
+          average_page_duration_seconds, pages_processed, records_processed,
+          records_per_second, current_sync_state,
+          failure_categories: { duplicate_key, missing_field, ... },
+          last_sync_at, next_sync_at
+        }
+    """
+    from sqlalchemy import text as _text
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    logger.info("[OrdersAPI] sync_metrics brand_id=%s", brand_id)
+
+    # ------------------------------------------------------------------ #
+    # Total local orders                                                   #
+    # ------------------------------------------------------------------ #
+    try:
+        total_res = await db.execute(
+            select(func.count(Order.id)).where(Order.brand_id == brand_id)
+        )
+        total_local_orders = total_res.scalar_one() or 0
+    except Exception:
+        await db.rollback()
+        total_local_orders = 0
+
+    # ------------------------------------------------------------------ #
+    # Orders by sync_status                                                #
+    # ------------------------------------------------------------------ #
+    try:
+        ok_res = await db.execute(
+            select(func.count(Order.id)).where(
+                Order.brand_id == brand_id,
+                Order.sync_status == "ok",
+            )
+        )
+        total_ok = ok_res.scalar_one() or 0
+    except Exception:
+        await db.rollback()
+        total_ok = 0
+
+    try:
+        partial_res = await db.execute(
+            select(func.count(Order.id)).where(
+                Order.brand_id == brand_id,
+                Order.sync_status == "partial",
+            )
+        )
+        total_partial = partial_res.scalar_one() or 0
+    except Exception:
+        await db.rollback()
+        total_partial = 0
+
+    try:
+        failed_res = await db.execute(
+            select(func.count(Order.id)).where(
+                Order.brand_id == brand_id,
+                Order.sync_status == "failed",
+            )
+        )
+        total_failed = failed_res.scalar_one() or 0
+    except Exception:
+        await db.rollback()
+        total_failed = 0
+
+    # ------------------------------------------------------------------ #
+    # Dead-letter count (sync_dead_letters table)                          #
+    # ------------------------------------------------------------------ #
+    try:
+        from sqlalchemy import text as _sdl_text
+        dl_res = await db.execute(
+            _sdl_text(
+                "SELECT COUNT(*) FROM sync_dead_letters "
+                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL"
+            ),
+            {"brand_id": brand_id},
+        )
+        dead_letter_count = dl_res.scalar() or 0
+    except Exception:
+        await db.rollback()
+        dead_letter_count = 0
+
+    # ------------------------------------------------------------------ #
+    # Failure category breakdown from dead-letter error messages           #
+    # ------------------------------------------------------------------ #
+    _all_categories = [
+        "duplicate_key", "missing_field", "malformed", "line_item_issue",
+        "fk_issue", "timeout", "rate_limit", "validation", "unknown",
+    ]
+    failure_categories: dict[str, int] = {cat: 0 for cat in _all_categories}
+
+    try:
+        from services.leaflink_sync import categorize_sync_failure as _categorize
+        from sqlalchemy import text as _fc_text
+        fc_res = await db.execute(
+            _fc_text(
+                "SELECT error_message FROM sync_dead_letters "
+                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL "
+                "LIMIT 500"
+            ),
+            {"brand_id": brand_id},
+        )
+        for (err_msg,) in fc_res.fetchall():
+            try:
+                cat = _categorize(Exception(err_msg or ""))
+                failure_categories[cat] = failure_categories.get(cat, 0) + 1
+            except Exception:
+                failure_categories["unknown"] = failure_categories.get("unknown", 0) + 1
+    except Exception:
+        await db.rollback()
+
+    # ------------------------------------------------------------------ #
+    # Last sync run stats                                                  #
+    # ------------------------------------------------------------------ #
+    last_sync_at = None
+    next_sync_at = None
+    last_full_sync_duration_seconds = None
+    pages_processed = None
+    records_processed = None
+    records_per_second = None
+    average_page_duration_seconds = None
+    current_sync_state = "idle"
+
+    try:
+        last_run_res = await db.execute(
+            select(SyncRun)
+            .where(SyncRun.brand_id == brand_id)
+            .order_by(SyncRun.started_at.desc())
+            .limit(1)
+        )
+        last_run = last_run_res.scalar_one_or_none()
+
+        if last_run:
+            current_sync_state = last_run.status or "idle"
+            last_sync_at = last_run.completed_at or last_run.last_progress_at
+            pages_processed = last_run.pages_synced or 0
+            records_processed = last_run.orders_loaded_this_run or 0
+
+            if last_run.started_at and last_run.completed_at:
+                duration = (last_run.completed_at - last_run.started_at).total_seconds()
+                last_full_sync_duration_seconds = round(duration, 1)
+                if records_processed and duration > 0:
+                    records_per_second = round(records_processed / duration, 1)
+                if pages_processed and duration > 0:
+                    average_page_duration_seconds = round(duration / pages_processed, 2)
+
+            # Estimate next sync at ~30 min after last sync
+            if last_sync_at:
+                from datetime import timedelta
+                next_sync_at = (last_sync_at + timedelta(minutes=30)).isoformat()
+                last_sync_at = last_sync_at.isoformat()
+    except Exception:
+        await db.rollback()
+
+    return make_json_safe({
+        "ok": True,
+        "brand_id": brand_id,
+        "org_id": org_id,
+        "total_local_orders": total_local_orders,
+        "total_ok": total_ok,
+        "total_partial": total_partial,
+        "total_failed": total_failed,
+        "dead_letter_count": dead_letter_count,
+        "last_full_sync_duration_seconds": last_full_sync_duration_seconds,
+        "average_page_duration_seconds": average_page_duration_seconds,
+        "pages_processed": pages_processed,
+        "records_processed": records_processed,
+        "records_per_second": records_per_second,
+        "current_sync_state": current_sync_state,
+        "failure_categories": failure_categories,
+        "last_sync_at": last_sync_at,
+        "next_sync_at": next_sync_at,
+        "timestamp": timestamp,
+    })
+
+
+# =============================================================================
+# Dead-Letter Analysis Endpoint
+# =============================================================================
+
+
+@router.get("/api/leaflink/orders/dead-letter-analysis")
+async def api_orders_dead_letter_analysis(
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    org_id: Optional[str] = Query(None, description="Organization ID (UUID)"),
+    sample_limit: int = Query(10, ge=1, le=50, description="Max sample failures to return"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns a structured analysis of dead-lettered orders for a brand.
+
+    Includes:
+    - Total dead-letter count
+    - Breakdown by failure stage (error_stage column)
+    - Breakdown by failure category (derived from error_message)
+    - Sample of recent failures with full context
+
+    Response:
+        {
+          ok, brand_id,
+          total_dead_letter_count,
+          by_failure_stage: { stage: count, ... },
+          by_failure_category: { category: count, ... },
+          sample_failures: [ { id, external_order_id, order_number,
+                               failure_stage, failure_category,
+                               exception_type, exception_message,
+                               payload_size_bytes, created_at }, ... ]
+        }
+    """
+    from sqlalchemy import text as _text
+    from services.leaflink_sync import categorize_sync_failure as _categorize
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    logger.info("[OrdersAPI] dead_letter_analysis brand_id=%s", brand_id)
+
+    # ------------------------------------------------------------------ #
+    # Total dead-letter count                                              #
+    # ------------------------------------------------------------------ #
+    try:
+        total_res = await db.execute(
+            _text(
+                "SELECT COUNT(*) FROM sync_dead_letters "
+                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL"
+            ),
+            {"brand_id": brand_id},
+        )
+        total_dead_letter_count = total_res.scalar() or 0
+    except Exception:
+        await db.rollback()
+        total_dead_letter_count = 0
+
+    # ------------------------------------------------------------------ #
+    # Breakdown by failure stage                                           #
+    # ------------------------------------------------------------------ #
+    by_failure_stage: dict[str, int] = {}
+    try:
+        stage_res = await db.execute(
+            _text(
+                "SELECT error_stage, COUNT(*) as cnt FROM sync_dead_letters "
+                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL "
+                "GROUP BY error_stage ORDER BY cnt DESC"
+            ),
+            {"brand_id": brand_id},
+        )
+        for row in stage_res.fetchall():
+            by_failure_stage[row[0] or "unknown"] = row[1]
+    except Exception:
+        await db.rollback()
+
+    # ------------------------------------------------------------------ #
+    # Breakdown by failure category (derived from error_message)          #
+    # ------------------------------------------------------------------ #
+    by_failure_category: dict[str, int] = {}
+    sample_rows = []
+    try:
+        rows_res = await db.execute(
+            _text(
+                "SELECT id, external_id, order_number, error_stage, error_message, "
+                "       raw_payload, created_at "
+                "FROM sync_dead_letters "
+                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL "
+                "ORDER BY created_at DESC "
+                "LIMIT :lim"
+            ),
+            {"brand_id": brand_id, "lim": max(sample_limit, 100)},
+        )
+        all_rows = rows_res.fetchall()
+
+        for row in all_rows:
+            err_msg = row[4] or ""
+            try:
+                cat = _categorize(Exception(err_msg))
+            except Exception:
+                cat = "unknown"
+            by_failure_category[cat] = by_failure_category.get(cat, 0) + 1
+
+            if len(sample_rows) < sample_limit:
+                # Estimate payload size from raw_payload JSON string length
+                raw_payload_val = row[5]
+                payload_size = len(str(raw_payload_val)) if raw_payload_val else 0
+
+                # Infer exception type from error message heuristics
+                exc_type = "Exception"
+                err_lower = err_msg.lower()
+                if "keyerror" in err_lower or "key error" in err_lower:
+                    exc_type = "KeyError"
+                elif "typeerror" in err_lower or "type error" in err_lower:
+                    exc_type = "TypeError"
+                elif "valueerror" in err_lower or "value error" in err_lower:
+                    exc_type = "ValueError"
+                elif "undefinedcolumn" in err_lower or "does not exist" in err_lower:
+                    exc_type = "UndefinedColumnError"
+                elif "duplicate key" in err_lower:
+                    exc_type = "UniqueViolation"
+                elif "foreign key" in err_lower:
+                    exc_type = "ForeignKeyViolation"
+                elif "not null" in err_lower or "null value" in err_lower:
+                    exc_type = "NotNullViolation"
+
+                created_at_val = row[6]
+                sample_rows.append({
+                    "id": row[0],
+                    "external_order_id": row[1],
+                    "order_number": row[2],
+                    "failure_stage": row[3] or "unknown",
+                    "failure_category": cat,
+                    "exception_type": exc_type,
+                    "exception_message": err_msg[:500],
+                    "payload_size_bytes": payload_size,
+                    "created_at": created_at_val.isoformat() if hasattr(created_at_val, "isoformat") else str(created_at_val),
+                })
+    except Exception as exc:
+        await db.rollback()
+        logger.error("[OrdersAPI] dead_letter_analysis_error brand_id=%s error=%s", brand_id, exc)
+
+    return make_json_safe({
+        "ok": True,
+        "brand_id": brand_id,
+        "org_id": org_id,
+        "total_dead_letter_count": total_dead_letter_count,
+        "by_failure_stage": by_failure_stage,
+        "by_failure_category": by_failure_category,
+        "sample_failures": sample_rows,
+        "timestamp": timestamp,
+    })

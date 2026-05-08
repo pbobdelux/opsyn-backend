@@ -194,6 +194,16 @@ class Order(Base):
         comment="Last sync error message for this order",
     )
 
+    # ------------------------------------------------------------------
+    # Sync health JSONB blob — full per-order sync health snapshot
+    # ------------------------------------------------------------------
+    sync_health: Mapped[Optional[dict]] = mapped_column(
+        JSONB,
+        nullable=True,
+        default=None,
+        comment="JSONB blob: {status, missing_fields, last_error, last_synced_at}",
+    )
+
     lines: Mapped[list["OrderLine"]] = relationship(
         "OrderLine",
         back_populates="order",

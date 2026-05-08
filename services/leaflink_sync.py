@@ -41,6 +41,101 @@ MAX_LINE_ITEM_RETRIES = 3
 
 
 # ---------------------------------------------------------------------------
+# Failure categorization — classify sync errors for structured reporting
+# ---------------------------------------------------------------------------
+
+# Ordered list of (category, predicates) — first match wins.
+_FAILURE_CATEGORY_RULES: list[tuple[str, list[str]]] = [
+    ("duplicate_key",   ["duplicate key", "uq_"]),
+    ("missing_field",   ["not null", "required", "null value in column"]),
+    ("malformed",       ["invalid input", "type mismatch", "invalid syntax", "json"]),
+    ("line_item_issue", ["order_lines", "line_item"]),
+    ("fk_issue",        ["foreign key", "does not exist", "violates foreign key"]),
+    ("timeout",         ["timeout", "timed out"]),
+    ("rate_limit",      ["429", "rate limit", "too many requests"]),
+    ("validation",      ["check constraint", "validation", "violates check"]),
+]
+
+
+def categorize_sync_failure(exception: Exception, context: Optional[dict] = None) -> str:
+    """Classify a sync exception into a named failure category.
+
+    Categories (first match wins):
+      duplicate_key   — unique constraint violation
+      missing_field   — NOT NULL / required field absent
+      malformed       — invalid input syntax / type mismatch / JSON error
+      line_item_issue — error in order_lines table or line item processing
+      fk_issue        — foreign key violation or column does not exist
+      timeout         — request or query timed out
+      rate_limit      — HTTP 429 / rate limit exceeded
+      validation      — check constraint / validation error
+      unknown         — default when no rule matches
+
+    Args:
+        exception: The caught exception.
+        context:   Optional dict with extra context (e.g. stage, external_id).
+
+    Returns:
+        Category string.
+    """
+    err_lower = str(exception).lower()
+    for category, keywords in _FAILURE_CATEGORY_RULES:
+        if any(kw in err_lower for kw in keywords):
+            return category
+    return "unknown"
+
+
+def log_sync_order_failed(
+    external_id: Optional[str],
+    order_number: Optional[str],
+    failure_stage: str,
+    exception: Exception,
+    page_number: Optional[int] = None,
+    cursor: Optional[str] = None,
+    payload_size: Optional[int] = None,
+) -> str:
+    """Emit a structured [SYNC_ORDER_FAILED] log line and return the failure category.
+
+    Args:
+        external_id:   LeafLink order PK.
+        order_number:  Human-readable order number.
+        failure_stage: Where the failure occurred (fetch, transform, upsert,
+                       line_item, customer_map, status_map, sync_health).
+        exception:     The caught exception.
+        page_number:   API page number (if available).
+        cursor:        Cursor hash (if cursor-based pagination).
+        payload_size:  Raw payload size in bytes (if available).
+
+    Returns:
+        The failure category string.
+    """
+    import traceback as _tb
+
+    category = categorize_sync_failure(exception)
+    exc_type = type(exception).__name__
+    exc_msg = str(exception)[:500]
+
+    # Capture last 3 stack frames as a compact summary
+    tb_lines = _tb.format_tb(exception.__traceback__) if exception.__traceback__ else []
+    tb_summary = " | ".join(line.strip().replace("\n", " ") for line in tb_lines[-3:])
+
+    logger.error(
+        "[SYNC_ORDER_FAILED] external_id=%s order_number=%s stage=%s category=%s"
+        " exception_type=%s message=%s page=%s payload_size=%s traceback=%s",
+        external_id or "unknown",
+        order_number or "unknown",
+        failure_stage,
+        category,
+        exc_type,
+        exc_msg,
+        page_number or "unknown",
+        payload_size or "unknown",
+        tb_summary[:500] if tb_summary else "none",
+    )
+    return category
+
+
+# ---------------------------------------------------------------------------
 # Advisory lock helpers — prevent overlapping syncs for the same brand
 # ---------------------------------------------------------------------------
 
@@ -1775,6 +1870,14 @@ async def sync_leaflink_orders(
             except Exception as header_exc:
                 # Header insert failed — write to dead-letter queue and skip this order
                 header_err_msg = str(header_exc)[:500]
+                _payload_size = len(str(raw_payload_for_dead_letter)) if raw_payload_for_dead_letter else 0
+                log_sync_order_failed(
+                    external_id=external_id,
+                    order_number=order_number,
+                    failure_stage="upsert",
+                    exception=header_exc,
+                    payload_size=_payload_size,
+                )
                 logger.error(
                     "[SYNC_HEADER_INSERT_FAILED] external_id=%s order_number=%s brand_id=%s error=%s",
                     external_id,
@@ -2027,7 +2130,14 @@ async def sync_leaflink_orders(
             except Exception as line_exc:
                 # Line item failure — save header with sync_status='partial', log, continue
                 line_err_msg = str(line_exc)[:500]
-
+                _li_payload_size = len(str(raw_payload_for_dead_letter)) if raw_payload_for_dead_letter else 0
+                log_sync_order_failed(
+                    external_id=external_id,
+                    order_number=order_number,
+                    failure_stage="line_item",
+                    exception=line_exc,
+                    payload_size=_li_payload_size,
+                )
                 logger.error(
                     "[SYNC_PARTIAL_SUCCESS] external_id=%s brand_id=%s header_saved=true line_items_failed=true error=%s",
                     external_id,
@@ -2050,6 +2160,14 @@ async def sync_leaflink_orders(
         except Exception as order_exc:
             # Outer per-order failure: log, record error, skip this order, continue
             err_reason = str(order_exc)[:300]
+            _outer_payload_size = len(str(raw_payload_for_dead_letter)) if raw_payload_for_dead_letter else 0
+            log_sync_order_failed(
+                external_id=order_external_id_for_log if order_external_id_for_log != "unknown" else None,
+                order_number=order_number_for_log,
+                failure_stage="transform",
+                exception=order_exc,
+                payload_size=_outer_payload_size,
+            )
             logger.warning(
                 "[ORDER_TRANSFORM_SKIPPED] external_id=%s reason=%s",
                 order_external_id_for_log,
@@ -2636,6 +2754,14 @@ INSERT INTO orders (
                         except Exception as _order_exc:
                             # Per-order failure: log with [ORDER_TRANSFORM_SKIPPED], write dead-letter, continue
                             _err_reason = str(_order_exc)[:300]
+                            _batch_payload_size = len(str(_raw_payload_ref)) if _raw_payload_ref else 0
+                            log_sync_order_failed(
+                                external_id=_order_ext_id_for_log if _order_ext_id_for_log != "unknown" else None,
+                                order_number=_order_number_for_log,
+                                failure_stage="upsert",
+                                exception=_order_exc,
+                                payload_size=_batch_payload_size,
+                            )
                             logger.warning(
                                 "[ORDER_TRANSFORM_SKIPPED] external_id=%s reason=%s",
                                 _order_ext_id_for_log,
@@ -4418,6 +4544,20 @@ async def sync_leaflink_background_continuous(
             # When total_pages is None (cursor-based), fall back to current_page
             last_completed_page = (next_page - 1) if next_page else (total_pages or current_page)
 
+            # [SYNC_PAGE_COMPLETE] Structured per-page completion log
+            _page_elapsed = round(time.monotonic() - batch_start, 2)
+            logger.info(
+                "[SYNC_PAGE_COMPLETE] page=%s count=%s running_total=%s has_next=%s"
+                " next_cursor=%s elapsed=%ss brand_id=%s",
+                current_page,
+                _orders_count,
+                total_orders_synced,
+                "true" if next_cursor else "false",
+                _cursor_hash(next_cursor) or "none",
+                _page_elapsed,
+                brand_id,
+            )
+
             # ------------------------------------------------------------------ #
             # Persist progress to DB (SyncRun) and update in-memory state        #
             # ------------------------------------------------------------------ #
@@ -4527,6 +4667,16 @@ async def sync_leaflink_background_continuous(
             sync_run_id,
         )
 
+        # [SYNC_COMPLETE] Structured end-of-sync summary log
+        logger.info(
+            "[SYNC_COMPLETE] total_pages=%s total_fetched=%s total_inserted=deferred"
+            " total_updated=deferred total_failed=unknown duration=%ss brand_id=%s sync_run_id=%s",
+            final_page,
+            total_orders_synced,
+            total_duration,
+            brand_id,
+            sync_run_id,
+        )
 
         logger.info(
             "[OrdersSync] bg_sync_complete brand=%s final_page=%s total_pages=%s "
