@@ -5032,7 +5032,7 @@ async def backfill_org_ids(
                 "SELECT o.id, o.brand_id::text, o.external_order_id, o.created_at, "
                 "b.org_id::text AS brand_org_id "
                 "FROM orders o "
-                "LEFT JOIN brands b ON b.id = o.brand_id "
+                "LEFT JOIN brands b ON CAST(b.id AS text) = CAST(o.brand_id AS text) "
                 "WHERE o.org_id IS NULL "
                 "LIMIT 5"
             )
@@ -5053,11 +5053,14 @@ async def backfill_org_ids(
             _text_backfill(
                 "UPDATE orders "
                 "SET org_id = ( "
-                "    SELECT org_id FROM brands WHERE brands.id = orders.brand_id "
+                "    SELECT org_id FROM brands "
+                "    WHERE CAST(brands.id AS text) = CAST(orders.brand_id AS text) "
                 ") "
                 "WHERE org_id IS NULL "
                 "AND EXISTS ( "
-                "    SELECT 1 FROM brands WHERE brands.id = orders.brand_id AND brands.org_id IS NOT NULL "
+                "    SELECT 1 FROM brands "
+                "    WHERE CAST(brands.id AS text) = CAST(orders.brand_id AS text) "
+                "    AND brands.org_id IS NOT NULL "
                 ")"
             )
         )

@@ -2776,12 +2776,12 @@ UPDATE orders SET
     sync_status = :sync_status,
     sync_health_status = :sync_health_status,
     sync_health_missing_fields = CAST(:sync_health_missing_fields AS jsonb),
-    synced_at = :synced_at,
-    last_synced_at = :last_synced_at,
-    updated_at = :updated_at
+    synced_at = CAST(:synced_at AS timestamptz),
+    last_synced_at = CAST(:last_synced_at AS timestamptz),
+    updated_at = CAST(:updated_at AS timestamptz)
 WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :external_order_id
 """
-                            # Serialize JSON fields for raw SQL binding — asyncpg
+
                             # cannot encode Python list/dict directly; it needs strings.
                             line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
                             raw_payload_str = json.dumps(make_json_safe(raw_payload)) if raw_payload else None
@@ -2881,12 +2881,17 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             update_params = normalize_uuid_fields(update_params)
                             update_params = normalize_datetime_fields(update_params)
                             update_params = apply_uuid_str_to_params(update_params)
-                            # Final guard: scan params for raw naive datetimes before execute
+                            # Final guard: convert ALL datetime params to ISO strings before execute.
+                            # asyncpg cannot bind Python datetime objects directly — must use ISO strings
+                            # with CAST(:col AS timestamptz) in the SQL.
                             for _param_key, _param_val in list(update_params.items()):
                                 if isinstance(_param_val, datetime):
-                                    if _param_val.tzinfo is None:
-                                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
-                                        update_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
+                                    update_params[_param_key] = _param_val.astimezone(timezone.utc).isoformat()
+                            # Assertion: block execution if any datetime object still remains
+                            for _param_key, _param_val in update_params.items():
+                                if isinstance(_param_val, datetime):
+                                    logger.error("[DATETIME_BIND_ASSERTION_FAILED] field=%s type=%s", _param_key, type(_param_val))
+                                    raise ValueError(f"Datetime object still in params at execute time: {_param_key}")
                             # Hard block: never execute UPDATE with org_id=None
                             if update_params.get("org_id") is None:
                                 logger.error(
@@ -2907,11 +2912,12 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 )
                                 batch_skipped += 1
                                 continue
+
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
                             )
-                            batch_updated += 1
+
                             # [ORDER_DB_WRITE] Log every successful order update
                             logger.info(
                                 "[ORDER_DB_WRITE] db_order_id=%s external_order_id=%s brand_id=%s org_id=%s customer_name=%s synced_at=%s status=%s",
@@ -2946,10 +2952,11 @@ INSERT INTO orders (
     :customer_name, :status, :total_cents, :amount, :item_count, :unit_count,
     :line_items_json, :raw_payload, :source, :review_status, :sync_status,
     :sync_health_status, CAST(:sync_health_missing_fields AS jsonb),
-    :synced_at, :last_synced_at,
-    :created_at, :updated_at
+    CAST(:synced_at AS timestamptz), CAST(:last_synced_at AS timestamptz),
+    CAST(:created_at AS timestamptz), CAST(:updated_at AS timestamptz)
 )
 """
+
                             # Serialize JSON fields for raw SQL binding — asyncpg
                             # cannot encode Python list/dict directly; it needs strings.
                             line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
@@ -3061,12 +3068,18 @@ INSERT INTO orders (
                             insert_params = normalize_uuid_fields(insert_params)
                             insert_params = normalize_datetime_fields(insert_params)
                             insert_params = apply_uuid_str_to_params(insert_params)
-                            # Final guard: scan params for raw naive datetimes before execute
+                            # Final guard: convert ALL datetime params to ISO strings before execute.
+                            # asyncpg cannot bind Python datetime objects directly — must use ISO strings
+                            # with CAST(:col AS timestamptz) in the SQL.
                             for _param_key, _param_val in list(insert_params.items()):
                                 if isinstance(_param_val, datetime):
-                                    if _param_val.tzinfo is None:
-                                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
-                                        insert_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
+                                    insert_params[_param_key] = _param_val.astimezone(timezone.utc).isoformat()
+                            # Assertion: block execution if any datetime object still remains
+                            for _param_key, _param_val in insert_params.items():
+                                if isinstance(_param_val, datetime):
+                                    logger.error("[DATETIME_BIND_ASSERTION_FAILED] field=%s type=%s", _param_key, type(_param_val))
+                                    raise ValueError(f"Datetime object still in params at execute time: {_param_key}")
+
                             # Hard block: never execute INSERT with org_id=None
                             if insert_params.get("org_id") is None:
                                 logger.error(
