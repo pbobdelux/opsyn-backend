@@ -500,3 +500,116 @@ from models.assistant_models import (  # noqa: F401, E402
 # ---------------------------------------------------------------------------
 from models.sync_health import DeadLetterLineItem, SyncHealth  # noqa: F401, E402
 
+
+# =============================================================================
+# Sync Dead Letter Model — order-level dead-letter queue with detailed metadata
+# =============================================================================
+
+class SyncDeadLetter(Base):
+    """
+    Order-level dead-letter queue with detailed failure metadata.
+
+    Written when an entire order header cannot be processed (header insert
+    failure, unrecoverable transform error, or unprocessable payload).
+
+    Distinct from dead_letter_line_items which tracks individual line item
+    failures. This table captures the full order payload plus structured
+    diagnostic fields so operators can identify and fix root causes.
+
+    Failure categories (failure_category column):
+      missing_customer          — customer_name absent or empty
+      missing_order_number      — order_number absent or empty
+      missing_external_order_id — external_id absent or empty
+      invalid_money             — amount/total field not parseable as float
+      invalid_timestamp         — created_at/updated_at not parseable as datetime
+      invalid_status            — status value not in allowed set
+      malformed_line_items      — line_items field present but not a valid list
+      orphan_line_items         — line items reference an order that doesn't exist
+      duplicate_external_id     — unique constraint violation on external_order_id
+      invalid_json_payload      — raw payload is not valid JSON
+      serializer_error          — ORM/serializer raised an exception
+      db_type_error             — PostgreSQL type mismatch (e.g. UUID vs varchar)
+      unknown_transform_error   — unclassified transform failure
+
+    Failure stages (failure_stage column):
+      header_extract    — extracting fields from raw payload
+      header_transform  — transforming/normalizing extracted fields
+      header_insert     — writing Order row to database
+      line_item_extract — extracting line items from payload
+      line_item_transform — normalizing line item fields
+      line_item_insert  — writing OrderLine rows to database
+    """
+
+    __tablename__ = "sync_dead_letters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String(120), nullable=False, default="leaflink")
+    brand_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    org_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+
+    # Order identification
+    external_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    order_number: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    customer_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # Raw payload
+    raw_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    # Legacy error fields (kept for backward compatibility)
+    error_stage: Mapped[str] = mapped_column(String(120), nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Structured failure metadata (added in 2026_05_23_01)
+    failure_stage: Mapped[Optional[str]] = mapped_column(
+        String(80),
+        nullable=True,
+        comment="header_extract | header_transform | header_insert | line_item_extract | line_item_transform | line_item_insert",
+    )
+    failure_category: Mapped[Optional[str]] = mapped_column(
+        String(80),
+        nullable=True,
+        comment="Specific failure category — see class docstring for full list",
+    )
+    exception_type: Mapped[Optional[str]] = mapped_column(
+        String(120),
+        nullable=True,
+        comment="Python exception class name (e.g. KeyError, ValueError, TypeError)",
+    )
+    exception_message: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Full exception message (up to 1000 chars)",
+    )
+    traceback_summary: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="First 500 chars of the Python traceback",
+    )
+    payload_keys: Mapped[Optional[list]] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="JSONB array of top-level keys present in the raw payload",
+    )
+    problematic_field: Mapped[Optional[str]] = mapped_column(
+        String(120),
+        nullable=True,
+        comment="The specific field that caused the failure",
+    )
+    problematic_value_preview: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="First 100 chars of the problematic field value",
+    )
+
+    # Retry tracking
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+

@@ -44,45 +44,111 @@ MAX_LINE_ITEM_RETRIES = 3
 # Failure categorization — classify sync errors for structured reporting
 # ---------------------------------------------------------------------------
 
+# Specific failure categories (replaces generic 'malformed').
+# These map directly to the failure_category column in sync_dead_letters.
+FAILURE_CATEGORIES = {
+    "missing_customer",
+    "missing_order_number",
+    "missing_external_order_id",
+    "invalid_money",
+    "invalid_timestamp",
+    "invalid_status",
+    "malformed_line_items",
+    "orphan_line_items",
+    "duplicate_external_id",
+    "invalid_json_payload",
+    "serializer_error",
+    "db_type_error",
+    "unknown_transform_error",
+    # Legacy / infrastructure categories
+    "duplicate_key",
+    "missing_field",
+    "line_item_issue",
+    "fk_issue",
+    "timeout",
+    "rate_limit",
+    "validation",
+    "unknown",
+}
+
 # Ordered list of (category, predicates) — first match wins.
 _FAILURE_CATEGORY_RULES: list[tuple[str, list[str]]] = [
-    ("duplicate_key",   ["duplicate key", "uq_"]),
-    ("missing_field",   ["not null", "required", "null value in column"]),
-    ("malformed",       ["invalid input", "type mismatch", "invalid syntax", "json"]),
-    ("line_item_issue", ["order_lines", "line_item"]),
-    ("fk_issue",        ["foreign key", "does not exist", "violates foreign key"]),
-    ("timeout",         ["timeout", "timed out"]),
-    ("rate_limit",      ["429", "rate limit", "too many requests"]),
-    ("validation",      ["check constraint", "validation", "violates check"]),
+    # Specific domain categories — checked first
+    ("duplicate_external_id",   ["duplicate key", "uq_brand_external_order", "uq_"]),
+    ("db_type_error",           ["invalid input syntax for type uuid", "invalid input syntax for type", "type mismatch"]),
+    ("invalid_json_payload",    ["invalid input syntax for type json", "json", "jsonb"]),
+    ("serializer_error",        ["not null", "null value in column", "required"]),
+    ("malformed_line_items",    ["order_lines", "line_item"]),
+    ("fk_issue",                ["foreign key", "does not exist", "violates foreign key"]),
+    ("timeout",                 ["timeout", "timed out"]),
+    ("rate_limit",              ["429", "rate limit", "too many requests"]),
+    ("validation",              ["check constraint", "validation", "violates check"]),
 ]
 
 
 def categorize_sync_failure(exception: Exception, context: Optional[dict] = None) -> str:
-    """Classify a sync exception into a named failure category.
+    """Classify a sync exception into a specific named failure category.
 
     Categories (first match wins):
-      duplicate_key   — unique constraint violation
-      missing_field   — NOT NULL / required field absent
-      malformed       — invalid input syntax / type mismatch / JSON error
-      line_item_issue — error in order_lines table or line item processing
-      fk_issue        — foreign key violation or column does not exist
-      timeout         — request or query timed out
-      rate_limit      — HTTP 429 / rate limit exceeded
-      validation      — check constraint / validation error
-      unknown         — default when no rule matches
+      duplicate_external_id   — unique constraint on (brand_id, external_order_id)
+      db_type_error           — PostgreSQL type mismatch (UUID vs varchar, etc.)
+      invalid_json_payload    — invalid JSON / JSONB input
+      serializer_error        — NOT NULL / required field absent
+      malformed_line_items    — error in order_lines table or line item processing
+      fk_issue                — foreign key violation or column does not exist
+      timeout                 — request or query timed out
+      rate_limit              — HTTP 429 / rate limit exceeded
+      validation              — check constraint / validation error
+      unknown_transform_error — default when no rule matches
+
+    Context keys that trigger specific categories (checked before rule matching):
+      failure_category: pre-classified category (returned as-is if valid)
+      missing_field:    field name → missing_customer / missing_order_number / etc.
 
     Args:
         exception: The caught exception.
-        context:   Optional dict with extra context (e.g. stage, external_id).
+        context:   Optional dict with extra context (e.g. stage, external_id,
+                   failure_category, missing_field).
 
     Returns:
         Category string.
     """
+    # If caller already classified the failure, trust it
+    if context:
+        pre_classified = context.get("failure_category")
+        if pre_classified and pre_classified in FAILURE_CATEGORIES:
+            return pre_classified
+
+        # Map missing_field context to specific categories
+        missing_field = context.get("missing_field")
+        if missing_field == "customer_name":
+            return "missing_customer"
+        if missing_field == "order_number":
+            return "missing_order_number"
+        if missing_field == "external_order_id":
+            return "missing_external_order_id"
+        if missing_field in ("amount", "total_amount", "total"):
+            return "invalid_money"
+        if missing_field in ("created_at", "updated_at", "external_created_at"):
+            return "invalid_timestamp"
+        if missing_field == "status":
+            return "invalid_status"
+        if missing_field == "line_items":
+            return "malformed_line_items"
+
     err_lower = str(exception).lower()
+    exc_type = type(exception).__name__
+
+    # Exception-type shortcuts
+    if exc_type == "ValueError" and "could not convert" in err_lower:
+        return "invalid_money"
+    if exc_type in ("KeyError",):
+        return "unknown_transform_error"
+
     for category, keywords in _FAILURE_CATEGORY_RULES:
         if any(kw in err_lower for kw in keywords):
             return category
-    return "unknown"
+    return "unknown_transform_error"
 
 
 def log_sync_order_failed(
@@ -93,31 +159,46 @@ def log_sync_order_failed(
     page_number: Optional[int] = None,
     cursor: Optional[str] = None,
     payload_size: Optional[int] = None,
-) -> str:
-    """Emit a structured [SYNC_ORDER_FAILED] log line and return the failure category.
+    customer_name: Optional[str] = None,
+    failure_category: Optional[str] = None,
+    problematic_field: Optional[str] = None,
+    context: Optional[dict] = None,
+) -> tuple[str, str, str]:
+    """Emit a structured [SYNC_ORDER_FAILED] log line and return failure metadata.
 
     Args:
-        external_id:   LeafLink order PK.
-        order_number:  Human-readable order number.
-        failure_stage: Where the failure occurred (fetch, transform, upsert,
-                       line_item, customer_map, status_map, sync_health).
-        exception:     The caught exception.
-        page_number:   API page number (if available).
-        cursor:        Cursor hash (if cursor-based pagination).
-        payload_size:  Raw payload size in bytes (if available).
+        external_id:       LeafLink order PK.
+        order_number:      Human-readable order number.
+        failure_stage:     Where the failure occurred (fetch, transform, upsert,
+                           line_item, customer_map, status_map, sync_health).
+        exception:         The caught exception.
+        page_number:       API page number (if available).
+        cursor:            Cursor hash (if cursor-based pagination).
+        payload_size:      Raw payload size in bytes (if available).
+        customer_name:     Customer name from the payload (if available).
+        failure_category:  Pre-classified failure category (overrides auto-detection).
+        problematic_field: The specific field that caused the failure.
+        context:           Optional dict with extra context for categorization.
 
     Returns:
-        The failure category string.
+        Tuple of (failure_category, exception_type, traceback_summary).
     """
     import traceback as _tb
 
-    category = categorize_sync_failure(exception)
+    _ctx = context or {}
+    if failure_category:
+        _ctx["failure_category"] = failure_category
+    if problematic_field:
+        _ctx["missing_field"] = problematic_field
+
+    category = categorize_sync_failure(exception, _ctx)
     exc_type = type(exception).__name__
     exc_msg = str(exception)[:500]
 
     # Capture last 3 stack frames as a compact summary
     tb_lines = _tb.format_tb(exception.__traceback__) if exception.__traceback__ else []
     tb_summary = " | ".join(line.strip().replace("\n", " ") for line in tb_lines[-3:])
+    tb_summary_short = tb_summary[:500] if tb_summary else "none"
 
     logger.error(
         "[SYNC_ORDER_FAILED] external_id=%s order_number=%s stage=%s category=%s"
@@ -130,9 +211,23 @@ def log_sync_order_failed(
         exc_msg,
         page_number or "unknown",
         payload_size or "unknown",
-        tb_summary[:500] if tb_summary else "none",
+        tb_summary_short,
     )
-    return category
+
+    # Detailed dead-letter log for structured analysis
+    logger.error(
+        "[DEAD_LETTER_DETAILED] external_order_id=%s order_number=%s customer=%s "
+        "failure_stage=%s failure_category=%s exception_type=%s problematic_field=%s",
+        external_id or "unknown",
+        order_number or "unknown",
+        customer_name or "unknown",
+        failure_stage,
+        category,
+        exc_type,
+        problematic_field or "unknown",
+    )
+
+    return category, exc_type, tb_summary_short
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +535,15 @@ async def _write_sync_dead_letter(
     external_id: Optional[str] = None,
     order_number: Optional[str] = None,
     source: str = "leaflink",
+    # Detailed diagnostic fields (added 2026_05_23_01)
+    failure_stage: Optional[str] = None,
+    failure_category: Optional[str] = None,
+    exception_type: Optional[str] = None,
+    exception_message: Optional[str] = None,
+    traceback_summary: Optional[str] = None,
+    problematic_field: Optional[str] = None,
+    problematic_value_preview: Optional[str] = None,
+    customer_name: Optional[str] = None,
 ) -> None:
     """Write a dead-letter record to sync_dead_letters for an order that could not be processed.
 
@@ -448,19 +552,40 @@ async def _write_sync_dead_letter(
     or the payload is unprocessable.
 
     Args:
-        brand_id:      Brand UUID.
-        raw_payload:   Full raw LeafLink order payload (stored as JSONB).
-        error_stage:   Where the failure occurred (e.g. 'header_insert', 'line_item_transform').
-        error_message: Exception or error description.
-        org_id:        Org UUID (nullable).
-        external_id:   LeafLink order PK (nullable).
-        order_number:  Human-readable order number (nullable).
-        source:        Integration name (default 'leaflink').
+        brand_id:                  Brand UUID.
+        raw_payload:               Full raw LeafLink order payload (stored as JSONB).
+        error_stage:               Where the failure occurred (legacy field, e.g. 'header_insert').
+        error_message:             Exception or error description.
+        org_id:                    Org UUID (nullable).
+        external_id:               LeafLink order PK (nullable).
+        order_number:              Human-readable order number (nullable).
+        source:                    Integration name (default 'leaflink').
+        failure_stage:             Structured stage name (header_extract, header_transform,
+                                   header_insert, line_item_extract, line_item_transform,
+                                   line_item_insert).
+        failure_category:          Specific failure category (see FAILURE_CATEGORIES).
+        exception_type:            Python exception class name (e.g. KeyError, ValueError).
+        exception_message:         Full exception message (up to 1000 chars).
+        traceback_summary:         First 500 chars of the Python traceback.
+        problematic_field:         The specific field that caused the failure.
+        problematic_value_preview: First 100 chars of the problematic field value.
+        customer_name:             Customer name from the payload (if available).
     """
     # Coerce brand_id and org_id to valid UUIDs or None before writing to the dead-letter table.
     # CAST(:brand_id AS uuid) in the SQL will fail if the value is not a valid UUID string.
     brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
     org_id = safe_uuid_for_db(org_id, "org_id")
+
+    # Extract payload_keys for debugging (top-level keys of the raw payload)
+    payload_keys_json: Optional[str] = None
+    if isinstance(raw_payload, dict):
+        try:
+            payload_keys_json = json.dumps(list(raw_payload.keys()))
+        except Exception:
+            payload_keys_json = None
+
+    # Use failure_stage as error_stage if not separately provided (backward compat)
+    effective_error_stage = failure_stage or error_stage
 
     try:
         async with AsyncSessionLocal() as db:
@@ -477,9 +602,18 @@ async def _write_sync_dead_letter(
                 "org_id": safe_uuid_for_db(org_id, "org_id"),
                 "external_id": external_id,
                 "order_number": order_number,
+                "customer_name": customer_name,
                 "raw_payload": raw_payload_str,
-                "error_stage": error_stage,
+                "error_stage": effective_error_stage,
                 "error_message": error_message[:2000],
+                "failure_stage": failure_stage,
+                "failure_category": failure_category,
+                "exception_type": exception_type,
+                "exception_message": (exception_message or "")[:1000] if exception_message else None,
+                "traceback_summary": (traceback_summary or "")[:500] if traceback_summary else None,
+                "payload_keys": payload_keys_json,
+                "problematic_field": problematic_field,
+                "problematic_value_preview": (problematic_value_preview or "")[:100] if problematic_value_preview else None,
                 "now": now,
             }, statement="_write_sync_dead_letter")
             # FINAL coercion — apply safe_uuid_for_db() directly into the params
@@ -510,26 +644,59 @@ async def _write_sync_dead_letter(
                         "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
                         _k, params[_k].isoformat(), params[_k].tzinfo, params[_k].tzinfo is not None,
                     )
-            await db.execute(
-                text("""
-                    INSERT INTO sync_dead_letters
-                        (source, brand_id, org_id, external_id, order_number,
-                         raw_payload, error_stage, error_message, retry_count, created_at)
-                    VALUES
-                        (:source, CAST(:brand_id AS uuid), CAST(:org_id AS uuid),
-                         :external_id, :order_number,
-                         CAST(:raw_payload AS jsonb), :error_stage, :error_message,
-                         0, :now)
-                """),
-                params,
-            )
+            # Try to write with new detail columns; fall back to legacy schema if columns don't exist yet
+            try:
+                await db.execute(
+                    text("""
+                        INSERT INTO sync_dead_letters
+                            (source, brand_id, org_id, external_id, order_number,
+                             customer_name, raw_payload, error_stage, error_message,
+                             failure_stage, failure_category, exception_type, exception_message,
+                             traceback_summary, payload_keys, problematic_field,
+                             problematic_value_preview, retry_count, created_at)
+                        VALUES
+                            (:source, CAST(:brand_id AS uuid), CAST(:org_id AS uuid),
+                             :external_id, :order_number,
+                             :customer_name, CAST(:raw_payload AS jsonb), :error_stage, :error_message,
+                             :failure_stage, :failure_category, :exception_type, :exception_message,
+                             :traceback_summary, CAST(:payload_keys AS jsonb), :problematic_field,
+                             :problematic_value_preview, 0, :now)
+                    """),
+                    params,
+                )
+            except Exception as _detail_exc:
+                # New columns may not exist yet (migration pending) — fall back to legacy insert
+                _detail_err = str(_detail_exc).lower()
+                if "column" in _detail_err and ("does not exist" in _detail_err or "unknown" in _detail_err):
+                    logger.warning(
+                        "[DEAD_LETTER_FALLBACK] new columns not yet migrated, using legacy schema: %s",
+                        str(_detail_exc)[:200],
+                    )
+                    await db.execute(
+                        text("""
+                            INSERT INTO sync_dead_letters
+                                (source, brand_id, org_id, external_id, order_number,
+                                 raw_payload, error_stage, error_message, retry_count, created_at)
+                            VALUES
+                                (:source, CAST(:brand_id AS uuid), CAST(:org_id AS uuid),
+                                 :external_id, :order_number,
+                                 CAST(:raw_payload AS jsonb), :error_stage, :error_message,
+                                 0, :now)
+                        """),
+                        params,
+                    )
+                else:
+                    raise
             await db.commit()
         logger.warning(
-            "[SYNC_DEAD_LETTER_WRITTEN] external_id=%s order_number=%s error_stage=%s error_message=%s brand_id=%s",
+            "[SYNC_DEAD_LETTER_WRITTEN] external_id=%s order_number=%s customer=%s "
+            "failure_stage=%s failure_category=%s error_stage=%s brand_id=%s",
             external_id,
             order_number,
+            customer_name or "unknown",
+            failure_stage or error_stage,
+            failure_category or "unclassified",
             error_stage,
-            error_message[:200],
             brand_id,
         )
     except Exception as exc:
@@ -1805,22 +1972,33 @@ async def sync_leaflink_orders(
                 brand_id,
             )
 
+            # Safe defaults — missing optional fields never kill the order header.
             customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
+            # order_number: fall back to ORDER-{external_id[:8]} if missing
+            order_number = safe_str(o.get("order_number")) or f"ORDER-{(external_id or 'UNKNOWN')[:8]}"
+            # status: fall back to "submitted" if missing or invalid
             status = (safe_str(o.get("status")) or "submitted").lower()
-            order_number = safe_str(o.get("order_number"))
 
-            # Try multiple field names with fallbacks.
-            # total_amount is the primary key set by the normalized LeafLink client;
-            # the remaining fields cover raw/un-normalized payloads.
-            amount_decimal = safe_decimal(
+            # amount: fault-tolerant — invalid money defaults to 0 with sync_health note
+            _raw_amount_v1 = (
                 o.get("total_amount")  # Primary: from normalized client
                 or o.get("amount")
                 or o.get("total")
                 or o.get("subtotal")
                 or o.get("price")
             )
-
-            if amount_decimal is None:
+            amount_decimal = safe_decimal(_raw_amount_v1)
+            _amount_sync_note_v1: str | None = None
+            if _raw_amount_v1 is not None and amount_decimal is None:
+                # Value present but unparseable — default to 0 and note it
+                amount_decimal = safe_decimal("0")
+                _amount_sync_note_v1 = "amount_invalid_value"
+                logger.warning(
+                    "[SAFE_AMOUNT_FALLBACK] external_id=%s raw_amount=%r — defaulting to 0",
+                    external_id,
+                    str(_raw_amount_v1)[:50],
+                )
+            elif amount_decimal is None:
                 logger.warning(
                     "leaflink: sync_amount_missing external_id=%s — no pricing field found in order",
                     external_id,
@@ -1895,6 +2073,8 @@ async def sync_leaflink_orders(
                         _sh_missing_upd.append("customer_name")
                     if amount_decimal is None:
                         _sh_missing_upd.append("amount")
+                    elif _amount_sync_note_v1:
+                        _sh_missing_upd.append(_amount_sync_note_v1)
                     if not normalized_line_items:
                         _sh_missing_upd.append("line_items")
                     if not status:
@@ -1918,6 +2098,8 @@ async def sync_leaflink_orders(
                         _sh_missing_new.append("customer_name")
                     if amount_decimal is None:
                         _sh_missing_new.append("amount")
+                    elif _amount_sync_note_v1:
+                        _sh_missing_new.append(_amount_sync_note_v1)
                     if not normalized_line_items:
                         _sh_missing_new.append("line_items")
                     if not status:
@@ -1966,12 +2148,13 @@ async def sync_leaflink_orders(
                 # Header insert failed — write to dead-letter queue and skip this order
                 header_err_msg = str(header_exc)[:500]
                 _payload_size = len(str(raw_payload_for_dead_letter)) if raw_payload_for_dead_letter else 0
-                log_sync_order_failed(
+                _hdr_category, _hdr_exc_type, _hdr_tb = log_sync_order_failed(
                     external_id=external_id,
                     order_number=order_number,
-                    failure_stage="upsert",
+                    failure_stage="header_insert",
                     exception=header_exc,
                     payload_size=_payload_size,
+                    customer_name=customer_name,
                 )
                 logger.error(
                     "[SYNC_HEADER_INSERT_FAILED] external_id=%s order_number=%s brand_id=%s error=%s",
@@ -1989,6 +2172,12 @@ async def sync_leaflink_orders(
                     org_id=org_id,
                     external_id=external_id,
                     order_number=order_number,
+                    customer_name=customer_name,
+                    failure_stage="header_insert",
+                    failure_category=_hdr_category,
+                    exception_type=_hdr_exc_type,
+                    exception_message=header_err_msg,
+                    traceback_summary=_hdr_tb,
                 )
                 dead_letter += 1
                 if len(errors) < 10:
@@ -2226,15 +2415,18 @@ async def sync_leaflink_orders(
                 total_lines_written += len(normalized_line_items)
 
             except Exception as line_exc:
-                # Line item failure — save header with sync_status='partial', log, continue
+                # Line item failure — save header with sync_status='partial', log, continue.
+                # Header is already committed; line item failures do NOT mark the order as dead-letter.
                 line_err_msg = str(line_exc)[:500]
                 _li_payload_size = len(str(raw_payload_for_dead_letter)) if raw_payload_for_dead_letter else 0
-                log_sync_order_failed(
+                _li_category, _li_exc_type, _li_tb = log_sync_order_failed(
                     external_id=external_id,
                     order_number=order_number,
-                    failure_stage="line_item",
+                    failure_stage="line_item_insert",
                     exception=line_exc,
                     payload_size=_li_payload_size,
+                    customer_name=customer_name,
+                    failure_category="malformed_line_items",
                 )
                 logger.error(
                     "[SYNC_PARTIAL_SUCCESS] external_id=%s brand_id=%s header_saved=true line_items_failed=true error=%s",
@@ -2242,7 +2434,8 @@ async def sync_leaflink_orders(
                     brand_id,
                     line_err_msg,
                 )
-                # Mark the order as partial so it can be reprocessed later
+                # Mark the order as partial so it can be reprocessed later.
+                # The order header is still valid — only line items failed.
                 try:
                     order_row.sync_status = "partial"
                     order_row.sync_health_status = "partial"
@@ -2253,16 +2446,16 @@ async def sync_leaflink_orders(
                     pass
                 partial += 1
                 if len(errors) < 10:
-                    errors.append(f"line_item_transform external_id={external_id}: {line_err_msg[:200]}")
+                    errors.append(f"line_item_insert external_id={external_id}: {line_err_msg[:200]}")
 
         except Exception as order_exc:
             # Outer per-order failure: log, record error, skip this order, continue
             err_reason = str(order_exc)[:300]
             _outer_payload_size = len(str(raw_payload_for_dead_letter)) if raw_payload_for_dead_letter else 0
-            log_sync_order_failed(
+            _outer_category, _outer_exc_type, _outer_tb = log_sync_order_failed(
                 external_id=order_external_id_for_log if order_external_id_for_log != "unknown" else None,
                 order_number=order_number_for_log,
-                failure_stage="transform",
+                failure_stage="header_transform",
                 exception=order_exc,
                 payload_size=_outer_payload_size,
             )
@@ -2287,6 +2480,11 @@ async def sync_leaflink_orders(
                 org_id=org_id,
                 external_id=order_external_id_for_log if order_external_id_for_log != "unknown" else None,
                 order_number=order_number_for_log,
+                failure_stage="header_transform",
+                failure_category=_outer_category,
+                exception_type=_outer_exc_type,
+                exception_message=err_reason,
+                traceback_summary=_outer_tb,
             )
             dead_letter += 1
             if len(errors) < 10:
@@ -2495,17 +2693,33 @@ async def sync_leaflink_orders_headers_only(
                                 _payload_company_id,
                             )
 
+                          # Safe defaults — missing optional fields never kill the order header.
+                          # customer_name: fall back to "Unknown Customer" (order still inserts)
                           customer_name = safe_str(o.get("customer_name")) or "Unknown Customer"
+                          # order_number: fall back to ORDER-{external_id[:8]} if missing
+                          order_number = safe_str(o.get("order_number")) or f"ORDER-{(external_id or 'UNKNOWN')[:8]}"
+                          # status: fall back to "submitted" if missing or invalid
                           status = (safe_str(o.get("status")) or "submitted").lower()
-                          order_number = safe_str(o.get("order_number"))
 
-                          amount_decimal = safe_decimal(
+                          # amount: fault-tolerant — invalid money defaults to 0 with sync_health note
+                          _raw_amount = (
                             o.get("total_amount")
                             or o.get("amount")
                             or o.get("total")
                             or o.get("subtotal")
                             or o.get("price")
                           )
+                          amount_decimal = safe_decimal(_raw_amount)
+                          _amount_sync_note: str | None = None
+                          if _raw_amount is not None and amount_decimal is None:
+                            # Value present but unparseable — default to 0 and note it
+                            amount_decimal = safe_decimal("0")
+                            _amount_sync_note = "amount_invalid_value"
+                            logger.warning(
+                                "[SAFE_AMOUNT_FALLBACK] external_id=%s raw_amount=%r — defaulting to 0",
+                                external_id,
+                                str(_raw_amount)[:50],
+                            )
                           total_cents = decimal_to_cents(amount_decimal) or 0
 
                           item_count = safe_int(o.get("item_count"), default=0)
@@ -2601,6 +2815,8 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                 _sh_missing.append("customer_name")
                             if amount_decimal is None:
                                 _sh_missing.append("amount")
+                            elif _amount_sync_note:
+                                _sh_missing.append(_amount_sync_note)
                             if not normalized_line_items:
                                 _sh_missing.append("line_items")
                             if not status:
@@ -2751,6 +2967,8 @@ INSERT INTO orders (
                                 _sh_missing_ins.append("customer_name")
                             if amount_decimal is None:
                                 _sh_missing_ins.append("amount")
+                            elif _amount_sync_note:
+                                _sh_missing_ins.append(_amount_sync_note)
                             if not normalized_line_items:
                                 _sh_missing_ins.append("line_items")
                             if not status:
@@ -2855,12 +3073,15 @@ INSERT INTO orders (
                             # Per-order failure: log with [ORDER_TRANSFORM_SKIPPED], write dead-letter, continue
                             _err_reason = str(_order_exc)[:300]
                             _batch_payload_size = len(str(_raw_payload_ref)) if _raw_payload_ref else 0
-                            log_sync_order_failed(
+                            # Extract customer_name for dead-letter metadata (may not be set yet)
+                            _dl_customer = safe_str(o.get("customer_name")) if isinstance(o, dict) else None
+                            _batch_category, _batch_exc_type, _batch_tb = log_sync_order_failed(
                                 external_id=_order_ext_id_for_log if _order_ext_id_for_log != "unknown" else None,
                                 order_number=_order_number_for_log,
-                                failure_stage="upsert",
+                                failure_stage="header_insert",
                                 exception=_order_exc,
                                 payload_size=_batch_payload_size,
+                                customer_name=_dl_customer,
                             )
                             logger.warning(
                                 "[ORDER_TRANSFORM_SKIPPED] external_id=%s reason=%s",
@@ -2887,6 +3108,12 @@ INSERT INTO orders (
                                     org_id=org_id_value,
                                     external_id=_order_ext_id_for_log if _order_ext_id_for_log != "unknown" else None,
                                     order_number=_order_number_for_log,
+                                    customer_name=_dl_customer,
+                                    failure_stage="header_insert",
+                                    failure_category=_batch_category,
+                                    exception_type=_batch_exc_type,
+                                    exception_message=_err_reason,
+                                    traceback_summary=_batch_tb,
                                 )
                             )
                             batch_dead_letter += 1

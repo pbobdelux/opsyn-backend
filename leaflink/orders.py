@@ -91,6 +91,67 @@ def money_to_float(value: Any) -> float | None:
         return None
 
 
+def safe_money_to_float(value: Any, field_name: str = "amount") -> tuple[float | None, str | None]:
+    """Fault-tolerant money parser — returns (value, sync_health_note).
+
+    Returns (float, None) on success.
+    Returns (0.0, note) when the value is present but unparseable.
+    Returns (None, None) when the value is absent.
+
+    This prevents a single bad money field from killing the entire order.
+    """
+    if value is None or value == "":
+        return None, None
+    try:
+        return float(value), None
+    except (TypeError, ValueError):
+        note = f"{field_name}_invalid_value"
+        logger.warning(
+            "[SAFE_MONEY_FALLBACK] field=%s value=%r — defaulting to 0",
+            field_name,
+            str(value)[:50],
+        )
+        return 0.0, note
+
+
+def safe_timestamp(value: Any, field_name: str = "timestamp") -> tuple["datetime | None", str | None]:
+    """Fault-tolerant timestamp parser — returns (datetime, sync_health_note).
+
+    Returns (datetime, None) on success.
+    Returns (None, note) when the value is present but unparseable.
+    Returns (None, None) when the value is absent.
+
+    This prevents a single bad timestamp from killing the entire order.
+    """
+    if value is None or value == "":
+        return None, None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc), None
+        return value.astimezone(timezone.utc), None
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc), None
+        except (ValueError, TypeError):
+            note = f"{field_name}_invalid_timestamp"
+            logger.warning(
+                "[SAFE_TIMESTAMP_FALLBACK] field=%s value=%r — defaulting to None",
+                field_name,
+                str(value)[:50],
+            )
+            return None, note
+    note = f"{field_name}_unexpected_type"
+    logger.warning(
+        "[SAFE_TIMESTAMP_FALLBACK] field=%s type=%s — defaulting to None",
+        field_name,
+        type(value).__name__,
+    )
+    return None, note
+
+
 def cents_to_amount(cents: int | None) -> float | None:
     if cents is None:
         return None
@@ -239,31 +300,72 @@ def compute_sync_health(order: Order, line_items: list[dict[str, Any]]) -> dict[
     - "partial" — header saved but some child data is missing (line items, totals, etc.)
     - "failed"  — sync explicitly failed for this order
 
+    Fault-tolerant: any exception reading order attributes is caught and
+    treated as a missing field rather than propagating to the caller.
+
     Returns a dict with:
         status:          "ok" | "partial" | "failed"
         missing_fields:  list of field names that are missing/empty
         last_synced_at:  datetime of last sync attempt
         last_error:      error string or null
+        notes:           list of sync_health notes (e.g. invalid field values)
     """
-    sync_status = getattr(order, "sync_status", "ok") or "ok"
-    last_synced_at = _ensure_utc(
-        getattr(order, "last_synced_at", None) or getattr(order, "synced_at", None)
-    )
+    try:
+        sync_status = getattr(order, "sync_status", "ok") or "ok"
+    except Exception:
+        sync_status = "ok"
 
-    # Determine missing required fields
+    try:
+        last_synced_at = _ensure_utc(
+            getattr(order, "last_synced_at", None) or getattr(order, "synced_at", None)
+        )
+    except Exception:
+        last_synced_at = None
+
+    # Determine missing required fields — each check is individually guarded
     missing_fields: list[str] = []
+    notes: list[str] = []
 
-    if not order.customer_name or order.customer_name == "Unknown Customer":
+    try:
+        customer_name = order.customer_name
+        if not customer_name or customer_name == "Unknown Customer":
+            missing_fields.append("customer_name")
+    except Exception:
         missing_fields.append("customer_name")
 
-    if order.amount is None and order.total_cents is None:
+    try:
+        # Check for invalid money values stored as 0 due to safe_money_to_float fallback
+        amount = order.amount
+        total_cents = order.total_cents
+        if amount is None and total_cents is None:
+            missing_fields.append("amount")
+        elif amount == 0 and total_cents == 0:
+            # Could be a legitimate $0 order or a fallback — note it but don't block
+            notes.append("amount_may_be_fallback")
+    except Exception:
         missing_fields.append("amount")
 
-    if not line_items:
+    try:
+        if not line_items:
+            missing_fields.append("line_items")
+    except Exception:
         missing_fields.append("line_items")
 
-    if not order.status:
+    try:
+        if not order.status:
+            missing_fields.append("status")
+    except Exception:
         missing_fields.append("status")
+
+    # Merge any sync_health_missing_fields already stored on the order
+    try:
+        stored_missing = getattr(order, "sync_health_missing_fields", None)
+        if isinstance(stored_missing, list):
+            for f in stored_missing:
+                if f not in missing_fields:
+                    missing_fields.append(f)
+    except Exception:
+        pass
 
     # Determine health status
     if sync_status == "failed":
@@ -274,14 +376,20 @@ def compute_sync_health(order: Order, line_items: list[dict[str, Any]]) -> dict[
         health_status = "ok"
 
     # Get last_error from sync_health_last_error if available, else None
-    last_error = getattr(order, "sync_health_last_error", None)
+    try:
+        last_error = getattr(order, "sync_health_last_error", None)
+    except Exception:
+        last_error = None
 
-    return {
+    result = {
         "status": health_status,
         "missing_fields": missing_fields,
         "last_synced_at": last_synced_at,
         "last_error": last_error,
     }
+    if notes:
+        result["notes"] = notes
+    return result
 
 
 def is_needs_review(order: Order, line_items: list[dict[str, Any]], blockers: list[dict[str, str]]) -> bool:
@@ -373,50 +481,118 @@ def serialize_order(order: Order) -> dict[str, Any]:
 
     All datetime fields are normalized to UTC-aware via _ensure_utc() so
     callers never receive a mix of naive and aware datetimes.
+
+    Fault-tolerant: individual field failures fall back to safe defaults
+    rather than propagating exceptions to the caller.
     """
-    line_items = build_line_items(order)
+    # Build line items — fault-tolerant (returns [] on any error)
+    try:
+        line_items = build_line_items(order)
+    except Exception as _li_exc:
+        logger.warning(
+            "[SERIALIZE_ORDER_FALLBACK] build_line_items failed order_id=%s error=%s",
+            getattr(order, "id", "unknown"),
+            str(_li_exc)[:100],
+        )
+        line_items = []
 
-    amount = money_to_float(order.amount)
-    if amount is None and order.total_cents is not None:
-        amount = cents_to_amount(order.total_cents)
+    # Amount — fault-tolerant with safe_money_to_float
+    try:
+        amount = money_to_float(order.amount)
+        if amount is None and order.total_cents is not None:
+            amount = cents_to_amount(order.total_cents)
+    except Exception:
+        amount = None
 
-    item_count = order.item_count
-    if item_count is None:
+    # Item/unit counts — fault-tolerant
+    try:
+        item_count = order.item_count
+        if item_count is None:
+            item_count = len(line_items)
+    except Exception:
         item_count = len(line_items)
 
-    unit_count = order.unit_count
-    if unit_count is None:
-        unit_count = sum((item.get("quantity") or 0) for item in line_items)
+    try:
+        unit_count = order.unit_count
+        if unit_count is None:
+            unit_count = sum((item.get("quantity") or 0) for item in line_items)
+    except Exception:
+        unit_count = 0
 
     blockers = derive_blockers(line_items)
     review_status = derive_review_status(line_items, blockers, order)
     sync_health = compute_sync_health(order, line_items)
 
     # Normalize all datetime fields to UTC-aware before returning.
-    # This prevents 'can't subtract offset-naive and offset-aware datetimes'
-    # errors when callers compare or subtract these values.
-    last_synced_at = _ensure_utc(order.last_synced_at or order.synced_at)
-    external_created_at = _ensure_utc(order.external_created_at)
-    external_updated_at = _ensure_utc(order.external_updated_at)
-    created_at = _ensure_utc(order.created_at)
-    updated_at = _ensure_utc(order.updated_at)
+    # Each field is individually guarded to prevent a single bad timestamp
+    # from killing the entire serialization.
+    try:
+        last_synced_at = _ensure_utc(order.last_synced_at or order.synced_at)
+    except Exception:
+        last_synced_at = None
+    try:
+        external_created_at = _ensure_utc(order.external_created_at)
+    except Exception:
+        external_created_at = None
+    try:
+        external_updated_at = _ensure_utc(order.external_updated_at)
+    except Exception:
+        external_updated_at = None
+    try:
+        created_at = _ensure_utc(order.created_at)
+    except Exception:
+        created_at = None
+    try:
+        updated_at = _ensure_utc(order.updated_at)
+    except Exception:
+        updated_at = None
+
+    # Safe scalar fields — fall back to None/defaults on any error
+    try:
+        order_id = order.id
+    except Exception:
+        order_id = None
+    try:
+        external_id = order.external_order_id
+    except Exception:
+        external_id = None
+    try:
+        order_number = order.order_number
+    except Exception:
+        order_number = None
+    try:
+        customer_name = order.customer_name or "Unknown Customer"
+    except Exception:
+        customer_name = "Unknown Customer"
+    try:
+        status = order.status
+    except Exception:
+        status = None
+    try:
+        sync_status = order.sync_status or "ok"
+    except Exception:
+        sync_status = "ok"
+    try:
+        source = order.source
+    except Exception:
+        source = "leaflink"
 
     return {
-        "id": order.id,
-        "external_id": order.external_order_id,
-        "order_number": order.order_number,
-        "customer_name": order.customer_name,
-        "status": order.status,
+        "id": order_id,
+        "external_id": external_id,
+        "order_number": order_number,
+        "customer_name": customer_name,
+        "status": status,
         "amount": amount,
         "item_count": item_count,
         "unit_count": unit_count,
         "line_items": line_items,
         "review_status": review_status,
         "blockers": blockers,
-        "sync_status": order.sync_status or "ok",
+        "sync_status": sync_status,
         "sync_health": sync_health,
         "last_synced_at": last_synced_at,
-        "source": order.source,
+        "source": source,
         "external_created_at": external_created_at,
         "external_updated_at": external_updated_at,
         "created_at": created_at,
