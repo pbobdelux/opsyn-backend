@@ -6,13 +6,53 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer as _defer, selectinload
 
 from database import get_db
 from models import Order, OrderLine
 
 logger = logging.getLogger("leaflink_orders")
 router = APIRouter()
+
+# Columns that may not exist in the database yet (pending migration).
+# Deferring them keeps them out of the SELECT list so the query succeeds
+# even before the migration runs.
+_DISPATCH_AR_COLS = [
+    "assigned_driver_id",
+    "assigned_driver_name",
+    "delivery_status",
+    "delivery_date",
+    "route_number",
+    "route_id",
+    "driver_note",
+    "delivery_instructions",
+    "payment_status",
+    "amount_paid",
+    "balance_due",
+    "due_date",
+    "days_overdue",
+    "invoice_number",
+    "ar_note",
+    "sync_health",
+]
+_DEFER_OPTS = [
+    _defer(getattr(Order, col))
+    for col in _DISPATCH_AR_COLS
+    if hasattr(Order, col)
+]
+
+
+def _safe_col(obj: object, attr: str, default=None):
+    """Safely read a possibly-deferred or missing ORM column.
+
+    Catches both ``AttributeError`` (column not on model) and any
+    SQLAlchemy lazy-load error (``MissingGreenlet``) that occurs when
+    accessing a deferred column in an async context.
+    """
+    try:
+        return getattr(obj, attr, default)
+    except Exception:
+        return default
 
 
 def money_to_float(value: Any) -> float | None:
@@ -250,8 +290,8 @@ def is_driver_queue(order: Order) -> bool:
     - delivery_status is pending
     """
     status = (order.status or "").lower()
-    delivery_status = getattr(order, "delivery_status", "pending") or "pending"
-    assigned_driver_id = getattr(order, "assigned_driver_id", None)
+    delivery_status = _safe_col(order, "delivery_status", "pending") or "pending"
+    assigned_driver_id = _safe_col(order, "assigned_driver_id", None)
 
     # Only include orders that are ready for dispatch
     ready_statuses = {"confirmed", "approved", "accepted", "ready", "packed", "fulfillment"}
@@ -278,9 +318,9 @@ def is_ar_queue(order: Order) -> bool:
     - not $0 due
     """
     status = (order.status or "").lower()
-    payment_status = getattr(order, "payment_status", "unpaid") or "unpaid"
-    balance_due = float(getattr(order, "balance_due", 0) or 0)
-    delivery_status = getattr(order, "delivery_status", "pending") or "pending"
+    payment_status = _safe_col(order, "payment_status", "unpaid") or "unpaid"
+    balance_due = float(_safe_col(order, "balance_due", 0) or 0)
+    delivery_status = _safe_col(order, "delivery_status", "pending") or "pending"
 
     # Only include delivered/completed orders or invoice-relevant statuses
     ar_statuses = {"delivered", "completed", "invoiced", "confirmed", "approved"}
@@ -342,23 +382,24 @@ def serialize_order(order: Order) -> dict[str, Any]:
         "external_updated_at": order.external_updated_at,
         "created_at": order.created_at,
         "updated_at": order.updated_at,
-        # Dispatch fields
-        "assigned_driver_id": getattr(order, "assigned_driver_id", None),
-        "assigned_driver_name": getattr(order, "assigned_driver_name", None),
-        "delivery_status": getattr(order, "delivery_status", "pending"),
-        "delivery_date": getattr(order, "delivery_date", None),
-        "route_number": getattr(order, "route_number", None),
-        "route_id": getattr(order, "route_id", None),
-        "driver_note": getattr(order, "driver_note", None),
-        "delivery_instructions": getattr(order, "delivery_instructions", None),
-        # AR fields
-        "payment_status": getattr(order, "payment_status", "unpaid"),
-        "amount_paid": float(order.amount_paid) if getattr(order, "amount_paid", None) is not None else 0,
-        "balance_due": float(order.balance_due) if getattr(order, "balance_due", None) is not None else 0,
-        "due_date": getattr(order, "due_date", None),
-        "days_overdue": getattr(order, "days_overdue", 0),
-        "invoice_number": getattr(order, "invoice_number", None),
-        "ar_note": getattr(order, "ar_note", None),
+        # Dispatch fields — use _safe_col() to handle deferred columns
+        # that may not exist in the database yet (pending migration).
+        "assigned_driver_id": _safe_col(order, "assigned_driver_id"),
+        "assigned_driver_name": _safe_col(order, "assigned_driver_name"),
+        "delivery_status": _safe_col(order, "delivery_status", "pending"),
+        "delivery_date": _safe_col(order, "delivery_date"),
+        "route_number": _safe_col(order, "route_number"),
+        "route_id": _safe_col(order, "route_id"),
+        "driver_note": _safe_col(order, "driver_note"),
+        "delivery_instructions": _safe_col(order, "delivery_instructions"),
+        # AR fields — same guard.
+        "payment_status": _safe_col(order, "payment_status", "unpaid"),
+        "amount_paid": float(_safe_col(order, "amount_paid", 0) or 0),
+        "balance_due": float(_safe_col(order, "balance_due", 0) or 0),
+        "due_date": _safe_col(order, "due_date"),
+        "days_overdue": _safe_col(order, "days_overdue", 0),
+        "invoice_number": _safe_col(order, "invoice_number"),
+        "ar_note": _safe_col(order, "ar_note"),
     }
 
 
@@ -370,7 +411,7 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
         logger.info("leaflink: get_orders db_query_start")
         result = await db.execute(
             select(Order)
-            .options(selectinload(Order.lines))
+            .options(selectinload(Order.lines), *_DEFER_OPTS)
             .order_by(Order.external_updated_at.desc().nullslast(), Order.updated_at.desc())
         )
         orders = result.scalars().all()

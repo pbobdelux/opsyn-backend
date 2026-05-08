@@ -25,6 +25,21 @@ logger = logging.getLogger("orders")
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 
+def _safe_col(obj: object, attr: str, default=None):
+    """Safely read a possibly-deferred or missing ORM column.
+
+    Handles three cases:
+    - Column exists and is loaded → returns the value.
+    - Column is deferred (not yet migrated) → SQLAlchemy raises
+      ``MissingGreenlet`` in async context; we catch it and return default.
+    - Attribute doesn't exist at all → ``AttributeError``; return default.
+    """
+    try:
+        return getattr(obj, attr, default)
+    except Exception:
+        return default
+
+
 async def _get_brand_order_count(
     db: AsyncSession,
     brand_id: str,
@@ -417,11 +432,38 @@ async def get_orders(
     # Build base query - SCOPED BY ORG_ID AND BRAND_ID                    #
     # Both filters are required for multi-tenant isolation.               #
     # ------------------------------------------------------------------ #
-    from sqlalchemy.orm import selectinload as _selectinload
+    from sqlalchemy.orm import defer as _defer, selectinload as _selectinload
+
+    # Defer columns that may not exist in the database yet (pending
+    # migration).  Using defer() prevents SQLAlchemy from including them
+    # in the SELECT list; accessing a deferred attribute on a loaded
+    # object raises a lazy-load which we guard with getattr() defaults.
+    _DISPATCH_AR_COLS = [
+        "assigned_driver_id",
+        "assigned_driver_name",
+        "delivery_status",
+        "delivery_date",
+        "route_number",
+        "route_id",
+        "driver_note",
+        "delivery_instructions",
+        "payment_status",
+        "amount_paid",
+        "balance_due",
+        "due_date",
+        "days_overdue",
+        "invoice_number",
+        "ar_note",
+        "sync_health",
+    ]
+    _defer_opts = []
+    for _col in _DISPATCH_AR_COLS:
+        if hasattr(Order, _col):
+            _defer_opts.append(_defer(getattr(Order, _col)))
 
     query = (
         select(Order)
-        .options(_selectinload(Order.lines))
+        .options(_selectinload(Order.lines), *_defer_opts)
         .where(
             and_(
                 Order.org_id == resolved_org_id,
@@ -509,7 +551,9 @@ async def get_orders(
         # Detail mode: full serialization with line_items
         serialized_orders = [serialize_order(o) for o in orders]
     else:
-        # List mode: headers only with routing fields, no line_items
+        # List mode: headers only with routing fields, no line_items.
+        # Use getattr() with safe defaults for dispatch/AR columns that
+        # may not exist in the database yet (deferred above).
         serialized_orders = [
             {
                 "id": o.id,
@@ -528,23 +572,24 @@ async def get_orders(
                 "external_updated_at": o.external_updated_at,
                 "created_at": o.created_at,
                 "updated_at": o.updated_at,
-                # Dispatch fields
-                "assigned_driver_id": o.assigned_driver_id,
-                "assigned_driver_name": o.assigned_driver_name,
-                "delivery_status": o.delivery_status,
-                "delivery_date": o.delivery_date,
-                "route_number": o.route_number,
-                "route_id": o.route_id,
-                "driver_note": o.driver_note,
-                "delivery_instructions": o.delivery_instructions,
-                # AR fields
-                "payment_status": o.payment_status,
-                "amount_paid": float(o.amount_paid) if o.amount_paid is not None else 0,
-                "balance_due": float(o.balance_due) if o.balance_due is not None else 0,
-                "due_date": o.due_date,
-                "days_overdue": o.days_overdue,
-                "invoice_number": o.invoice_number,
-                "ar_note": o.ar_note,
+                # Dispatch fields — guarded with _safe_col() in case the
+                # migration adding these columns hasn't run yet.
+                "assigned_driver_id": _safe_col(o, "assigned_driver_id"),
+                "assigned_driver_name": _safe_col(o, "assigned_driver_name"),
+                "delivery_status": _safe_col(o, "delivery_status", "pending"),
+                "delivery_date": _safe_col(o, "delivery_date"),
+                "route_number": _safe_col(o, "route_number"),
+                "route_id": _safe_col(o, "route_id"),
+                "driver_note": _safe_col(o, "driver_note"),
+                "delivery_instructions": _safe_col(o, "delivery_instructions"),
+                # AR fields — same guard.
+                "payment_status": _safe_col(o, "payment_status", "unpaid"),
+                "amount_paid": float(_safe_col(o, "amount_paid", 0) or 0),
+                "balance_due": float(_safe_col(o, "balance_due", 0) or 0),
+                "due_date": _safe_col(o, "due_date"),
+                "days_overdue": _safe_col(o, "days_overdue", 0),
+                "invoice_number": _safe_col(o, "invoice_number"),
+                "ar_note": _safe_col(o, "ar_note"),
             }
             for o in orders
         ]
@@ -622,7 +667,7 @@ async def get_order(
 
     Returns the full order including all dispatch and AR fields.
     """
-    from leaflink.orders import build_line_items, derive_blockers, derive_review_status, money_to_float, cents_to_amount
+    from leaflink.orders import build_line_items, derive_blockers, derive_review_status, money_to_float, cents_to_amount, _DEFER_OPTS as _ll_defer_opts
     from services.organization_service import lookup_organization
     from sqlalchemy import and_
     from sqlalchemy.orm import selectinload as _selectinload
@@ -675,7 +720,7 @@ async def get_order(
     try:
         result = await db.execute(
             select(Order)
-            .options(_selectinload(Order.lines))
+            .options(_selectinload(Order.lines), *_ll_defer_opts)
             .where(
                 and_(
                     Order.id == order_id,
@@ -722,8 +767,8 @@ async def get_order(
         "[OrdersAPI] get_order found order_id=%s external_id=%s delivery_status=%s payment_status=%s",
         order_id,
         order.external_order_id,
-        order.delivery_status,
-        order.payment_status,
+        _safe_col(order, "delivery_status", "pending"),
+        _safe_col(order, "payment_status", "unpaid"),
     )
 
     return make_json_safe({
@@ -749,23 +794,24 @@ async def get_order(
             "external_updated_at": order.external_updated_at,
             "created_at": order.created_at,
             "updated_at": order.updated_at,
-            # Dispatch fields
-            "assigned_driver_id": order.assigned_driver_id,
-            "assigned_driver_name": order.assigned_driver_name,
-            "delivery_status": order.delivery_status,
-            "delivery_date": order.delivery_date,
-            "route_number": order.route_number,
-            "route_id": order.route_id,
-            "driver_note": order.driver_note,
-            "delivery_instructions": order.delivery_instructions,
-            # AR fields
-            "payment_status": order.payment_status,
-            "amount_paid": float(order.amount_paid) if order.amount_paid is not None else 0,
-            "balance_due": float(order.balance_due) if order.balance_due is not None else 0,
-            "due_date": order.due_date,
-            "days_overdue": order.days_overdue,
-            "invoice_number": order.invoice_number,
-            "ar_note": order.ar_note,
+            # Dispatch fields — guarded with _safe_col() in case the
+            # migration adding these columns hasn't run yet.
+            "assigned_driver_id": _safe_col(order, "assigned_driver_id"),
+            "assigned_driver_name": _safe_col(order, "assigned_driver_name"),
+            "delivery_status": _safe_col(order, "delivery_status", "pending"),
+            "delivery_date": _safe_col(order, "delivery_date"),
+            "route_number": _safe_col(order, "route_number"),
+            "route_id": _safe_col(order, "route_id"),
+            "driver_note": _safe_col(order, "driver_note"),
+            "delivery_instructions": _safe_col(order, "delivery_instructions"),
+            # AR fields — same guard.
+            "payment_status": _safe_col(order, "payment_status", "unpaid"),
+            "amount_paid": float(_safe_col(order, "amount_paid", 0) or 0),
+            "balance_due": float(_safe_col(order, "balance_due", 0) or 0),
+            "due_date": _safe_col(order, "due_date"),
+            "days_overdue": _safe_col(order, "days_overdue", 0),
+            "invoice_number": _safe_col(order, "invoice_number"),
+            "ar_note": _safe_col(order, "ar_note"),
         },
     })
 
@@ -1078,8 +1124,10 @@ async def orders_api_freshness(
         db_total_orders = count_result.scalar() or 0
 
         # 2. Get most recent orders for the brand
+        from leaflink.orders import _DEFER_OPTS as _ll_defer_opts_fresh
         orders_result = await db.execute(
             select(Order)
+            .options(*_ll_defer_opts_fresh)
             .where(Order.brand_id == brand)
             .order_by(Order.updated_at.desc())
             .limit(limit)
@@ -3885,7 +3933,7 @@ async def api_order_resync(
     Fetches the order from LeafLink by its external_order_id and re-upserts it.
     Returns full order detail with sync_health.
     """
-    from leaflink.orders import serialize_order, build_line_items, compute_sync_health
+    from leaflink.orders import serialize_order, build_line_items, compute_sync_health, _DEFER_OPTS as _ll_defer_opts_resync
     from services.credential_resolver import resolve_brand_credential
     from services.leaflink_sync import sync_leaflink_orders_headers_only
     from sqlalchemy.orm import selectinload as _selectinload
@@ -3897,7 +3945,7 @@ async def api_order_resync(
     try:
         result = await db.execute(
             select(Order)
-            .options(_selectinload(Order.lines))
+            .options(_selectinload(Order.lines), *_ll_defer_opts_resync)
             .where(Order.id == order_id, Order.brand_id == brand_id)
         )
         order = result.scalar_one_or_none()
@@ -3994,7 +4042,7 @@ async def api_order_resync(
     try:
         result2 = await db.execute(
             select(Order)
-            .options(_selectinload(Order.lines))
+            .options(_selectinload(Order.lines), *_ll_defer_opts_resync)
             .where(Order.id == order_id, Order.brand_id == brand_id)
         )
         order = result2.scalar_one_or_none() or order
@@ -4027,7 +4075,7 @@ async def api_orders_queues(
     - driver_queue: approved orders with no driver assigned
     - ar_queue: delivered/completed orders with balance_due > 0
     """
-    from leaflink.orders import is_needs_review, is_driver_queue, is_ar_queue, build_line_items, derive_blockers
+    from leaflink.orders import is_needs_review, is_driver_queue, is_ar_queue, build_line_items, derive_blockers, _DEFER_OPTS as _ll_defer_opts_queues
     from sqlalchemy.orm import selectinload as _selectinload
 
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -4036,7 +4084,7 @@ async def api_orders_queues(
     try:
         result = await db.execute(
             select(Order)
-            .options(_selectinload(Order.lines))
+            .options(_selectinload(Order.lines), *_ll_defer_opts_queues)
             .where(Order.brand_id == brand_id)
         )
         orders = result.scalars().all()
