@@ -726,6 +726,135 @@ async def get_orders(
     })
 
 
+@router.get("/db-debug")
+async def orders_db_debug(
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Raw database diagnostic for orders table.
+
+    Returns:
+    - Total row count in orders table
+    - Count grouped by org_id
+    - Count grouped by brand_id
+    - Latest 5 inserted rows (order by created_at desc)
+    - Latest committed row timestamp
+
+    Use this to verify actual DB contents vs. sync_metrics.
+    """
+    from sqlalchemy import text as _text_debug
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    logger.info("[OrdersAPI] db_debug brand_id=%s", brand_id)
+
+    try:
+        # Total rows in orders table (unfiltered)
+        _total_res = await db.execute(_text_debug("SELECT COUNT(*) FROM orders"))
+        total_rows = _total_res.scalar() or 0
+
+        # Count grouped by org_id
+        _by_org_res = await db.execute(
+            _text_debug(
+                "SELECT org_id::text, COUNT(*) as cnt FROM orders GROUP BY org_id ORDER BY cnt DESC LIMIT 20"
+            )
+        )
+        by_org_id = [{"org_id": str(row[0]) if row[0] else None, "count": row[1]} for row in _by_org_res.fetchall()]
+
+        # Count grouped by brand_id
+        _by_brand_res = await db.execute(
+            _text_debug(
+                "SELECT brand_id, COUNT(*) as cnt FROM orders GROUP BY brand_id ORDER BY cnt DESC LIMIT 20"
+            )
+        )
+        by_brand_id = [{"brand_id": str(row[0]) if row[0] else None, "count": row[1]} for row in _by_brand_res.fetchall()]
+
+        # Count for this specific brand_id
+        _brand_count_res = await db.execute(
+            _text_debug("SELECT COUNT(*) FROM orders WHERE brand_id = :brand_id"),
+            {"brand_id": brand_id},
+        )
+        brand_count = _brand_count_res.scalar() or 0
+
+        # Count for this brand with non-null org_id
+        _brand_org_count_res = await db.execute(
+            _text_debug(
+                "SELECT COUNT(*) FROM orders WHERE brand_id = :brand_id AND org_id IS NOT NULL"
+            ),
+            {"brand_id": brand_id},
+        )
+        brand_with_org_count = _brand_org_count_res.scalar() or 0
+
+        # Latest 5 inserted rows for this brand
+        _latest_res = await db.execute(
+            _text_debug(
+                "SELECT id, brand_id, org_id::text, external_order_id, order_number, "
+                "customer_name, status, created_at, updated_at, synced_at "
+                "FROM orders WHERE brand_id = :brand_id "
+                "ORDER BY created_at DESC NULLS LAST LIMIT 5"
+            ),
+            {"brand_id": brand_id},
+        )
+        latest_rows = []
+        for row in _latest_res.fetchall():
+            latest_rows.append({
+                "id": row[0],
+                "brand_id": str(row[1]) if row[1] else None,
+                "org_id": str(row[2]) if row[2] else None,
+                "external_order_id": row[3],
+                "order_number": row[4],
+                "customer_name": row[5],
+                "status": row[6],
+                "created_at": row[7].isoformat() if row[7] and hasattr(row[7], "isoformat") else str(row[7]) if row[7] else None,
+                "updated_at": row[8].isoformat() if row[8] and hasattr(row[8], "isoformat") else str(row[8]) if row[8] else None,
+                "synced_at": row[9].isoformat() if row[9] and hasattr(row[9], "isoformat") else str(row[9]) if row[9] else None,
+            })
+
+        # Latest committed row timestamp for this brand
+        _latest_ts_res = await db.execute(
+            _text_debug(
+                "SELECT MAX(created_at) FROM orders WHERE brand_id = :brand_id"
+            ),
+            {"brand_id": brand_id},
+        )
+        latest_ts = _latest_ts_res.scalar()
+
+        logger.info(
+            "[OrdersAPI] db_debug brand_id=%s total_rows=%s brand_count=%s brand_with_org=%s",
+            brand_id,
+            total_rows,
+            brand_count,
+            brand_with_org_count,
+        )
+
+        return make_json_safe({
+            "ok": True,
+            "brand_id": brand_id,
+            "timestamp": timestamp,
+            "total_rows_in_table": total_rows,
+            "brand_count": brand_count,
+            "brand_with_org_id_count": brand_with_org_count,
+            "brand_null_org_id_count": brand_count - brand_with_org_count,
+            "by_org_id": by_org_id,
+            "by_brand_id": by_brand_id,
+            "latest_committed_at": latest_ts.isoformat() if latest_ts and hasattr(latest_ts, "isoformat") else str(latest_ts) if latest_ts else None,
+            "latest_5_rows": latest_rows,
+        })
+
+    except Exception as exc:
+        logger.error("[OrdersAPI] db_debug error brand_id=%s error=%s", brand_id, exc, exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        return make_json_safe({
+            "ok": False,
+            "brand_id": brand_id,
+            "timestamp": timestamp,
+            "error": str(exc)[:500],
+        })
+
+
 @router.get("/health")
 async def orders_health(
     brand: Optional[str] = Query(None, description="Brand slug to check (e.g., 'noble-nectar')"),

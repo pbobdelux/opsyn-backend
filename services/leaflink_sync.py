@@ -280,15 +280,6 @@ async def _update_sync_health_phase1(
             _phase1_params = normalize_uuid_fields(_phase1_params)
             _phase1_params = normalize_datetime_fields(_phase1_params)
             _phase1_params = apply_uuid_str_to_params(_phase1_params)
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase1 columns=brand_id"
-            )
-            for _k, _v in _phase1_params.items():
-                if isinstance(_v, datetime):
-                    logger.info(
-                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
-                    )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, orders_fetched_last_run, updated_at)
@@ -329,15 +320,6 @@ async def _update_sync_health_phase2(
             _phase2_params = normalize_uuid_fields(_phase2_params)
             _phase2_params = normalize_datetime_fields(_phase2_params)
             _phase2_params = apply_uuid_str_to_params(_phase2_params)
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase2 columns=brand_id"
-            )
-            for _k, _v in _phase2_params.items():
-                if isinstance(_v, datetime):
-                    logger.info(
-                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
-                    )
             await db.execute(
                 text("""
                     UPDATE sync_health SET
@@ -376,15 +358,6 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
             _sync_error_params = normalize_uuid_fields(_sync_error_params)
             _sync_error_params = normalize_datetime_fields(_sync_error_params)
             _sync_error_params = apply_uuid_str_to_params(_sync_error_params)
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=_record_sync_error columns=brand_id"
-            )
-            for _k, _v in _sync_error_params.items():
-                if isinstance(_v, datetime):
-                    logger.info(
-                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
-                    )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, last_error_at, updated_at)
@@ -418,15 +391,6 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
             _retryable_params = normalize_uuid_fields(_retryable_params)
             _retryable_params = normalize_datetime_fields(_retryable_params)
             _retryable_params = apply_uuid_str_to_params(_retryable_params)
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=_record_retryable_error columns=brand_id"
-            )
-            for _k, _v in _retryable_params.items():
-                if isinstance(_v, datetime):
-                    logger.info(
-                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
-                    )
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
@@ -479,19 +443,13 @@ async def _dead_letter_line_item(
             _dead_letter_params = normalize_uuid_fields(_dead_letter_params)
             _dead_letter_params = normalize_datetime_fields(_dead_letter_params)
             _dead_letter_params = apply_uuid_str_to_params(_dead_letter_params)
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=_dead_letter_line_item columns=brand_id"
-            )
-            for _k, _v in _dead_letter_params.items():
+            # Ensure all datetime fields are UTC-aware before execute
+            for _k, _v in list(_dead_letter_params.items()):
                 if isinstance(_v, datetime):
                     if _v.tzinfo is None:
                         _dead_letter_params[_k] = _v.replace(tzinfo=timezone.utc)
                     else:
                         _dead_letter_params[_k] = _v.astimezone(timezone.utc)
-                    logger.info(
-                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, _dead_letter_params[_k].isoformat(), _dead_letter_params[_k].tzinfo, _dead_letter_params[_k].tzinfo is not None,
-                    )
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -631,19 +589,13 @@ async def _write_sync_dead_letter(
             params = normalize_uuid_fields(params)
             params = normalize_datetime_fields(params)
             params = apply_uuid_str_to_params(params)
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=_write_sync_dead_letter columns=brand_id,org_id"
-            )
-            for _k, _v in params.items():
+            # Ensure all datetime fields are UTC-aware before execute
+            for _k, _v in list(params.items()):
                 if isinstance(_v, datetime):
                     if _v.tzinfo is None:
                         params[_k] = _v.replace(tzinfo=timezone.utc)
                     else:
                         params[_k] = _v.astimezone(timezone.utc)
-                    logger.info(
-                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, params[_k].isoformat(), params[_k].tzinfo, params[_k].tzinfo is not None,
-                    )
             # Try to write with new detail columns; fall back to legacy schema if columns don't exist yet
             try:
                 await db.execute(
@@ -1615,7 +1567,7 @@ async def _insert_line_items_standalone(
         else f":{col}"
         for col in insert_columns
     )
-    logger.info(
+    logger.debug(
         "[UUID_SQL_CAST_APPLIED] statement=_insert_line_items_standalone columns=%s",
         ",".join(col for col in insert_columns if col in _uuid_columns),
     )
@@ -2227,7 +2179,7 @@ async def sync_leaflink_orders(
                     else f":{col}"
                     for col in _li_insert_columns
                 )
-                logger.info(
+                logger.debug(
                     "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders columns=%s",
                     ",".join(col for col in _li_insert_columns if col in _li_uuid_columns),
                 )
@@ -2585,6 +2537,20 @@ async def sync_leaflink_orders_headers_only(
     brand_id_value = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
     org_id_value = safe_uuid_for_db(org_id, "org_id") if org_id else None
 
+    # [ORG_CONTEXT] Log org_id at entry so we can trace propagation from request → insert
+    logger.info(
+        "[ORG_CONTEXT] sync_leaflink_orders_headers_only brand_id=%s org_id_raw=%s org_id_coerced=%s orders=%s",
+        brand_id_value,
+        org_id,
+        org_id_value,
+        len(orders),
+    )
+    if not org_id_value:
+        logger.warning(
+            "[ORG_CONTEXT] org_id is NULL — orders will be inserted without org_id and will be invisible to GET /orders. "
+            "Ensure org_id is passed from the sync worker via BrandAPICredential.org_id.",
+        )
+
     total_created = 0
     total_updated = 0
     total_skipped = 0
@@ -2886,15 +2852,14 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             update_params = normalize_uuid_fields(update_params)
                             update_params = normalize_datetime_fields(update_params)
                             update_params = apply_uuid_str_to_params(update_params)
-                            logger.info(
-                                "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders_headers_only_update columns=org_id,brand_id"
-                            )
-                            for _k, _v in update_params.items():
-                                if isinstance(_v, datetime):
-                                    logger.info(
-                                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
-                                    )
+                            # Fail-fast: ensure all datetime params are UTC-aware before execute
+                            for _dt_key in ("synced_at", "last_synced_at", "updated_at"):
+                                _dt_val = update_params.get(_dt_key)
+                                if isinstance(_dt_val, datetime):
+                                    if _dt_val.tzinfo is None:
+                                        update_params[_dt_key] = _dt_val.replace(tzinfo=timezone.utc)
+                                    else:
+                                        update_params[_dt_key] = _dt_val.astimezone(timezone.utc)
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -3039,15 +3004,22 @@ INSERT INTO orders (
                             insert_params = normalize_uuid_fields(insert_params)
                             insert_params = normalize_datetime_fields(insert_params)
                             insert_params = apply_uuid_str_to_params(insert_params)
+                            # Fail-fast: ensure all datetime params are UTC-aware before execute
+                            for _dt_key in ("synced_at", "last_synced_at", "created_at", "updated_at"):
+                                _dt_val = insert_params.get(_dt_key)
+                                if isinstance(_dt_val, datetime):
+                                    if _dt_val.tzinfo is None:
+                                        insert_params[_dt_key] = _dt_val.replace(tzinfo=timezone.utc)
+                                    else:
+                                        insert_params[_dt_key] = _dt_val.astimezone(timezone.utc)
+                            # [ORDER_INSERT_PREP] Log org_id and key fields before execute
                             logger.info(
-                                "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders_headers_only_insert columns=org_id,brand_id"
+                                "[ORDER_INSERT_PREP] external_id=%s brand_id=%s org_id=%s customer_name=%s",
+                                insert_params.get("external_order_id"),
+                                insert_params.get("brand_id"),
+                                insert_params.get("org_id"),
+                                insert_params.get("customer_name"),
                             )
-                            for _k, _v in insert_params.items():
-                                if isinstance(_v, datetime):
-                                    logger.info(
-                                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
-                                    )
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
@@ -3125,6 +3097,15 @@ INSERT INTO orders (
                             continue
                 # Explicit commit guarantee
                 await db.commit()
+                logger.info(
+                    "[ORDER_INSERT_COMMIT] brand_id=%s batch=%s/%s created=%s updated=%s org_id=%s",
+                    brand_id_value,
+                    batch_num,
+                    len(batches),
+                    batch_created,
+                    batch_updated,
+                    org_id_value,
+                )
 
             # Batch committed successfully (async with db.begin() exited cleanly)
             batch_duration = round(time.monotonic() - batch_start, 2)
@@ -3161,6 +3142,15 @@ INSERT INTO orders (
         except Exception as batch_exc:
             batch_duration = round(time.monotonic() - batch_start, 2)
             err_msg = str(batch_exc)
+            logger.error(
+                "[ORDER_INSERT_ROLLBACK] brand_id=%s batch=%s/%s error=%s duration=%ss org_id=%s",
+                brand_id_value,
+                batch_num,
+                len(batches),
+                err_msg[:300],
+                batch_duration,
+                org_id_value,
+            )
             logger.error(
                 "[OrdersSync] batch_failed batch=%s/%s brand=%s batch_size=%s error=%s duration=%ss",
                 batch_num,
@@ -3469,7 +3459,7 @@ async def sync_leaflink_line_items(
         else f":{col}"
         for col in insert_columns
     )
-    logger.info(
+    logger.debug(
         "[UUID_SQL_CAST_APPLIED] statement=_upsert_line_items columns=%s",
         ",".join(col for col in insert_columns if col in _uuid_columns),
     )
@@ -4498,6 +4488,7 @@ async def sync_leaflink_background_continuous(
     sync_run_id: Optional[int] = None,
     auth_scheme: str = "Token",
     base_url: Optional[str] = None,
+    org_id: Optional[str] = None,
 ) -> None:
     """
     Fetch all remaining LeafLink pages in adaptive batches and upsert to DB.
@@ -4524,6 +4515,9 @@ async def sync_leaflink_background_continuous(
         total_orders_available: Total orders reported by LeafLink (for progress display).
         sync_run_id:            Optional SyncRun.id to persist progress against.
         base_url:               LeafLink base URL (from DB credential, required).
+        org_id:                 Organization UUID for multi-tenant isolation. Written to every
+                                order row so GET /orders can filter by org_id AND brand_id.
+                                Sourced from BrandAPICredential.org_id in the sync worker.
     """
     from services.leaflink_client import LeafLinkClient
     from services.sync_run_manager import (
@@ -4536,12 +4530,19 @@ async def sync_leaflink_background_continuous(
     # [SYNC_ENTRY] Log entry into the background continuous sync function
     logger.info(
         "[SYNC_ENTRY] sync_leaflink_background_continuous entered brand_id=%s"
-        " start_page=%s total_pages=%s sync_run_id=%s",
+        " start_page=%s total_pages=%s sync_run_id=%s org_id=%s",
         brand_id,
         start_page,
         total_pages if total_pages is not None else "cursor_based",
         sync_run_id,
+        org_id or "MISSING",
     )
+    if not org_id:
+        logger.warning(
+            "[ORG_CONTEXT] sync_leaflink_background_continuous received org_id=None brand_id=%s"
+            " — orders will be inserted without org_id. Check BrandAPICredential.org_id.",
+            brand_id,
+        )
 
     try:
         bg_start = time.monotonic()
@@ -5022,6 +5023,7 @@ async def sync_leaflink_background_continuous(
                         brand_id=brand_id,
                         orders=batch_orders,
                         pages_fetched=pages_fetched_this_batch,
+                        org_id=org_id,
                     )
                     # Line items are deferred inside sync_leaflink_orders_headers_only
                     # via asyncio.create_task — no need to spawn a second task here.
