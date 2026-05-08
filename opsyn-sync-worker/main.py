@@ -107,16 +107,24 @@ async def process_sync_requests() -> None:
 
                 request_id = request.id
                 brand_id = request.brand_id
+                org_id = request.org_id  # propagated from X-OPSYN-ORG at enqueue time
                 start_page = request.start_page
                 total_pages = request.total_pages
                 total_orders_available = request.total_orders_available
 
                 logger.info(
-                    "[SyncWorker] processing_request id=%s brand=%s start_page=%s total_pages=%s",
+                    "[SyncWorker] processing_request id=%s brand=%s org_id=%s start_page=%s total_pages=%s",
                     request_id,
                     brand_id,
+                    org_id,
                     start_page,
                     total_pages,
+                )
+                logger.info(
+                    "[ORG_CONTEXT] stage=worker_dequeue org_id=%s brand_id=%s"
+                    " external_order_id=N/A",
+                    org_id,
+                    brand_id,
                 )
 
             # ---------------------------------------------------------------- #
@@ -187,6 +195,12 @@ async def process_sync_requests() -> None:
                     total_pages,
                 )
 
+                logger.info(
+                    "[ORG_CONTEXT] stage=worker_before_sync org_id=%s brand_id=%s"
+                    " external_order_id=N/A",
+                    org_id,
+                    brand_id,
+                )
                 await sync_leaflink_background_continuous(
                     brand_id=brand_id,
                     api_key=api_key,
@@ -196,6 +210,7 @@ async def process_sync_requests() -> None:
                     manager=None,  # Worker uses DB-only progress tracking
                     total_orders_available=total_orders_available,
                     base_url=base_url,
+                    org_id=org_id,
                 )
 
                 # Mark complete
