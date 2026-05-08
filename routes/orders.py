@@ -401,6 +401,82 @@ async def get_orders(
     logger.info("[OrdersAPI] leaflink_credential_check skipped reason=read_endpoint")
 
     # ------------------------------------------------------------------ #
+    # Diagnostic: log row counts to trace empty-result issues             #
+    # These are cheap indexed queries that run before the main query.     #
+    # ------------------------------------------------------------------ #
+    try:
+        from sqlalchemy import text as _text_diag
+        # Total rows in orders table (unfiltered)
+        _total_rows_res = await db.execute(_text_diag("SELECT COUNT(*) FROM orders"))
+        _total_rows = _total_rows_res.scalar() or 0
+
+        # Rows by brand_id
+        _brand_rows_res = await db.execute(
+            _text_diag("SELECT COUNT(*) FROM orders WHERE brand_id = :brand_id"),
+            {"brand_id": brand_id},
+        )
+        _brand_rows = _brand_rows_res.scalar() or 0
+
+        # Rows by org_id
+        _org_rows_res = await db.execute(
+            _text_diag("SELECT COUNT(*) FROM orders WHERE org_id = CAST(:org_id AS uuid)"),
+            {"org_id": resolved_org_id},
+        )
+        _org_rows = _org_rows_res.scalar() or 0
+
+        # Rows matching both brand_id AND org_id (what the main query will see)
+        _both_rows_res = await db.execute(
+            _text_diag(
+                "SELECT COUNT(*) FROM orders "
+                "WHERE brand_id = :brand_id AND org_id = CAST(:org_id AS uuid)"
+            ),
+            {"brand_id": brand_id, "org_id": resolved_org_id},
+        )
+        _both_rows = _both_rows_res.scalar() or 0
+
+        # Latest inserted order timestamp
+        _latest_res = await db.execute(
+            _text_diag(
+                "SELECT MAX(created_at) FROM orders "
+                "WHERE brand_id = :brand_id"
+            ),
+            {"brand_id": brand_id},
+        )
+        _latest_ts = _latest_res.scalar()
+
+        logger.info(
+            "[OrdersAPI][DIAGNOSTIC] org_id=%s brand_id=%s "
+            "total_rows_in_table=%s rows_by_brand=%s rows_by_org=%s "
+            "rows_matching_both_filters=%s latest_insert=%s",
+            resolved_org_id,
+            brand_id,
+            _total_rows,
+            _brand_rows,
+            _org_rows,
+            _both_rows,
+            _latest_ts.isoformat() if _latest_ts and hasattr(_latest_ts, "isoformat") else _latest_ts,
+        )
+
+        if _brand_rows > 0 and _both_rows == 0:
+            logger.warning(
+                "[OrdersAPI][DIAGNOSTIC] FILTER_MISMATCH brand_id=%s has %s rows by brand "
+                "but 0 rows matching org_id=%s — org_id filter may be wrong",
+                brand_id,
+                _brand_rows,
+                resolved_org_id,
+            )
+        if _total_rows == 0:
+            logger.warning(
+                "[OrdersAPI][DIAGNOSTIC] EMPTY_TABLE orders table has 0 rows total"
+            )
+    except Exception as _diag_exc:
+        logger.info("[OrdersAPI][DIAGNOSTIC] diagnostic_query_failed error=%s", str(_diag_exc)[:100])
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
     # Decode cursor → (cursor_id, cursor_updated_at)                      #
     # Cursor format: base64("id=<N>&updated_at=<ISO>")                    #
     # ------------------------------------------------------------------ #
@@ -3517,22 +3593,23 @@ async def api_orders_full_resync(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Full backfill/resync of all LeafLink orders.
+    Enqueue a full backfill/resync of all LeafLink orders as an async background job.
 
-    Walks every page from LeafLink until all available orders are stored locally.
-    This is the correct endpoint to use when the local cache is incomplete.
+    Returns immediately with a sync_run_id and state="queued".
+    Never waits for sync completion — never executes the sync loop inside the
+    request thread.  The background worker picks up the SyncRequest and runs
+    sync_leaflink_full_resync asynchronously.
 
     Returns:
-        { ok, total_fetched, total_inserted, total_updated, failed_count, progress_info }
+        { ok, sync_run_id, state, message, brand_id, timestamp }
     """
     from services.credential_resolver import resolve_brand_credential
-    from services.sync_run_manager import create_sync_run, mark_completed, mark_failed
-    from services.leaflink_sync import sync_leaflink_full_resync
+    from services.sync_run_manager import create_sync_run
 
     timestamp = datetime.now(timezone.utc).isoformat()
-    logger.info("[OrdersAPI] full_resync brand_id=%s org=%s", brand_id, x_opsyn_org)
+    logger.info("[OrdersAPI] full_resync_enqueue brand_id=%s org=%s", brand_id, x_opsyn_org)
 
-    # Resolve credential
+    # Resolve credential — validate it exists before enqueuing
     cred_row = await resolve_brand_credential(db, brand_id, "leaflink")
     if not cred_row:
         return make_json_safe({
@@ -3542,77 +3619,77 @@ async def api_orders_full_resync(
             "timestamp": timestamp,
         })
 
-    api_key = cred_row[4]
-    company_id = cred_row[3]
-    auth_scheme = cred_row[9] if len(cred_row) > 9 and cred_row[9] else "Token"
-    base_url = cred_row[8] if len(cred_row) > 8 else None
     resolved_brand_id = cred_row[1]
 
-    # Create SyncRun for full resync
+    # Create SyncRun record (own transaction, committed immediately)
     sync_run_id = None
     try:
         async with AsyncSessionLocal() as _run_db:
             async with _run_db.begin():
                 _run = await create_sync_run(_run_db, resolved_brand_id, mode="full")
                 sync_run_id = _run.id
-    except ValueError:
-        pass  # Already active
-    except Exception as run_exc:
-        logger.warning("[OrdersAPI] full_resync run_create_error error=%s", run_exc)
-
-    try:
-        result = await sync_leaflink_full_resync(
-            brand_id=resolved_brand_id,
-            api_key=api_key,
-            company_id=company_id,
-            auth_scheme=auth_scheme,
-            base_url=base_url,
-            sync_run_id=sync_run_id,
+        logger.info(
+            "[OrdersAPI] full_resync sync_run_created brand_id=%s run_id=%s",
+            resolved_brand_id,
+            sync_run_id,
         )
-
-        if sync_run_id:
-            try:
-                async with AsyncSessionLocal() as _done_db:
-                    async with _done_db.begin():
-                        await mark_completed(_done_db, sync_run_id)
-            except Exception:
-                pass
-
-        return make_json_safe({
-            "ok": result.get("ok", True),
-            "brand_id": resolved_brand_id,
-            "sync_run_id": sync_run_id,
-            "total_fetched": result.get("total_fetched", 0),
-            "total_inserted": result.get("total_inserted", 0),
-            "total_updated": result.get("total_updated", 0),
-            "failed_count": result.get("failed_count", 0),
-            "pages_synced": result.get("pages_synced", 0),
-            "duration_seconds": result.get("duration_seconds", 0),
-            "total_local_orders": result.get("total_local_orders", 0),
-            "progress_info": {
-                "pages_synced": result.get("pages_synced", 0),
-                "total_fetched": result.get("total_fetched", 0),
-                "total_local_orders": result.get("total_local_orders", 0),
-            },
-            "timestamp": timestamp,
-        })
-
-    except Exception as exc:
-        err_msg = str(exc)[:300]
-        logger.error("[OrdersAPI] full_resync error brand_id=%s error=%s", brand_id, err_msg, exc_info=True)
-        if sync_run_id:
-            try:
-                async with AsyncSessionLocal() as _fail_db:
-                    async with _fail_db.begin():
-                        await mark_failed(_fail_db, sync_run_id, err_msg)
-            except Exception:
-                pass
+    except ValueError as dup_exc:
+        # Active run already exists — return its ID so the caller can poll status
+        logger.warning(
+            "[OrdersAPI] full_resync sync_already_active brand_id=%s detail=%s",
+            resolved_brand_id,
+            dup_exc,
+        )
         return make_json_safe({
             "ok": False,
-            "brand_id": brand_id,
-            "error": err_msg,
+            "error": "sync_already_active",
+            "detail": str(dup_exc),
+            "brand_id": resolved_brand_id,
+            "state": "already_running",
             "timestamp": timestamp,
         })
+    except Exception as run_exc:
+        logger.warning("[OrdersAPI] full_resync run_create_error error=%s", run_exc)
+        # Non-fatal — proceed without a SyncRun record
+
+    # Enqueue background SyncRequest — worker picks this up and runs the full resync
+    try:
+        async with AsyncSessionLocal() as _enq_db:
+            async with _enq_db.begin():
+                _enq_db.add(SyncRequest(
+                    brand_id=resolved_brand_id,
+                    status="pending",
+                    start_page=1,
+                    total_pages=None,
+                    total_orders_available=None,
+                ))
+        logger.info(
+            "[OrdersAPI] full_resync enqueued brand_id=%s run_id=%s",
+            resolved_brand_id,
+            sync_run_id,
+        )
+    except Exception as enq_exc:
+        logger.error(
+            "[OrdersAPI] full_resync enqueue_error brand_id=%s error=%s",
+            resolved_brand_id,
+            enq_exc,
+        )
+        return make_json_safe({
+            "ok": False,
+            "error": f"Failed to enqueue sync job: {str(enq_exc)[:200]}",
+            "brand_id": resolved_brand_id,
+            "sync_run_id": sync_run_id,
+            "timestamp": timestamp,
+        })
+
+    return make_json_safe({
+        "ok": True,
+        "sync_run_id": sync_run_id,
+        "state": "queued",
+        "message": "Full resync started",
+        "brand_id": resolved_brand_id,
+        "timestamp": timestamp,
+    })
 
 
 @router.get("/sync-status")
@@ -3623,22 +3700,59 @@ async def api_orders_sync_status(
     """
     Returns the current sync status for a brand.
 
+    Non-blocking: reads from sync_metrics_snapshots cache first, then falls
+    back to a lightweight SyncRun query.  Never performs full DB scans or
+    dead-letter aggregations inline.
+
     Response includes:
     - last_successful_sync_at
     - last_attempted_sync_at
-    - total_local_orders
+    - total_local_orders (from snapshot cache)
     - total_leaflink_estimate (if available from last sync run)
     - current_sync_state: idle/running/failed/partial/success
-    - partial_sync_count (orders with missing child data)
-    - failed_order_count
+    - partial_sync_count (from snapshot cache)
+    - failed_order_count (from snapshot cache)
     - last_error
+    - data_source: "snapshot" | "sync_run" (indicates where data came from)
     """
     from services.sync_run_manager import detect_stalled
+    from sqlalchemy import text as _text_ss
 
     timestamp = datetime.now(timezone.utc).isoformat()
     logger.info("[OrdersAPI] sync_status brand_id=%s", brand_id)
 
-    # Get active and last completed sync runs
+    # ------------------------------------------------------------------ #
+    # Fast path: read from snapshot cache                                  #
+    # ------------------------------------------------------------------ #
+    snapshot = None
+    try:
+        snap_result = await db.execute(
+            _text_ss(
+                "SELECT total_local_orders, total_ok, total_partial, total_failed, "
+                "dead_letter_count, pages_processed, records_processed, "
+                "last_successful_sync_at, updated_at, sync_run_id "
+                "FROM sync_metrics_snapshots "
+                "WHERE brand_id = :brand_id "
+                "ORDER BY updated_at DESC NULLS LAST "
+                "LIMIT 1"
+            ),
+            {"brand_id": brand_id},
+        )
+        snapshot = snap_result.fetchone()
+    except Exception as snap_exc:
+        logger.info(
+            "[OrdersAPI] sync_status snapshot_miss brand_id=%s reason=%s",
+            brand_id,
+            str(snap_exc)[:100],
+        )
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Lightweight SyncRun query (always needed for state/error/ETA)       #
+    # ------------------------------------------------------------------ #
     try:
         active_run = await SyncRun.get_active_run(db, brand_id)
     except Exception:
@@ -3651,7 +3765,6 @@ async def api_orders_sync_status(
         await db.rollback()
         last_completed = None
 
-    # Get last attempted sync (any status)
     try:
         last_run_result = await db.execute(
             select(SyncRun)
@@ -3664,43 +3777,9 @@ async def api_orders_sync_status(
         await db.rollback()
         last_run = None
 
-    # Count total local orders
-    try:
-        count_result = await db.execute(
-            select(func.count(Order.id)).where(Order.brand_id == brand_id)
-        )
-        total_local_orders = count_result.scalar_one() or 0
-    except Exception:
-        await db.rollback()
-        total_local_orders = 0
-
-    # Count partial sync orders (sync_status = 'partial')
-    try:
-        partial_result = await db.execute(
-            select(func.count(Order.id)).where(
-                Order.brand_id == brand_id,
-                Order.sync_status == "partial",
-            )
-        )
-        partial_sync_count = partial_result.scalar_one() or 0
-    except Exception:
-        await db.rollback()
-        partial_sync_count = 0
-
-    # Count failed orders (sync_status = 'failed')
-    try:
-        failed_result = await db.execute(
-            select(func.count(Order.id)).where(
-                Order.brand_id == brand_id,
-                Order.sync_status == "failed",
-            )
-        )
-        failed_order_count = failed_result.scalar_one() or 0
-    except Exception:
-        await db.rollback()
-        failed_order_count = 0
-
-    # Determine sync state
+    # ------------------------------------------------------------------ #
+    # Determine sync state                                                 #
+    # ------------------------------------------------------------------ #
     is_stalled = detect_stalled(active_run) if active_run else False
 
     if active_run and not is_stalled:
@@ -3716,25 +3795,39 @@ async def api_orders_sync_status(
     else:
         current_sync_state = "idle"
 
-    # Get timestamps
-    last_successful_sync_at = (
-        last_completed.completed_at.isoformat()
-        if last_completed and last_completed.completed_at
-        else None
-    )
+    # ------------------------------------------------------------------ #
+    # Populate counts from snapshot (fast) or fallback to 0               #
+    # ------------------------------------------------------------------ #
+    data_source = "sync_run"
+    if snapshot:
+        total_local_orders = snapshot[0] or 0
+        partial_sync_count = snapshot[2] or 0
+        failed_order_count = snapshot[3] or 0
+        snap_last_sync = snapshot[7]
+        data_source = "snapshot"
+    else:
+        total_local_orders = 0
+        partial_sync_count = 0
+        failed_order_count = 0
+        snap_last_sync = None
+
+    # ------------------------------------------------------------------ #
+    # Timestamps                                                           #
+    # ------------------------------------------------------------------ #
+    last_successful_sync_at = None
+    if snap_last_sync:
+        last_successful_sync_at = snap_last_sync.isoformat() if hasattr(snap_last_sync, "isoformat") else str(snap_last_sync)
+    elif last_completed and last_completed.completed_at:
+        last_successful_sync_at = last_completed.completed_at.isoformat()
+
     last_attempted_sync_at = (
         last_run.started_at.isoformat()
         if last_run and last_run.started_at
         else None
     )
-    last_error = (
-        last_run.last_error if last_run else None
-    )
+    last_error = last_run.last_error if last_run else None
 
-    # Total LeafLink estimate from last run
-    total_leaflink_estimate = None
-    if last_run:
-        total_leaflink_estimate = last_run.total_orders_available
+    total_leaflink_estimate = last_run.total_orders_available if last_run else None
 
     return make_json_safe({
         "ok": True,
@@ -3750,6 +3843,7 @@ async def api_orders_sync_status(
         "active_sync_run_id": active_run.id if active_run else None,
         "pages_synced": last_run.pages_synced if last_run else 0,
         "orders_loaded_this_run": last_run.orders_loaded_this_run if last_run else 0,
+        "data_source": data_source,
         "timestamp": timestamp,
     })
 
@@ -3822,8 +3916,11 @@ async def api_orders_sync_metrics(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Returns detailed sync metrics for a brand including failure category breakdown,
-    dead-letter counts, and performance statistics.
+    Returns detailed sync metrics for a brand.
+
+    Non-blocking: reads from sync_metrics_snapshots cache instead of performing
+    full DB scans or dead-letter aggregations inline.  Falls back to a lightweight
+    SyncRun query for timing/state fields not stored in the snapshot.
 
     Response:
         {
@@ -3832,123 +3929,55 @@ async def api_orders_sync_metrics(
           dead_letter_count, last_full_sync_duration_seconds,
           average_page_duration_seconds, pages_processed, records_processed,
           records_per_second, current_sync_state,
-          failure_categories: { duplicate_key, missing_field, ... },
-          last_sync_at, next_sync_at
+          failure_categories: { ... },
+          last_sync_at, next_sync_at,
+          data_source: "snapshot" | "sync_run"
         }
     """
-    from sqlalchemy import text as _text
+    from sqlalchemy import text as _text_sm
+    from datetime import timedelta
 
     timestamp = datetime.now(timezone.utc).isoformat()
     logger.info("[OrdersAPI] sync_metrics brand_id=%s", brand_id)
 
     # ------------------------------------------------------------------ #
-    # Total local orders                                                   #
+    # Fast path: read from snapshot cache (single indexed query)           #
     # ------------------------------------------------------------------ #
+    snapshot = None
     try:
-        total_res = await db.execute(
-            select(func.count(Order.id)).where(Order.brand_id == brand_id)
-        )
-        total_local_orders = total_res.scalar_one() or 0
-    except Exception:
-        await db.rollback()
-        total_local_orders = 0
-
-    # ------------------------------------------------------------------ #
-    # Orders by sync_status                                                #
-    # ------------------------------------------------------------------ #
-    try:
-        ok_res = await db.execute(
-            select(func.count(Order.id)).where(
-                Order.brand_id == brand_id,
-                Order.sync_status == "ok",
-            )
-        )
-        total_ok = ok_res.scalar_one() or 0
-    except Exception:
-        await db.rollback()
-        total_ok = 0
-
-    try:
-        partial_res = await db.execute(
-            select(func.count(Order.id)).where(
-                Order.brand_id == brand_id,
-                Order.sync_status == "partial",
-            )
-        )
-        total_partial = partial_res.scalar_one() or 0
-    except Exception:
-        await db.rollback()
-        total_partial = 0
-
-    try:
-        failed_res = await db.execute(
-            select(func.count(Order.id)).where(
-                Order.brand_id == brand_id,
-                Order.sync_status == "failed",
-            )
-        )
-        total_failed = failed_res.scalar_one() or 0
-    except Exception:
-        await db.rollback()
-        total_failed = 0
-
-    # ------------------------------------------------------------------ #
-    # Dead-letter count (sync_dead_letters table)                          #
-    # ------------------------------------------------------------------ #
-    try:
-        from sqlalchemy import text as _sdl_text
-        dl_res = await db.execute(
-            _sdl_text(
-                "SELECT COUNT(*) FROM sync_dead_letters "
-                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL"
+        snap_result = await db.execute(
+            _text_sm(
+                "SELECT total_local_orders, total_ok, total_partial, total_failed, "
+                "dead_letter_count, count_by_failure_category, "
+                "pages_processed, records_processed, sync_rate, "
+                "last_successful_sync_at, updated_at, sync_run_id "
+                "FROM sync_metrics_snapshots "
+                "WHERE brand_id = :brand_id "
+                "ORDER BY updated_at DESC NULLS LAST "
+                "LIMIT 1"
             ),
             {"brand_id": brand_id},
         )
-        dead_letter_count = dl_res.scalar() or 0
-    except Exception:
-        await db.rollback()
-        dead_letter_count = 0
-
-    # ------------------------------------------------------------------ #
-    # Failure category breakdown from dead-letter error messages           #
-    # ------------------------------------------------------------------ #
-    _all_categories = [
-        "duplicate_key", "missing_field", "malformed", "line_item_issue",
-        "fk_issue", "timeout", "rate_limit", "validation", "unknown",
-    ]
-    failure_categories: dict[str, int] = {cat: 0 for cat in _all_categories}
-
-    try:
-        from services.leaflink_sync import categorize_sync_failure as _categorize
-        from sqlalchemy import text as _fc_text
-        fc_res = await db.execute(
-            _fc_text(
-                "SELECT error_message FROM sync_dead_letters "
-                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL "
-                "LIMIT 500"
-            ),
-            {"brand_id": brand_id},
+        snapshot = snap_result.fetchone()
+    except Exception as snap_exc:
+        logger.info(
+            "[OrdersAPI] sync_metrics snapshot_miss brand_id=%s reason=%s",
+            brand_id,
+            str(snap_exc)[:100],
         )
-        for (err_msg,) in fc_res.fetchall():
-            try:
-                cat = _categorize(Exception(err_msg or ""))
-                failure_categories[cat] = failure_categories.get(cat, 0) + 1
-            except Exception:
-                failure_categories["unknown"] = failure_categories.get("unknown", 0) + 1
-    except Exception:
-        await db.rollback()
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
-    # Last sync run stats                                                  #
+    # Lightweight SyncRun query for timing/state fields                   #
     # ------------------------------------------------------------------ #
-    last_sync_at = None
-    next_sync_at = None
     last_full_sync_duration_seconds = None
-    pages_processed = None
-    records_processed = None
-    records_per_second = None
     average_page_duration_seconds = None
     current_sync_state = "idle"
+    last_sync_at = None
+    next_sync_at = None
 
     try:
         last_run_res = await db.execute(
@@ -3961,25 +3990,58 @@ async def api_orders_sync_metrics(
 
         if last_run:
             current_sync_state = last_run.status or "idle"
-            last_sync_at = last_run.completed_at or last_run.last_progress_at
-            pages_processed = last_run.pages_synced or 0
-            records_processed = last_run.orders_loaded_this_run or 0
+            _last_ts = last_run.completed_at or last_run.last_progress_at
 
             if last_run.started_at and last_run.completed_at:
-                duration = (last_run.completed_at - last_run.started_at).total_seconds()
-                last_full_sync_duration_seconds = round(duration, 1)
-                if records_processed and duration > 0:
-                    records_per_second = round(records_processed / duration, 1)
-                if pages_processed and duration > 0:
-                    average_page_duration_seconds = round(duration / pages_processed, 2)
+                _dur = (last_run.completed_at - last_run.started_at).total_seconds()
+                last_full_sync_duration_seconds = round(_dur, 1)
+                _pages = last_run.pages_synced or 0
+                if _pages > 0 and _dur > 0:
+                    average_page_duration_seconds = round(_dur / _pages, 2)
 
-            # Estimate next sync at ~30 min after last sync
-            if last_sync_at:
-                from datetime import timedelta
-                next_sync_at = (last_sync_at + timedelta(minutes=30)).isoformat()
-                last_sync_at = last_sync_at.isoformat()
+            if _last_ts:
+                next_sync_at = (_last_ts + timedelta(minutes=30)).isoformat()
+                last_sync_at = _last_ts.isoformat()
     except Exception:
         await db.rollback()
+
+    # ------------------------------------------------------------------ #
+    # Populate counts from snapshot or fall back to zeros                  #
+    # ------------------------------------------------------------------ #
+    data_source = "sync_run"
+    _all_categories = [
+        "duplicate_key", "missing_field", "malformed", "line_item_issue",
+        "fk_issue", "timeout", "rate_limit", "validation", "unknown",
+    ]
+    failure_categories: dict[str, int] = {cat: 0 for cat in _all_categories}
+
+    if snapshot:
+        total_local_orders = snapshot[0] or 0
+        total_ok = snapshot[1] or 0
+        total_partial = snapshot[2] or 0
+        total_failed = snapshot[3] or 0
+        dead_letter_count = snapshot[4] or 0
+        # Merge stored failure category breakdown if available
+        stored_cats = snapshot[5]
+        if isinstance(stored_cats, dict):
+            for k, v in stored_cats.items():
+                failure_categories[k] = failure_categories.get(k, 0) + (v or 0)
+        pages_processed = snapshot[6]
+        records_processed = snapshot[7]
+        records_per_second = float(snapshot[8]) if snapshot[8] is not None else None
+        snap_last_sync = snapshot[9]
+        if snap_last_sync and not last_sync_at:
+            last_sync_at = snap_last_sync.isoformat() if hasattr(snap_last_sync, "isoformat") else str(snap_last_sync)
+        data_source = "snapshot"
+    else:
+        total_local_orders = 0
+        total_ok = 0
+        total_partial = 0
+        total_failed = 0
+        dead_letter_count = 0
+        pages_processed = None
+        records_processed = None
+        records_per_second = None
 
     return make_json_safe({
         "ok": True,
@@ -3999,6 +4061,7 @@ async def api_orders_sync_metrics(
         "failure_categories": failure_categories,
         "last_sync_at": last_sync_at,
         "next_sync_at": next_sync_at,
+        "data_source": data_source,
         "timestamp": timestamp,
     })
 
@@ -4475,6 +4538,174 @@ async def api_orders_sync_status_debug(
         "last_sync": last_sync,
         "failure_summary": failure_summary,
         "health": health,
+    })
+
+
+# =============================================================================
+# Runtime Health Endpoint — lightweight, never performs heavy work
+# =============================================================================
+
+
+@router.get("/runtime-health")
+async def api_orders_runtime_health(
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Lightweight runtime health check for the orders subsystem.
+
+    Returns immediately (<100ms) by reading from sync_metrics_snapshots cache
+    and a single lightweight SyncRun query.  Never performs full DB scans,
+    dead-letter aggregations, or any heavy computation inline.
+
+    Response fields:
+    - worker_active:          True if a sync run is currently queued or syncing
+    - queue_depth:            Number of pending SyncRequest rows
+    - sync_running:           True if status is "syncing"
+    - db_latency_ms:          Round-trip time for a trivial DB query (ms)
+    - avg_processing_rate:    Records per second from last snapshot
+    - dead_letter_count:      Cached dead-letter count from snapshot
+    - memory_usage_mb:        Process RSS memory in MB (if available)
+    - current_sync_run_id:    Active SyncRun ID (or null)
+    - last_successful_insert: Timestamp of last snapshot update
+    - snapshot_age_seconds:   How old the cached snapshot is
+    - total_local_orders:     Cached order count from snapshot
+    """
+    import os as _os
+    import time as _time
+    from sqlalchemy import text as _text_rh
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    logger.info("[OrdersAPI] runtime_health brand_id=%s", brand_id)
+
+    # ------------------------------------------------------------------ #
+    # DB latency probe — trivial query to measure round-trip time          #
+    # ------------------------------------------------------------------ #
+    db_latency_ms: Optional[float] = None
+    try:
+        _t0 = _time.monotonic()
+        await db.execute(_text_rh("SELECT 1"))
+        db_latency_ms = round((_time.monotonic() - _t0) * 1000, 1)
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------------ #
+    # Read snapshot cache (single indexed query)                           #
+    # ------------------------------------------------------------------ #
+    snapshot = None
+    try:
+        snap_result = await db.execute(
+            _text_rh(
+                "SELECT total_local_orders, dead_letter_count, sync_rate, "
+                "last_successful_sync_at, updated_at, sync_run_id "
+                "FROM sync_metrics_snapshots "
+                "WHERE brand_id = :brand_id "
+                "ORDER BY updated_at DESC NULLS LAST "
+                "LIMIT 1"
+            ),
+            {"brand_id": brand_id},
+        )
+        snapshot = snap_result.fetchone()
+    except Exception as snap_exc:
+        logger.info(
+            "[OrdersAPI] runtime_health snapshot_miss brand_id=%s reason=%s",
+            brand_id,
+            str(snap_exc)[:100],
+        )
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Lightweight SyncRun query                                            #
+    # ------------------------------------------------------------------ #
+    active_run = None
+    try:
+        active_run = await SyncRun.get_active_run(db, brand_id)
+    except Exception:
+        await db.rollback()
+
+    # ------------------------------------------------------------------ #
+    # Queue depth — count pending SyncRequest rows for this brand          #
+    # ------------------------------------------------------------------ #
+    queue_depth = 0
+    try:
+        qd_result = await db.execute(
+            select(func.count(SyncRequest.id)).where(
+                SyncRequest.brand_id == brand_id,
+                SyncRequest.status == "pending",
+            )
+        )
+        queue_depth = qd_result.scalar_one() or 0
+    except Exception:
+        await db.rollback()
+
+    # ------------------------------------------------------------------ #
+    # Memory usage (best-effort, not available in all environments)        #
+    # ------------------------------------------------------------------ #
+    memory_usage_mb: Optional[float] = None
+    try:
+        import resource as _resource
+        _usage = _resource.getrusage(_resource.RUSAGE_SELF)
+        # ru_maxrss is in KB on Linux, bytes on macOS
+        import sys as _sys
+        if _sys.platform == "darwin":
+            memory_usage_mb = round(_usage.ru_maxrss / (1024 * 1024), 1)
+        else:
+            memory_usage_mb = round(_usage.ru_maxrss / 1024, 1)
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------------ #
+    # Populate from snapshot                                               #
+    # ------------------------------------------------------------------ #
+    total_local_orders = None
+    dead_letter_count = None
+    avg_processing_rate = None
+    last_successful_insert = None
+    snapshot_age_seconds = None
+    snap_run_id = None
+
+    if snapshot:
+        total_local_orders = snapshot[0]
+        dead_letter_count = snapshot[1]
+        avg_processing_rate = float(snapshot[2]) if snapshot[2] is not None else None
+        last_successful_insert = (
+            snapshot[3].isoformat()
+            if snapshot[3] and hasattr(snapshot[3], "isoformat")
+            else None
+        )
+        snap_updated_at = snapshot[4]
+        snap_run_id = snapshot[5]
+        if snap_updated_at:
+            try:
+                _snap_dt = snap_updated_at if snap_updated_at.tzinfo else snap_updated_at.replace(tzinfo=timezone.utc)
+                snapshot_age_seconds = round((datetime.now(timezone.utc) - _snap_dt).total_seconds(), 1)
+            except Exception:
+                pass
+
+    worker_active = active_run is not None
+    sync_running = active_run is not None and active_run.status == "syncing"
+    current_sync_run_id = active_run.id if active_run else (
+        int(snap_run_id) if snap_run_id and snap_run_id.isdigit() else None
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "brand_id": brand_id,
+        "worker_active": worker_active,
+        "queue_depth": queue_depth,
+        "sync_running": sync_running,
+        "db_latency_ms": db_latency_ms,
+        "avg_processing_rate": avg_processing_rate,
+        "dead_letter_count": dead_letter_count,
+        "memory_usage_mb": memory_usage_mb,
+        "current_sync_run_id": current_sync_run_id,
+        "last_successful_insert": last_successful_insert,
+        "snapshot_age_seconds": snapshot_age_seconds,
+        "total_local_orders": total_local_orders,
+        "timestamp": timestamp,
     })
 
 
