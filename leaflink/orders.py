@@ -441,6 +441,12 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
         # Track newest/oldest order dates
         order_date = order.external_updated_at or order.external_created_at or order.updated_at
         if order_date is not None:
+            # Normalize to UTC-aware before comparison to avoid offset-naive vs
+            # offset-aware TypeError when mixing datetime sources.
+            if order_date.tzinfo is None:
+                order_date = order_date.replace(tzinfo=timezone.utc)
+            else:
+                order_date = order_date.astimezone(timezone.utc)
             if newest_order_date is None or order_date > newest_order_date:
                 newest_order_date = order_date
             if oldest_order_date is None or order_date < oldest_order_date:

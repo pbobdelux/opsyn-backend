@@ -466,7 +466,7 @@ async def get_orders(
         .options(_selectinload(Order.lines), *_defer_opts)
         .where(
             and_(
-                Order.org_id == resolved_org_id,
+                Order.org_id == cast(resolved_org_id, PG_UUID(as_uuid=False)),
                 Order.brand_id == brand_id,
             )
         )
@@ -515,7 +515,7 @@ async def get_orders(
     try:
         count_result = await db.execute(
             select(func.count(Order.id)).where(
-                and_(Order.org_id == resolved_org_id, Order.brand_id == brand_id)
+                and_(Order.org_id == cast(resolved_org_id, PG_UUID(as_uuid=False)), Order.brand_id == brand_id)
             )
         )
         total_in_database = count_result.scalar_one() or 0
@@ -4700,7 +4700,7 @@ async def get_order(
             .where(
                 and_(
                     Order.id == order_id,
-                    Order.org_id == resolved_org_id,
+                    Order.org_id == cast(resolved_org_id, PG_UUID(as_uuid=False)),
                     Order.brand_id == brand_id,
                 )
             )
