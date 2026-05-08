@@ -141,13 +141,161 @@ def derive_blockers(line_items: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 
 def derive_review_status(line_items: list[dict[str, Any]], blockers: list[dict[str, str]], order: Order) -> str:
+    """Derive review status for an order.
+
+    Rules (in priority order):
+    1. If order.review_status is already set, use it.
+    2. If there are blockers (unknown SKU, mapping issues), return "blocked".
+    3. If line_items is empty AND the order sync_status is "partial" or "failed",
+       return "needs_review" (real issue — child data missing).
+    4. If line_items is empty but sync_status is "ok", return "ok" (not yet synced
+       or genuinely has no line items — not a blocking issue).
+    5. Otherwise return "ready".
+    """
     if order.review_status:
         return order.review_status
     if blockers:
         return "blocked"
     if not line_items:
-        return "needs_review"
+        # Only flag as needs_review if there's a real sync problem
+        order_sync_status = getattr(order, "sync_status", "ok") or "ok"
+        if order_sync_status in ("partial", "failed"):
+            return "needs_review"
+        # No line items but sync is ok — not a blocking issue
+        return "ok"
     return "ready"
+
+
+def compute_sync_health(order: Order, line_items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute a sync_health object for an order.
+
+    An order is considered:
+    - "ok"      — all required data is present and sync succeeded
+    - "partial" — header saved but some child data is missing (line items, totals, etc.)
+    - "failed"  — sync explicitly failed for this order
+
+    Returns a dict with:
+        status:          "ok" | "partial" | "failed"
+        missing_fields:  list of field names that are missing/empty
+        last_synced_at:  datetime of last sync attempt
+        last_error:      error string or null
+    """
+    sync_status = getattr(order, "sync_status", "ok") or "ok"
+    last_synced_at = getattr(order, "last_synced_at", None) or getattr(order, "synced_at", None)
+
+    # Determine missing required fields
+    missing_fields: list[str] = []
+
+    if not order.customer_name or order.customer_name == "Unknown Customer":
+        missing_fields.append("customer_name")
+
+    if order.amount is None and order.total_cents is None:
+        missing_fields.append("amount")
+
+    if not line_items:
+        missing_fields.append("line_items")
+
+    if not order.status:
+        missing_fields.append("status")
+
+    # Determine health status
+    if sync_status == "failed":
+        health_status = "failed"
+    elif sync_status == "partial" or missing_fields:
+        health_status = "partial"
+    else:
+        health_status = "ok"
+
+    # Get last_error from sync_health_last_error if available, else None
+    last_error = getattr(order, "sync_health_last_error", None)
+
+    return {
+        "status": health_status,
+        "missing_fields": missing_fields,
+        "last_synced_at": last_synced_at,
+        "last_error": last_error,
+    }
+
+
+def is_needs_review(order: Order, line_items: list[dict[str, Any]], blockers: list[dict[str, str]]) -> bool:
+    """Return True if an order should appear in the Needs Review queue.
+
+    An order needs review ONLY if it has a real blocking issue:
+    - sync_health.status is "partial" or "failed"
+    - has blockers (unknown SKU, mapping issues)
+    - missing required data (customer, line items, totals)
+    - order has invalid/unknown status
+    """
+    sync_status = getattr(order, "sync_status", "ok") or "ok"
+    if sync_status in ("partial", "failed"):
+        return True
+    if blockers:
+        return True
+    if not order.customer_name or order.customer_name == "Unknown Customer":
+        return True
+    if order.amount is None and order.total_cents is None:
+        return True
+    if not line_items and sync_status not in ("ok",):
+        return True
+    return False
+
+
+def is_driver_queue(order: Order) -> bool:
+    """Return True if an order should appear in the Driver Queue.
+
+    Driver Queue includes orders that:
+    - status is approved/ready for delivery (confirmed, approved, accepted)
+    - no driver assigned (assigned_driver_id is null)
+    - not blocked/cancelled/completed
+    - delivery_status is pending
+    """
+    status = (order.status or "").lower()
+    delivery_status = getattr(order, "delivery_status", "pending") or "pending"
+    assigned_driver_id = getattr(order, "assigned_driver_id", None)
+
+    # Only include orders that are ready for dispatch
+    ready_statuses = {"confirmed", "approved", "accepted", "ready", "packed", "fulfillment"}
+    if status not in ready_statuses:
+        return False
+
+    # Must not have a driver assigned
+    if assigned_driver_id:
+        return False
+
+    # Must not be cancelled or completed
+    if delivery_status in ("delivered", "cancelled", "failed"):
+        return False
+
+    return True
+
+
+def is_ar_queue(order: Order) -> bool:
+    """Return True if an order should appear in the AR Queue.
+
+    AR Queue includes orders that:
+    - status is delivered/completed OR invoice-relevant
+    - unpaid/overdue/balance_due > 0
+    - not $0 due
+    """
+    status = (order.status or "").lower()
+    payment_status = getattr(order, "payment_status", "unpaid") or "unpaid"
+    balance_due = float(getattr(order, "balance_due", 0) or 0)
+    delivery_status = getattr(order, "delivery_status", "pending") or "pending"
+
+    # Only include delivered/completed orders or invoice-relevant statuses
+    ar_statuses = {"delivered", "completed", "invoiced", "confirmed", "approved"}
+    if status not in ar_statuses and delivery_status != "delivered":
+        return False
+
+    # Must have a balance due
+    if balance_due <= 0:
+        return False
+
+    # Must not be fully paid
+    if payment_status == "paid":
+        return False
+
+    return True
 
 
 def serialize_order(order: Order) -> dict[str, Any]:
@@ -172,6 +320,7 @@ def serialize_order(order: Order) -> dict[str, Any]:
 
     blockers = derive_blockers(line_items)
     review_status = derive_review_status(line_items, blockers, order)
+    sync_health = compute_sync_health(order, line_items)
 
     return {
         "id": order.id,
@@ -186,6 +335,7 @@ def serialize_order(order: Order) -> dict[str, Any]:
         "review_status": review_status,
         "blockers": blockers,
         "sync_status": order.sync_status or "ok",
+        "sync_health": sync_health,
         "last_synced_at": order.last_synced_at or order.synced_at,
         "source": order.source,
         "external_created_at": order.external_created_at,
