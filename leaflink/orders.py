@@ -14,6 +14,31 @@ from models import Order, OrderLine
 logger = logging.getLogger("leaflink_orders")
 router = APIRouter()
 
+
+def _ensure_utc(dt: Any) -> "datetime | None":
+    """Normalize any datetime value to UTC-aware.
+
+    Handles None, ISO strings, naive datetimes, and aware datetimes.
+    Returns a UTC-aware datetime or None — never a naive datetime.
+    This prevents 'can't subtract offset-naive and offset-aware datetimes'
+    errors when mixing datetime sources (DB, API, server clock).
+    """
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        if not dt:
+            return None
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(dt, datetime):
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 # Columns that may not exist in the database yet (pending migration).
 # Deferring them keeps them out of the SELECT list so the query succeeds
 # even before the migration runs.
@@ -221,7 +246,9 @@ def compute_sync_health(order: Order, line_items: list[dict[str, Any]]) -> dict[
         last_error:      error string or null
     """
     sync_status = getattr(order, "sync_status", "ok") or "ok"
-    last_synced_at = getattr(order, "last_synced_at", None) or getattr(order, "synced_at", None)
+    last_synced_at = _ensure_utc(
+        getattr(order, "last_synced_at", None) or getattr(order, "synced_at", None)
+    )
 
     # Determine missing required fields
     missing_fields: list[str] = []
@@ -343,6 +370,9 @@ def serialize_order(order: Order) -> dict[str, Any]:
 
     Reusable across endpoints — call this on each order in a paginated
     result set rather than loading all orders into memory at once.
+
+    All datetime fields are normalized to UTC-aware via _ensure_utc() so
+    callers never receive a mix of naive and aware datetimes.
     """
     line_items = build_line_items(order)
 
@@ -362,6 +392,15 @@ def serialize_order(order: Order) -> dict[str, Any]:
     review_status = derive_review_status(line_items, blockers, order)
     sync_health = compute_sync_health(order, line_items)
 
+    # Normalize all datetime fields to UTC-aware before returning.
+    # This prevents 'can't subtract offset-naive and offset-aware datetimes'
+    # errors when callers compare or subtract these values.
+    last_synced_at = _ensure_utc(order.last_synced_at or order.synced_at)
+    external_created_at = _ensure_utc(order.external_created_at)
+    external_updated_at = _ensure_utc(order.external_updated_at)
+    created_at = _ensure_utc(order.created_at)
+    updated_at = _ensure_utc(order.updated_at)
+
     return {
         "id": order.id,
         "external_id": order.external_order_id,
@@ -376,12 +415,12 @@ def serialize_order(order: Order) -> dict[str, Any]:
         "blockers": blockers,
         "sync_status": order.sync_status or "ok",
         "sync_health": sync_health,
-        "last_synced_at": order.last_synced_at or order.synced_at,
+        "last_synced_at": last_synced_at,
         "source": order.source,
-        "external_created_at": order.external_created_at,
-        "external_updated_at": order.external_updated_at,
-        "created_at": order.created_at,
-        "updated_at": order.updated_at,
+        "external_created_at": external_created_at,
+        "external_updated_at": external_updated_at,
+        "created_at": created_at,
+        "updated_at": updated_at,
         # Dispatch fields — use _safe_col() to handle deferred columns
         # that may not exist in the database yet (pending migration).
         "assigned_driver_id": _safe_col(order, "assigned_driver_id"),
@@ -537,7 +576,11 @@ async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
     )
 
     refreshed_at = datetime.now(timezone.utc).isoformat()
-    order_date = order.external_updated_at or order.external_created_at or order.updated_at
+    # Normalize order_date to UTC-aware before calling .isoformat() to avoid
+    # TypeError when mixing naive and aware datetimes.
+    order_date = _ensure_utc(
+        order.external_updated_at or order.external_created_at or order.updated_at
+    )
     newest_order_date_iso = order_date.isoformat() if order_date else None
 
     logger.info("[OrdersAPI] db_count=1")
@@ -572,12 +615,12 @@ async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
             "review_status": review_status,
             "blockers": blockers,
             "sync_status": order.sync_status or "ok",
-            "last_synced_at": order.last_synced_at or order.synced_at,
+            "last_synced_at": _ensure_utc(order.last_synced_at or order.synced_at),
             "source": order.source,
-            "external_created_at": order.external_created_at,
-            "external_updated_at": order.external_updated_at,
-            "created_at": order.created_at,
-            "updated_at": order.updated_at,
+            "external_created_at": _ensure_utc(order.external_created_at),
+            "external_updated_at": _ensure_utc(order.external_updated_at),
+            "created_at": _ensure_utc(order.created_at),
+            "updated_at": _ensure_utc(order.updated_at),
         }
     }
 
