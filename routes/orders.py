@@ -22,7 +22,7 @@ from utils.json_utils import make_json_safe
 
 logger = logging.getLogger("orders")
 
-router = APIRouter(prefix="/orders", tags=["orders"])
+router = APIRouter(prefix="/api/leaflink/orders", tags=["orders"])
 
 
 async def _get_brand_order_count(
@@ -602,171 +602,6 @@ async def get_orders(
         "has_more": has_more,
         "next_cursor": next_cursor,
         "prev_cursor": prev_cursor,
-    })
-
-
-@router.get("/{order_id}")
-async def get_order(
-    order_id: int,
-    x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
-    brand_id: str = Query(..., description="Brand ID (UUID)"),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Fetch a single order by its internal ID for a brand.
-
-    Requires:
-    - X-OPSYN-ORG header: Organization ID (UUID or org_code like \"noble\")
-    - brand_id query param: Brand ID (UUID)
-    - order_id path param: Internal order ID (integer)
-
-    Returns the full order including all dispatch and AR fields.
-    """
-    from leaflink.orders import build_line_items, derive_blockers, derive_review_status, money_to_float, cents_to_amount
-    from services.organization_service import lookup_organization
-    from sqlalchemy import and_
-    from sqlalchemy.orm import selectinload as _selectinload
-
-    if not x_opsyn_org:
-        logger.warning("[OrdersAPI] get_order missing_org_id order_id=%s", order_id)
-        return {"ok": False, "error": "X-OPSYN-ORG header is required"}
-
-    if not brand_id:
-        logger.warning("[OrdersAPI] get_order missing_brand_id order_id=%s", order_id)
-        return {"ok": False, "error": "brand_id query parameter is required"}
-
-    logger.info(
-        "[OrdersAPI] get_order request org_id=%s brand_id=%s order_id=%s",
-        x_opsyn_org,
-        brand_id,
-        order_id,
-    )
-
-    # Resolve org_id (supports UUID or org_code)
-    org_lookup = await lookup_organization(db, x_opsyn_org)
-    if not org_lookup.get("ok"):
-        logger.warning("[OrdersAPI] get_order org_lookup_failed error=%s", org_lookup.get("error"))
-        return {"ok": False, "error": org_lookup.get("error")}
-
-    resolved_org = org_lookup.get("organization")
-    resolved_org_id = str(resolved_org.id)
-
-    # Validate brand exists and belongs to org
-    from models.auth_models import Brand
-    brand_result = await db.execute(
-        select(Brand).where(
-            and_(
-                Brand.id == cast(brand_id, PG_UUID(as_uuid=False)),
-                Brand.org_id == cast(resolved_org_id, PG_UUID(as_uuid=False)),
-            )
-        )
-    )
-    brand = brand_result.scalar_one_or_none()
-
-    if not brand:
-        logger.warning(
-            "[OrdersAPI] get_order brand_not_found brand_id=%s org_id=%s",
-            brand_id,
-            resolved_org_id,
-        )
-        return {"ok": False, "error": "Brand not found or does not belong to organization"}
-
-    # Fetch the order scoped by org_id AND brand_id for tenant isolation
-    try:
-        result = await db.execute(
-            select(Order)
-            .options(_selectinload(Order.lines))
-            .where(
-                and_(
-                    Order.id == order_id,
-                    Order.org_id == resolved_org_id,
-                    Order.brand_id == brand_id,
-                )
-            )
-        )
-        order = result.scalar_one_or_none()
-    except Exception as exc:
-        logger.error(
-            "[OrdersAPI] get_order db_query_failed order_id=%s org_id=%s brand_id=%s error=%s",
-            order_id,
-            resolved_org_id,
-            brand_id,
-            exc,
-            exc_info=True,
-        )
-        return {"ok": False, "error": "Database query failed"}
-
-    if not order:
-        logger.info(
-            "[OrdersAPI] get_order not_found order_id=%s org_id=%s brand_id=%s",
-            order_id,
-            resolved_org_id,
-            brand_id,
-        )
-        return {"ok": False, "error": "Order not found"}
-
-    # Serialize the order with all fields including dispatch and AR
-    line_items = build_line_items(order)
-
-    amount = money_to_float(order.amount)
-    if amount is None and order.total_cents is not None:
-        amount = cents_to_amount(order.total_cents)
-
-    item_count = order.item_count if order.item_count is not None else len(line_items)
-    unit_count = order.unit_count if order.unit_count is not None else sum((item.get("quantity") or 0) for item in line_items)
-
-    blockers = derive_blockers(line_items)
-    review_status = derive_review_status(line_items, blockers, order)
-
-    logger.info(
-        "[OrdersAPI] get_order found order_id=%s external_id=%s delivery_status=%s payment_status=%s",
-        order_id,
-        order.external_order_id,
-        order.delivery_status,
-        order.payment_status,
-    )
-
-    return make_json_safe({
-        "ok": True,
-        "org_id": resolved_org_id,
-        "brand_id": brand_id,
-        "order": {
-            "id": order.id,
-            "external_id": order.external_order_id,
-            "order_number": order.order_number,
-            "customer_name": order.customer_name,
-            "status": order.status,
-            "amount": amount,
-            "item_count": item_count,
-            "unit_count": unit_count,
-            "line_items": line_items,
-            "review_status": review_status,
-            "blockers": blockers,
-            "sync_status": order.sync_status or "ok",
-            "last_synced_at": order.last_synced_at or order.synced_at,
-            "source": order.source,
-            "external_created_at": order.external_created_at,
-            "external_updated_at": order.external_updated_at,
-            "created_at": order.created_at,
-            "updated_at": order.updated_at,
-            # Dispatch fields
-            "assigned_driver_id": order.assigned_driver_id,
-            "assigned_driver_name": order.assigned_driver_name,
-            "delivery_status": order.delivery_status,
-            "delivery_date": order.delivery_date,
-            "route_number": order.route_number,
-            "route_id": order.route_id,
-            "driver_note": order.driver_note,
-            "delivery_instructions": order.delivery_instructions,
-            # AR fields
-            "payment_status": order.payment_status,
-            "amount_paid": float(order.amount_paid) if order.amount_paid is not None else 0,
-            "balance_due": float(order.balance_due) if order.balance_due is not None else 0,
-            "due_date": order.due_date,
-            "days_overdue": order.days_overdue,
-            "invoice_number": order.invoice_number,
-            "ar_note": order.ar_note,
-        },
     })
 
 
@@ -3524,7 +3359,7 @@ async def test_leaflink_paths(
 # =============================================================================
 
 
-@router.post("/api/leaflink/orders/sync")
+@router.post("/sync")
 async def api_orders_incremental_sync(
     request: Request,
     x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
@@ -3627,7 +3462,7 @@ async def api_orders_incremental_sync(
         })
 
 
-@router.post("/api/leaflink/orders/full-resync")
+@router.post("/full-resync")
 async def api_orders_full_resync(
     request: Request,
     x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
@@ -3733,7 +3568,7 @@ async def api_orders_full_resync(
         })
 
 
-@router.get("/api/leaflink/orders/sync-status")
+@router.get("/sync-status")
 async def api_orders_sync_status(
     brand_id: str = Query(..., description="Brand ID (UUID)"),
     db: AsyncSession = Depends(get_db),
@@ -3872,9 +3707,9 @@ async def api_orders_sync_status(
     })
 
 
-@router.post("/api/leaflink/orders/{order_id}/resync")
+@router.post("/{order_id}/resync")
 async def api_order_resync(
-    order_id: int,
+    order_id: str,
     x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
     brand_id: str = Query(..., description="Brand ID (UUID)"),
     db: AsyncSession = Depends(get_db),
@@ -4014,7 +3849,7 @@ async def api_order_resync(
     })
 
 
-@router.get("/api/leaflink/orders/queues")
+@router.get("/queues")
 async def api_orders_queues(
     brand_id: str = Query(..., description="Brand ID (UUID)"),
     db: AsyncSession = Depends(get_db),
@@ -4075,7 +3910,7 @@ async def api_orders_queues(
 # =============================================================================
 
 
-@router.get("/api/leaflink/orders/sync-metrics")
+@router.get("/sync-metrics")
 async def api_orders_sync_metrics(
     brand_id: str = Query(..., description="Brand ID (UUID)"),
     org_id: Optional[str] = Query(None, description="Organization ID (UUID)"),
@@ -4268,7 +4103,7 @@ async def api_orders_sync_metrics(
 # =============================================================================
 
 
-@router.get("/api/leaflink/orders/dead-letter-analysis")
+@router.get("/dead-letter-analysis")
 async def api_orders_dead_letter_analysis(
     brand_id: str = Query(..., description="Brand ID (UUID)"),
     org_id: Optional[str] = Query(None, description="Organization ID (UUID)"),
@@ -4419,7 +4254,7 @@ async def api_orders_dead_letter_analysis(
 # =============================================================================
 
 
-@router.get("/api/leaflink/orders/sync-status-debug")
+@router.get("/sync-status-debug")
 async def api_orders_sync_status_debug(
     brand_id: str = Query(..., description="Brand ID (UUID)"),
     org_id: Optional[str] = Query(None, description="Organization ID (UUID)"),
@@ -4735,4 +4570,175 @@ async def api_orders_sync_status_debug(
         "last_sync": last_sync,
         "failure_summary": failure_summary,
         "health": health,
+    })
+
+
+# =============================================================================
+# Dynamic routes — must be registered AFTER all static routes so that paths
+# like /sync-status, /queues, /sync-metrics etc. are matched first.
+# =============================================================================
+
+
+@router.get("/{order_id}")
+async def get_order(
+    order_id: str,
+    x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Fetch a single order by its internal ID for a brand.
+
+    Requires:
+    - X-OPSYN-ORG header: Organization ID (UUID or org_code like "noble")
+    - brand_id query param: Brand ID (UUID)
+    - order_id path param: Internal order ID (string)
+
+    Returns the full order including all dispatch and AR fields.
+    """
+    from leaflink.orders import build_line_items, derive_blockers, derive_review_status, money_to_float, cents_to_amount
+    from services.organization_service import lookup_organization
+    from sqlalchemy import and_
+    from sqlalchemy.orm import selectinload as _selectinload
+
+    if not x_opsyn_org:
+        logger.warning("[OrdersAPI] get_order missing_org_id order_id=%s", order_id)
+        return {"ok": False, "error": "X-OPSYN-ORG header is required"}
+
+    if not brand_id:
+        logger.warning("[OrdersAPI] get_order missing_brand_id order_id=%s", order_id)
+        return {"ok": False, "error": "brand_id query parameter is required"}
+
+    logger.info(
+        "[OrdersAPI] get_order request org_id=%s brand_id=%s order_id=%s",
+        x_opsyn_org,
+        brand_id,
+        order_id,
+    )
+
+    # Resolve org_id (supports UUID or org_code)
+    org_lookup = await lookup_organization(db, x_opsyn_org)
+    if not org_lookup.get("ok"):
+        logger.warning("[OrdersAPI] get_order org_lookup_failed error=%s", org_lookup.get("error"))
+        return {"ok": False, "error": org_lookup.get("error")}
+
+    resolved_org = org_lookup.get("organization")
+    resolved_org_id = str(resolved_org.id)
+
+    # Validate brand exists and belongs to org
+    from models.auth_models import Brand
+    brand_result = await db.execute(
+        select(Brand).where(
+            and_(
+                Brand.id == cast(brand_id, PG_UUID(as_uuid=False)),
+                Brand.org_id == cast(resolved_org_id, PG_UUID(as_uuid=False)),
+            )
+        )
+    )
+    brand = brand_result.scalar_one_or_none()
+
+    if not brand:
+        logger.warning(
+            "[OrdersAPI] get_order brand_not_found brand_id=%s org_id=%s",
+            brand_id,
+            resolved_org_id,
+        )
+        return {"ok": False, "error": "Brand not found or does not belong to organization"}
+
+    # Fetch the order scoped by org_id AND brand_id for tenant isolation
+    try:
+        result = await db.execute(
+            select(Order)
+            .options(_selectinload(Order.lines))
+            .where(
+                and_(
+                    Order.id == order_id,
+                    Order.org_id == resolved_org_id,
+                    Order.brand_id == brand_id,
+                )
+            )
+        )
+        order = result.scalar_one_or_none()
+    except Exception as exc:
+        logger.error(
+            "[OrdersAPI] get_order db_query_failed order_id=%s org_id=%s brand_id=%s error=%s",
+            order_id,
+            resolved_org_id,
+            brand_id,
+            exc,
+            exc_info=True,
+        )
+        return {"ok": False, "error": "Database query failed"}
+
+    if not order:
+        logger.info(
+            "[OrdersAPI] get_order not_found order_id=%s org_id=%s brand_id=%s",
+            order_id,
+            resolved_org_id,
+            brand_id,
+        )
+        return {"ok": False, "error": "Order not found"}
+
+    # Serialize the order with all fields including dispatch and AR
+    line_items = build_line_items(order)
+
+    amount = money_to_float(order.amount)
+    if amount is None and order.total_cents is not None:
+        amount = cents_to_amount(order.total_cents)
+
+    item_count = order.item_count if order.item_count is not None else len(line_items)
+    unit_count = order.unit_count if order.unit_count is not None else sum((item.get("quantity") or 0) for item in line_items)
+
+    blockers = derive_blockers(line_items)
+    review_status = derive_review_status(line_items, blockers, order)
+
+    logger.info(
+        "[OrdersAPI] get_order found order_id=%s external_id=%s delivery_status=%s payment_status=%s",
+        order_id,
+        order.external_order_id,
+        order.delivery_status,
+        order.payment_status,
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "org_id": resolved_org_id,
+        "brand_id": brand_id,
+        "order": {
+            "id": order.id,
+            "external_id": order.external_order_id,
+            "order_number": order.order_number,
+            "customer_name": order.customer_name,
+            "status": order.status,
+            "amount": amount,
+            "item_count": item_count,
+            "unit_count": unit_count,
+            "line_items": line_items,
+            "review_status": review_status,
+            "blockers": blockers,
+            "sync_status": order.sync_status or "ok",
+            "last_synced_at": order.last_synced_at or order.synced_at,
+            "source": order.source,
+            "external_created_at": order.external_created_at,
+            "external_updated_at": order.external_updated_at,
+            "created_at": order.created_at,
+            "updated_at": order.updated_at,
+            # Dispatch fields
+            "assigned_driver_id": order.assigned_driver_id,
+            "assigned_driver_name": order.assigned_driver_name,
+            "delivery_status": order.delivery_status,
+            "delivery_date": order.delivery_date,
+            "route_number": order.route_number,
+            "route_id": order.route_id,
+            "driver_note": order.driver_note,
+            "delivery_instructions": order.delivery_instructions,
+            # AR fields
+            "payment_status": order.payment_status,
+            "amount_paid": float(order.amount_paid) if order.amount_paid is not None else 0,
+            "balance_due": float(order.balance_due) if order.balance_due is not None else 0,
+            "due_date": order.due_date,
+            "days_overdue": order.days_overdue,
+            "invoice_number": order.invoice_number,
+            "ar_note": order.ar_note,
+        },
     })
