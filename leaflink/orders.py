@@ -192,6 +192,23 @@ def serialize_order(order: Order) -> dict[str, Any]:
         "external_updated_at": order.external_updated_at,
         "created_at": order.created_at,
         "updated_at": order.updated_at,
+        # Dispatch fields
+        "assigned_driver_id": getattr(order, "assigned_driver_id", None),
+        "assigned_driver_name": getattr(order, "assigned_driver_name", None),
+        "delivery_status": getattr(order, "delivery_status", "pending"),
+        "delivery_date": getattr(order, "delivery_date", None),
+        "route_number": getattr(order, "route_number", None),
+        "route_id": getattr(order, "route_id", None),
+        "driver_note": getattr(order, "driver_note", None),
+        "delivery_instructions": getattr(order, "delivery_instructions", None),
+        # AR fields
+        "payment_status": getattr(order, "payment_status", "unpaid"),
+        "amount_paid": float(order.amount_paid) if getattr(order, "amount_paid", None) is not None else 0,
+        "balance_due": float(order.balance_due) if getattr(order, "balance_due", None) is not None else 0,
+        "due_date": getattr(order, "due_date", None),
+        "days_overdue": getattr(order, "days_overdue", 0),
+        "invoice_number": getattr(order, "invoice_number", None),
+        "ar_note": getattr(order, "ar_note", None),
     }
 
 

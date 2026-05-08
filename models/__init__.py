@@ -14,6 +14,8 @@ from typing import Any, Optional
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -23,7 +25,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -87,10 +89,25 @@ class Order(Base):
         UniqueConstraint("brand_id", "external_order_id", name="uq_brand_external_order"),
         Index("ix_orders_brand_id", "brand_id"),
         Index("ix_orders_order_number", "order_number"),
+        # Dispatch / AR indexes
+        Index("ix_orders_assigned_driver", "assigned_driver_id"),
+        Index("ix_orders_delivery_status", "delivery_status"),
+        Index("ix_orders_payment_status", "payment_status"),
+        Index("ix_orders_route_id", "route_id"),
+        # Check constraints for status enums
+        CheckConstraint(
+            "delivery_status IN ('pending','assigned','out_for_delivery','delivered','failed','needs_reschedule','cancelled')",
+            name="ck_orders_delivery_status",
+        ),
+        CheckConstraint(
+            "payment_status IN ('unpaid','partial','paid','overdue','collection_issue','write_off')",
+            name="ck_orders_payment_status",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     brand_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    org_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True, index=True)
     external_order_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
 
     order_number: Mapped[str | None] = mapped_column(String(120), nullable=True)
@@ -121,6 +138,39 @@ class Order(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+    # ------------------------------------------------------------------
+    # Dispatch fields — connect orders to the driver/route system
+    # ------------------------------------------------------------------
+    assigned_driver_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=False),
+        ForeignKey("drivers.id"),
+        nullable=True,
+        default=None,
+    )
+    assigned_driver_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, default=None)
+    delivery_status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")
+    delivery_date: Mapped[Optional[object]] = mapped_column(Date, nullable=True, default=None)
+    route_number: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, default=None)
+    route_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=False),
+        ForeignKey("routes.id"),
+        nullable=True,
+        default=None,
+    )
+    driver_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
+    delivery_instructions: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
+
+    # ------------------------------------------------------------------
+    # Accounts-receivable (AR) fields
+    # ------------------------------------------------------------------
+    payment_status: Mapped[str] = mapped_column(String(30), nullable=False, default="unpaid")
+    amount_paid: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    balance_due: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    due_date: Mapped[Optional[object]] = mapped_column(Date, nullable=True, default=None)
+    days_overdue: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    invoice_number: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, default=None)
+    ar_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
 
     lines: Mapped[list["OrderLine"]] = relationship(
         "OrderLine",
