@@ -26,33 +26,45 @@ if TYPE_CHECKING:
 logger = logging.getLogger("leaflink_sync")
 
 
-def ensure_db_datetime(value):
+def ensure_utc_datetime(value: Any) -> Optional[datetime]:
     """Ensure a datetime value is timezone-aware UTC for DB binding.
 
-    asyncpg requires native Python datetime objects (not strings) for timestamptz columns.
-    This helper normalizes any datetime input to a UTC-aware datetime object.
+    Handles all input types and always returns a UTC-aware datetime or None.
+    This is the ONLY function that should normalize datetimes before DB persistence.
 
     Args:
-        value: datetime object, ISO string, or None
+        value: datetime, date, ISO string, or None
 
     Returns:
         UTC-aware datetime object, or None
 
     Raises:
-        ValueError if value is a string for a timestamp column (should have been parsed earlier)
+        ValueError if value cannot be normalized
     """
     if value is None:
         return None
+
+    # ISO string → parse to datetime
     if isinstance(value, str):
-        # Parse ISO string to datetime
-        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        try:
+            # Handle both "Z" and "+00:00" formats
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (ValueError, AttributeError) as e:
+            raise ValueError(f"Cannot parse ISO string: {value}") from e
+
+    # date object → UTC datetime midnight
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+
+    # datetime object → ensure UTC-aware
     if isinstance(value, datetime):
         if value.tzinfo is None:
             # Naive datetime — assume UTC
             return value.replace(tzinfo=timezone.utc)
         # Already aware — convert to UTC
         return value.astimezone(timezone.utc)
-    return value
+
+    raise ValueError(f"Cannot normalize datetime: {type(value).__name__}")
 
 
 def _cursor_hash(cursor: Optional[str]) -> Optional[str]:
@@ -2586,6 +2598,7 @@ async def sync_leaflink_orders_headers_only(
     malformed_payload = 0
     line_item_failure = 0
     transaction_abort = 0
+    datetime_normalization_failures = 0
 
     # Split orders into batches of batch_size
     batches = [
@@ -2878,24 +2891,25 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             update_params = normalize_uuid_fields(update_params)
                             update_params = normalize_datetime_fields(update_params)
                             update_params = apply_uuid_str_to_params(update_params)
-                            # Convert datetime params to UTC-aware Python datetime objects (not strings).
-                            # asyncpg requires native datetime objects for timestamptz columns.
-                            datetime_fields = ['synced_at', 'last_synced_at', 'updated_at', 'created_at',
-                                               'external_created_at', 'external_updated_at', 'due_date', 'route_date', 'delivered_at']
-                            for _field in datetime_fields:
-                                if _field in update_params and update_params[_field] is not None:
-                                    update_params[_field] = ensure_db_datetime(update_params[_field])
-                            # Assertion: datetime params must be UTC-aware Python objects, not strings
-                            for _param_key, _param_val in update_params.items():
-                                if _param_key in datetime_fields:
-                                    if isinstance(_param_val, str):
-                                        logger.error("[DATETIME_BIND_ASSERTION_FAILED] field=%s is string (should be datetime)", _param_key)
-                                        raise ValueError(f"Datetime param {_param_key} is string, not datetime object")
-                                    if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
-                                        logger.error("[DATETIME_BIND_ASSERTION_FAILED] field=%s is naive datetime", _param_key)
-                                        raise ValueError(f"Datetime param {_param_key} is naive (not UTC-aware)")
-                                    if isinstance(_param_val, datetime):
-                                        logger.debug("[DATETIME_BIND_READY] field=%s type=datetime tz=UTC", _param_key)
+
+                            # Normalize ALL datetime fields to UTC-aware before SQL execution
+                            update_params["synced_at"] = ensure_utc_datetime(update_params.get("synced_at"))
+                            update_params["last_synced_at"] = ensure_utc_datetime(update_params.get("last_synced_at"))
+                            update_params["updated_at"] = ensure_utc_datetime(update_params.get("updated_at"))
+                            update_params["created_at"] = ensure_utc_datetime(update_params.get("created_at"))
+                            update_params["external_created_at"] = ensure_utc_datetime(update_params.get("external_created_at"))
+                            update_params["external_updated_at"] = ensure_utc_datetime(update_params.get("external_updated_at"))
+                            update_params["due_date"] = ensure_utc_datetime(update_params.get("due_date"))
+                            update_params["payment_date"] = ensure_utc_datetime(update_params.get("payment_date"))
+                            update_params["delivery_date"] = ensure_utc_datetime(update_params.get("delivery_date"))
+
+                            # Assertion: no naive datetimes should remain
+                            for _field, _value in update_params.items():
+                                if isinstance(_value, datetime):
+                                    if _value.tzinfo is None:
+                                        datetime_normalization_failures += 1
+                                    assert _value.tzinfo is not None, f"[DATETIME_NORMALIZATION_FAILED] {_field} is naive"
+                                    logger.debug("[DATETIME_AUDIT] field=%s tzinfo=%s aware=true", _field, _value.tzinfo)
                             # Hard block: never execute UPDATE with org_id=None
                             if update_params.get("org_id") is None:
                                 logger.error(
@@ -3056,24 +3070,25 @@ INSERT INTO orders (
                             insert_params = normalize_uuid_fields(insert_params)
                             insert_params = normalize_datetime_fields(insert_params)
                             insert_params = apply_uuid_str_to_params(insert_params)
-                            # Convert datetime params to UTC-aware Python datetime objects (not strings).
-                            # asyncpg requires native datetime objects for timestamptz columns.
-                            datetime_fields = ['synced_at', 'last_synced_at', 'created_at', 'updated_at',
-                                               'external_created_at', 'external_updated_at', 'due_date', 'route_date', 'delivered_at']
-                            for _field in datetime_fields:
-                                if _field in insert_params and insert_params[_field] is not None:
-                                    insert_params[_field] = ensure_db_datetime(insert_params[_field])
-                            # Assertion: datetime params must be UTC-aware Python objects, not strings
-                            for _param_key, _param_val in insert_params.items():
-                                if _param_key in datetime_fields:
-                                    if isinstance(_param_val, str):
-                                        logger.error("[DATETIME_BIND_ASSERTION_FAILED] field=%s is string (should be datetime)", _param_key)
-                                        raise ValueError(f"Datetime param {_param_key} is string, not datetime object")
-                                    if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
-                                        logger.error("[DATETIME_BIND_ASSERTION_FAILED] field=%s is naive datetime", _param_key)
-                                        raise ValueError(f"Datetime param {_param_key} is naive (not UTC-aware)")
-                                    if isinstance(_param_val, datetime):
-                                        logger.debug("[DATETIME_BIND_READY] field=%s type=datetime tz=UTC", _param_key)
+
+                            # Normalize ALL datetime fields to UTC-aware before SQL execution
+                            insert_params["synced_at"] = ensure_utc_datetime(insert_params.get("synced_at"))
+                            insert_params["last_synced_at"] = ensure_utc_datetime(insert_params.get("last_synced_at"))
+                            insert_params["created_at"] = ensure_utc_datetime(insert_params.get("created_at"))
+                            insert_params["updated_at"] = ensure_utc_datetime(insert_params.get("updated_at"))
+                            insert_params["external_created_at"] = ensure_utc_datetime(insert_params.get("external_created_at"))
+                            insert_params["external_updated_at"] = ensure_utc_datetime(insert_params.get("external_updated_at"))
+                            insert_params["due_date"] = ensure_utc_datetime(insert_params.get("due_date"))
+                            insert_params["payment_date"] = ensure_utc_datetime(insert_params.get("payment_date"))
+                            insert_params["delivery_date"] = ensure_utc_datetime(insert_params.get("delivery_date"))
+
+                            # Assertion: no naive datetimes should remain
+                            for _field, _value in insert_params.items():
+                                if isinstance(_value, datetime):
+                                    if _value.tzinfo is None:
+                                        datetime_normalization_failures += 1
+                                    assert _value.tzinfo is not None, f"[DATETIME_NORMALIZATION_FAILED] {_field} is naive"
+                                    logger.debug("[DATETIME_AUDIT] field=%s tzinfo=%s aware=true", _field, _value.tzinfo)
 
                             # Hard block: never execute INSERT with org_id=None
                             if insert_params.get("org_id") is None:
@@ -3419,7 +3434,8 @@ INSERT INTO orders (
         "leaflink_seen=%s headers_inserted=%s headers_updated=%s headers_skipped=%s "
         "headers_failed=%s db_visible_count=%s dead_letter_count=%s rollback_count=%s "
         "transaction_failures=%s "
-        "persistence_ratio=%.1f%% rollback_ratio=%.1f%% dead_letter_ratio=%.1f%%",
+        "persistence_ratio=%.1f%% rollback_ratio=%.1f%% dead_letter_ratio=%.1f%% "
+        "datetime_normalization_failures=%s",
         brand_id_value,
         org_id_value,
         _records_seen,
@@ -3434,6 +3450,7 @@ INSERT INTO orders (
         _persistence_ratio * 100,
         _rollback_ratio * 100,
         _dead_letter_ratio * 100,
+        datetime_normalization_failures,
     )
 
     logger.info(
@@ -4673,6 +4690,24 @@ async def sync_leaflink_background_continuous(
         mark_stalled as _srm_mark_stalled,
         mark_failed as _srm_mark_failed,
     )
+
+    # Startup self-test: validate datetime normalization
+    try:
+        _test_naive = datetime(2026, 5, 8, 12, 0, 0)
+        _test_aware = datetime(2026, 5, 8, 12, 0, 0, tzinfo=timezone.utc)
+        _test_string = "2026-05-08T12:00:00Z"
+        _test_date = date(2026, 5, 8)
+
+        assert ensure_utc_datetime(_test_naive).tzinfo is not None
+        assert ensure_utc_datetime(_test_aware).tzinfo is not None
+        assert ensure_utc_datetime(_test_string).tzinfo is not None
+        assert ensure_utc_datetime(_test_date).tzinfo is not None
+        assert ensure_utc_datetime(None) is None
+
+        logger.info("[DATETIME_SELF_TEST_OK] all normalization paths validated")
+    except Exception as _test_exc:
+        logger.error("[DATETIME_SELF_TEST_FAILED] error=%s", str(_test_exc)[:200])
+        raise
 
     # [SYNC_ENTRY] Log entry into the background continuous sync function
     logger.info(
