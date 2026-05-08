@@ -184,6 +184,7 @@ async def _update_sync_health_phase1(
             )
             _phase1_params = normalize_uuid_fields(_phase1_params)
             _phase1_params = normalize_datetime_fields(_phase1_params)
+            _phase1_params = apply_uuid_str_to_params(_phase1_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase1 columns=brand_id"
             )
@@ -232,6 +233,7 @@ async def _update_sync_health_phase2(
             )
             _phase2_params = normalize_uuid_fields(_phase2_params)
             _phase2_params = normalize_datetime_fields(_phase2_params)
+            _phase2_params = apply_uuid_str_to_params(_phase2_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase2 columns=brand_id"
             )
@@ -278,6 +280,7 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
             )
             _sync_error_params = normalize_uuid_fields(_sync_error_params)
             _sync_error_params = normalize_datetime_fields(_sync_error_params)
+            _sync_error_params = apply_uuid_str_to_params(_sync_error_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_record_sync_error columns=brand_id"
             )
@@ -319,6 +322,7 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
             )
             _retryable_params = normalize_uuid_fields(_retryable_params)
             _retryable_params = normalize_datetime_fields(_retryable_params)
+            _retryable_params = apply_uuid_str_to_params(_retryable_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_record_retryable_error columns=brand_id"
             )
@@ -379,6 +383,7 @@ async def _dead_letter_line_item(
             }, statement="_dead_letter_line_item")
             _dead_letter_params = normalize_uuid_fields(_dead_letter_params)
             _dead_letter_params = normalize_datetime_fields(_dead_letter_params)
+            _dead_letter_params = apply_uuid_str_to_params(_dead_letter_params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_dead_letter_line_item columns=brand_id"
             )
@@ -392,11 +397,6 @@ async def _dead_letter_line_item(
                         "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
                         _k, _dead_letter_params[_k].isoformat(), _dead_letter_params[_k].tzinfo, _dead_letter_params[_k].tzinfo is not None,
                     )
-            # CAST(:brand_id AS UUID) in SQL requires a str, not a uuid.UUID object.
-            # normalize_uuid_fields() converts strings to UUID objects, so we must
-            # convert back to str immediately before execute().
-            if isinstance(_dead_letter_params.get("brand_id"), UUID):
-                _dead_letter_params["brand_id"] = str(_dead_letter_params["brand_id"])
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -496,6 +496,7 @@ async def _write_sync_dead_letter(
             )
             params = normalize_uuid_fields(params)
             params = normalize_datetime_fields(params)
+            params = apply_uuid_str_to_params(params)
             logger.info(
                 "[UUID_SQL_CAST_APPLIED] statement=_write_sync_dead_letter columns=brand_id,org_id"
             )
@@ -509,13 +510,6 @@ async def _write_sync_dead_letter(
                         "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
                         _k, params[_k].isoformat(), params[_k].tzinfo, params[_k].tzinfo is not None,
                     )
-            # CAST(:brand_id AS uuid) and CAST(:org_id AS uuid) in SQL require str values,
-            # not uuid.UUID objects. normalize_uuid_fields() converts strings to UUID objects,
-            # so we must convert back to str immediately before execute().
-            if isinstance(params.get("brand_id"), UUID):
-                params["brand_id"] = str(params["brand_id"])
-            if isinstance(params.get("org_id"), UUID):
-                params["org_id"] = str(params["org_id"])
             await db.execute(
                 text("""
                     INSERT INTO sync_dead_letters
@@ -1175,6 +1169,68 @@ def normalize_uuid_fields(params: dict) -> dict:
     return normalized
 
 
+def ensure_uuid_str(value: Any) -> Optional[str]:
+    """Convert UUID objects to strings for asyncpg bind params.
+
+    asyncpg requires string values for TEXT/VARCHAR columns and for
+    CAST(:x AS uuid) expressions — it rejects raw uuid.UUID objects with
+    "expected str, got UUID".  Call this on every UUID-typed bind parameter
+    immediately before execute() to guarantee asyncpg receives a str.
+
+    Args:
+        value: Any value — UUID object, string, or None.
+
+    Returns:
+        str (canonical UUID form) if value is a non-empty UUID or string,
+        None if value is None or empty.
+    """
+    if value is None:
+        return None
+    if isinstance(value, UUID):
+        converted = str(value)
+        logger.info(
+            "[UUID_NORMALIZED] key=<direct_call> original_type=UUID final_type=str value=%s",
+            converted,
+        )
+        return converted
+    if isinstance(value, str):
+        return value if value else None
+    # Fallback: stringify anything else (e.g. int PKs that slipped through)
+    return str(value) if value else None
+
+
+def apply_uuid_str_to_params(params: dict) -> dict:
+    """Convert all UUID-typed bind params to strings before asyncpg execute().
+
+    Walks every key in *params* and converts uuid.UUID values to str so that
+    asyncpg never receives a raw UUID object.  Logs every conversion with the
+    [UUID_NORMALIZED] prefix for full observability.
+
+    This is the final barrier before execute() — call it after
+    normalize_uuid_fields() and sanitize_sql_params() have run.
+
+    Args:
+        params: SQL parameters dict (not mutated — a new dict is returned).
+
+    Returns:
+        New dict with all uuid.UUID values replaced by their str equivalents.
+    """
+    result: dict = {}
+    for key, value in params.items():
+        if isinstance(value, UUID):
+            converted = str(value)
+            logger.info(
+                "[UUID_NORMALIZED] key=%s original_type=%s final_type=%s",
+                key,
+                type(value).__name__,
+                type(converted).__name__,
+            )
+            result[key] = converted
+        else:
+            result[key] = value
+    return result
+
+
 def normalize_datetime_fields(params: dict, field_prefix: str = "") -> dict:
     """Recursively normalize all datetime values in SQL parameters to UTC-aware.
 
@@ -1590,6 +1646,9 @@ async def _insert_line_items_standalone(
                 insert_params["created_at"] = to_utc_naive(insert_params["created_at"])
             if "updated_at" in insert_params:
                 insert_params["updated_at"] = to_utc_naive(insert_params["updated_at"])
+
+            # Final barrier: ensure all UUID objects are strings before asyncpg execute()
+            insert_params = apply_uuid_str_to_params(insert_params)
 
             # Log the final bind values
             logger.debug(
@@ -2143,6 +2202,9 @@ async def sync_leaflink_orders(
                     if "updated_at" in _li_params:
                         _li_params["updated_at"] = to_utc_naive(_li_params["updated_at"])
 
+                    # Final barrier: ensure all UUID objects are strings before asyncpg execute()
+                    _li_params = apply_uuid_str_to_params(_li_params)
+
                     # Log the final bind values
                     logger.debug(
                         "[ORDER_LINES_FINAL_DATETIME_BIND] created_at=%s type=%s tzinfo=%s updated_at=%s type=%s tzinfo=%s column_type=TIMESTAMP",
@@ -2607,6 +2669,7 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             )
                             update_params = normalize_uuid_fields(update_params)
                             update_params = normalize_datetime_fields(update_params)
+                            update_params = apply_uuid_str_to_params(update_params)
                             logger.info(
                                 "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders_headers_only_update columns=org_id,brand_id"
                             )
@@ -2757,6 +2820,7 @@ INSERT INTO orders (
                             )
                             insert_params = normalize_uuid_fields(insert_params)
                             insert_params = normalize_datetime_fields(insert_params)
+                            insert_params = apply_uuid_str_to_params(insert_params)
                             logger.info(
                                 "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders_headers_only_insert columns=org_id,brand_id"
                             )
@@ -3390,6 +3454,9 @@ async def sync_leaflink_line_items(
                     insert_params["created_at"] = to_utc_naive(insert_params["created_at"])
                 if "updated_at" in insert_params:
                     insert_params["updated_at"] = to_utc_naive(insert_params["updated_at"])
+
+                # Final barrier: ensure all UUID objects are strings before asyncpg execute()
+                insert_params = apply_uuid_str_to_params(insert_params)
 
                 # Log the final bind values
                 logger.debug(
@@ -4324,8 +4391,10 @@ async def sync_leaflink_background_continuous(
                                               AND integration_name = 'leaflink'
                                               AND is_active = true
                                         """),
-                                        {"brand_id": safe_uuid_for_db(brand_id, "brand_id") or brand_id,
-                                         "error": _err_str[:500]},
+                                        apply_uuid_str_to_params({
+                                            "brand_id": safe_uuid_for_db(brand_id, "brand_id") or brand_id,
+                                            "error": _err_str[:500],
+                                        }),
                                     )
                         except Exception as _auth_cb_exc:
                             logger.error(
