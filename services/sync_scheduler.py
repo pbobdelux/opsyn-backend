@@ -275,6 +275,13 @@ async def poll_and_execute() -> None:
             company_id: str = cred.company_id or ""
             auth_scheme: str = cred.auth_scheme or "Token"
             base_url: str = cred.base_url or ""
+            org_id: str = getattr(cred, "org_id", None) or ""
+            logger.info(
+                "[SyncWorker] org_id_from_credential id=%s brand=%s org_id=%s",
+                sync_run_id,
+                brand_id,
+                org_id or "MISSING",
+            )
 
             # Validate api_key
             if not api_key or not api_key.strip():
@@ -356,6 +363,7 @@ async def poll_and_execute() -> None:
             sync_run_id=sync_run_id,  # Pass SyncRun ID for direct DB updates
             total_orders_available=total_orders_available,
             base_url=base_url,
+            org_id=org_id or None,
         )
 
         logger.info("[SyncWorker] sync_complete id=%s brand=%s", sync_run_id, brand_id)

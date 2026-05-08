@@ -4984,6 +4984,129 @@ async def orders_db_debug(
         })
 
 
+@router.post("/backfill-org-ids")
+async def backfill_org_ids(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Repair historical NULL org_id orders by joining with brands table.
+
+    UPDATE orders
+    SET org_id = (
+        SELECT org_id FROM brands WHERE brands.id = orders.brand_id
+    )
+    WHERE org_id IS NULL;
+
+    Returns:
+    - updated_count: number of rows updated
+    - remaining_null_count: number of rows still NULL after update
+    - sample_rows: up to 5 sample rows that were updated
+    """
+    from sqlalchemy import text as _text_backfill
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    logger.info("[OrdersAPI] backfill_org_ids start")
+
+    try:
+        # Count rows with NULL org_id before update
+        _before_res = await db.execute(
+            _text_backfill("SELECT COUNT(*) FROM orders WHERE org_id IS NULL")
+        )
+        null_count_before = _before_res.scalar() or 0
+
+        if null_count_before == 0:
+            logger.info("[OrdersAPI] backfill_org_ids no_null_rows_found")
+            return make_json_safe({
+                "ok": True,
+                "updated_count": 0,
+                "remaining_null_count": 0,
+                "null_count_before": 0,
+                "sample_rows": [],
+                "message": "No orders with NULL org_id found — nothing to backfill",
+                "timestamp": timestamp,
+            })
+
+        # Capture sample rows before update (for reporting)
+        _sample_before_res = await db.execute(
+            _text_backfill(
+                "SELECT o.id, o.brand_id::text, o.external_order_id, o.created_at, "
+                "b.org_id::text AS brand_org_id "
+                "FROM orders o "
+                "LEFT JOIN brands b ON b.id = o.brand_id "
+                "WHERE o.org_id IS NULL "
+                "LIMIT 5"
+            )
+        )
+        sample_before = [
+            {
+                "id": row[0],
+                "brand_id": row[1],
+                "external_order_id": row[2],
+                "created_at": row[3].isoformat() if row[3] and hasattr(row[3], "isoformat") else str(row[3]),
+                "brand_org_id": row[4],
+            }
+            for row in _sample_before_res.fetchall()
+        ]
+
+        # Perform the backfill UPDATE
+        _update_res = await db.execute(
+            _text_backfill(
+                "UPDATE orders "
+                "SET org_id = ( "
+                "    SELECT org_id FROM brands WHERE brands.id = orders.brand_id "
+                ") "
+                "WHERE org_id IS NULL "
+                "AND EXISTS ( "
+                "    SELECT 1 FROM brands WHERE brands.id = orders.brand_id AND brands.org_id IS NOT NULL "
+                ")"
+            )
+        )
+        updated_count = _update_res.rowcount if hasattr(_update_res, "rowcount") else 0
+
+        await db.commit()
+
+        # Count remaining NULL rows after update
+        _after_res = await db.execute(
+            _text_backfill("SELECT COUNT(*) FROM orders WHERE org_id IS NULL")
+        )
+        remaining_null_count = _after_res.scalar() or 0
+
+        logger.info(
+            "[OrdersAPI] backfill_org_ids complete null_before=%s updated=%s remaining_null=%s",
+            null_count_before,
+            updated_count,
+            remaining_null_count,
+        )
+
+        return make_json_safe({
+            "ok": True,
+            "null_count_before": null_count_before,
+            "updated_count": updated_count,
+            "remaining_null_count": remaining_null_count,
+            "sample_rows": sample_before,
+            "message": (
+                f"Backfilled {updated_count} orders with org_id from brands table. "
+                f"{remaining_null_count} rows still have NULL org_id "
+                f"(brands table may be missing org_id for those brand_ids)."
+                if remaining_null_count > 0
+                else f"Successfully backfilled {updated_count} orders. All orders now have org_id set."
+            ),
+            "timestamp": timestamp,
+        })
+
+    except Exception as exc:
+        logger.error("[OrdersAPI] backfill_org_ids error=%s", str(exc)[:300], exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        return make_json_safe({
+            "ok": False,
+            "error": str(exc)[:300],
+            "timestamp": timestamp,
+        })
+
+
 @router.post("/{order_id}/resync")
 async def api_order_resync(
     order_id: str,

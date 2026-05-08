@@ -69,6 +69,8 @@ FAILURE_CATEGORIES = {
     "rate_limit",
     "validation",
     "unknown",
+    # org_id propagation failures
+    "missing_org_context",
 }
 
 # Ordered list of (category, predicates) — first match wins.
@@ -280,15 +282,12 @@ async def _update_sync_health_phase1(
             _phase1_params = normalize_uuid_fields(_phase1_params)
             _phase1_params = normalize_datetime_fields(_phase1_params)
             _phase1_params = apply_uuid_str_to_params(_phase1_params)
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase1 columns=brand_id"
-            )
-            for _k, _v in _phase1_params.items():
-                if isinstance(_v, datetime):
-                    logger.info(
-                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
-                    )
+            # Final guard: scan params for raw naive datetimes before execute
+            for _param_key, _param_val in _phase1_params.items():
+                if isinstance(_param_val, datetime):
+                    if _param_val.tzinfo is None:
+                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
+                        _phase1_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, orders_fetched_last_run, updated_at)
@@ -329,15 +328,12 @@ async def _update_sync_health_phase2(
             _phase2_params = normalize_uuid_fields(_phase2_params)
             _phase2_params = normalize_datetime_fields(_phase2_params)
             _phase2_params = apply_uuid_str_to_params(_phase2_params)
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=_update_sync_health_phase2 columns=brand_id"
-            )
-            for _k, _v in _phase2_params.items():
-                if isinstance(_v, datetime):
-                    logger.info(
-                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
-                    )
+            # Final guard: scan params for raw naive datetimes before execute
+            for _param_key, _param_val in _phase2_params.items():
+                if isinstance(_param_val, datetime):
+                    if _param_val.tzinfo is None:
+                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
+                        _phase2_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
             await db.execute(
                 text("""
                     UPDATE sync_health SET
@@ -376,15 +372,12 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
             _sync_error_params = normalize_uuid_fields(_sync_error_params)
             _sync_error_params = normalize_datetime_fields(_sync_error_params)
             _sync_error_params = apply_uuid_str_to_params(_sync_error_params)
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=_record_sync_error columns=brand_id"
-            )
-            for _k, _v in _sync_error_params.items():
-                if isinstance(_v, datetime):
-                    logger.info(
-                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
-                    )
+            # Final guard: scan params for raw naive datetimes before execute
+            for _param_key, _param_val in _sync_error_params.items():
+                if isinstance(_param_val, datetime):
+                    if _param_val.tzinfo is None:
+                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
+                        _sync_error_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, last_error_at, updated_at)
@@ -418,15 +411,12 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
             _retryable_params = normalize_uuid_fields(_retryable_params)
             _retryable_params = normalize_datetime_fields(_retryable_params)
             _retryable_params = apply_uuid_str_to_params(_retryable_params)
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=_record_retryable_error columns=brand_id"
-            )
-            for _k, _v in _retryable_params.items():
-                if isinstance(_v, datetime):
-                    logger.info(
-                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
-                    )
+            # Final guard: scan params for raw naive datetimes before execute
+            for _param_key, _param_val in _retryable_params.items():
+                if isinstance(_param_val, datetime):
+                    if _param_val.tzinfo is None:
+                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
+                        _retryable_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
@@ -479,19 +469,14 @@ async def _dead_letter_line_item(
             _dead_letter_params = normalize_uuid_fields(_dead_letter_params)
             _dead_letter_params = normalize_datetime_fields(_dead_letter_params)
             _dead_letter_params = apply_uuid_str_to_params(_dead_letter_params)
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=_dead_letter_line_item columns=brand_id"
-            )
-            for _k, _v in _dead_letter_params.items():
-                if isinstance(_v, datetime):
-                    if _v.tzinfo is None:
-                        _dead_letter_params[_k] = _v.replace(tzinfo=timezone.utc)
+            # Final guard: scan params for raw naive datetimes before execute
+            for _param_key, _param_val in list(_dead_letter_params.items()):
+                if isinstance(_param_val, datetime):
+                    if _param_val.tzinfo is None:
+                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
+                        _dead_letter_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
                     else:
-                        _dead_letter_params[_k] = _v.astimezone(timezone.utc)
-                    logger.info(
-                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, _dead_letter_params[_k].isoformat(), _dead_letter_params[_k].tzinfo, _dead_letter_params[_k].tzinfo is not None,
-                    )
+                        _dead_letter_params[_param_key] = _param_val.astimezone(timezone.utc)
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -631,19 +616,14 @@ async def _write_sync_dead_letter(
             params = normalize_uuid_fields(params)
             params = normalize_datetime_fields(params)
             params = apply_uuid_str_to_params(params)
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=_write_sync_dead_letter columns=brand_id,org_id"
-            )
-            for _k, _v in params.items():
-                if isinstance(_v, datetime):
-                    if _v.tzinfo is None:
-                        params[_k] = _v.replace(tzinfo=timezone.utc)
+            # Final guard: scan params for raw naive datetimes before execute
+            for _param_key, _param_val in list(params.items()):
+                if isinstance(_param_val, datetime):
+                    if _param_val.tzinfo is None:
+                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
+                        params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
                     else:
-                        params[_k] = _v.astimezone(timezone.utc)
-                    logger.info(
-                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                        _k, params[_k].isoformat(), params[_k].tzinfo, params[_k].tzinfo is not None,
-                    )
+                        params[_param_key] = _param_val.astimezone(timezone.utc)
             # Try to write with new detail columns; fall back to legacy schema if columns don't exist yet
             try:
                 await db.execute(
@@ -2901,15 +2881,32 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             update_params = normalize_uuid_fields(update_params)
                             update_params = normalize_datetime_fields(update_params)
                             update_params = apply_uuid_str_to_params(update_params)
-                            logger.info(
-                                "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders_headers_only_update columns=org_id,brand_id"
-                            )
-                            for _k, _v in update_params.items():
-                                if isinstance(_v, datetime):
-                                    logger.info(
-                                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                            # Final guard: scan params for raw naive datetimes before execute
+                            for _param_key, _param_val in list(update_params.items()):
+                                if isinstance(_param_val, datetime):
+                                    if _param_val.tzinfo is None:
+                                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
+                                        update_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
+                            # Hard block: never execute UPDATE with org_id=None
+                            if update_params.get("org_id") is None:
+                                logger.error(
+                                    "[ORG_CONTEXT_MISSING_FATAL] brand_id=%s external_id=%s",
+                                    brand_id_value, external_id,
+                                )
+                                asyncio.create_task(
+                                    _write_sync_dead_letter(
+                                        brand_id=brand_id_value,
+                                        raw_payload=_raw_payload_ref,
+                                        error_stage="org_context_missing",
+                                        error_message="org_id is None at update time",
+                                        org_id=None,
+                                        external_id=external_id,
+                                        failure_category="missing_org_context",
+                                        failure_stage="header_insert",
                                     )
+                                )
+                                batch_skipped += 1
+                                continue
                             await db.execute(
                                 text(update_stmt),
                                 update_params,
@@ -3064,15 +3061,32 @@ INSERT INTO orders (
                             insert_params = normalize_uuid_fields(insert_params)
                             insert_params = normalize_datetime_fields(insert_params)
                             insert_params = apply_uuid_str_to_params(insert_params)
-                            logger.info(
-                                "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders_headers_only_insert columns=org_id,brand_id"
-                            )
-                            for _k, _v in insert_params.items():
-                                if isinstance(_v, datetime):
-                                    logger.info(
-                                        "[FINAL_DATETIME_AUDIT] field=%s value=%s tzinfo=%s is_aware=%s",
-                                        _k, _v.isoformat(), _v.tzinfo, _v.tzinfo is not None,
+                            # Final guard: scan params for raw naive datetimes before execute
+                            for _param_key, _param_val in list(insert_params.items()):
+                                if isinstance(_param_val, datetime):
+                                    if _param_val.tzinfo is None:
+                                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
+                                        insert_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
+                            # Hard block: never execute INSERT with org_id=None
+                            if insert_params.get("org_id") is None:
+                                logger.error(
+                                    "[ORG_CONTEXT_MISSING_FATAL] brand_id=%s external_id=%s",
+                                    brand_id_value, external_id,
+                                )
+                                asyncio.create_task(
+                                    _write_sync_dead_letter(
+                                        brand_id=brand_id_value,
+                                        raw_payload=_raw_payload_ref,
+                                        error_stage="org_context_missing",
+                                        error_message="org_id is None at insert time",
+                                        org_id=None,
+                                        external_id=external_id,
+                                        failure_category="missing_org_context",
+                                        failure_stage="header_insert",
                                     )
+                                )
+                                batch_skipped += 1
+                                continue
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
@@ -4622,12 +4636,19 @@ async def sync_leaflink_background_continuous(
         sync_run_id,
         org_id,
     )
-    logger.info(
-        "[ORG_CONTEXT] stage=bg_continuous_entry org_id=%s brand_id=%s"
-        " external_order_id=N/A",
-        org_id,
-        brand_id,
-    )
+    if org_id is None:
+        logger.warning(
+            "[ORG_CONTEXT] stage=bg_continuous_entry org_id=MISSING brand_id=%s"
+            " — orders will be blocked at insert time (missing_org_context)",
+            brand_id,
+        )
+    else:
+        logger.info(
+            "[ORG_CONTEXT] stage=bg_continuous_entry org_id=%s brand_id=%s"
+            " external_order_id=N/A",
+            org_id,
+            brand_id,
+        )
 
     try:
         bg_start = time.monotonic()
