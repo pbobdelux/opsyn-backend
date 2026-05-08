@@ -126,6 +126,9 @@ class Order(Base):
     review_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
     sync_status: Mapped[str] = mapped_column(String(50), nullable=False, default="ok")
 
+    # Per-order sync health: {"status": "ok"|"partial"|"failed", "missing_fields": [], "last_synced_at": ..., "last_error": ...}
+    sync_health: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
     raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     external_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

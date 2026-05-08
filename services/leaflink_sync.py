@@ -3568,11 +3568,29 @@ async def sync_leaflink_background_continuous(
         sync_run_id,
     )
 
+    # [DEBUG_SYNC_CONFIG] Log all sync configuration at entry
+    logger.info(
+        "[DEBUG_SYNC_CONFIG] brand_id=%s company_id=%s auth_scheme=%s"
+        " base_url=%s start_page=%s total_pages=%s total_orders_available=%s"
+        " sync_run_id=%s pagination_mode=%s",
+        brand_id,
+        company_id or "none",
+        auth_scheme,
+        (base_url[:60] if base_url else "canonical"),
+        start_page,
+        total_pages if total_pages is not None else "None",
+        total_orders_available or "unknown",
+        sync_run_id,
+        "cursor_based" if total_pages is None else "page_count",
+    )
+
     try:
         bg_start = time.monotonic()
         current_page = start_page
         batch_size = _BG_BATCH_DEFAULT
         total_orders_synced = 0
+        total_inserted_synced = 0
+        total_updated_synced = 0
         resume_url: Optional[str] = None
         _prev_cursor: Optional[str] = None  # for cursor-loop detection
 
@@ -3878,6 +3896,22 @@ async def sync_leaflink_background_continuous(
                 brand_id,
             )
 
+            # [DEBUG_PAGINATION] Detailed per-page pagination state
+            logger.info(
+                "[DEBUG_PAGINATION] brand_id=%s page=%s count_this_batch=%s"
+                " running_total=%s has_next=%s next_page=%s cursor_hash=%s"
+                " batch_size=%s elapsed_seconds=%.1f",
+                brand_id,
+                current_page,
+                _orders_count,
+                total_orders_synced + _orders_count,
+                "true" if next_cursor else "false",
+                next_page or "none",
+                _cursor_hash(next_cursor),
+                batch_size,
+                time.monotonic() - bg_start,
+            )
+
             # [SYNC_FILTER_DISABLED] All filters are disabled — passing all orders through.
             # Provider dates are unreliable (may be naive/offset-naive); no date comparison
             # is performed during ingestion. Raw dates are preserved in raw_payload JSONB.
@@ -4029,13 +4063,18 @@ async def sync_leaflink_background_continuous(
 
                     # [SYNC_TRANSFORM_RESULT] Log transformation results from headers-only upsert
                     _input_count = len(batch_orders)
-                    _transformed = persist_result.get("created", 0) + persist_result.get("updated", 0) if persist_result else 0
+                    _page_inserted = persist_result.get("created", 0) if persist_result else 0
+                    _page_updated = persist_result.get("updated", 0) if persist_result else 0
+                    _transformed = _page_inserted + _page_updated
                     _skipped = persist_result.get("skipped", 0) if persist_result else 0
+                    total_inserted_synced += _page_inserted
+                    total_updated_synced += _page_updated
                     logger.info(
-                        "[SYNC_TRANSFORM_RESULT] page=%s input_count=%s transformed=%s skipped=%s brand_id=%s",
+                        "[SYNC_TRANSFORM_RESULT] page=%s input_count=%s inserted=%s updated=%s skipped=%s brand_id=%s",
                         current_page,
                         _input_count,
-                        _transformed,
+                        _page_inserted,
+                        _page_updated,
                         _skipped,
                         brand_id,
                     )
@@ -4161,13 +4200,40 @@ async def sync_leaflink_background_continuous(
 
         # [SYNC_FINAL_COUNTS] Log final summary for the entire sync run
         logger.info(
-            "[SYNC_FINAL_COUNTS] fetched=%s created=deferred updated=deferred skipped=deferred errors=0"
+            "[SYNC_FINAL_COUNTS] fetched=%s inserted=%s updated=%s skipped=deferred errors=0"
             " final_page=%s total_pages=%s duration=%ss brand_id=%s sync_run_id=%s",
             total_orders_synced,
+            total_inserted_synced,
+            total_updated_synced,
             final_page,
             total_pages,
             total_duration,
             brand_id,
+            sync_run_id,
+        )
+
+        # [DEBUG_SYNC_COMPLETE] Final debug summary with local DB count
+        try:
+            async with AsyncSessionLocal() as _final_count_db:
+                from sqlalchemy import func as _func, select as _select
+                from models import Order as _Order
+                _final_count_result = await _final_count_db.execute(
+                    _select(_func.count(_Order.id)).where(_Order.brand_id == brand_id)
+                )
+                _final_local_count = _final_count_result.scalar_one() or 0
+        except Exception:
+            _final_local_count = -1
+
+        logger.info(
+            "[DEBUG_SYNC_COMPLETE] brand_id=%s total_fetched_this_run=%s"
+            " final_local_db_count=%s final_page=%s total_pages=%s"
+            " duration_seconds=%s sync_run_id=%s",
+            brand_id,
+            total_orders_synced,
+            _final_local_count,
+            final_page,
+            total_pages if total_pages is not None else "cursor_based",
+            total_duration,
             sync_run_id,
         )
 

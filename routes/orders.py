@@ -3517,3 +3517,807 @@ async def test_leaflink_paths(
         "results": results,
         "working_endpoint": working[0]["url"] if working else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# New sync endpoints required by the Orders system
+# ---------------------------------------------------------------------------
+
+@router.post("/incremental-sync")
+async def orders_incremental_sync(
+    x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Incremental sync from LeafLink.
+
+    Pulls all new/updated orders since the last successful sync run.
+    Handles full pagination until no more pages are returned by LeafLink.
+
+    Returns:
+        ok, total_fetched, total_inserted, total_updated, failed_count, last_sync_at
+    """
+    import time as _time
+    from services.leaflink_client import LeafLinkClient
+    from services.leaflink_sync import sync_leaflink_orders
+    from services.organization_service import lookup_organization
+    from services.sync_run_manager import create_sync_run, mark_completed, mark_failed
+    from services.credential_resolver import resolve_brand_credential
+    from models.auth_models import Brand
+    from sqlalchemy import and_
+
+    started_at = datetime.now(timezone.utc)
+    wall_start = _time.monotonic()
+
+    logger.info(
+        "[IncrementalSync] request org=%s brand_id=%s",
+        x_opsyn_org,
+        brand_id,
+    )
+
+    if not x_opsyn_org:
+        return {"ok": False, "error": "X-OPSYN-ORG header is required"}
+
+    # Resolve org
+    org_lookup = await lookup_organization(db, x_opsyn_org)
+    if not org_lookup.get("ok"):
+        return {"ok": False, "error": org_lookup.get("error")}
+    resolved_org = org_lookup.get("organization")
+    org_id = str(resolved_org.id)
+
+    # Validate brand belongs to org
+    brand_result = await db.execute(
+        select(Brand).where(
+            and_(
+                Brand.id == cast(brand_id, PG_UUID(as_uuid=False)),
+                Brand.org_id == cast(org_id, PG_UUID(as_uuid=False)),
+            )
+        )
+    )
+    brand_obj = brand_result.scalar_one_or_none()
+    if not brand_obj:
+        return {"ok": False, "error": "Brand not found or does not belong to organization"}
+
+    # Resolve credential
+    cred_row = await resolve_brand_credential(db, brand_id, "leaflink")
+    if not cred_row:
+        return {"ok": False, "error": "leaflink_credential_not_found", "brand_id": brand_id}
+
+    api_key = cred_row[4]
+    company_id = cred_row[3]
+    base_url = cred_row[8] if len(cred_row) > 8 else None
+    auth_scheme = (cred_row[9] if len(cred_row) > 9 and cred_row[9] else "Token")
+
+    # Find last successful sync to determine modified__gte
+    last_sync_at: Optional[str] = None
+    try:
+        last_run = await SyncRun.get_last_completed_run(db, brand_id)
+        if last_run and last_run.completed_at:
+            last_sync_at = last_run.completed_at.isoformat()
+    except Exception:
+        await db.rollback()
+
+    # Create SyncRun
+    sync_run_id: Optional[int] = None
+    try:
+        async with AsyncSessionLocal() as _run_db:
+            async with _run_db.begin():
+                _run = await create_sync_run(_run_db, brand_id, mode="incremental")
+                sync_run_id = _run.id
+    except ValueError:
+        pass  # Already active — proceed without a new run
+    except Exception as exc:
+        logger.error("[IncrementalSync] create_run_error brand=%s error=%s", brand_id, exc)
+
+    logger.info(
+        "[IncrementalSync] start brand=%s org=%s run_id=%s last_sync_at=%s",
+        brand_id, org_id, sync_run_id, last_sync_at,
+    )
+
+    try:
+        client = LeafLinkClient(
+            api_key=api_key,
+            company_id=company_id,
+            brand_id=brand_id,
+            base_url=base_url,
+            auth_scheme=auth_scheme,
+        )
+    except Exception as exc:
+        err = str(exc)[:300]
+        logger.error("[IncrementalSync] client_init_error brand=%s error=%s", brand_id, err)
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _fail_db:
+                    async with _fail_db.begin():
+                        await mark_failed(_fail_db, sync_run_id, err)
+            except Exception:
+                pass
+        return {"ok": False, "error": f"Client init failed: {err}", "brand_id": brand_id}
+
+    # Fetch all pages (incremental — filtered by modified__gte if available)
+    try:
+        loop = asyncio.get_event_loop()
+        fetch_result = await asyncio.wait_for(
+            loop.run_in_executor(
+                _leaflink_executor,
+                lambda: client.fetch_recent_orders(
+                    normalize=True,
+                    brand=brand_id,
+                    modified__gte=last_sync_at,
+                ),
+            ),
+            timeout=BACKGROUND_SYNC_TIMEOUT,
+        )
+        orders = fetch_result.get("orders", [])
+        pages_fetched = fetch_result.get("pages_fetched", 0)
+    except asyncio.TimeoutError:
+        err = "Incremental sync timed out"
+        logger.error("[IncrementalSync] timeout brand=%s", brand_id)
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _fail_db:
+                    async with _fail_db.begin():
+                        await mark_failed(_fail_db, sync_run_id, err)
+            except Exception:
+                pass
+        return {"ok": False, "error": err, "brand_id": brand_id}
+    except Exception as exc:
+        err = str(exc)[:300]
+        logger.error("[IncrementalSync] fetch_error brand=%s error=%s", brand_id, err)
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _fail_db:
+                    async with _fail_db.begin():
+                        await mark_failed(_fail_db, sync_run_id, err)
+            except Exception:
+                pass
+        return {"ok": False, "error": f"LeafLink fetch failed: {err}", "brand_id": brand_id}
+
+    logger.info(
+        "[IncrementalSync] fetch_complete brand=%s orders=%s pages=%s",
+        brand_id, len(orders), pages_fetched,
+    )
+
+    # Upsert to DB
+    try:
+        async with AsyncSessionLocal() as _upsert_db:
+            async with _upsert_db.begin():
+                sync_result = await sync_leaflink_orders(
+                    _upsert_db, brand_id, orders,
+                    pages_fetched=pages_fetched, org_id=org_id,
+                )
+    except Exception as exc:
+        err = str(exc)[:300]
+        logger.error("[IncrementalSync] upsert_error brand=%s error=%s", brand_id, err)
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _fail_db:
+                    async with _fail_db.begin():
+                        await mark_failed(_fail_db, sync_run_id, err)
+            except Exception:
+                pass
+        return {"ok": False, "error": f"DB upsert failed: {err}", "brand_id": brand_id}
+
+    # Mark completed
+    if sync_run_id:
+        try:
+            async with AsyncSessionLocal() as _done_db:
+                async with _done_db.begin():
+                    await mark_completed(_done_db, sync_run_id)
+        except Exception as exc:
+            logger.error("[IncrementalSync] mark_completed_error run_id=%s error=%s", sync_run_id, exc)
+
+    duration = round(_time.monotonic() - wall_start, 2)
+    total_fetched = len(orders)
+    total_inserted = sync_result.get("created", 0)
+    total_updated = sync_result.get("updated", 0)
+    failed_count = sync_result.get("error_count", 0)
+
+    logger.info(
+        "[IncrementalSync] complete brand=%s fetched=%s inserted=%s updated=%s failed=%s duration=%ss",
+        brand_id, total_fetched, total_inserted, total_updated, failed_count, duration,
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "brand_id": brand_id,
+        "org_id": org_id,
+        "sync_run_id": sync_run_id,
+        "total_fetched": total_fetched,
+        "total_inserted": total_inserted,
+        "total_updated": total_updated,
+        "failed_count": failed_count,
+        "pages_fetched": pages_fetched,
+        "last_sync_at": last_sync_at,
+        "started_at": started_at.isoformat(),
+        "duration_seconds": duration,
+    })
+
+
+@router.post("/full-resync")
+async def orders_full_resync(
+    x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Full backfill/resync of all LeafLink orders.
+
+    Walks every page from LeafLink until all available orders are stored.
+    This is a long-running operation — it runs synchronously and may take
+    several minutes for large catalogs (e.g. 16k orders).
+
+    Returns:
+        ok, total_fetched, total_inserted, total_updated, failed_count,
+        started_at, completed_at
+    """
+    import time as _time
+    from services.leaflink_client import LeafLinkClient
+    from services.leaflink_sync import sync_leaflink_orders
+    from services.organization_service import lookup_organization
+    from services.sync_run_manager import create_sync_run, mark_completed, mark_failed
+    from services.credential_resolver import resolve_brand_credential
+    from models.auth_models import Brand
+    from sqlalchemy import and_
+
+    started_at = datetime.now(timezone.utc)
+    wall_start = _time.monotonic()
+
+    logger.info(
+        "[FullResync] request org=%s brand_id=%s",
+        x_opsyn_org,
+        brand_id,
+    )
+
+    if not x_opsyn_org:
+        return {"ok": False, "error": "X-OPSYN-ORG header is required"}
+
+    # Resolve org
+    org_lookup = await lookup_organization(db, x_opsyn_org)
+    if not org_lookup.get("ok"):
+        return {"ok": False, "error": org_lookup.get("error")}
+    resolved_org = org_lookup.get("organization")
+    org_id = str(resolved_org.id)
+
+    # Validate brand belongs to org
+    brand_result = await db.execute(
+        select(Brand).where(
+            and_(
+                Brand.id == cast(brand_id, PG_UUID(as_uuid=False)),
+                Brand.org_id == cast(org_id, PG_UUID(as_uuid=False)),
+            )
+        )
+    )
+    brand_obj = brand_result.scalar_one_or_none()
+    if not brand_obj:
+        return {"ok": False, "error": "Brand not found or does not belong to organization"}
+
+    # Resolve credential
+    cred_row = await resolve_brand_credential(db, brand_id, "leaflink")
+    if not cred_row:
+        return {"ok": False, "error": "leaflink_credential_not_found", "brand_id": brand_id}
+
+    api_key = cred_row[4]
+    company_id = cred_row[3]
+    base_url = cred_row[8] if len(cred_row) > 8 else None
+    auth_scheme = (cred_row[9] if len(cred_row) > 9 and cred_row[9] else "Token")
+
+    # Create SyncRun (full mode)
+    sync_run_id: Optional[int] = None
+    try:
+        async with AsyncSessionLocal() as _run_db:
+            async with _run_db.begin():
+                _run = await create_sync_run(_run_db, brand_id, mode="full")
+                sync_run_id = _run.id
+    except ValueError:
+        pass  # Already active — proceed without a new run
+    except Exception as exc:
+        logger.error("[FullResync] create_run_error brand=%s error=%s", brand_id, exc)
+
+    logger.info(
+        "[FullResync] start brand=%s org=%s run_id=%s",
+        brand_id, org_id, sync_run_id,
+    )
+
+    try:
+        client = LeafLinkClient(
+            api_key=api_key,
+            company_id=company_id,
+            brand_id=brand_id,
+            base_url=base_url,
+            auth_scheme=auth_scheme,
+        )
+    except Exception as exc:
+        err = str(exc)[:300]
+        logger.error("[FullResync] client_init_error brand=%s error=%s", brand_id, err)
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _fail_db:
+                    async with _fail_db.begin():
+                        await mark_failed(_fail_db, sync_run_id, err)
+            except Exception:
+                pass
+        return {"ok": False, "error": f"Client init failed: {err}", "brand_id": brand_id}
+
+    # Fetch ALL pages from LeafLink (no max_pages limit = full resync)
+    logger.info(
+        "[FullResync] leaflink_fetch_start brand=%s endpoint=%s/orders-received/",
+        brand_id, client.base_url,
+    )
+    try:
+        loop = asyncio.get_event_loop()
+        fetch_result = await asyncio.wait_for(
+            loop.run_in_executor(
+                _leaflink_executor,
+                lambda: client.fetch_recent_orders(
+                    normalize=True,
+                    brand=brand_id,
+                    max_pages=None,  # Fetch ALL pages — no limit
+                ),
+            ),
+            timeout=BACKGROUND_SYNC_TIMEOUT,
+        )
+        orders = fetch_result.get("orders", [])
+        pages_fetched = fetch_result.get("pages_fetched", 0)
+    except asyncio.TimeoutError:
+        err = f"Full resync timed out after {BACKGROUND_SYNC_TIMEOUT}s"
+        logger.error("[FullResync] timeout brand=%s", brand_id)
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _fail_db:
+                    async with _fail_db.begin():
+                        await mark_failed(_fail_db, sync_run_id, err)
+            except Exception:
+                pass
+        return {"ok": False, "error": err, "brand_id": brand_id}
+    except Exception as exc:
+        err = str(exc)[:300]
+        logger.error("[FullResync] fetch_error brand=%s error=%s", brand_id, err)
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _fail_db:
+                    async with _fail_db.begin():
+                        await mark_failed(_fail_db, sync_run_id, err)
+            except Exception:
+                pass
+        return {"ok": False, "error": f"LeafLink fetch failed: {err}", "brand_id": brand_id}
+
+    logger.info(
+        "[FullResync] fetch_complete brand=%s total_orders=%s pages=%s",
+        brand_id, len(orders), pages_fetched,
+    )
+
+    # Upsert all orders to DB
+    try:
+        async with AsyncSessionLocal() as _upsert_db:
+            async with _upsert_db.begin():
+                sync_result = await sync_leaflink_orders(
+                    _upsert_db, brand_id, orders,
+                    pages_fetched=pages_fetched, org_id=org_id,
+                )
+    except Exception as exc:
+        err = str(exc)[:300]
+        logger.error("[FullResync] upsert_error brand=%s error=%s", brand_id, err)
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _fail_db:
+                    async with _fail_db.begin():
+                        await mark_failed(_fail_db, sync_run_id, err)
+            except Exception:
+                pass
+        return {"ok": False, "error": f"DB upsert failed: {err}", "brand_id": brand_id}
+
+    completed_at = datetime.now(timezone.utc)
+
+    # Mark completed
+    if sync_run_id:
+        try:
+            async with AsyncSessionLocal() as _done_db:
+                async with _done_db.begin():
+                    await mark_completed(_done_db, sync_run_id)
+        except Exception as exc:
+            logger.error("[FullResync] mark_completed_error run_id=%s error=%s", sync_run_id, exc)
+
+    duration = round(_time.monotonic() - wall_start, 2)
+    total_fetched = len(orders)
+    total_inserted = sync_result.get("created", 0)
+    total_updated = sync_result.get("updated", 0)
+    failed_count = sync_result.get("error_count", 0)
+
+    logger.info(
+        "[FullResync] complete brand=%s fetched=%s inserted=%s updated=%s failed=%s pages=%s duration=%ss",
+        brand_id, total_fetched, total_inserted, total_updated, failed_count, pages_fetched, duration,
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "brand_id": brand_id,
+        "org_id": org_id,
+        "sync_run_id": sync_run_id,
+        "total_fetched": total_fetched,
+        "total_inserted": total_inserted,
+        "total_updated": total_updated,
+        "failed_count": failed_count,
+        "pages_fetched": pages_fetched,
+        "started_at": started_at.isoformat(),
+        "completed_at": completed_at.isoformat(),
+        "duration_seconds": duration,
+    })
+
+
+@router.get("/sync-status")
+async def orders_sync_status_detailed(
+    x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Detailed sync status for a brand.
+
+    Returns:
+        last_successful_sync_at, last_attempted_sync_at, total_local_orders,
+        total_leaflink_estimate, current_sync_state, partial_sync_count,
+        failed_order_count, last_error
+    """
+    from services.organization_service import lookup_organization
+    from models.auth_models import Brand
+    from sqlalchemy import and_
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    logger.info(
+        "[SyncStatusDetailed] request org=%s brand_id=%s",
+        x_opsyn_org,
+        brand_id,
+    )
+
+    if not x_opsyn_org:
+        return {"ok": False, "error": "X-OPSYN-ORG header is required"}
+
+    # Resolve org
+    org_lookup = await lookup_organization(db, x_opsyn_org)
+    if not org_lookup.get("ok"):
+        return {"ok": False, "error": org_lookup.get("error")}
+    resolved_org = org_lookup.get("organization")
+    org_id = str(resolved_org.id)
+
+    # Validate brand belongs to org
+    brand_result = await db.execute(
+        select(Brand).where(
+            and_(
+                Brand.id == cast(brand_id, PG_UUID(as_uuid=False)),
+                Brand.org_id == cast(org_id, PG_UUID(as_uuid=False)),
+            )
+        )
+    )
+    brand_obj = brand_result.scalar_one_or_none()
+    if not brand_obj:
+        return {"ok": False, "error": "Brand not found or does not belong to organization"}
+
+    # Total local orders
+    try:
+        count_result = await db.execute(
+            select(func.count(Order.id)).where(
+                Order.brand_id == brand_id,
+                Order.org_id == org_id,
+            )
+        )
+        total_local_orders = count_result.scalar_one() or 0
+    except Exception as exc:
+        logger.error("[SyncStatusDetailed] count_error brand=%s error=%s", brand_id, exc)
+        await db.rollback()
+        total_local_orders = 0
+
+    # Partial orders (sync_status = partial or missing required fields)
+    try:
+        partial_result = await db.execute(
+            select(func.count(Order.id)).where(
+                Order.brand_id == brand_id,
+                Order.org_id == org_id,
+                Order.sync_status.in_(["partial", "failed", "error"]),
+            )
+        )
+        partial_sync_count = partial_result.scalar_one() or 0
+    except Exception as exc:
+        logger.error("[SyncStatusDetailed] partial_count_error brand=%s error=%s", brand_id, exc)
+        await db.rollback()
+        partial_sync_count = 0
+
+    # Failed orders (review_status = blocked)
+    try:
+        failed_result = await db.execute(
+            select(func.count(Order.id)).where(
+                Order.brand_id == brand_id,
+                Order.org_id == org_id,
+                Order.review_status == "blocked",
+            )
+        )
+        failed_order_count = failed_result.scalar_one() or 0
+    except Exception as exc:
+        logger.error("[SyncStatusDetailed] failed_count_error brand=%s error=%s", brand_id, exc)
+        await db.rollback()
+        failed_order_count = 0
+
+    # Active and last completed sync runs
+    try:
+        active_run = await SyncRun.get_active_run(db, brand_id)
+    except Exception:
+        await db.rollback()
+        active_run = None
+
+    try:
+        last_completed = await SyncRun.get_last_completed_run(db, brand_id)
+    except Exception:
+        await db.rollback()
+        last_completed = None
+
+    # Determine current sync state
+    last_successful_sync_at: Optional[str] = None
+    last_attempted_sync_at: Optional[str] = None
+    last_error: Optional[str] = None
+    total_leaflink_estimate: Optional[int] = None
+
+    if last_completed:
+        last_successful_sync_at = (
+            last_completed.completed_at.isoformat()
+            if last_completed.completed_at else None
+        )
+        total_leaflink_estimate = last_completed.total_orders_available
+
+    if active_run:
+        last_attempted_sync_at = (
+            active_run.started_at.isoformat()
+            if active_run.started_at else None
+        )
+        last_error = active_run.last_error
+        if active_run.total_orders_available:
+            total_leaflink_estimate = active_run.total_orders_available
+    elif last_completed:
+        last_attempted_sync_at = (
+            last_completed.started_at.isoformat()
+            if last_completed.started_at else None
+        )
+        last_error = last_completed.last_error
+
+    # Determine current_sync_state
+    if active_run:
+        from services.sync_run_manager import detect_stalled
+        is_stalled = detect_stalled(active_run)
+        if is_stalled:
+            current_sync_state = "partial"
+        elif active_run.status == "syncing":
+            current_sync_state = "running"
+        else:
+            current_sync_state = "running"
+    elif last_completed:
+        current_sync_state = "success"
+    elif total_local_orders > 0:
+        # Orders exist but no completed run — partial state
+        current_sync_state = "partial"
+    else:
+        current_sync_state = "idle"
+
+    # Check for failed runs if no active or completed run
+    if not active_run and not last_completed:
+        try:
+            failed_run_result = await db.execute(
+                select(SyncRun)
+                .where(SyncRun.brand_id == brand_id, SyncRun.status == "failed")
+                .order_by(SyncRun.completed_at.desc())
+                .limit(1)
+            )
+            failed_run = failed_run_result.scalar_one_or_none()
+            if failed_run:
+                current_sync_state = "failed"
+                last_error = failed_run.last_error
+                last_attempted_sync_at = (
+                    failed_run.started_at.isoformat()
+                    if failed_run.started_at else None
+                )
+        except Exception:
+            await db.rollback()
+
+    logger.info(
+        "[SyncStatusDetailed] response brand=%s state=%s local=%s estimate=%s partial=%s failed=%s",
+        brand_id, current_sync_state, total_local_orders,
+        total_leaflink_estimate, partial_sync_count, failed_order_count,
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "brand_id": brand_id,
+        "org_id": org_id,
+        "last_successful_sync_at": last_successful_sync_at,
+        "last_attempted_sync_at": last_attempted_sync_at,
+        "total_local_orders": total_local_orders,
+        "total_leaflink_estimate": total_leaflink_estimate,
+        "current_sync_state": current_sync_state,
+        "partial_sync_count": partial_sync_count,
+        "failed_order_count": failed_order_count,
+        "last_error": last_error,
+        "active_sync_run_id": active_run.id if active_run else None,
+        "timestamp": timestamp,
+    })
+
+
+@router.post("/{order_id}/resync")
+async def order_single_resync(
+    order_id: int,
+    x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Resync a single order from LeafLink by internal order ID.
+
+    Fetches the latest data for this specific order from LeafLink and
+    updates the local record. Useful for fixing individual orders that
+    have stale or partial data.
+
+    Returns:
+        ok, order_id, status, synced_at
+    """
+    import time as _time
+    from services.leaflink_client import LeafLinkClient
+    from services.leaflink_sync import sync_leaflink_orders
+    from services.organization_service import lookup_organization
+    from services.credential_resolver import resolve_brand_credential
+    from models.auth_models import Brand
+    from sqlalchemy import and_
+    from sqlalchemy.orm import selectinload as _selectinload
+
+    wall_start = _time.monotonic()
+
+    logger.info(
+        "[SingleResync] request org=%s brand_id=%s order_id=%s",
+        x_opsyn_org, brand_id, order_id,
+    )
+
+    if not x_opsyn_org:
+        return {"ok": False, "error": "X-OPSYN-ORG header is required"}
+
+    # Resolve org
+    org_lookup = await lookup_organization(db, x_opsyn_org)
+    if not org_lookup.get("ok"):
+        return {"ok": False, "error": org_lookup.get("error")}
+    resolved_org = org_lookup.get("organization")
+    org_id = str(resolved_org.id)
+
+    # Validate brand belongs to org
+    brand_result = await db.execute(
+        select(Brand).where(
+            and_(
+                Brand.id == cast(brand_id, PG_UUID(as_uuid=False)),
+                Brand.org_id == cast(org_id, PG_UUID(as_uuid=False)),
+            )
+        )
+    )
+    brand_obj = brand_result.scalar_one_or_none()
+    if not brand_obj:
+        return {"ok": False, "error": "Brand not found or does not belong to organization"}
+
+    # Fetch the existing order to get its external_order_id
+    try:
+        order_result = await db.execute(
+            select(Order)
+            .options(_selectinload(Order.lines))
+            .where(
+                and_(
+                    Order.id == order_id,
+                    Order.brand_id == brand_id,
+                    Order.org_id == org_id,
+                )
+            )
+        )
+        order = order_result.scalar_one_or_none()
+    except Exception as exc:
+        logger.error("[SingleResync] db_error order_id=%s error=%s", order_id, exc)
+        return {"ok": False, "error": "Database error", "order_id": order_id}
+
+    if not order:
+        return {"ok": False, "error": "Order not found", "order_id": order_id}
+
+    external_order_id = order.external_order_id
+    logger.info(
+        "[SingleResync] found_order order_id=%s external_id=%s",
+        order_id, external_order_id,
+    )
+
+    # Resolve credential
+    cred_row = await resolve_brand_credential(db, brand_id, "leaflink")
+    if not cred_row:
+        return {"ok": False, "error": "leaflink_credential_not_found", "order_id": order_id}
+
+    api_key = cred_row[4]
+    company_id = cred_row[3]
+    base_url = cred_row[8] if len(cred_row) > 8 else None
+    auth_scheme = (cred_row[9] if len(cred_row) > 9 and cred_row[9] else "Token")
+
+    try:
+        client = LeafLinkClient(
+            api_key=api_key,
+            company_id=company_id,
+            brand_id=brand_id,
+            base_url=base_url,
+            auth_scheme=auth_scheme,
+        )
+    except Exception as exc:
+        err = str(exc)[:300]
+        logger.error("[SingleResync] client_init_error brand=%s error=%s", brand_id, err)
+        return {"ok": False, "error": f"Client init failed: {err}", "order_id": order_id}
+
+    # Fetch the specific order from LeafLink by external_order_id
+    # LeafLink supports filtering by id via ?id=<external_id>
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _fetch_single():
+            payload = client.list_orders(limit=1, offset=0, extra_params={"id": external_order_id})
+            if isinstance(payload, dict):
+                results = (
+                    payload.get("results")
+                    or payload.get("data")
+                    or payload.get("orders")
+                    or []
+                )
+            elif isinstance(payload, list):
+                results = payload
+            else:
+                results = []
+            return results
+
+        raw_orders = await asyncio.wait_for(
+            loop.run_in_executor(_leaflink_executor, _fetch_single),
+            timeout=LEAFLINK_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "LeafLink request timed out", "order_id": order_id}
+    except Exception as exc:
+        err = str(exc)[:300]
+        logger.error("[SingleResync] fetch_error order_id=%s error=%s", order_id, err)
+        return {"ok": False, "error": f"LeafLink fetch failed: {err}", "order_id": order_id}
+
+    if not raw_orders:
+        logger.warning(
+            "[SingleResync] not_found_in_leaflink order_id=%s external_id=%s",
+            order_id, external_order_id,
+        )
+        return {
+            "ok": False,
+            "error": "Order not found in LeafLink",
+            "order_id": order_id,
+            "external_order_id": external_order_id,
+        }
+
+    # Normalize and upsert
+    normalized = [client._normalize_order(raw_orders[0])] if raw_orders else []
+
+    try:
+        async with AsyncSessionLocal() as _upsert_db:
+            async with _upsert_db.begin():
+                sync_result = await sync_leaflink_orders(
+                    _upsert_db, brand_id, normalized,
+                    pages_fetched=1, org_id=org_id,
+                )
+    except Exception as exc:
+        err = str(exc)[:300]
+        logger.error("[SingleResync] upsert_error order_id=%s error=%s", order_id, err)
+        return {"ok": False, "error": f"DB upsert failed: {err}", "order_id": order_id}
+
+    synced_at = datetime.now(timezone.utc).isoformat()
+    duration = round(_time.monotonic() - wall_start, 2)
+
+    logger.info(
+        "[SingleResync] complete order_id=%s external_id=%s duration=%ss",
+        order_id, external_order_id, duration,
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "order_id": order_id,
+        "external_order_id": external_order_id,
+        "status": order.status,
+        "synced_at": synced_at,
+        "duration_seconds": duration,
+    })
