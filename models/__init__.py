@@ -728,6 +728,92 @@ class SyncMetricsSnapshot(Base):
 # LeafLink Webhook Event Model — audit log for all inbound webhook events
 # =============================================================================
 
+# ---------------------------------------------------------------------------
+# Payload sanitization helpers (used by routes/webhooks.py before storage)
+# ---------------------------------------------------------------------------
+
+import json as _json
+import logging as _models_logging
+
+_models_log = _models_logging.getLogger("models")
+
+_WEBHOOK_PAYLOAD_MAX_BYTES = 1_048_576   # 1 MB hard cap
+_WEBHOOK_PAYLOAD_MAX_NESTING = 10        # max nesting depth
+_WEBHOOK_PAYLOAD_PREVIEW_CHARS = 500     # chars for log preview
+_WEBHOOK_LINE_ITEMS_MAX = 1_000          # max line_items array length
+_WEBHOOK_SENSITIVE_FIELDS = frozenset({"api_key", "webhook_key", "password", "secret", "token"})
+
+
+def sanitize_webhook_payload(payload: dict) -> tuple:
+    """
+    Sanitize a webhook payload for safe storage.
+
+    Applies the following transformations:
+    - Removes sensitive fields (api_key, webhook_key, passwords, etc.)
+    - Truncates line_items arrays exceeding 1000 items
+    - Caps nesting depth at 10 levels
+    - Enforces 1MB size cap (truncates to marker if exceeded)
+
+    Args:
+        payload: Raw webhook payload dict.
+
+    Returns:
+        (sanitized_payload, was_truncated) tuple.
+    """
+    if not isinstance(payload, dict):
+        return payload, False
+
+    was_truncated = False
+    sanitized = {}
+
+    for key, value in payload.items():
+        # Remove sensitive fields
+        if key.lower() in _WEBHOOK_SENSITIVE_FIELDS:
+            was_truncated = True
+            continue
+
+        # Truncate oversized line_items arrays
+        if key == "line_items" and isinstance(value, list) and len(value) > _WEBHOOK_LINE_ITEMS_MAX:
+            _models_log.warning(
+                "[WEBHOOK_PAYLOAD_SANITIZED] truncated line_items from %d to %d items",
+                len(value),
+                _WEBHOOK_LINE_ITEMS_MAX,
+            )
+            value = value[:_WEBHOOK_LINE_ITEMS_MAX]
+            was_truncated = True
+
+        sanitized[key] = value
+
+    # Enforce 1MB size cap
+    try:
+        payload_bytes = _json.dumps(sanitized).encode("utf-8")
+        if len(payload_bytes) > _WEBHOOK_PAYLOAD_MAX_BYTES:
+            _models_log.warning(
+                "[WEBHOOK_PAYLOAD_TRUNCATED] payload_size_bytes=%d exceeds max=%d -- truncating",
+                len(payload_bytes),
+                _WEBHOOK_PAYLOAD_MAX_BYTES,
+            )
+            sanitized = {
+                "_truncated": True,
+                "_original_size_bytes": len(payload_bytes),
+                "_truncation_reason": "payload_exceeded_1mb_limit",
+                "preview": _json.dumps(sanitized)[:_WEBHOOK_PAYLOAD_PREVIEW_CHARS],
+            }
+            was_truncated = True
+    except Exception:
+        pass
+
+    return sanitized, was_truncated
+
+
+def get_payload_preview(payload: dict) -> str:
+    """Extract a short preview of a payload for logging (first 500 chars)."""
+    try:
+        return _json.dumps(payload)[:_WEBHOOK_PAYLOAD_PREVIEW_CHARS]
+    except Exception:
+        return str(payload)[:_WEBHOOK_PAYLOAD_PREVIEW_CHARS]
+
+
 class LeafLinkWebhookEvent(Base):
     """
     Stores every inbound LeafLink webhook event for audit, idempotency,

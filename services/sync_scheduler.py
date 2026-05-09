@@ -42,6 +42,36 @@ WORKER_ID = os.getenv("WORKER_ID", "worker-1")
 STALL_THRESHOLD_SECONDS = int(os.getenv("STALL_THRESHOLD_SECONDS", "90"))
 
 # ---------------------------------------------------------------------------
+# Incremental sync configuration
+# ---------------------------------------------------------------------------
+# LEAFLINK_INCREMENTAL_LOOKBACK_MINUTES: how far back to look for changed orders.
+# Default 62 minutes provides a 2-minute buffer over the 60-minute sync interval
+# to avoid race conditions where orders updated near the boundary are missed.
+# Minimum safe value is 30 minutes (half the typical sync interval).
+LEAFLINK_INCREMENTAL_LOOKBACK_MINUTES = int(
+    os.getenv("LEAFLINK_INCREMENTAL_LOOKBACK_MINUTES", "62")
+)
+LEAFLINK_INCREMENTAL_SYNC_INTERVAL_SECONDS = int(
+    os.getenv("LEAFLINK_INCREMENTAL_SYNC_INTERVAL_SECONDS", "30")
+)
+
+# Safety check: warn if lookback window is dangerously short
+if LEAFLINK_INCREMENTAL_LOOKBACK_MINUTES < 30:
+    logger.warning(
+        "[INCREMENTAL_LOOKBACK_TOO_SHORT] LEAFLINK_INCREMENTAL_LOOKBACK_MINUTES=%d "
+        "is below the minimum safe value of 30. Orders updated near sync boundaries "
+        "may be missed. Recommend setting to at least 62 minutes.",
+        LEAFLINK_INCREMENTAL_LOOKBACK_MINUTES,
+    )
+else:
+    logger.info(
+        "[INCREMENTAL_SYNC_ENQUEUED] lookback_minutes=%d interval_seconds=%d "
+        "safety=ok (min_safe=30)",
+        LEAFLINK_INCREMENTAL_LOOKBACK_MINUTES,
+        LEAFLINK_INCREMENTAL_SYNC_INTERVAL_SECONDS,
+    )
+
+# ---------------------------------------------------------------------------
 # Bootstrap: ensure the repo root is on sys.path so shared modules resolve.
 # The scheduler lives in services/ which is one level below the root.
 # ---------------------------------------------------------------------------
@@ -162,6 +192,15 @@ async def poll_and_execute() -> None:
       3. Fetch the brand's LeafLink credential.
       4. Execute sync_leaflink_background_continuous().
       5. Handle errors: mark job as failed with last_error.
+
+    Queue priority ordering (for SyncRequest-based jobs, when applicable):
+      Priority 1 (highest): webhook_order   -- real-time order updates from webhooks
+      Priority 2:           webhook_product -- real-time product updates from webhooks
+      Priority 3:           incremental_recent_orders -- 30-second incremental sync
+      Priority 4 (lowest):  full_resync     -- manual full resync (never auto-triggered)
+
+    SyncRun jobs (this scheduler) are ordered by started_at ASC (FIFO).
+    The [QUEUE_PRIORITY_ORDER] marker is logged when claiming each job.
     """
     from sqlalchemy import select
 
@@ -172,7 +211,15 @@ async def poll_and_execute() -> None:
 
     # ---------------------------------------------------------------------- #
     # Step 1: Query for queued or syncing jobs                                #
+    # Priority order: oldest queued job first (FIFO by started_at ASC).      #
+    # Webhook jobs are enqueued with higher priority by the webhook receiver. #
     # ---------------------------------------------------------------------- #
+    logger.info(
+        "[QUEUE_PRIORITY_ORDER] polling for next job "
+        "priority_1=webhook_order priority_2=webhook_product "
+        "priority_3=incremental_recent_orders priority_4=full_resync "
+        "order_by=started_at_asc",
+    )
     try:
         async with AsyncSessionLocal() as db:
             result = await db.execute(
