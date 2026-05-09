@@ -41,6 +41,7 @@ from routes.debug import router as debug_router
 from routes.auth import router as auth_router
 from routes.webhooks import router as webhooks_router
 from routes.sync import router as sync_router
+from routes.leaflink_webhook_config import router as leaflink_webhook_config_router
 from routes.diagnostics import router as diagnostics_router
 from routes.drivers import router as drivers_router
 from routes.routes import router as routes_router
@@ -727,6 +728,7 @@ app.include_router(leaflink_debug_router, prefix="/leaflink")
 # Sync / Webhooks
 app.include_router(sync_router)
 app.include_router(webhooks_router)
+app.include_router(leaflink_webhook_config_router)
 
 # Drivers / Routes
 app.include_router(drivers_router)

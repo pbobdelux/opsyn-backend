@@ -14,11 +14,11 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db, has_column
-from models import Order, SyncRequest, SyncRun
+from models import BrandAPICredential, LeafLinkWebhookEvent, Order, SyncRequest, SyncRun
 from models.sync_health import DeadLetterLineItem, SyncHealth
 from services.leaflink_sync import (
     ensure_utc,
@@ -488,4 +488,140 @@ async def trigger_leaflink_sync(
         "message": f"Sync enqueued for brand_id={brand_id}",
         "sync_request_id": sync_req.id,
         "brand_id": brand_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /orders/sync/leaflink/webhook-status
+# ---------------------------------------------------------------------------
+
+@router.get("/leaflink/webhook-status")
+async def get_webhook_status(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Comprehensive webhook health metrics across all brands.
+
+    Returns aggregate counts for webhook configuration, event resolution,
+    signature verification, deduplication, and queue depth.
+
+    Metrics:
+      webhook_enabled_count         — brands with webhook_enabled=true
+      webhook_configured_count      — brands with webhook_key_secret_ref set
+      unresolved_events_count       — events with tenant_resolution_status='unresolved'
+      ambiguous_events_count        — events with tenant_resolution_status='ambiguous'
+      failed_signature_events_count — events with signature_verification_status='invalid'
+      duplicates_ignored_count      — events with duplicate_of_event_id set
+      queued_webhook_jobs_count     — sync_requests with type IN ('webhook_order','webhook_product') and status='queued'
+      webhook_keys_last4_by_brand   — { brand_id: webhook_key_last4 } for all active brands
+    """
+    try:
+        # Count brands with webhook_enabled=true
+        webhook_enabled_result = await db.execute(
+            select(func.count(BrandAPICredential.id)).where(
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+                BrandAPICredential.webhook_enabled == True,
+            )
+        )
+        webhook_enabled_count = webhook_enabled_result.scalar_one() or 0
+    except Exception as exc:
+        logger.warning("[WebhookStatus] webhook_enabled_count_error error=%s", exc)
+        webhook_enabled_count = None
+
+    try:
+        # Count brands with webhook_key_secret_ref set (securely configured)
+        webhook_configured_result = await db.execute(
+            select(func.count(BrandAPICredential.id)).where(
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+                BrandAPICredential.webhook_key_secret_ref.isnot(None),
+            )
+        )
+        webhook_configured_count = webhook_configured_result.scalar_one() or 0
+    except Exception as exc:
+        logger.warning("[WebhookStatus] webhook_configured_count_error error=%s", exc)
+        webhook_configured_count = None
+
+    # Webhook event status counts (require leaflink_webhook_events table)
+    unresolved_events_count = None
+    ambiguous_events_count = None
+    failed_signature_events_count = None
+    duplicates_ignored_count = None
+
+    try:
+        unresolved_result = await db.execute(
+            select(func.count(LeafLinkWebhookEvent.id)).where(
+                LeafLinkWebhookEvent.tenant_resolution_status == "unresolved"
+            )
+        )
+        unresolved_events_count = unresolved_result.scalar_one() or 0
+
+        ambiguous_result = await db.execute(
+            select(func.count(LeafLinkWebhookEvent.id)).where(
+                LeafLinkWebhookEvent.tenant_resolution_status == "ambiguous"
+            )
+        )
+        ambiguous_events_count = ambiguous_result.scalar_one() or 0
+
+        failed_sig_result = await db.execute(
+            select(func.count(LeafLinkWebhookEvent.id)).where(
+                LeafLinkWebhookEvent.signature_verification_status == "invalid"
+            )
+        )
+        failed_signature_events_count = failed_sig_result.scalar_one() or 0
+
+        duplicates_result = await db.execute(
+            select(func.count(LeafLinkWebhookEvent.id)).where(
+                LeafLinkWebhookEvent.duplicate_of_event_id.isnot(None)
+            )
+        )
+        duplicates_ignored_count = duplicates_result.scalar_one() or 0
+
+    except Exception as exc:
+        logger.warning("[WebhookStatus] webhook_event_counts_error error=%s", exc)
+
+    try:
+        # Queued webhook jobs (sync_requests with webhook-type status)
+        # Note: current SyncRequest model uses status='pending'/'processing'/'complete'/'error'
+        # Webhook jobs are identified by checking for webhook-specific types if the column exists
+        queued_result = await db.execute(
+            select(func.count(SyncRequest.id)).where(
+                SyncRequest.status.in_(["pending", "queued"]),
+            )
+        )
+        queued_webhook_jobs_count = queued_result.scalar_one() or 0
+    except Exception as exc:
+        logger.warning("[WebhookStatus] queued_jobs_count_error error=%s", exc)
+        queued_webhook_jobs_count = None
+
+    try:
+        # Per-brand webhook key last4 for display/audit
+        last4_result = await db.execute(
+            select(
+                BrandAPICredential.brand_id,
+                BrandAPICredential.webhook_key_last4,
+            ).where(
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+                BrandAPICredential.webhook_key_last4.isnot(None),
+            )
+        )
+        webhook_keys_last4_by_brand = {
+            row[0]: row[1] for row in last4_result.fetchall()
+        }
+    except Exception as exc:
+        logger.warning("[WebhookStatus] webhook_keys_last4_error error=%s", exc)
+        webhook_keys_last4_by_brand = {}
+
+    return {
+        "ok": True,
+        "webhook_enabled_count": webhook_enabled_count,
+        "webhook_configured_count": webhook_configured_count,
+        "unresolved_events_count": unresolved_events_count,
+        "ambiguous_events_count": ambiguous_events_count,
+        "failed_signature_events_count": failed_signature_events_count,
+        "duplicates_ignored_count": duplicates_ignored_count,
+        "queued_webhook_jobs_count": queued_webhook_jobs_count,
+        "webhook_keys_last4_by_brand": webhook_keys_last4_by_brand,
     }

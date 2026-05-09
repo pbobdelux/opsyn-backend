@@ -499,12 +499,17 @@ async def upsert_webhook_order(
 # ---------------------------------------------------------------------------
 # Main webhook processor
 # ---------------------------------------------------------------------------
-
 async def process_leaflink_webhook(
     payload: dict[str, Any],
     payload_bytes: bytes,
     signature_header: Optional[str],
     db: AsyncSession,
+    # Pre-resolved tenant parameters (from routes/webhooks.py multi-source resolver).
+    # When provided, skip tenant resolution and signature verification steps.
+    _resolved_brand_id: Optional[str] = None,
+    _resolved_org_id: Optional[str] = None,
+    _resolved_cred: Optional[Any] = None,
+    _skip_signature_check: bool = False,
 ) -> dict[str, Any]:
     """
     Process an inbound LeafLink webhook payload end-to-end.
@@ -512,7 +517,9 @@ async def process_leaflink_webhook(
     Steps:
     1. Extract company_id and event from payload
     2. Resolve tenant (brand_id, org_id, credential) from company_id
+       — skipped if _resolved_brand_id is provided (pre-resolved by caller)
     3. Verify LL-Signature using credential.webhook_key
+       — skipped if _skip_signature_check=True (already verified by caller)
     4. Upsert orders from payload
     5. Return structured result
 
@@ -541,21 +548,33 @@ async def process_leaflink_webhook(
 
     # ------------------------------------------------------------------ #
     # Step 1: Resolve tenant from company_id                              #
+    # (skipped when pre-resolved tenant is passed from the webhook route) #
     # ------------------------------------------------------------------ #
-    tenant = await resolve_tenant_from_company_id(db, company_id or "")
-    if not tenant["ok"]:
-        return {
-            "ok": False,
-            "received_count": 0,
-            "upserted_count": 0,
-            "errors": [tenant["error"]],
-            "error": tenant["error"],
-            "status_code": tenant["status_code"],
-        }
+    if _resolved_brand_id is not None and _resolved_cred is not None:
+        # Use pre-resolved tenant — skip DB lookup
+        brand_id: str = _resolved_brand_id
+        org_id: Optional[str] = _resolved_org_id
+        cred: BrandAPICredential = _resolved_cred
+        logger.info(
+            "[LeafLinkWebhook] using_pre_resolved_tenant brand_id=%s org_id=%s",
+            brand_id,
+            org_id,
+        )
+    else:
+        tenant = await resolve_tenant_from_company_id(db, company_id or "")
+        if not tenant["ok"]:
+            return {
+                "ok": False,
+                "received_count": 0,
+                "upserted_count": 0,
+                "errors": [tenant["error"]],
+                "error": tenant["error"],
+                "status_code": tenant["status_code"],
+            }
 
-    brand_id: str = tenant["brand_id"]
-    org_id: Optional[str] = tenant["org_id"]
-    cred: BrandAPICredential = tenant["credential"]
+        brand_id = tenant["brand_id"]
+        org_id = tenant["org_id"]
+        cred = tenant["credential"]
 
     # Coerce org_id and brand_id to valid UUIDs or None before any DB write.
     # This prevents "column is of type uuid but expression is of type character varying"
@@ -574,44 +593,46 @@ async def process_leaflink_webhook(
 
     # ------------------------------------------------------------------ #
     # Step 2: Verify signature                                            #
+    # (skipped when _skip_signature_check=True — already done by caller) #
     # ------------------------------------------------------------------ #
-    webhook_key = cred.webhook_key
-    if webhook_key:
-        if not signature_header:
+    if not _skip_signature_check:
+        webhook_key = cred.webhook_key  # Legacy plaintext fallback for direct calls
+        if webhook_key:
+            if not signature_header:
+                logger.warning(
+                    "[LeafLinkWebhook] missing_signature brand_id=%s",
+                    brand_id,
+                )
+                return {
+                    "ok": False,
+                    "received_count": 0,
+                    "upserted_count": 0,
+                    "errors": ["Missing LL-Signature header"],
+                    "error": "Missing LL-Signature header",
+                    "status_code": 400,
+                }
+
+            if not verify_ll_signature(payload_bytes, signature_header, webhook_key):
+                logger.warning(
+                    "[LeafLinkWebhook] invalid_signature brand_id=%s",
+                    brand_id,
+                )
+                return {
+                    "ok": False,
+                    "received_count": 0,
+                    "upserted_count": 0,
+                    "errors": ["Invalid signature"],
+                    "error": "Invalid signature",
+                    "status_code": 400,
+                }
+
+            logger.info("[LeafLinkWebhook] signature_verified brand_id=%s", brand_id)
+        else:
+            # No webhook_key configured — skip signature check but log a warning
             logger.warning(
-                "[LeafLinkWebhook] missing_signature brand_id=%s",
+                "[LeafLinkWebhook] signature_check_skipped brand_id=%s reason=no_webhook_key_configured",
                 brand_id,
             )
-            return {
-                "ok": False,
-                "received_count": 0,
-                "upserted_count": 0,
-                "errors": ["Missing LL-Signature header"],
-                "error": "Missing LL-Signature header",
-                "status_code": 400,
-            }
-
-        if not verify_ll_signature(payload_bytes, signature_header, webhook_key):
-            logger.warning(
-                "[LeafLinkWebhook] invalid_signature brand_id=%s",
-                brand_id,
-            )
-            return {
-                "ok": False,
-                "received_count": 0,
-                "upserted_count": 0,
-                "errors": ["Invalid signature"],
-                "error": "Invalid signature",
-                "status_code": 400,
-            }
-
-        logger.info("[LeafLinkWebhook] signature_verified brand_id=%s", brand_id)
-    else:
-        # No webhook_key configured — skip signature check but log a warning
-        logger.warning(
-            "[LeafLinkWebhook] signature_check_skipped brand_id=%s reason=no_webhook_key_configured",
-            brand_id,
-        )
 
     # ------------------------------------------------------------------ #
     # Step 3: Extract orders from payload                                 #
