@@ -28,7 +28,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import BrandAPICredential
-from services.aws_secrets_manager import store_webhook_key_in_aws
+from services.aws_secrets_config import get_aws_config
+from services.aws_secrets_manager import store_webhook_secret
 
 logger = logging.getLogger("leaflink_webhook_config")
 
@@ -83,6 +84,26 @@ async def configure_webhook(
     brand_id = body.brand_id
     webhook_key = body.webhook_key
 
+    # Validate AWS Secrets Manager is configured before doing anything else
+    aws_config = get_aws_config()
+    if not aws_config.is_configured():
+        logger.warning(
+            "[WEBHOOK_CONFIG] AWS Secrets Manager not configured brand=%s",
+            brand_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "AWS Secrets Manager is not configured",
+                "error_code": "AWS_SECRETS_NOT_CONFIGURED",
+                "details": (
+                    "Configure AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION "
+                    "in Railway variables."
+                ),
+                "status": 503,
+            },
+        )
+
     # Look up the brand credential
     try:
         result = await db.execute(
@@ -118,27 +139,31 @@ async def configure_webhook(
             },
         )
 
-    # Store webhook key in AWS Secrets Manager
+    # Store webhook key in AWS Secrets Manager (new validated path)
     logger.info(
         "[WebhookConfig] storing webhook key in AWS brand_id=%s",
         brand_id,
     )
-    secret_arn = await store_webhook_key_in_aws(brand_id, webhook_key)
+    success, secret_ref, error_code = await store_webhook_secret(brand_id, webhook_key)
 
-    if not secret_arn:
+    if not success:
         logger.error(
-            "[WEBHOOK_SECRET_STORE_FAILED] brand_id=%s reason=aws_store_returned_none",
+            "[WEBHOOK_SECRET_STORE_FAILED] brand_id=%s error_code=%s",
             brand_id,
+            error_code,
         )
         raise HTTPException(
-            status_code=500,
+            status_code=503,
             detail={
                 "error": "Failed to store webhook key in AWS Secrets Manager",
-                "error_code": "WEBHOOK_SECRET_STORE_FAILED",
+                "error_code": error_code,
                 "details": "Check AWS credentials, permissions, and region configuration",
-                "status": 500,
+                "status": 503,
             },
         )
+
+    # Use secret_ref (name) as the ARN-equivalent reference
+    secret_arn = secret_ref
 
     # Persist ARN reference and metadata in DB (never the raw key)
     webhook_key_last4 = webhook_key[-4:] if len(webhook_key) >= 4 else webhook_key

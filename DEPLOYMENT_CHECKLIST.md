@@ -1,4 +1,80 @@
-# PR #371 + Hardening Deployment Checklist
+# Opsyn Backend Deployment Checklist
+
+## AWS Secrets Manager Configuration
+
+### Required Railway Variables
+
+Set these in your Railway project variables:
+
+```
+AWS_ACCESS_KEY_ID=<your-aws-access-key>
+AWS_SECRET_ACCESS_KEY=<your-aws-secret-key>
+AWS_REGION=us-east-1
+AWS_SECRETS_MANAGER_PREFIX=opsyn/leaflink/webhooks
+```
+
+### Required IAM Permissions
+
+The AWS user/role must have these permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:DeleteSecret",
+        "secretsmanager:ListSecrets"
+      ],
+      "Resource": "arn:aws:secretsmanager:*:*:secret:opsyn/leaflink/webhooks/*"
+    }
+  ]
+}
+```
+
+### Verification
+
+After deployment, verify AWS Secrets Manager is working:
+
+```bash
+# Check AWS configuration status
+curl "https://opsyn-backend-production.up.railway.app/admin/aws-secrets-status"
+
+# Configure a webhook (should return 200 if AWS is configured)
+curl -X POST "https://opsyn-backend-production.up.railway.app/api/leaflink/orders/webhook-config" \
+  -H "Content-Type: application/json" \
+  -H "X-OPSYN-ORG: noble" \
+  -d '{
+    "brand_id": "380e963d-36fc-4928-a4f4-e569cd535f9e",
+    "webhook_key": "TEST_SECRET",
+    "webhook_enabled": true,
+    "webhook_signature_required": true,
+    "leaflink_company_id": "9008"
+  }'
+```
+
+Expected responses:
+- If AWS is configured: HTTP 200
+- If AWS is not configured: HTTP 503 with `AWS_SECRETS_NOT_CONFIGURED` error code
+- If AWS permissions are insufficient: HTTP 503 with `AWS_SECRETS_PERMISSION_DENIED` error code
+
+## Bootstrap Schema Recovery
+
+Bootstrap schema recovery runs automatically during app startup. Verify it completed:
+
+```bash
+curl "https://opsyn-backend-production.up.railway.app/admin/bootstrap-status"
+curl "https://opsyn-backend-production.up.railway.app/admin/raw-schema-check"
+```
+
+Both should return HTTP 200 with `ok: true`.
+
+---
 
 ## Pre-Deployment
 - [ ] All tests pass (unit + integration)
@@ -7,13 +83,14 @@
 - [ ] AWS credentials configured in production environment
 
 ## Environment Variables Required
-- `AWS_REGION` (default: us-east-1) — AWS region for Secrets Manager
-- `AWS_ACCESS_KEY_ID` (optional) — AWS access key (uses IAM role if not set)
-- `AWS_SECRET_ACCESS_KEY` (optional) — AWS secret key (uses IAM role if not set)
+- `AWS_ACCESS_KEY_ID` — AWS access key (required; uses IAM role if not set)
+- `AWS_SECRET_ACCESS_KEY` — AWS secret key (required; uses IAM role if not set)
+- `AWS_REGION` — AWS region for Secrets Manager (required; no default)
+- `AWS_SECRETS_MANAGER_PREFIX` (default: opsyn/leaflink/webhooks) — secret name prefix
 - `LEAFLINK_INCREMENTAL_LOOKBACK_MINUTES` (default: 62) — lookback window for incremental sync
 - `SYNC_REQUEST_WORKER_POLL_INTERVAL` (default: 1) — seconds between queue polls
 
-## AWS Permissions Required
+## AWS Permissions Required (legacy secret path)
 ```json
 {
   "Version": "2012-10-17",

@@ -68,6 +68,76 @@ async def get_bootstrap_status():
 
 
 # =============================================================================
+# Endpoint: GET /admin/aws-secrets-status
+# Diagnostic endpoint — checks AWS Secrets Manager configuration and connectivity.
+# =============================================================================
+
+
+@router.get("/aws-secrets-status")
+async def get_aws_secrets_status(
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Check AWS Secrets Manager configuration and connectivity.
+
+    Returns:
+        {
+            "configured": bool,
+            "region": str or null,
+            "can_create_secret": bool,
+            "can_read_secret": bool,
+            "error_code": str or null,
+            "safe_message": str,
+        }
+    """
+    from services.aws_secrets_config import get_aws_config
+
+    try:
+        await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+    except HTTPException:
+        # Allow unauthenticated access to this diagnostic endpoint
+        pass
+
+    config = get_aws_config()
+
+    if not config.is_configured():
+        return {
+            "configured": False,
+            "region": None,
+            "can_create_secret": False,
+            "can_read_secret": False,
+            "error_code": "AWS_SECRETS_NOT_CONFIGURED",
+            "safe_message": (
+                "AWS Secrets Manager is not configured. "
+                "Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION."
+            ),
+        }
+
+    # Test connection
+    success, error = await config.test_connection()
+
+    if success:
+        return {
+            "configured": True,
+            "region": config.region,
+            "can_create_secret": True,
+            "can_read_secret": True,
+            "error_code": None,
+            "safe_message": "AWS Secrets Manager is configured and accessible.",
+        }
+    else:
+        return {
+            "configured": True,
+            "region": config.region,
+            "can_create_secret": False,
+            "can_read_secret": False,
+            "error_code": "AWS_SECRETS_CONNECTION_FAILED",
+            "safe_message": f"AWS Secrets Manager is configured but not accessible: {error}",
+        }
+
+
+# =============================================================================
 # Endpoint: GET /admin/schema-status
 # Internal endpoint — returns live webhook schema health for debugging.
 # =============================================================================
