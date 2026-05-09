@@ -17,6 +17,39 @@ from services.organization_service import lookup_organization
 logger = logging.getLogger("auth_service")
 
 
+def _log_uuid_type(value, field_name: str):
+    """Log the Python type of a value before using it in a UUID query."""
+    logger.debug(
+        "[UUID_TYPE_CHECK] field=%s type=%s value=%s",
+        field_name,
+        type(value).__name__,
+        str(value)[:50],
+    )
+
+
+def _coerce_uuid(value, field_name: str) -> UUID:
+    """Convert a string or UUID value to a UUID object, raising ValueError on failure."""
+    if isinstance(value, UUID):
+        _log_uuid_type(value, field_name)
+        return value
+    try:
+        coerced = UUID(str(value))
+        logger.info(
+            "[UUID_COERCE] field=%s converted string to UUID value=%s",
+            field_name,
+            str(coerced)[:50],
+        )
+        return coerced
+    except (ValueError, TypeError) as exc:
+        logger.error(
+            "[UUID_COERCE] field=%s invalid UUID format value=%s error=%s",
+            field_name,
+            str(value)[:50],
+            str(exc)[:200],
+        )
+        raise
+
+
 async def setup_employee_passcode(
     db: AsyncSession,
     email: str,
@@ -55,38 +88,59 @@ async def setup_employee_passcode(
             employee.last_name,
         )
 
+        employee_uuid = _coerce_uuid(employee.id, "employee.id")
+        _log_uuid_type(employee_uuid, "employee_uuid")
+
+        # Check if an active passcode already exists (idempotency)
+        logger.info("[Auth] checking_existing_passcode employee_id=%s", employee_uuid)
+        result = await db.execute(
+            select(EmployeePasscode).where(
+                EmployeePasscode.employee_id == employee_uuid,
+                EmployeePasscode.is_active == True,  # noqa: E712
+            )
+        )
+        existing = result.scalar_one_or_none()
+
+        if existing:
+            logger.info(
+                "[Auth] passcode_already_exists employee_id=%s passcode_id=%s",
+                employee_uuid,
+                existing.id,
+            )
+            return {
+                "ok": True,
+                "employee_id": str(employee_uuid),
+                "message": f"Passcode already exists for {employee.email}",
+            }
+
         # Hash passcode
         logger.info("[Auth] hashing_passcode")
         passcode_hash = hash_passcode(passcode)
         logger.info("[Auth] passcode_hashed hash_length=%d", len(passcode_hash))
 
         # Create passcode record
-        passcode_id = str(uuid.uuid4())
         new_passcode = EmployeePasscode(
-            id=passcode_id,
-            employee_id=employee.id,
+            employee_id=employee_uuid,
             passcode_hash=passcode_hash,
             is_active=True,
         )
 
         logger.info(
-            "[Auth] inserting_passcode passcode_id=%s employee_id=%s",
-            passcode_id,
-            employee.id,
+            "[Auth] inserting_passcode employee_id=%s",
+            employee_uuid,
         )
 
         db.add(new_passcode)
         await db.commit()
 
         logger.info(
-            "[Auth] passcode_created passcode_id=%s employee_id=%s",
-            passcode_id,
-            employee.id,
+            "[Auth] passcode_created employee_id=%s",
+            employee_uuid,
         )
 
         return {
             "ok": True,
-            "employee_id": employee.id,
+            "employee_id": str(employee_uuid),
             "message": f"Passcode set for {employee.email}",
         }
 
@@ -107,14 +161,37 @@ async def grant_brand_access(
 
     Args:
         db: Database session
-        employee_id: Employee ID
+        employee_id: Employee ID (string or UUID)
         brand_slug: Brand slug
         role: Access role (admin, editor, viewer)
 
     Returns:
-        {ok: bool, message: str}
+        {ok: bool, message: str, employee_id: str}
     """
     try:
+        # Convert employee_id to UUID object to avoid uuid = varchar operator error
+        try:
+            employee_uuid = _coerce_uuid(employee_id, "employee_id")
+        except (ValueError, TypeError):
+            return {"ok": False, "error": f"Invalid employee_id format: {employee_id}"}
+
+        logger.info(
+            "[Auth] grant_brand_access employee_id=%s brand_slug=%s role=%s",
+            employee_uuid,
+            brand_slug,
+            role,
+        )
+
+        # Verify employee exists
+        result = await db.execute(
+            select(Employee).where(Employee.id == employee_uuid)
+        )
+        employee = result.scalar_one_or_none()
+
+        if not employee:
+            logger.error("[Auth] employee_not_found employee_id=%s", employee_uuid)
+            return {"ok": False, "error": f"Employee not found: {employee_uuid}"}
+
         # Find brand by slug
         result = await db.execute(
             select(Brand).where(Brand.slug == brand_slug)
@@ -125,12 +202,34 @@ async def grant_brand_access(
             logger.error("[Auth] brand_not_found slug=%s", brand_slug)
             return {"ok": False, "error": "Brand not found"}
 
+        brand_uuid = _coerce_uuid(brand.id, "brand.id")
+
+        # Check if access already exists (idempotency)
+        result = await db.execute(
+            select(EmployeeBrandAccess).where(
+                EmployeeBrandAccess.employee_id == employee_uuid,
+                EmployeeBrandAccess.brand_id == brand_uuid,
+                EmployeeBrandAccess.is_active == True,  # noqa: E712
+            )
+        )
+        existing = result.scalar_one_or_none()
+
+        if existing:
+            logger.info(
+                "[Auth] brand_access_already_exists employee_id=%s brand_id=%s",
+                employee_uuid,
+                brand_uuid,
+            )
+            return {
+                "ok": True,
+                "message": f"Brand access already exists: {brand_slug}",
+                "employee_id": str(employee_uuid),
+            }
+
         # Create brand access record
-        access_id = str(uuid.uuid4())
         brand_access = EmployeeBrandAccess(
-            id=access_id,
-            employee_id=employee_id,
-            brand_id=brand.id,
+            employee_id=employee_uuid,
+            brand_id=brand_uuid,
             role=role,
             is_active=True,
         )
@@ -140,14 +239,15 @@ async def grant_brand_access(
 
         logger.info(
             "[Auth] brand_access_granted employee_id=%s brand_id=%s role=%s",
-            employee_id,
-            brand.id,
+            employee_uuid,
+            brand_uuid,
             role,
         )
 
         return {
             "ok": True,
             "message": f"Brand access granted: {brand_slug}",
+            "employee_id": str(employee_uuid),
         }
 
     except Exception as e:
@@ -167,19 +267,62 @@ async def grant_app_access(
 
     Args:
         db: Database session
-        employee_id: Employee ID
+        employee_id: Employee ID (string or UUID)
         app_id: App ID (brand_app, driver_app, crm_app)
         role: Access role (admin, editor, viewer)
 
     Returns:
-        {ok: bool, message: str}
+        {ok: bool, message: str, employee_id: str}
     """
     try:
+        # Convert employee_id to UUID object to avoid uuid = varchar operator error
+        try:
+            employee_uuid = _coerce_uuid(employee_id, "employee_id")
+        except (ValueError, TypeError):
+            return {"ok": False, "error": f"Invalid employee_id format: {employee_id}"}
+
+        logger.info(
+            "[Auth] grant_app_access employee_id=%s app_id=%s role=%s",
+            employee_uuid,
+            app_id,
+            role,
+        )
+
+        # Verify employee exists
+        result = await db.execute(
+            select(Employee).where(Employee.id == employee_uuid)
+        )
+        employee = result.scalar_one_or_none()
+
+        if not employee:
+            logger.error("[Auth] employee_not_found employee_id=%s", employee_uuid)
+            return {"ok": False, "error": f"Employee not found: {employee_uuid}"}
+
+        # Check if access already exists (idempotency)
+        result = await db.execute(
+            select(EmployeeAppAccess).where(
+                EmployeeAppAccess.employee_id == employee_uuid,
+                EmployeeAppAccess.app_id == app_id,
+                EmployeeAppAccess.is_active == True,  # noqa: E712
+            )
+        )
+        existing = result.scalar_one_or_none()
+
+        if existing:
+            logger.info(
+                "[Auth] app_access_already_exists employee_id=%s app_id=%s",
+                employee_uuid,
+                app_id,
+            )
+            return {
+                "ok": True,
+                "message": f"App access already exists: {app_id}",
+                "employee_id": str(employee_uuid),
+            }
+
         # Create app access record
-        access_id = str(uuid.uuid4())
         app_access = EmployeeAppAccess(
-            id=access_id,
-            employee_id=employee_id,
+            employee_id=employee_uuid,
             app_id=app_id,
             role=role,
             is_active=True,
@@ -190,7 +333,7 @@ async def grant_app_access(
 
         logger.info(
             "[Auth] app_access_granted employee_id=%s app_id=%s role=%s",
-            employee_id,
+            employee_uuid,
             app_id,
             role,
         )
@@ -198,6 +341,7 @@ async def grant_app_access(
         return {
             "ok": True,
             "message": f"App access granted: {app_id}",
+            "employee_id": str(employee_uuid),
         }
 
     except Exception as e:
