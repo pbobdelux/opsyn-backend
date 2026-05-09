@@ -138,6 +138,64 @@ async def get_aws_secrets_status(
 
 
 # =============================================================================
+# Endpoint: GET /admin/secrets-status
+# Admin diagnostic endpoint — unified AWS Secrets Manager status check.
+# =============================================================================
+
+
+@router.get("/secrets-status")
+async def get_secrets_status(
+    x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
+    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Check AWS Secrets Manager configuration and connectivity.
+
+    Returns detailed status including create/read/update/delete capability checks.
+    Requires X-OPSYN-ORG header (admin auth).
+
+    Returns:
+        {
+            "aws_configured": bool,
+            "region": str,
+            "can_create_secret": bool,
+            "can_read_secret": bool,
+            "can_update_secret": bool,
+            "can_delete_secret": bool,
+            "error_code": str or null,
+            "error_message": str or null,
+            "timestamp": str,
+        }
+    """
+    from datetime import datetime, timezone
+    from services.integration_secrets import validate_aws_secrets_manager
+
+    try:
+        await _get_org_from_header(x_opsyn_org, x_opsyn_secret, db)
+    except HTTPException:
+        # Allow unauthenticated access to this diagnostic endpoint
+        pass
+
+    result = await validate_aws_secrets_manager()
+
+    return {
+        "aws_configured": result.get("aws_configured", False),
+        "region": result.get("region"),
+        "can_create_secret": result.get("can_create", False),
+        "can_read_secret": result.get("can_read", False),
+        "can_update_secret": result.get("can_update", False),
+        "can_delete_secret": result.get("can_read", False),  # same permission level
+        "error_code": result.get("error_code"),
+        "error_message": (
+            f"AWS Secrets Manager error: {result['error_code']}"
+            if result.get("error_code")
+            else None
+        ),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# =============================================================================
 # Endpoint: GET /admin/schema-status
 # Internal endpoint — returns live webhook schema health for debugging.
 # =============================================================================

@@ -159,9 +159,43 @@ async def process_sync_requests() -> None:
                             await err_db.commit()
                     continue
 
-                api_key: str = cred.api_key or ""
                 company_id: str = cred.company_id or ""
                 base_url: str = cred.base_url or ""
+
+                # Load API key from AWS Secrets Manager if a secret ref is set,
+                # otherwise fall back to plaintext (legacy) if allowed.
+                api_key_secret_ref = getattr(cred, "api_key_secret_ref", None)
+                if api_key_secret_ref:
+                    try:
+                        from services.integration_secrets import get_integration_secret
+                        api_key = await get_integration_secret(api_key_secret_ref)
+                        logger.info(
+                            "[LEAFLINK_SYNC] loaded_api_key_from_aws secret_ref=%s brand=%s",
+                            api_key_secret_ref,
+                            brand_id,
+                        )
+                    except Exception as _aws_exc:
+                        logger.error(
+                            "[LEAFLINK_SYNC] aws_api_key_load_failed brand=%s secret_ref=%s error=%s",
+                            brand_id,
+                            api_key_secret_ref,
+                            str(_aws_exc)[:200],
+                        )
+                        api_key = ""
+                elif cred.api_key and os.getenv("ALLOW_PLAINTEXT_SECRET_FALLBACK") == "true":
+                    api_key = cred.api_key
+                    logger.warning(
+                        "[LEAFLINK_SYNC] using_plaintext_api_key fallback_enabled=true brand=%s",
+                        brand_id,
+                    )
+                else:
+                    api_key = cred.api_key or ""
+                    if api_key:
+                        logger.warning(
+                            "[LEAFLINK_SYNC] using_plaintext_api_key no_secret_ref brand=%s "
+                            "note=migrate_to_api_key_secret_ref",
+                            brand_id,
+                        )
 
                 if not api_key.strip() or not company_id.strip():
                     logger.error(

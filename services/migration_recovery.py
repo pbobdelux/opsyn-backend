@@ -38,6 +38,8 @@ _CRITICAL_CREDENTIAL_COLUMNS = [
     "webhook_enabled",
     "webhook_signature_required",
     "leaflink_company_id",
+    "api_key_secret_ref",
+    "api_key_last4",
 ]
 
 # ---------------------------------------------------------------------------
@@ -69,6 +71,16 @@ _CREDENTIAL_COLUMN_SQL: list[tuple[str, str]] = [
         "leaflink_company_id",
         "ALTER TABLE brand_api_credentials "
         "ADD COLUMN IF NOT EXISTS leaflink_company_id VARCHAR(120)",
+    ),
+    (
+        "api_key_secret_ref",
+        "ALTER TABLE brand_api_credentials "
+        "ADD COLUMN IF NOT EXISTS api_key_secret_ref VARCHAR(255)",
+    ),
+    (
+        "api_key_last4",
+        "ALTER TABLE brand_api_credentials "
+        "ADD COLUMN IF NOT EXISTS api_key_last4 VARCHAR(4)",
     ),
 ]
 

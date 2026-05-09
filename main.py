@@ -135,7 +135,7 @@ from leaflink.orders import router as leaflink_orders_router  # noqa: E402
 from routes.ai import router as ai_router  # noqa: E402
 from routes.crm import router as crm_router  # noqa: E402
 from routes.health import router as health_router  # noqa: E402
-from routes.integrations import router as integrations_router  # noqa: E402
+from routes.integrations import router as integrations_router, _api_router as integrations_api_router  # noqa: E402
 from routes.integrations_health import router as integrations_health_router  # noqa: E402
 from routes.leaflink_debug import router as leaflink_debug_router  # noqa: E402
 from routes.orders import router as orders_router  # noqa: E402
@@ -976,6 +976,7 @@ app.include_router(voice_brain_router)
 
 # Integrations
 app.include_router(integrations_router)
+app.include_router(integrations_api_router)
 app.include_router(integrations_health_router)
 
 # Existing LeafLink routes
