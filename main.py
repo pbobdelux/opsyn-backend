@@ -35,7 +35,7 @@ if not _raw_bootstrap_url:
 logger.info("[BOOTSTRAP_DB_URL_VALID] DATABASE_URL validated")
 
 # =============================================================================
-# PHASE 3: Create a minimal async engine for bootstrap (NOT database.py engine)
+# PHASE 2b: Normalize DATABASE_URL for bootstrap engine (NOT database.py engine)
 # =============================================================================
 
 def _normalize_url_for_bootstrap(url: str) -> str:
@@ -53,7 +53,7 @@ def _normalize_url_for_bootstrap(url: str) -> str:
 _bootstrap_db_url = _normalize_url_for_bootstrap(_raw_bootstrap_url)
 
 # =============================================================================
-# PHASE 4: Run bootstrap_schema_recovery() BEFORE any ORM imports
+# PHASE 3: Run bootstrap_schema_recovery() BEFORE any ORM imports
 # =============================================================================
 
 async def _run_bootstrap() -> None:
@@ -93,50 +93,68 @@ async def _run_bootstrap() -> None:
 asyncio.run(_run_bootstrap())
 
 # =============================================================================
-# PHASE 5: Initialize database module AFTER bootstrap succeeds
+# PHASE 4: Verify bootstrap columns exist (uses a fresh dedicated engine)
 # =============================================================================
-logger.info("[BOOTSTRAP_DB_INIT] initializing database module after bootstrap")
+logger.info("[BOOTSTRAP_COLUMN_VERIFICATION] querying schema")
 
-async def _init_database() -> None:
-    """Initialize the database engine after bootstrap completes."""
-    from database import initialize_database_after_bootstrap
-    await initialize_database_after_bootstrap()
-
-asyncio.run(_init_database())
-logger.info("[BOOTSTRAP_DB_INIT_COMPLETE] database module initialized")
-
-# =============================================================================
-# PHASE 5b: Bootstrap gate — verify bootstrap completed before importing ORM
-# =============================================================================
-from database import is_bootstrap_complete as _is_bootstrap_complete  # noqa: E402
-if not _is_bootstrap_complete():
-    logger.error("[BOOTSTRAP_GATE] bootstrap not complete — hard exit")
-    sys.exit(1)
-logger.info("[BOOTSTRAP_GATE] bootstrap verified complete")
-
-# =============================================================================
-# PHASE 5c: Raw SQL column verification after bootstrap
-# =============================================================================
 async def _verify_bootstrap_columns() -> None:
-    """Verify critical columns exist after bootstrap."""
-    logger.info("[BOOTSTRAP_COLUMN_VERIFICATION] verifying critical columns exist")
+    """Verify critical columns exist after bootstrap recovery."""
+    _verify_engine = create_async_engine(
+        _bootstrap_db_url,
+        echo=False,
+        pool_pre_ping=True,
+        connect_args={"ssl": "require"},
+        execution_options={"compiled_cache": None},
+    )
     try:
-        from database import _engine as _boot_engine
-        if _boot_engine is None:
-            logger.warning("[BOOTSTRAP_COLUMN_VERIFICATION] engine not available — skipping")
-            return
-        async with _boot_engine.connect() as conn:
+        async with _verify_engine.connect() as conn:
             result = await conn.execute(text("""
-                SELECT column_name FROM information_schema.columns
+                SELECT column_name
+                FROM information_schema.columns
                 WHERE table_name='brand_api_credentials'
                 ORDER BY column_name
             """))
             columns = [row[0] for row in result.fetchall()]
             logger.info("[BOOTSTRAP_COLUMN_VERIFICATION] columns=%s", columns)
-    except Exception as _col_exc:
-        logger.warning("[BOOTSTRAP_COLUMN_VERIFICATION] failed error=%s", _col_exc)
+
+            # Verify critical columns exist
+            critical = [
+                "webhook_key_secret_ref",
+                "webhook_key_last4",
+                "webhook_enabled",
+                "webhook_signature_required",
+                "leaflink_company_id",
+            ]
+            missing = [c for c in critical if c not in columns]
+            if missing:
+                logger.error("[BOOTSTRAP_COLUMN_VERIFICATION] missing_critical=%s", missing)
+                sys.exit(1)
+
+            logger.info("[BOOTSTRAP_COLUMN_VERIFICATION] all_critical_columns_present=true")
+    finally:
+        await _verify_engine.dispose()
 
 asyncio.run(_verify_bootstrap_columns())
+
+# =============================================================================
+# PHASE 5: Initialize database engine (now safe after bootstrap)
+# =============================================================================
+logger.info("[BOOTSTRAP_DB_ENGINE_INIT] initializing database engine")
+
+async def _init_db() -> None:
+    """Initialize database engine after bootstrap completes."""
+    from database import _initialize_engine
+    await _initialize_engine()
+    logger.info("[BOOTSTRAP_DB_ENGINE_INIT] engine initialized and ready")
+
+asyncio.run(_init_db())
+
+# Bootstrap gate — verify engine initialized before importing ORM
+from database import is_bootstrap_complete as _is_bootstrap_complete  # noqa: E402
+if not _is_bootstrap_complete():
+    logger.error("[BOOTSTRAP_GATE] bootstrap not complete — hard exit")
+    sys.exit(1)
+logger.info("[BOOTSTRAP_GATE] bootstrap verified complete")
 
 # =============================================================================
 # PHASE 6: Bootstrap succeeded — NOW import ORM models and routers

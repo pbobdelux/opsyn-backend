@@ -181,25 +181,21 @@ def _build_database_url() -> str:
     return url
 
 
-async def initialize_database_after_bootstrap() -> None:
-    """
-    Create the async engine and session factory AFTER bootstrap has completed.
+async def _initialize_engine() -> None:
+    """Create engine and AsyncSessionLocal after bootstrap completes.
 
-    This MUST be called by main.py after bootstrap_schema_recovery() succeeds
-    and BEFORE any ORM models or routers are imported.
-
-    Populates the module-level _engine, _AsyncSessionLocal, DATABASE_URL, and
-    _bootstrap_complete flag so all downstream code can use them.
+    This function MUST be called after bootstrap_schema_recovery() succeeds
+    and BEFORE any ORM models are queried.
     """
     global _engine, _AsyncSessionLocal, DATABASE_URL, _bootstrap_complete
 
-    logger.info("[BOOTSTRAP_DB_INIT] building DATABASE_URL")
-    DATABASE_URL = _build_database_url()
+    if _engine is not None:
+        logger.info("[DB_ENGINE_INIT] engine already initialized")
+        return
 
-    logger.info(
-        "[BOOTSTRAP_DB_INIT] creating engine database_url=%s",
-        DATABASE_URL[:50] + "..." if DATABASE_URL else "NOT_SET",
-    )
+    logger.info("[DB_ENGINE_INIT] creating engine after bootstrap")
+
+    DATABASE_URL = _build_database_url()
 
     _parsed_url = urlparse(DATABASE_URL)
     _drivername = _parsed_url.scheme
@@ -207,7 +203,7 @@ async def initialize_database_after_bootstrap() -> None:
     _has_ssl_in_url = "ssl" in _parsed_url.query.lower() or "sslmode" in _parsed_url.query.lower()
 
     logger.info(
-        "[BOOTSTRAP_DB_INIT] drivername=%s host=%s ssl_in_url=%s",
+        "[DB_ENGINE_INIT] drivername=%s host=%s ssl_in_url=%s",
         _drivername,
         _host,
         _has_ssl_in_url,
@@ -221,15 +217,11 @@ async def initialize_database_after_bootstrap() -> None:
         execution_options={"compiled_cache": None},
     )
 
-    logger.info("[BOOTSTRAP_DB_INIT] engine_created connect_args_ssl=require compiled_cache=disabled")
-
     _AsyncSessionLocal = async_sessionmaker(
         bind=_engine,
         class_=AsyncSession,
         expire_on_commit=False,
     )
-
-    logger.info("[BOOTSTRAP_DB_INIT] session_factory_created")
 
     _bootstrap_complete = True
 
@@ -242,13 +234,19 @@ async def initialize_database_after_bootstrap() -> None:
     _mod.engine = _engine
     _mod.AsyncSessionLocal = _AsyncSessionLocal
 
-    logger.info("[BOOTSTRAP_DB_INIT_COMPLETE] database module initialized bootstrap_complete=true")
+    logger.info("[DB_ENGINE_INIT] engine created and AsyncSessionLocal ready")
 
 
 # ---------------------------------------------------------------------------
+# Backward-compatible alias — callers that used initialize_database_after_bootstrap()
+# can continue to work; new code should call _initialize_engine() directly.
+# ---------------------------------------------------------------------------
+initialize_database_after_bootstrap = _initialize_engine
+
+# ---------------------------------------------------------------------------
 # Backward-compatible module-level aliases.
-# These are None until initialize_database_after_bootstrap() is called.
-# initialize_database_after_bootstrap() updates these via sys.modules so that
+# These are None until _initialize_engine() is called.
+# _initialize_engine() updates these via sys.modules so that
 # code doing `from database import engine` AFTER bootstrap gets the real engine.
 # ---------------------------------------------------------------------------
 engine = None
@@ -258,7 +256,8 @@ AsyncSessionLocal = None
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     if _AsyncSessionLocal is None:
         raise RuntimeError(
-            "DATABASE_URL is not configured — bootstrap must run first"
+            "DATABASE_URL is not configured or engine not initialized. "
+            "Bootstrap may have failed."
         )
 
     async with _AsyncSessionLocal() as session:
@@ -273,6 +272,7 @@ async def refresh_connection_pool() -> None:
     global _engine, _AsyncSessionLocal, engine, AsyncSessionLocal
 
     if _engine is None:
+        logger.warning("[Database] engine not initialized — skipping refresh")
         return
 
     logger.info("[Database] disposing_connection_pool")
