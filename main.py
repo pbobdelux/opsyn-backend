@@ -949,31 +949,46 @@ async def lifespan(app: FastAPI):
         logger.error("[Startup] table_verification_failed error=%s", str(e)[:500], exc_info=True)
 
     # Seed auth data for known employees (idempotent — skips if already set up)
-    from services.seed_auth import seed_preston_anderson
-    from database import AsyncSessionLocal as _SeedSessionLocal
+    # Wrapped individually so a failure here does NOT block the scheduler or yield.
     try:
-        seed_result = await seed_preston_anderson(_SeedSessionLocal())
-        if seed_result.get("ok"):
-            logger.info("[Startup] auth_seed_complete")
+        from database import AsyncSessionLocal as _SeedSessionLocal
+        from services.seed_auth import seed_preston_anderson
+        if _SeedSessionLocal is not None:
+            seed_result = await seed_preston_anderson(_SeedSessionLocal())
+            if seed_result.get("ok"):
+                logger.info("[STARTUP_AUTH_SEED] ok=true")
+            else:
+                logger.warning("[STARTUP_AUTH_SEED] ok=false reason=%s", seed_result.get("error"))
         else:
-            logger.warning("[Startup] auth_seed_skipped reason=%s", seed_result.get("error"))
+            logger.warning("[STARTUP_AUTH_SEED] skipped reason=no_session_factory")
     except Exception as e:
-        logger.warning("[Startup] auth_seed_error error=%s", str(e)[:500])
+        logger.error("[STARTUP_AUTH_SEED_FAILED] error=%s", str(e)[:200])
+        # Do NOT re-raise — let the scheduler and yield continue
 
     # Start background sync scheduler as an asyncio task (non-blocking)
-    print("🚀 Starting sync scheduler...")
-    scheduler_task = asyncio.create_task(run_scheduler())
-    print("✅ Sync scheduler task created")
+    # Wrapped individually so a failure here does NOT block the yield.
+    scheduler_task = None
+    try:
+        print("🚀 Starting sync scheduler...")
+        scheduler_task = asyncio.create_task(run_scheduler())
+        print("✅ Sync scheduler task created")
+        logger.info("[STARTUP_SCHEDULER] started")
+    except Exception as e:
+        logger.error("[STARTUP_SCHEDULER_FAILED] error=%s", str(e)[:200])
+        # Do NOT re-raise — app should still serve requests
 
     yield
 
-    # On shutdown, cancel the scheduler task
-    logger.info("[Shutdown] cancelling background sync scheduler")
-    scheduler_task.cancel()
-    try:
-        await scheduler_task
-    except asyncio.CancelledError:
-        logger.info("[Shutdown] background sync scheduler cancelled")
+    # On shutdown, cancel the scheduler task (if it was started)
+    if scheduler_task is not None:
+        logger.info("[Shutdown] cancelling background sync scheduler")
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            logger.info("[Shutdown] background sync scheduler cancelled")
+    else:
+        logger.info("[Shutdown] scheduler_task was None — nothing to cancel")
 
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
