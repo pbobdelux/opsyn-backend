@@ -83,12 +83,14 @@ def get_engine():
 
 
 def get_async_session_local():
-    """Return the session factory, raising if bootstrap has not run yet."""
+    """Get AsyncSessionLocal, raising if database not initialized yet."""
+    global _AsyncSessionLocal
     if _AsyncSessionLocal is None:
         raise RuntimeError(
-            "Database not initialized — bootstrap must run first. "
-            "Call initialize_database_after_bootstrap() before using sessions."
+            "[DB_NOT_INITIALIZED] AsyncSessionLocal not available — "
+            "database must be initialized via initialize_database_after_bootstrap() first"
         )
+    logger.info("[DB_SESSION_FACTORY_REQUESTED] returning AsyncSessionLocal")
     return _AsyncSessionLocal
 
 
@@ -193,6 +195,8 @@ async def initialize_database_after_bootstrap() -> None:
     """
     global _engine, _AsyncSessionLocal, DATABASE_URL, _bootstrap_complete
 
+    logger.info("[DB_INIT_START] initializing database module")
+
     logger.info("[BOOTSTRAP_DB_INIT] building DATABASE_URL")
     DATABASE_URL = _build_database_url()
 
@@ -221,6 +225,7 @@ async def initialize_database_after_bootstrap() -> None:
         execution_options={"compiled_cache": None},
     )
 
+    logger.info("[DB_INIT_ENGINE_CREATED] async engine created")
     logger.info("[BOOTSTRAP_DB_INIT] engine_created connect_args_ssl=require compiled_cache=disabled")
 
     _AsyncSessionLocal = async_sessionmaker(
@@ -229,9 +234,16 @@ async def initialize_database_after_bootstrap() -> None:
         expire_on_commit=False,
     )
 
+    logger.info("[DB_INIT_SESSION_FACTORY_CREATED] session factory created")
     logger.info("[BOOTSTRAP_DB_INIT] session_factory_created")
 
+    # Verify connection works
+    logger.info("[DB_INIT_CONNECTION_VERIFIED] testing database connection")
+    async with _engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+
     _bootstrap_complete = True
+    logger.info("[DB_INIT_COMPLETE] database initialization complete")
 
     # Update module-level aliases so `from database import engine` and
     # `from database import AsyncSessionLocal` work after bootstrap.
