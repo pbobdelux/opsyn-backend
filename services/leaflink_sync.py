@@ -5269,9 +5269,120 @@ async def sync_leaflink_background_continuous(
             _prev_cursor = next_cursor
             resume_url = next_cursor
 
-            # ------------------------------------------------------------------ #
-            # Upsert order headers (headers-only, line items deferred)            #
-            # ------------------------------------------------------------------ #
+            # ================================================================== #
+            # PHASE A: Persist pagination state BEFORE any order processing      #
+            # This MUST succeed even if all orders fail.                          #
+            # Phase A failure → abort entire sync.                               #
+            # Phase B failure → skip orders, continue pagination.                #
+            # ================================================================== #
+
+            total_orders_synced += len(batch_orders)
+            pages_processed += 1
+            records_seen_from_leaflink += _orders_count
+            last_progress_at = datetime.now(timezone.utc)
+
+            # When total_pages is None (cursor-based), fall back to current_page
+            last_completed_page = (next_page - 1) if next_page else (total_pages or current_page)
+
+            logger.debug("[PHASE_A_START] page=%s", pages_processed)
+
+            # [PAGINATION_STATE_PERSISTED] — persist state BEFORE any order processing
+            logger.info(
+                "[PAGINATION_STATE_PERSISTED] page=%s count=%s next_present=%s results_len=%s",
+                pages_processed,
+                leaflink_total_count,
+                next_cursor is not None,
+                _orders_count,
+            )
+
+            if manager:
+                manager.record_page_complete(brand_id, last_completed_page)
+
+            await _persist_run_progress(
+                pages_synced=last_completed_page,
+                orders_loaded=total_orders_synced,
+                cursor=next_cursor,
+                page=last_completed_page,
+                total_pages_val=total_pages,
+                total_orders_available=leaflink_total_count,
+            )
+
+            # Explicit commit of pagination state — isolated from order processing
+            if sync_run_id:
+                try:
+                    async with AsyncSessionLocal() as _state_db:
+                        async with _state_db.begin():
+                            await _state_db.execute(
+                                text("""
+                                    UPDATE sync_runs
+                                    SET last_next_url = :next_url,
+                                        total_orders_available = COALESCE(:total_count, total_orders_available),
+                                        current_page = :page,
+                                        last_progress_at = :now
+                                    WHERE id = :run_id
+                                """),
+                                {
+                                    "next_url": next_cursor,
+                                    "total_count": leaflink_total_count,
+                                    "page": pages_processed,
+                                    "now": datetime.now(timezone.utc),
+                                    "run_id": sync_run_id,
+                                },
+                            )
+                        await _state_db.commit()
+                    logger.info(
+                        "[PAGINATION_STATE_COMMITTED] page=%s count=%s next_present=%s",
+                        pages_processed,
+                        leaflink_total_count,
+                        next_cursor is not None,
+                    )
+                except Exception as _url_exc:
+                    logger.error(
+                        "[OrdersSync] last_next_url_persist_error run_id=%s error=%s",
+                        sync_run_id,
+                        _url_exc,
+                    )
+
+            # [SYNC_ACCUMULATOR] debug only
+            logger.debug(
+                "[SYNC_ACCUMULATOR] total_fetched=%s after_page=%s brand_id=%s",
+                total_orders_synced,
+                current_page,
+                brand_id,
+            )
+
+            # Memory diagnostics every 10 pages
+            if pages_processed % 10 == 0:
+                try:
+                    import psutil as _psutil
+                    _process = _psutil.Process(os.getpid())
+                    _rss_mb = _process.memory_info().rss / 1024 / 1024
+                    logger.info(
+                        "[SYNC_MEMORY] page=%s records_seen=%s rss_mb=%.1f",
+                        pages_processed,
+                        records_seen_from_leaflink,
+                        _rss_mb,
+                    )
+                except Exception as _mem_exc:
+                    logger.warning("[MEMORY_CHECK_ERROR] error=%s", str(_mem_exc)[:200])
+
+            # Log sampled progress every 10 pages (debug only — heartbeat covers this)
+            if pages_processed % 10 == 0:
+                logger.debug(
+                    "[LeafLinkSync] progress id=%s page=%s orders_seen=%s leaflink_total=%s",
+                    sync_run_id,
+                    pages_processed,
+                    records_seen_from_leaflink,
+                    leaflink_total_count,
+                )
+
+            # ================================================================== #
+            # PHASE B: Transform → Insert/Update (isolated from Phase A)         #
+            # Failures here do NOT rollback pagination state.                    #
+            # ================================================================== #
+
+            logger.debug("[PHASE_B_START] page=%s orders_count=%s", pages_processed, _orders_count)
+
             persist_result: Optional[dict] = None
             if batch_orders:
                 # [LEAFLINK_COMPANY_ROLE] Infer company role from first order on first page
@@ -5301,6 +5412,11 @@ async def sync_leaflink_background_continuous(
                         )
 
                 try:
+                    logger.info(
+                        "[FIRST_ORDER_PROCESSING_START] page=%s orders_count=%s",
+                        pages_processed,
+                        _orders_count,
+                    )
                     logger.debug(
                         "[ORG_CONTEXT] stage=bg_continuous_before_upsert org_id=%s brand_id=%s"
                         " external_order_id=N/A batch_size=%s page=%s",
@@ -5341,14 +5457,28 @@ async def sync_leaflink_background_continuous(
                         org_id,
                     )
 
+                    logger.info(
+                        "[FIRST_ORDER_PROCESSING_SUCCESS] page=%s inserted=%s updated=%s",
+                        pages_processed,
+                        persist_result.get("created", 0) if persist_result else 0,
+                        persist_result.get("updated", 0) if persist_result else 0,
+                    )
+
                 except Exception as upsert_exc:
+                    logger.error(
+                        "[FIRST_ORDER_PROCESSING_FAIL] page=%s error=%s",
+                        pages_processed,
+                        str(upsert_exc)[:300],
+                        exc_info=True,
+                    )
                     logger.error(
                         "[OrdersSync] bg_batch_upsert_error brand=%s page=%s error=%s",
                         brand_id,
                         current_page,
                         upsert_exc,
-                        exc_info=True,
+                        exc_info=False,
                     )
+                    # Continue to next page — pagination state is already persisted (Phase A)
                 else:
                     # Log upsert result in debug format
                     _inserted = persist_result.get("inserted_count", persist_result.get("created", 0)) if persist_result else 0
@@ -5366,36 +5496,17 @@ async def sync_leaflink_background_continuous(
                         brand_id,
                     )
 
-            total_orders_synced += len(batch_orders)
-            pages_processed += 1
-            records_seen_from_leaflink += _orders_count
-            last_progress_at = datetime.now(timezone.utc)
-
-            # [SYNC_ACCUMULATOR] debug only
-            logger.debug(
-                "[SYNC_ACCUMULATOR] total_fetched=%s after_page=%s brand_id=%s",
-                total_orders_synced,
-                current_page,
-                brand_id,
+            # [PHASE_B_COMPLETE] Log after order processing
+            _batch_upserted = (persist_result.get("created", 0) + persist_result.get("updated", 0)) if batch_orders and persist_result else 0
+            _batch_skipped = persist_result.get("skipped", 0) if batch_orders and persist_result else 0
+            _batch_failed = persist_result.get("failed_count", 0) if batch_orders and persist_result else 0
+            logger.info(
+                "[PHASE_B_COMPLETE] page=%s inserted=%s updated=%s skipped=%s",
+                pages_processed,
+                persist_result.get("created", 0) if persist_result else 0,
+                persist_result.get("updated", 0) if persist_result else 0,
+                _batch_skipped,
             )
-
-            # Memory diagnostics every 10 pages
-            if pages_processed % 10 == 0:
-                try:
-                    import psutil as _psutil
-                    _process = _psutil.Process(os.getpid())
-                    _rss_mb = _process.memory_info().rss / 1024 / 1024
-                    logger.info(
-                        "[SYNC_MEMORY] page=%s records_seen=%s rss_mb=%.1f",
-                        pages_processed,
-                        records_seen_from_leaflink,
-                        _rss_mb,
-                    )
-                except Exception as _mem_exc:
-                    logger.warning("[MEMORY_CHECK_ERROR] error=%s", str(_mem_exc)[:200])
-
-            # When total_pages is None (cursor-based), fall back to current_page
-            last_completed_page = (next_page - 1) if next_page else (total_pages or current_page)
 
             # [SYNC_PAGE_COMPLETE] debug only
             _page_elapsed = round(time.monotonic() - batch_start, 2)
@@ -5412,9 +5523,6 @@ async def sync_leaflink_background_continuous(
             )
 
             # [SYNC_PAGE_SUMMARY] Structured per-page summary for observability
-            _batch_upserted = (persist_result.get("created", 0) + persist_result.get("updated", 0)) if batch_orders and persist_result else 0
-            _batch_skipped = persist_result.get("skipped", 0) if batch_orders and persist_result else 0
-            _batch_failed = persist_result.get("failed_count", 0) if batch_orders and persist_result else 0
             logger.info(
                 "[SYNC_PAGE_SUMMARY] run_id=%s page=%s offset=%s fetched_count=%s "
                 "upserted_headers=%s skipped=%s failed=%s total_seen_so_far=%s "
@@ -5430,60 +5538,6 @@ async def sync_leaflink_background_continuous(
                 leaflink_total_count,
                 next_cursor is not None,
             )
-
-            # ------------------------------------------------------------------ #
-            # Persist progress to DB (SyncRun) and update in-memory state        #
-            # ------------------------------------------------------------------ #
-            if manager:
-                manager.record_page_complete(brand_id, last_completed_page)
-
-            await _persist_run_progress(
-                pages_synced=last_completed_page,
-                orders_loaded=total_orders_synced,
-                cursor=next_cursor,
-                page=last_completed_page,
-                total_pages_val=total_pages,
-                total_orders_available=leaflink_total_count,
-            )
-
-            # Persist last_next_url, total_orders_available, and current_page to SyncRun
-            if sync_run_id:
-                try:
-                    async with AsyncSessionLocal() as _url_db:
-                        async with _url_db.begin():
-                            await _url_db.execute(
-                                text("""
-                                    UPDATE sync_runs
-                                    SET last_next_url = :next_url,
-                                        total_orders_available = COALESCE(:total_count, total_orders_available),
-                                        current_page = :page,
-                                        last_progress_at = :now
-                                    WHERE id = :run_id
-                                """),
-                                {
-                                    "next_url": next_cursor,
-                                    "total_count": leaflink_total_count,
-                                    "page": pages_processed,
-                                    "now": datetime.now(timezone.utc),
-                                    "run_id": sync_run_id,
-                                },
-                            )
-                except Exception as _url_exc:
-                    logger.error(
-                        "[OrdersSync] last_next_url_persist_error run_id=%s error=%s",
-                        sync_run_id,
-                        _url_exc,
-                    )
-
-            # Log sampled progress every 10 pages (debug only — heartbeat covers this)
-            if pages_processed % 10 == 0:
-                logger.debug(
-                    "[LeafLinkSync] progress id=%s page=%s orders_seen=%s leaflink_total=%s",
-                    sync_run_id,
-                    pages_processed,
-                    records_seen_from_leaflink,
-                    leaflink_total_count,
-                )
 
             # ------------------------------------------------------------------ #
             # Adaptive batch sizing based on fetch latency                        #
