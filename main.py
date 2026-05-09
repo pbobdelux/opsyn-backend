@@ -93,7 +93,53 @@ async def _run_bootstrap() -> None:
 asyncio.run(_run_bootstrap())
 
 # =============================================================================
-# PHASE 5: Bootstrap succeeded — NOW import ORM models and routers
+# PHASE 5: Initialize database module AFTER bootstrap succeeds
+# =============================================================================
+logger.info("[BOOTSTRAP_DB_INIT] initializing database module after bootstrap")
+
+async def _init_database() -> None:
+    """Initialize the database engine after bootstrap completes."""
+    from database import initialize_database_after_bootstrap
+    await initialize_database_after_bootstrap()
+
+asyncio.run(_init_database())
+logger.info("[BOOTSTRAP_DB_INIT_COMPLETE] database module initialized")
+
+# =============================================================================
+# PHASE 5b: Bootstrap gate — verify bootstrap completed before importing ORM
+# =============================================================================
+from database import is_bootstrap_complete as _is_bootstrap_complete  # noqa: E402
+if not _is_bootstrap_complete():
+    logger.error("[BOOTSTRAP_GATE] bootstrap not complete — hard exit")
+    sys.exit(1)
+logger.info("[BOOTSTRAP_GATE] bootstrap verified complete")
+
+# =============================================================================
+# PHASE 5c: Raw SQL column verification after bootstrap
+# =============================================================================
+async def _verify_bootstrap_columns() -> None:
+    """Verify critical columns exist after bootstrap."""
+    logger.info("[BOOTSTRAP_COLUMN_VERIFICATION] verifying critical columns exist")
+    try:
+        from database import _engine as _boot_engine
+        if _boot_engine is None:
+            logger.warning("[BOOTSTRAP_COLUMN_VERIFICATION] engine not available — skipping")
+            return
+        async with _boot_engine.connect() as conn:
+            result = await conn.execute(text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name='brand_api_credentials'
+                ORDER BY column_name
+            """))
+            columns = [row[0] for row in result.fetchall()]
+            logger.info("[BOOTSTRAP_COLUMN_VERIFICATION] columns=%s", columns)
+    except Exception as _col_exc:
+        logger.warning("[BOOTSTRAP_COLUMN_VERIFICATION] failed error=%s", _col_exc)
+
+asyncio.run(_verify_bootstrap_columns())
+
+# =============================================================================
+# PHASE 6: Bootstrap succeeded — NOW import ORM models and routers
 # =============================================================================
 logger.info("[BOOTSTRAP_PRE_ROUTER_IMPORT] importing ORM models and routers")
 
