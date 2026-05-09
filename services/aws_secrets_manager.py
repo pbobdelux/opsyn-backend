@@ -1,6 +1,21 @@
 """
 AWS Secrets Manager integration for secure webhook key storage.
 
+New high-level API (uses AWSSecretsConfig for explicit credential validation):
+    store_webhook_secret(brand_id, webhook_key)   -> (success, secret_ref, error_code)
+    retrieve_webhook_secret(secret_ref)            -> Optional[str]
+
+Legacy low-level API (kept for backward compatibility):
+    store_webhook_key_in_aws(brand_id, webhook_key) -> Optional[str]  (ARN)
+    load_webhook_key_from_aws(secret_ref)           -> Optional[str]
+    delete_webhook_key_from_aws(secret_ref)         -> bool
+    validate_aws_credentials()                      -> bool
+    get_webhook_key_for_brand(...)                  -> Optional[str]
+
+---
+
+AWS Secrets Manager integration for secure webhook key storage.
+
 Provides functions to store, load, and delete per-brand webhook keys
 in AWS Secrets Manager. Raw webhook keys are never stored in the database —
 only the ARN/reference is persisted in brand_api_credentials.webhook_key_secret_ref.
@@ -333,3 +348,126 @@ async def get_webhook_key_for_brand(brand_id: str, secret_ref: Optional[str], pl
         brand_id,
     )
     return None
+
+
+# =============================================================================
+# High-level API — uses AWSSecretsConfig for explicit credential validation
+# =============================================================================
+
+
+async def store_webhook_secret(
+    brand_id: str,
+    webhook_key: str,
+) -> tuple[bool, Optional[str], Optional[str]]:
+    """Store webhook secret in AWS Secrets Manager.
+
+    Uses AWSSecretsConfig for explicit credential validation before attempting
+    any AWS API calls.  Supports create-or-update semantics via put_secret_value
+    with a ResourceNotFoundException fallback to create_secret.
+
+    Returns:
+        (success: bool, secret_ref: Optional[str], error_code: Optional[str])
+    """
+    import json as _json
+
+    from services.aws_secrets_config import get_aws_config
+
+    config = get_aws_config()
+
+    if not config.is_configured():
+        logger.warning(
+            "[AWS_SECRETS_STORE_FAILED] AWS Secrets Manager not configured brand=%s",
+            brand_id,
+        )
+        return False, None, "AWS_SECRETS_NOT_CONFIGURED"
+
+    try:
+        import boto3
+
+        logger.info("[AWS_SECRETS_STORE_START] storing webhook secret brand=%s", brand_id)
+
+        client = boto3.client(
+            "secretsmanager",
+            region_name=config.region,
+            aws_access_key_id=config.access_key_id,
+            aws_secret_access_key=config.secret_access_key,
+        )
+
+        secret_name = config.get_secret_name(brand_id)
+        secret_value = _json.dumps({
+            "webhook_key": webhook_key,
+            "brand_id": brand_id,
+        })
+
+        try:
+            # Try to update existing secret
+            client.put_secret_value(
+                SecretId=secret_name,
+                SecretString=secret_value,
+            )
+            logger.info("[AWS_SECRETS_STORE_SUCCESS] updated secret brand=%s", brand_id)
+        except client.exceptions.ResourceNotFoundException:
+            # Create new secret
+            client.create_secret(
+                Name=secret_name,
+                SecretString=secret_value,
+                Description=f"LeafLink webhook key for brand {brand_id}",
+            )
+            logger.info("[AWS_SECRETS_STORE_SUCCESS] created secret brand=%s", brand_id)
+
+        return True, secret_name, None
+
+    except Exception as e:
+        error_msg = str(e)[:200]
+
+        if "AccessDenied" in error_msg or "UnauthorizedOperation" in error_msg:
+            logger.error(
+                "[AWS_SECRETS_PERMISSION_DENIED] insufficient permissions brand=%s error=%s",
+                brand_id,
+                error_msg,
+            )
+            return False, None, "AWS_SECRETS_PERMISSION_DENIED"
+
+        logger.error(
+            "[AWS_SECRETS_STORE_FAILED] error storing secret brand=%s error=%s",
+            brand_id,
+            error_msg,
+        )
+        return False, None, "AWS_SECRETS_STORE_FAILED"
+
+
+async def retrieve_webhook_secret(secret_ref: str) -> Optional[str]:
+    """Retrieve webhook secret from AWS Secrets Manager.
+
+    Uses AWSSecretsConfig for explicit credential validation.
+
+    Returns:
+        The webhook key string, or None if not found / AWS not configured.
+    """
+    import json as _json
+
+    from services.aws_secrets_config import get_aws_config
+
+    config = get_aws_config()
+
+    if not config.is_configured():
+        logger.warning("[AWS_SECRETS_RETRIEVE_FAILED] AWS not configured")
+        return None
+
+    try:
+        import boto3
+
+        client = boto3.client(
+            "secretsmanager",
+            region_name=config.region,
+            aws_access_key_id=config.access_key_id,
+            aws_secret_access_key=config.secret_access_key,
+        )
+
+        response = client.get_secret_value(SecretId=secret_ref)
+        secret_value = _json.loads(response["SecretString"])
+        return secret_value.get("webhook_key")
+
+    except Exception as e:
+        logger.error("[AWS_SECRETS_RETRIEVE_FAILED] error=%s", str(e)[:200])
+        return None
