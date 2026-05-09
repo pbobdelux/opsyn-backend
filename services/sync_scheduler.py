@@ -41,6 +41,12 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "5"))
 WORKER_ID = os.getenv("WORKER_ID", "worker-1")
 STALL_THRESHOLD_SECONDS = int(os.getenv("STALL_THRESHOLD_SECONDS", "90"))
 
+# Incremental sync: enqueue an incremental_recent_orders job every N seconds
+# as a safety net in case webhooks miss any updates.
+LEAFLINK_INCREMENTAL_SYNC_INTERVAL_SECONDS = int(
+    os.getenv("LEAFLINK_INCREMENTAL_SYNC_INTERVAL_SECONDS", "30")
+)
+
 # ---------------------------------------------------------------------------
 # Bootstrap: ensure the repo root is on sys.path so shared modules resolve.
 # The scheduler lives in services/ which is one level below the root.
@@ -565,7 +571,58 @@ async def run_scheduler() -> None:
         sys.stdout.flush()
         raise
 
+    # Track when we last enqueued an incremental sync job
+    _last_incremental_enqueue: float = 0.0
+
+    async def _enqueue_incremental_sync_for_all_brands() -> None:
+        """
+        Enqueue an incremental_recent_orders job for every active LeafLink brand.
+
+        Called every LEAFLINK_INCREMENTAL_SYNC_INTERVAL_SECONDS as a safety net
+        to catch any orders that webhooks may have missed.
+        """
+        try:
+            from sqlalchemy import select as _select
+            from database import AsyncSessionLocal
+            from models import BrandAPICredential, SyncRequest
+
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    _select(BrandAPICredential).where(
+                        BrandAPICredential.integration_name == "leaflink",
+                        BrandAPICredential.is_active == True,
+                    )
+                )
+                creds = result.scalars().all()
+
+            if not creds:
+                return
+
+            async with AsyncSessionLocal() as enqueue_db:
+                async with enqueue_db.begin():
+                    for cred in creds:
+                        enqueue_db.add(SyncRequest(
+                            brand_id=cred.brand_id,
+                            org_id=getattr(cred, "org_id", None),
+                            type="incremental_recent_orders",
+                            status="queued",
+                            retry_count=0,
+                            max_retries=3,
+                        ))
+
+            logger.info(
+                "[LEAFLINK_INCREMENTAL_SYNC_START] enqueued incremental jobs for %s brand(s)",
+                len(creds),
+            )
+        except Exception as inc_exc:
+            logger.error(
+                "[LEAFLINK_INCREMENTAL_SYNC_START] enqueue_failed error=%s",
+                str(inc_exc)[:300],
+                exc_info=True,
+            )
+
     # Main polling loop
+    import time as _time
     while True:
         try:
             await poll_and_execute()
@@ -577,6 +634,18 @@ async def run_scheduler() -> None:
                 exc_info=True,
             )
             sys.stdout.flush()
+
+        # Enqueue incremental sync jobs at the configured interval
+        _now = _time.monotonic()
+        if _now - _last_incremental_enqueue >= LEAFLINK_INCREMENTAL_SYNC_INTERVAL_SECONDS:
+            _last_incremental_enqueue = _now
+            try:
+                await _enqueue_incremental_sync_for_all_brands()
+            except Exception as _inc_exc:
+                logger.error(
+                    "[LEAFLINK_INCREMENTAL_SYNC_START] outer_error error=%s",
+                    str(_inc_exc)[:200],
+                )
 
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 

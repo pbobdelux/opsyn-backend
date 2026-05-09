@@ -11,6 +11,7 @@ Handles inbound webhook payloads from LeafLink:
 import hashlib
 import hmac
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -20,9 +21,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal
-from models import BrandAPICredential, Order
+from models import BrandAPICredential, Order, LeafLinkWebhookEvent, SyncRequest
 from services.leaflink_sync import safe_uuid_for_db, safe_uuid_mapped_product
 from utils.json_utils import make_json_safe
+
+# Feature flag: require signature verification (default True in production)
+LEAFLINK_WEBHOOK_REQUIRE_SIGNATURE = os.getenv("LEAFLINK_WEBHOOK_REQUIRE_SIGNATURE", "true").lower() == "true"
 
 logger = logging.getLogger("leaflink_webhook")
 
@@ -497,6 +501,39 @@ async def upsert_webhook_order(
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Idempotency key generation
+# ---------------------------------------------------------------------------
+
+def _build_idempotency_key(
+    payload: dict[str, Any],
+    event_type: str,
+    object_id: Optional[str],
+) -> str:
+    """
+    Build a deterministic idempotency key for a webhook event.
+
+    Uses event_id from payload if present; otherwise derives a key from
+    source + event_type + object_id + updated_at to ensure uniqueness
+    across retries while deduplicating identical deliveries.
+    """
+    # Prefer an explicit event_id from the payload
+    event_id = _safe_str(payload.get("event_id") or payload.get("id"))
+    if event_id:
+        return f"leaflink:{event_id}"
+
+    # Derive deterministic key from payload fields
+    source = _safe_str(payload.get("source")) or "leaflink"
+    updated_at = _safe_str(
+        payload.get("updated_at")
+        or payload.get("modified")
+        or payload.get("timestamp")
+    ) or ""
+    raw = f"{source}:{event_type}:{object_id or ''}:{updated_at}"
+    return f"leaflink:{hashlib.sha256(raw.encode()).hexdigest()[:32]}"
+
+
+# ---------------------------------------------------------------------------
 # Main webhook processor
 # ---------------------------------------------------------------------------
 
@@ -509,12 +546,14 @@ async def process_leaflink_webhook(
     """
     Process an inbound LeafLink webhook payload end-to-end.
 
-    Steps:
+    Webhook-first architecture:
     1. Extract company_id and event from payload
     2. Resolve tenant (brand_id, org_id, credential) from company_id
     3. Verify LL-Signature using credential.webhook_key
-    4. Upsert orders from payload
-    5. Return structured result
+    4. Idempotency check — skip if already seen (by idempotency_key)
+    5. Store event in leaflink_webhook_events (status=pending)
+    6. Enqueue sync_request(s) for each order/product in payload
+    7. Return 200 immediately — no inline upsert
 
     Always returns a dict — never raises. Caller returns HTTP 200.
 
@@ -522,10 +561,10 @@ async def process_leaflink_webhook(
         {
             "ok": bool,
             "received_count": int,
-            "upserted_count": int,
+            "enqueued_count": int,
             "errors": list[str],
-            "error": str | None,       # top-level error message if ok=False
-            "status_code": int,        # suggested HTTP status (200, 400, 409)
+            "error": str | None,
+            "status_code": int,
         }
     """
     start = time.monotonic()
@@ -534,7 +573,7 @@ async def process_leaflink_webhook(
     event = _safe_str(payload.get("event")) or "unknown"
 
     logger.info(
-        "[LeafLinkWebhook] received company_id=%s event=%s",
+        "[LEAFLINK_WEBHOOK_RECEIVED] company_id=%s event=%s",
         company_id,
         event,
     )
@@ -547,6 +586,7 @@ async def process_leaflink_webhook(
         return {
             "ok": False,
             "received_count": 0,
+            "enqueued_count": 0,
             "upserted_count": 0,
             "errors": [tenant["error"]],
             "error": tenant["error"],
@@ -558,9 +598,7 @@ async def process_leaflink_webhook(
     cred: BrandAPICredential = tenant["credential"]
 
     # Coerce org_id and brand_id to valid UUIDs or None before any DB write.
-    # This prevents "column is of type uuid but expression is of type character varying"
-    # errors from sending webhook orders to the dead-letter queue.
-    brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
+    brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id
     org_id = safe_uuid_for_db(org_id, "org_id")
 
     logger.info(
@@ -576,75 +614,87 @@ async def process_leaflink_webhook(
     # Step 2: Verify signature                                            #
     # ------------------------------------------------------------------ #
     webhook_key = cred.webhook_key
+    require_sig = LEAFLINK_WEBHOOK_REQUIRE_SIGNATURE
+
     if webhook_key:
         if not signature_header:
             logger.warning(
                 "[LeafLinkWebhook] missing_signature brand_id=%s",
                 brand_id,
             )
-            return {
-                "ok": False,
-                "received_count": 0,
-                "upserted_count": 0,
-                "errors": ["Missing LL-Signature header"],
-                "error": "Missing LL-Signature header",
-                "status_code": 400,
-            }
+            if require_sig:
+                return {
+                    "ok": False,
+                    "received_count": 0,
+                    "enqueued_count": 0,
+                    "upserted_count": 0,
+                    "errors": ["Missing LL-Signature header"],
+                    "error": "Missing LL-Signature header",
+                    "status_code": 400,
+                }
 
-        if not verify_ll_signature(payload_bytes, signature_header, webhook_key):
+        elif not verify_ll_signature(payload_bytes, signature_header, webhook_key):
             logger.warning(
                 "[LeafLinkWebhook] invalid_signature brand_id=%s",
                 brand_id,
             )
-            return {
-                "ok": False,
-                "received_count": 0,
-                "upserted_count": 0,
-                "errors": ["Invalid signature"],
-                "error": "Invalid signature",
-                "status_code": 400,
-            }
-
-        logger.info("[LeafLinkWebhook] signature_verified brand_id=%s", brand_id)
+            if require_sig:
+                return {
+                    "ok": False,
+                    "received_count": 0,
+                    "enqueued_count": 0,
+                    "upserted_count": 0,
+                    "errors": ["Invalid signature"],
+                    "error": "Invalid signature",
+                    "status_code": 400,
+                }
+        else:
+            logger.info("[LEAFLINK_WEBHOOK_VERIFIED] brand_id=%s", brand_id)
     else:
-        # No webhook_key configured — skip signature check but log a warning
         logger.warning(
             "[LeafLinkWebhook] signature_check_skipped brand_id=%s reason=no_webhook_key_configured",
             brand_id,
         )
 
     # ------------------------------------------------------------------ #
-    # Step 3: Extract orders from payload                                 #
+    # Step 3: Extract orders and products from payload                    #
     # ------------------------------------------------------------------ #
     data = payload.get("data") or {}
     orders_raw: list[dict] = []
+    products_raw: list[dict] = []
 
     if isinstance(data, dict):
         orders_raw = data.get("orders") or []
+        products_raw = data.get("products") or []
     elif isinstance(data, list):
         orders_raw = data
 
-    # Also handle flat payload where orders are at the top level
+    # Flat payload fallbacks
     if not orders_raw and isinstance(payload.get("orders"), list):
         orders_raw = payload["orders"]
+    if not products_raw and isinstance(payload.get("products"), list):
+        products_raw = payload["products"]
 
-    received_count = len(orders_raw)
+    received_count = len(orders_raw) + len(products_raw)
+
     logger.info(
-        "[LeafLinkWebhook] orders_extracted brand_id=%s count=%s event=%s",
+        "[LeafLinkWebhook] objects_extracted brand_id=%s orders=%s products=%s event=%s",
         brand_id,
-        received_count,
+        len(orders_raw),
+        len(products_raw),
         event,
     )
 
     if received_count == 0:
         logger.info(
-            "[LeafLinkWebhook] no_orders_in_payload brand_id=%s event=%s",
+            "[LeafLinkWebhook] no_objects_in_payload brand_id=%s event=%s",
             brand_id,
             event,
         )
         return {
             "ok": True,
             "received_count": 0,
+            "enqueued_count": 0,
             "upserted_count": 0,
             "errors": [],
             "error": None,
@@ -652,56 +702,166 @@ async def process_leaflink_webhook(
         }
 
     # ------------------------------------------------------------------ #
-    # Step 4: Upsert orders in a single transaction                       #
+    # Step 4: Idempotency check + event storage + job enqueue             #
     # ------------------------------------------------------------------ #
-    upserted_count = 0
+    enqueued_count = 0
     errors: list[str] = []
 
+    # Determine event_type from the event field
+    event_lower = event.lower()
+    if "product" in event_lower:
+        if "creat" in event_lower:
+            event_type = "product_created"
+        else:
+            event_type = "product_updated"
+        object_type = "product"
+    else:
+        if "creat" in event_lower:
+            event_type = "order_created"
+        else:
+            event_type = "order_updated"
+        object_type = "order"
+
     try:
-        async with AsyncSessionLocal() as upsert_db:
-            async with upsert_db.begin():
+        async with AsyncSessionLocal() as enqueue_db:
+            async with enqueue_db.begin():
+                # Process orders
                 for order_data in orders_raw:
                     if not isinstance(order_data, dict):
                         errors.append("Skipped non-dict order entry")
                         continue
 
-                    result = await upsert_webhook_order(
-                        upsert_db,
-                        brand_id=brand_id,
-                        org_id=org_id,
-                        order_data=order_data,
+                    external_id = _safe_str(
+                        order_data.get("id")
+                        or order_data.get("external_id")
+                        or order_data.get("external_order_id")
                     )
 
-                    if result["action"] in ("created", "updated"):
-                        upserted_count += 1
-                    elif result["error"]:
-                        errors.append(result["error"])
+                    idem_key = _build_idempotency_key(order_data, event_type, external_id)
+
+                    # Idempotency check
+                    existing = await enqueue_db.execute(
+                        select(LeafLinkWebhookEvent).where(
+                            LeafLinkWebhookEvent.idempotency_key == idem_key
+                        )
+                    )
+                    if existing.scalar_one_or_none():
+                        logger.info(
+                            "[LEAFLINK_WEBHOOK_DUPLICATE_IGNORED] idempotency_key=%s brand_id=%s",
+                            idem_key,
+                            brand_id,
+                        )
+                        continue
+
+                    # Store webhook event
+                    webhook_event = LeafLinkWebhookEvent(
+                        brand_id=brand_id,
+                        org_id=org_id,
+                        event_type=event_type,
+                        object_type="order",
+                        object_id=external_id,
+                        payload_json=make_json_safe(order_data),
+                        idempotency_key=idem_key,
+                        status="pending",
+                    )
+                    enqueue_db.add(webhook_event)
+
+                    # Enqueue sync_request for this order
+                    sync_req = SyncRequest(
+                        brand_id=brand_id,
+                        org_id=org_id,
+                        type="webhook_order",
+                        object_id=external_id,
+                        status="queued",
+                        retry_count=0,
+                        max_retries=3,
+                    )
+                    enqueue_db.add(sync_req)
+                    enqueued_count += 1
+
+                # Process products
+                for product_data in products_raw:
+                    if not isinstance(product_data, dict):
+                        errors.append("Skipped non-dict product entry")
+                        continue
+
+                    external_id = _safe_str(
+                        product_data.get("id")
+                        or product_data.get("external_id")
+                        or product_data.get("external_product_id")
+                    )
+
+                    prod_event_type = (
+                        "product_created" if "creat" in event_lower else "product_updated"
+                    )
+                    idem_key = _build_idempotency_key(product_data, prod_event_type, external_id)
+
+                    # Idempotency check
+                    existing = await enqueue_db.execute(
+                        select(LeafLinkWebhookEvent).where(
+                            LeafLinkWebhookEvent.idempotency_key == idem_key
+                        )
+                    )
+                    if existing.scalar_one_or_none():
+                        logger.info(
+                            "[LEAFLINK_WEBHOOK_DUPLICATE_IGNORED] idempotency_key=%s brand_id=%s",
+                            idem_key,
+                            brand_id,
+                        )
+                        continue
+
+                    # Store webhook event
+                    webhook_event = LeafLinkWebhookEvent(
+                        brand_id=brand_id,
+                        org_id=org_id,
+                        event_type=prod_event_type,
+                        object_type="product",
+                        object_id=external_id,
+                        payload_json=make_json_safe(product_data),
+                        idempotency_key=idem_key,
+                        status="pending",
+                    )
+                    enqueue_db.add(webhook_event)
+
+                    # Enqueue sync_request for this product
+                    sync_req = SyncRequest(
+                        brand_id=brand_id,
+                        org_id=org_id,
+                        type="webhook_product",
+                        object_id=external_id,
+                        status="queued",
+                        retry_count=0,
+                        max_retries=3,
+                    )
+                    enqueue_db.add(sync_req)
+                    enqueued_count += 1
 
     except Exception as exc:
         err_msg = str(exc)[:300]
         logger.error(
-            "[LeafLinkWebhook] upsert_transaction_error brand_id=%s error=%s",
+            "[LEAFLINK_WEBHOOK_PROCESSING_FAILED] brand_id=%s error=%s",
             brand_id,
             err_msg,
             exc_info=True,
         )
-        errors.append(f"Transaction error: {err_msg}")
+        errors.append(f"Enqueue error: {err_msg}")
 
     duration = round(time.monotonic() - start, 3)
     logger.info(
-        "[LeafLinkWebhook] complete received_count=%s upserted_count=%s errors=%s duration=%ss brand_id=%s",
+        "[LEAFLINK_WEBHOOK_ENQUEUED] received=%s enqueued=%s errors=%s duration=%ss brand_id=%s",
         received_count,
-        upserted_count,
+        enqueued_count,
         len(errors),
         duration,
         brand_id,
     )
 
     return {
-        "ok": len(errors) == 0 or upserted_count > 0,
+        "ok": enqueued_count > 0 or (received_count > 0 and len(errors) == 0),
         "received_count": received_count,
-        "upserted_count": upserted_count,
+        "enqueued_count": enqueued_count,
+        "upserted_count": enqueued_count,  # backward compat alias
         "errors": errors,
-        "error": errors[0] if errors and upserted_count == 0 else None,
+        "error": errors[0] if errors and enqueued_count == 0 else None,
         "status_code": 200,
     }

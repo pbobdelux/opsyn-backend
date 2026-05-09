@@ -40,7 +40,7 @@ from routes.admin import router as admin_router
 from routes.debug import router as debug_router
 from routes.auth import router as auth_router
 from routes.webhooks import router as webhooks_router
-from routes.sync import router as sync_router
+from routes.sync import router as sync_router, webhook_status_router
 from routes.diagnostics import router as diagnostics_router
 from routes.drivers import router as drivers_router
 from routes.routes import router as routes_router
@@ -657,15 +657,28 @@ async def lifespan(app: FastAPI):
     scheduler_task = asyncio.create_task(run_scheduler())
     print("✅ Sync scheduler task created")
 
+    # Start the sync_request background worker (webhook-first queue processor)
+    print("🚀 Starting sync request worker...")
+    from services.sync_request_background_worker import run_sync_request_worker
+    sync_worker_task = asyncio.create_task(run_sync_request_worker())
+    print("✅ Sync request worker task created")
+
     yield
 
-    # On shutdown, cancel the scheduler task
+    # On shutdown, cancel background tasks
     logger.info("[Shutdown] cancelling background sync scheduler")
     scheduler_task.cancel()
     try:
         await scheduler_task
     except asyncio.CancelledError:
         logger.info("[Shutdown] background sync scheduler cancelled")
+
+    logger.info("[Shutdown] cancelling sync request worker")
+    sync_worker_task.cancel()
+    try:
+        await sync_worker_task
+    except asyncio.CancelledError:
+        logger.info("[Shutdown] sync request worker cancelled")
 
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
@@ -726,6 +739,7 @@ app.include_router(leaflink_debug_router, prefix="/leaflink")
 
 # Sync / Webhooks
 app.include_router(sync_router)
+app.include_router(webhook_status_router)
 app.include_router(webhooks_router)
 
 # Drivers / Routes
