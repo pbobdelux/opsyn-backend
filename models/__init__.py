@@ -486,14 +486,94 @@ class SyncRequest(Base):
         default=None,
         comment="Organization UUID — propagated to order inserts so org_id is never NULL",
     )
-    status: Mapped[str] = mapped_column(String(50), default="pending")  # pending, processing, complete, error
+    # Job type — determines what the worker does with this request.
+    # webhook_order / webhook_product: targeted single-object fetch from LeafLink API
+    # incremental_recent_orders: fetch orders changed in the last ~1 hour (API safety net)
+    # full_resync: delegate to sync_leaflink_background_continuous() (manual/on-demand only)
+    type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="full_resync",
+        comment="webhook_order | webhook_product | incremental_recent_orders | full_resync",
+    )
+    # Specific LeafLink order/product ID for targeted webhook-triggered fetches
+    object_id: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        default=None,
+        comment="External LeafLink order or product ID for targeted single-object sync",
+    )
+    status: Mapped[str] = mapped_column(String(50), default="queued")  # queued, processing, completed, failed
     start_page: Mapped[int] = mapped_column(Integer, default=1)
     total_pages: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_orders_available: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_retries: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# =============================================================================
+# LeafLink Webhook Events Model — idempotency tracking for inbound webhooks
+# =============================================================================
+
+class LeafLinkWebhookEvent(Base):
+    """
+    Records every inbound LeafLink webhook POST for idempotency and observability.
+
+    One row per unique event (deduplicated by idempotency_key).
+    Written immediately on receipt, before any processing, so duplicate
+    deliveries from LeafLink are detected and silently ignored.
+
+    Status lifecycle:
+      pending   → event received, sync job enqueued
+      processed → sync job completed successfully
+      failed    → sync job failed after max retries
+    """
+
+    __tablename__ = "leaflink_webhook_events"
+    __table_args__ = (
+        Index("ix_leaflink_webhook_events_brand_created", "brand_id", "created_at"),
+        Index("ix_leaflink_webhook_events_brand_status", "brand_id", "status"),
+        UniqueConstraint("idempotency_key", name="uix_leaflink_webhook_events_idempotency_key"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=False),
+        primary_key=True,
+        default=lambda: str(__import__("uuid").uuid4()),
+    )
+    brand_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    org_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    event_type: Mapped[Optional[str]] = mapped_column(
+        String(80),
+        nullable=True,
+        comment="order_created | order_updated | product_created | product_updated",
+    )
+    object_type: Mapped[Optional[str]] = mapped_column(
+        String(50),
+        nullable=True,
+        comment="order | product",
+    )
+    object_id: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="External LeafLink order or product ID",
+    )
+    payload_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="pending",
+        comment="pending | processed | failed",
+    )
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 # ---------------------------------------------------------------------------

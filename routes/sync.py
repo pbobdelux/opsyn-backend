@@ -10,15 +10,17 @@ Provides:
 """
 
 import logging
+import os
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db, has_column
-from models import Order, SyncRequest, SyncRun
+from models import LeafLinkWebhookEvent, Order, SyncRequest, SyncRun
 from models.sync_health import DeadLetterLineItem, SyncHealth
 from services.leaflink_sync import (
     ensure_utc,
@@ -489,3 +491,142 @@ async def trigger_leaflink_sync(
         "sync_request_id": sync_req.id,
         "brand_id": brand_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/leaflink/orders/webhook-status
+# ---------------------------------------------------------------------------
+
+_WEBHOOK_STATUS_ROUTER = APIRouter(prefix="/api/leaflink/orders", tags=["webhook-status"])
+
+
+@_WEBHOOK_STATUS_ROUTER.get("/webhook-status")
+async def get_webhook_status(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Observability endpoint for LeafLink webhook health.
+
+    Returns aggregate stats from leaflink_webhook_events and sync_requests
+    so operators can verify the webhook pipeline is functioning correctly.
+    """
+    require_sig = os.getenv("LEAFLINK_WEBHOOK_REQUIRE_SIGNATURE", "true").lower() == "true"
+
+    # ------------------------------------------------------------------ #
+    # leaflink_webhook_events stats                                        #
+    # ------------------------------------------------------------------ #
+    total_events = 0
+    total_processed = 0
+    total_failed = 0
+    total_pending = 0
+    last_event_received: Optional[str] = None
+    last_event_processed: Optional[str] = None
+
+    try:
+        # Total events
+        r = await db.execute(select(func.count(LeafLinkWebhookEvent.id)))
+        total_events = r.scalar_one() or 0
+
+        # By status
+        r = await db.execute(
+            select(LeafLinkWebhookEvent.status, func.count(LeafLinkWebhookEvent.id))
+            .group_by(LeafLinkWebhookEvent.status)
+        )
+        for status, cnt in r.fetchall():
+            if status == "processed":
+                total_processed = cnt
+            elif status == "failed":
+                total_failed = cnt
+            elif status == "pending":
+                total_pending = cnt
+
+        # Last event received
+        r = await db.execute(
+            select(func.max(LeafLinkWebhookEvent.created_at))
+        )
+        last_created = r.scalar_one()
+        if last_created:
+            last_event_received = last_created.isoformat()
+
+        # Last event processed
+        r = await db.execute(
+            select(func.max(LeafLinkWebhookEvent.processed_at))
+        )
+        last_processed = r.scalar_one()
+        if last_processed:
+            last_event_processed = last_processed.isoformat()
+
+    except Exception as exc:
+        logger.warning("[WebhookStatus] webhook_events_query_failed error=%s", str(exc)[:200])
+
+    # ------------------------------------------------------------------ #
+    # sync_requests queue stats                                            #
+    # ------------------------------------------------------------------ #
+    queued_webhook_jobs = 0
+    queued_incremental_jobs = 0
+
+    try:
+        r = await db.execute(
+            select(SyncRequest.type, func.count(SyncRequest.id))
+            .where(SyncRequest.status == "queued")
+            .group_by(SyncRequest.type)
+        )
+        for job_type, cnt in r.fetchall():
+            if job_type in ("webhook_order", "webhook_product"):
+                queued_webhook_jobs += cnt
+            elif job_type == "incremental_recent_orders":
+                queued_incremental_jobs += cnt
+    except Exception as exc:
+        logger.warning("[WebhookStatus] sync_requests_query_failed error=%s", str(exc)[:200])
+
+    # ------------------------------------------------------------------ #
+    # Last sync timestamps from SyncRun                                   #
+    # ------------------------------------------------------------------ #
+    last_incremental_sync: Optional[str] = None
+    last_full_sync: Optional[str] = None
+
+    try:
+        r = await db.execute(
+            select(func.max(SyncRun.completed_at)).where(
+                SyncRun.status == "completed",
+                SyncRun.mode == "incremental",
+            )
+        )
+        ts = r.scalar_one()
+        if ts:
+            last_incremental_sync = ts.isoformat()
+    except Exception:
+        pass
+
+    try:
+        r = await db.execute(
+            select(func.max(SyncRun.completed_at)).where(
+                SyncRun.status == "completed",
+                SyncRun.mode == "full",
+            )
+        )
+        ts = r.scalar_one()
+        if ts:
+            last_full_sync = ts.isoformat()
+    except Exception:
+        pass
+
+    return {
+        "webhook_receiver_enabled": True,
+        "signature_required": require_sig,
+        "total_events_received": total_events,
+        "total_processed": total_processed,
+        "total_duplicates_ignored": 0,  # tracked via log markers; not stored separately
+        "failed_events": total_failed,
+        "pending_events": total_pending,
+        "last_event_received": last_event_received,
+        "last_event_processed": last_event_processed,
+        "queued_webhook_jobs": queued_webhook_jobs,
+        "queued_incremental_jobs": queued_incremental_jobs,
+        "last_incremental_sync": last_incremental_sync,
+        "last_full_sync": last_full_sync,
+    }
+
+
+# Re-export the webhook-status router so main.py can include it
+webhook_status_router = _WEBHOOK_STATUS_ROUTER

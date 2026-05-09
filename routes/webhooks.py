@@ -111,9 +111,10 @@ async def receive_leaflink_webhook(
         content={
             "ok": result["ok"],
             "received_count": result["received_count"],
-            "upserted_count": result["upserted_count"],
+            "enqueued_count": result.get("enqueued_count", 0),
+            "upserted_count": result.get("upserted_count", 0),
             "errors": result["errors"],
-            **({"error": result["error"]} if result.get("error") else {}),
+            **({**{"error": result["error"]}} if result.get("error") else {}),
         },
     )
 
