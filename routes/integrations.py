@@ -85,6 +85,56 @@ async def _resolve_org_id(
     return str(org_result["organization"].id)
 
 
+async def _resolve_org_id_from_header_only(
+    x_opsyn_org: Optional[str],
+    db: AsyncSession,
+) -> str:
+    """Resolve org_id from X-OPSYN-ORG header only (no secret validation).
+
+    Used for internal bootstrap/admin setup of integration credentials.
+    Does NOT validate X-OPSYN-SECRET — only resolves the org_id.
+
+    Args:
+        x_opsyn_org: X-OPSYN-ORG header value (org code or UUID)
+        db: Database session
+
+    Returns:
+        Authenticated org_id (UUID string)
+
+    Raises:
+        HTTPException 401 if header is missing
+        HTTPException 404 if org not found
+    """
+    from services.organization_service import lookup_organization
+
+    if not x_opsyn_org:
+        logger.warning("[INTEGRATION_AUTH_DEBUG] missing_x_opsyn_org_header")
+        raise HTTPException(status_code=401, detail="X-OPSYN-ORG header is required")
+
+    logger.info(
+        "[INTEGRATION_AUTH_DEBUG] resolving_org_from_header_only org_identifier=%s",
+        x_opsyn_org,
+    )
+
+    # Resolve org_id via org_code or UUID lookup
+    org_result = await lookup_organization(db, x_opsyn_org)
+    if not org_result.get("ok") or not org_result.get("organization"):
+        logger.warning(
+            "[INTEGRATION_AUTH_DEBUG] org_not_found org_identifier=%s",
+            x_opsyn_org,
+        )
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    org_id = str(org_result["organization"].id)
+    logger.info(
+        "[INTEGRATION_AUTH_DEBUG] org_resolved org_identifier=%s org_id=%s auth_mode=header_only",
+        x_opsyn_org,
+        org_id,
+    )
+
+    return org_id
+
+
 async def _verify_brand_belongs_to_org(
     db: AsyncSession,
     org_id: str,
@@ -440,7 +490,6 @@ async def configure_integration_credentials(
     integration_name: str,
     body: CredentialsConfigRequest,
     x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
-    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
     """Configure integration credentials for a brand.
@@ -465,8 +514,14 @@ async def configure_integration_credentials(
     brand_id = body.brand_id.strip()
     integration_name_lower = integration_name.lower().strip()
 
-    # Resolve and authenticate org
-    org_id = await _resolve_org_id(x_opsyn_org, x_opsyn_secret, db)
+    # Resolve org from header only (no secret validation — internal bootstrap mode)
+    org_id = await _resolve_org_id_from_header_only(x_opsyn_org, db)
+    logger.info(
+        "[INTEGRATION_AUTH_DEBUG] post_credentials_start org_id=%s brand_id=%s integration=%s",
+        org_id,
+        brand_id,
+        integration_name_lower,
+    )
 
     # Verify brand belongs to org
     await _verify_brand_belongs_to_org(db, org_id, brand_id)
@@ -671,7 +726,6 @@ async def get_integration_credentials(
     integration_name: str,
     brand_id: str = Query(..., description="Brand UUID"),
     x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
-    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
     """Retrieve integration credential metadata for a brand.
@@ -689,8 +743,14 @@ async def get_integration_credentials(
     """
     integration_name_lower = integration_name.lower().strip()
 
-    # Resolve and authenticate org
-    org_id = await _resolve_org_id(x_opsyn_org, x_opsyn_secret, db)
+    # Resolve org from header only (no secret validation — internal bootstrap mode)
+    org_id = await _resolve_org_id_from_header_only(x_opsyn_org, db)
+    logger.info(
+        "[INTEGRATION_AUTH_DEBUG] get_credentials_start org_id=%s brand_id=%s integration=%s",
+        org_id,
+        brand_id,
+        integration_name_lower,
+    )
 
     # Verify brand belongs to org
     await _verify_brand_belongs_to_org(db, org_id, brand_id)
@@ -755,7 +815,6 @@ async def delete_integration_credentials(
     integration_name: str,
     brand_id: str = Query(..., description="Brand UUID"),
     x_opsyn_org: Optional[str] = Header(default=None, alias="x-opsyn-org"),
-    x_opsyn_secret: Optional[str] = Header(default=None, alias="x-opsyn-secret"),
     db: AsyncSession = Depends(get_db),
 ):
     """Delete integration credentials for a brand.
@@ -769,8 +828,14 @@ async def delete_integration_credentials(
 
     integration_name_lower = integration_name.lower().strip()
 
-    # Resolve and authenticate org
-    org_id = await _resolve_org_id(x_opsyn_org, x_opsyn_secret, db)
+    # Resolve org from header only (no secret validation — internal bootstrap mode)
+    org_id = await _resolve_org_id_from_header_only(x_opsyn_org, db)
+    logger.info(
+        "[INTEGRATION_AUTH_DEBUG] delete_credentials_start org_id=%s brand_id=%s integration=%s",
+        org_id,
+        brand_id,
+        integration_name_lower,
+    )
 
     # Verify brand belongs to org
     await _verify_brand_belongs_to_org(db, org_id, brand_id)
