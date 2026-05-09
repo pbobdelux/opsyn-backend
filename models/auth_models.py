@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from sqlalchemy import Column, String, DateTime, Boolean, ForeignKey
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from database import Base
 
@@ -7,9 +8,9 @@ from database import Base
 class Organization(Base):
     __tablename__ = "organizations"
 
-    id = Column(String, primary_key=True)
+    id = Column(UUID(as_uuid=True), primary_key=True)
     org_code = Column(String, unique=True, nullable=True)
-    slug = Column(String, unique=True, nullable=False)
+    slug = Column(String, nullable=False)
     name = Column(String, nullable=False)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -18,8 +19,8 @@ class Organization(Base):
 class Brand(Base):
     __tablename__ = "brands"
 
-    id = Column(String, primary_key=True)
-    org_id = Column(String, ForeignKey("organizations.id"), nullable=False)
+    id = Column(UUID(as_uuid=True), primary_key=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
     slug = Column(String, nullable=False)
     name = Column(String, nullable=False)
     # is_active removed - column doesn't exist in database
@@ -29,8 +30,8 @@ class Brand(Base):
 class Employee(Base):
     __tablename__ = "employees"
 
-    id = Column(String, primary_key=True)
-    org_id = Column(String, ForeignKey("organizations.id"), nullable=False)
+    id = Column(UUID(as_uuid=True), primary_key=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
     first_name = Column(String, nullable=False)
     last_name = Column(String, nullable=False)
     email = Column(String, unique=True, nullable=False)
@@ -50,8 +51,8 @@ class Employee(Base):
 class EmployeePasscode(Base):
     __tablename__ = "employee_passcodes"
 
-    id = Column(String, primary_key=True)
-    employee_id = Column(String, ForeignKey("employees.id"), nullable=False)
+    id = Column(UUID(as_uuid=True), primary_key=True)
+    employee_id = Column(UUID(as_uuid=True), ForeignKey("employees.id"), nullable=False)
     passcode_hash = Column(String, nullable=False)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -67,9 +68,9 @@ class EmployeePasscode(Base):
 class EmployeeBrandAccess(Base):
     __tablename__ = "employee_brand_access"
 
-    id = Column(String, primary_key=True)
-    employee_id = Column(String, ForeignKey("employees.id"), nullable=False)
-    brand_id = Column(String, ForeignKey("brands.id"), nullable=False)
+    id = Column(UUID(as_uuid=True), primary_key=True)
+    employee_id = Column(UUID(as_uuid=True), ForeignKey("employees.id"), nullable=False)
+    brand_id = Column(UUID(as_uuid=True), ForeignKey("brands.id"), nullable=False)
     role = Column(String, default="viewer")  # admin, editor, viewer
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -80,8 +81,8 @@ class EmployeeBrandAccess(Base):
 class EmployeeAppAccess(Base):
     __tablename__ = "employee_app_access"
 
-    id = Column(String, primary_key=True)
-    employee_id = Column(String, ForeignKey("employees.id"), nullable=False)
+    id = Column(UUID(as_uuid=True), primary_key=True)
+    employee_id = Column(UUID(as_uuid=True), ForeignKey("employees.id"), nullable=False)
     app_id = Column(String, nullable=False)  # brand_app, driver_app, crm_app
     role = Column(String, default="viewer")  # admin, editor, viewer
     is_active = Column(Boolean, default=True)
