@@ -258,6 +258,12 @@ async def initialize_database_after_bootstrap() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _initialize_engine: canonical alias used by the sync worker bootstrap.
+# Identical to initialize_database_after_bootstrap() — both names are valid.
+# ---------------------------------------------------------------------------
+_initialize_engine = initialize_database_after_bootstrap
+
+# ---------------------------------------------------------------------------
 # Backward-compatible module-level aliases.
 # These are None until initialize_database_after_bootstrap() is called.
 # initialize_database_after_bootstrap() updates these via sys.modules so that
