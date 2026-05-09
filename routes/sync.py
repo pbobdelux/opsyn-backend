@@ -7,6 +7,10 @@ Provides:
   - GET  /orders/sync/leaflink/dead-letter — list dead-lettered line items
   - POST /orders/sync/leaflink/replay-dead-letter — replay a dead-lettered item
   - POST /orders/sync/recover           — retry failed/retryable sync runs
+
+Webhook endpoints (namespace: /api/leaflink/orders):
+  - GET  /api/leaflink/orders/webhook-status  — webhook health metrics
+  - POST /api/leaflink/orders/webhook-replay  — replay unresolved/failed events
 """
 
 import logging
@@ -14,11 +18,11 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db, has_column
-from models import Order, SyncRequest, SyncRun
+from models import BrandAPICredential, LeafLinkWebhookEvent, Order, SyncRequest, SyncRun
 from models.sync_health import DeadLetterLineItem, SyncHealth
 from services.leaflink_sync import (
     ensure_utc,
@@ -489,3 +493,274 @@ async def trigger_leaflink_sync(
         "sync_request_id": sync_req.id,
         "brand_id": brand_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# Webhook health + replay endpoints — namespace: /api/leaflink/orders
+# ---------------------------------------------------------------------------
+
+_webhook_router = APIRouter(prefix="/api/leaflink/orders", tags=["leaflink-webhook-status"])
+
+
+@_webhook_router.get("/webhook-status")
+async def get_webhook_status(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Comprehensive webhook health metrics across all brands.
+
+    Returns aggregate counts for webhook configuration, event resolution,
+    signature verification, deduplication, and queue depth.
+
+    Metrics:
+      webhook_enabled_count         — brands with webhook_enabled=true
+      webhook_configured_count      — brands with webhook_key_secret_ref set
+      unresolved_events_count       — events with tenant_resolution_status='unresolved'
+      ambiguous_events_count        — events with tenant_resolution_status='ambiguous'
+      failed_signature_events_count — events with signature_verification_status='invalid'
+      duplicates_ignored_count      — events with duplicate_of_event_id set
+      webhook_keys_last4_by_brand   — { brand_id: webhook_key_last4 } for all active brands
+    """
+    try:
+        # Count brands with webhook_enabled=true
+        try:
+            enabled_result = await db.execute(
+                select(func.count(BrandAPICredential.id)).where(
+                    BrandAPICredential.webhook_enabled == True,
+                    BrandAPICredential.integration_name == "leaflink",
+                    BrandAPICredential.is_active == True,
+                )
+            )
+            webhook_enabled_count = enabled_result.scalar_one() or 0
+        except Exception:
+            webhook_enabled_count = 0
+
+        # Count brands with webhook_key_secret_ref set
+        try:
+            configured_result = await db.execute(
+                select(func.count(BrandAPICredential.id)).where(
+                    BrandAPICredential.webhook_key_secret_ref.isnot(None),
+                    BrandAPICredential.integration_name == "leaflink",
+                    BrandAPICredential.is_active == True,
+                )
+            )
+            webhook_configured_count = configured_result.scalar_one() or 0
+        except Exception:
+            webhook_configured_count = 0
+
+        # Count unresolved events
+        try:
+            unresolved_result = await db.execute(
+                select(func.count(LeafLinkWebhookEvent.id)).where(
+                    LeafLinkWebhookEvent.tenant_resolution_status == "unresolved"
+                )
+            )
+            unresolved_events_count = unresolved_result.scalar_one() or 0
+        except Exception:
+            unresolved_events_count = 0
+
+        # Count ambiguous events
+        try:
+            ambiguous_result = await db.execute(
+                select(func.count(LeafLinkWebhookEvent.id)).where(
+                    LeafLinkWebhookEvent.tenant_resolution_status == "ambiguous"
+                )
+            )
+            ambiguous_events_count = ambiguous_result.scalar_one() or 0
+        except Exception:
+            ambiguous_events_count = 0
+
+        # Count invalid signature events
+        try:
+            invalid_sig_result = await db.execute(
+                select(func.count(LeafLinkWebhookEvent.id)).where(
+                    LeafLinkWebhookEvent.signature_verification_status == "invalid"
+                )
+            )
+            failed_signature_events_count = invalid_sig_result.scalar_one() or 0
+        except Exception:
+            failed_signature_events_count = 0
+
+        # Count deduplicated events
+        try:
+            dedup_result = await db.execute(
+                select(func.count(LeafLinkWebhookEvent.id)).where(
+                    LeafLinkWebhookEvent.duplicate_of_event_id.isnot(None)
+                )
+            )
+            duplicates_ignored_count = dedup_result.scalar_one() or 0
+        except Exception:
+            duplicates_ignored_count = 0
+
+        # Get webhook_key_last4 by brand
+        try:
+            last4_result = await db.execute(
+                select(
+                    BrandAPICredential.brand_id,
+                    BrandAPICredential.webhook_key_last4,
+                ).where(
+                    BrandAPICredential.integration_name == "leaflink",
+                    BrandAPICredential.is_active == True,
+                    BrandAPICredential.webhook_key_last4.isnot(None),
+                )
+            )
+            webhook_keys_last4_by_brand = {
+                row[0]: row[1] for row in last4_result.fetchall()
+            }
+        except Exception:
+            webhook_keys_last4_by_brand = {}
+
+        return {
+            "ok": True,
+            "webhook_enabled_count": webhook_enabled_count,
+            "webhook_configured_count": webhook_configured_count,
+            "unresolved_events_count": unresolved_events_count,
+            "ambiguous_events_count": ambiguous_events_count,
+            "failed_signature_events_count": failed_signature_events_count,
+            "duplicates_ignored_count": duplicates_ignored_count,
+            "webhook_keys_last4_by_brand": webhook_keys_last4_by_brand,
+        }
+
+    except Exception as exc:
+        logger.error("[WebhookStatus] error=%s", str(exc)[:300], exc_info=True)
+        return {
+            "ok": False,
+            "error": str(exc)[:300],
+        }
+
+
+async def _replay_webhook_events(
+    db: AsyncSession,
+    event_ids: Optional[list] = None,
+    brand_id: Optional[str] = None,
+    status: Optional[str] = None,
+) -> int:
+    """
+    Re-enqueue matching webhook events as new SyncRequests.
+
+    Args:
+        db: Active async database session.
+        event_ids: Optional list of specific event UUIDs to replay.
+        brand_id: Optional brand filter.
+        status: Optional status filter: 'unresolved' | 'ambiguous' | 'all'.
+
+    Returns:
+        Count of events replayed.
+    """
+    replayed = 0
+
+    try:
+        # Build query
+        query = select(LeafLinkWebhookEvent)
+
+        if event_ids:
+            query = query.where(LeafLinkWebhookEvent.id.in_(event_ids))
+        elif status and status != "all":
+            query = query.where(
+                LeafLinkWebhookEvent.tenant_resolution_status == status
+            )
+
+        if brand_id:
+            query = query.where(LeafLinkWebhookEvent.brand_id == brand_id)
+
+        result = await db.execute(query)
+        events = result.scalars().all()
+
+        for event in events:
+            if not event.brand_id:
+                logger.warning(
+                    "[WebhookReplay] skipping_event_no_brand_id event_id=%s",
+                    event.id,
+                )
+                continue
+
+            try:
+                # Create a new SyncRequest for this event
+                sync_req = SyncRequest(
+                    brand_id=event.brand_id,
+                    org_id=event.org_id,
+                    status="pending",
+                    start_page=1,
+                )
+                db.add(sync_req)
+                await db.flush()
+
+                # Mark event as replayed
+                event.enqueued_job_id = sync_req.id
+                event.processed_at = __import__("datetime").datetime.now(
+                    __import__("datetime").timezone.utc
+                )
+
+                replayed += 1
+                logger.info(
+                    "[WebhookReplay] replayed event_id=%s brand_id=%s sync_request_id=%s",
+                    event.id,
+                    event.brand_id,
+                    sync_req.id,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[WebhookReplay] replay_failed event_id=%s error=%s",
+                    event.id,
+                    str(exc)[:200],
+                )
+
+        await db.commit()
+
+    except Exception as exc:
+        logger.error("[WebhookReplay] query_failed error=%s", str(exc)[:300])
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    return replayed
+
+
+@_webhook_router.post("/webhook-replay")
+async def replay_webhook_events(
+    event_id: Optional[str] = Query(None, description="Specific event UUID to replay"),
+    brand_id: Optional[str] = Query(None, description="Filter by brand_id"),
+    status: Optional[str] = Query(
+        None,
+        description="Filter by status: unresolved | ambiguous | all",
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Re-enqueue unresolved or failed webhook events as new sync jobs.
+
+    Examples:
+      POST /api/leaflink/orders/webhook-replay?status=unresolved
+        → replays all unresolved events
+
+      POST /api/leaflink/orders/webhook-replay?event_id=<uuid>
+        → replays a specific event
+
+      POST /api/leaflink/orders/webhook-replay?brand_id=<id>&status=ambiguous
+        → replays all ambiguous events for a brand
+    """
+    event_ids = [event_id] if event_id else None
+
+    replayed_count = await _replay_webhook_events(
+        db=db,
+        event_ids=event_ids,
+        brand_id=brand_id,
+        status=status,
+    )
+
+    return {
+        "ok": True,
+        "replayed_count": replayed_count,
+        "filters": {
+            "event_id": event_id,
+            "brand_id": brand_id,
+            "status": status,
+        },
+        "message": f"Replayed {replayed_count} webhook event(s) as sync jobs.",
+    }
+
+
+# Note: _webhook_router is NOT included here — it is registered directly in main.py
+# to avoid path prefix collision with sync_router's /orders/sync prefix.
+# See main.py: app.include_router(webhook_status_router)

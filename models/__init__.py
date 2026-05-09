@@ -66,12 +66,12 @@ class BrandAPICredential(Base):
         default=None,
         comment="Auto-detected auth scheme: Bearer, Token, or Raw",
     )
-    # Webhook support
+    # Webhook support — DEPRECATED plaintext key (kept for backward compat)
     webhook_key: Mapped[Optional[str]] = mapped_column(
         String(255),
         nullable=True,
         default=None,
-        comment="LeafLink webhook secret for HMAC-SHA256 signature verification",
+        comment="DEPRECATED: use webhook_key_secret_ref instead. Raw webhook key stored in plaintext — do not populate for new credentials.",
     )
     org_id: Mapped[Optional[str]] = mapped_column(
         String(120),
@@ -79,6 +79,39 @@ class BrandAPICredential(Base):
         default=None,
         comment="Organization ID for fast tenant resolution from webhook payloads",
     )
+
+    # Secure webhook credential fields (per-brand, AWS Secrets Manager backed)
+    webhook_key_secret_ref: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        default=None,
+        comment="AWS Secrets Manager ARN/reference for the raw webhook key",
+    )
+    webhook_key_last4: Mapped[Optional[str]] = mapped_column(
+        String(4),
+        nullable=True,
+        default=None,
+        comment="Last 4 chars of webhook key for display/audit (never the full key)",
+    )
+    webhook_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="Whether webhook processing is enabled for this brand",
+    )
+    webhook_signature_required: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        comment="Whether LL-Signature HMAC-SHA256 verification is required",
+    )
+    leaflink_company_id: Mapped[Optional[str]] = mapped_column(
+        String(120),
+        nullable=True,
+        default=None,
+        comment="LeafLink company ID for fast tenant resolution from webhook payloads",
+    )
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
@@ -688,4 +721,80 @@ class SyncMetricsSnapshot(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
+# =============================================================================
+# LeafLink Webhook Event Model — audit log for all inbound webhook events
+# =============================================================================
+
+class LeafLinkWebhookEvent(Base):
+    """
+    Stores every inbound LeafLink webhook event for audit, idempotency,
+    and debugging of unresolved/ambiguous tenant events.
+
+    Key design decisions:
+      - tenant_resolution_status tracks whether we could identify the brand
+      - signature_verification_status tracks HMAC-SHA256 verification outcome
+      - duplicate_of_event_id enables deduplication tracking
+      - brand_id is nullable to allow storing events before tenant is resolved
+      - raw_payload is capped at 1MB (enforced in routes/webhooks.py)
+    """
+
+    __tablename__ = "leaflink_webhook_events"
+    __table_args__ = (
+        Index("ix_leaflink_webhook_events_brand_id", "brand_id"),
+        Index("ix_leaflink_webhook_events_tenant_status", "tenant_resolution_status"),
+        Index("ix_leaflink_webhook_events_received_at", "received_at"),
+        Index(
+            "ix_leaflink_webhook_events_brand_idempotency",
+            "brand_id",
+            "idempotency_key",
+            postgresql_where="brand_id IS NOT NULL",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=False),
+        primary_key=True,
+        default=lambda: str(__import__("uuid").uuid4()),
+    )
+
+    # Tenant identification (nullable until resolved)
+    brand_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True, index=True)
+    org_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+
+    # Event metadata
+    event_type: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    raw_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    # Tenant resolution tracking
+    # unresolved | resolved | ambiguous
+    tenant_resolution_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="unresolved"
+    )
+
+    # Signature verification: verified | skipped | invalid | missing
+    signature_verification_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    signature_verification_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Deduplication: if this event is a duplicate, reference the original
+    duplicate_of_event_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=False),
+        ForeignKey("leaflink_webhook_events.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # Processing outcome
+    enqueued_job_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    processing_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Timestamps
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
     )
