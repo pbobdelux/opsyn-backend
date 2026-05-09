@@ -19,8 +19,30 @@ Ordering guarantees (applied in priority order):
      drivers, route_stops) were executing before
      2026_05_21_02_add_drivers_routes_stops.sql created those tables.
   3. All remaining migrations run in alphabetical (timestamp) order.
+
+Quarantine:
+  Migrations listed in SKIPPED_LEGACY_MIGRATIONS are never applied.  They are
+  logged with [MIGRATION_SKIPPED_LEGACY] so the skip is always auditable.
+
+Checksums:
+  Each applied migration records a SHA-256 checksum of its file content in the
+  schema_migrations table.  On subsequent startups, if a previously-applied
+  migration file has changed on disk, a warning is logged.  This detects
+  accidental edits to already-applied migrations.
+
+Log markers emitted:
+  [MIGRATION_DISCOVERED]         — list of all .sql files found on disk
+  [MIGRATION_SKIPPED_LEGACY]     — quarantined migration skipped with reason
+  [MIGRATION_EXECUTION_PLAN]     — ordered list of migrations to attempt
+  [MIGRATION_ORDER]              — per-migration execution start
+  [MIGRATION_EXECUTED]           — per-migration success
+  [MIGRATION_FAILED_CRITICAL]    — critical migration failed (startup aborted)
+  [MIGRATION_FAILED_NONCRITICAL] — noncritical migration failed (startup continues)
+  [MIGRATION_CHECKSUM_CHANGED]   — previously-applied migration file was modified
+  [MIGRATION_SUMMARY]            — final counts after all migrations attempted
 """
 
+import hashlib
 import logging
 import os
 import re
@@ -33,6 +55,32 @@ MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "migra
 
 # Migrations whose filenames match this pattern are promoted to run first.
 _LEAFLINK_REPAIR_PATTERN = re.compile(r"fix_leaflink", re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Quarantine list — migrations that must NEVER be applied.
+#
+# Keys are exact filenames; values are human-readable reasons.  The runner
+# logs [MIGRATION_SKIPPED_LEGACY] for each entry so skips are always auditable.
+# Files must remain on disk — removing them would cause the runner to lose the
+# skip record and potentially attempt to apply them on a fresh database.
+# ---------------------------------------------------------------------------
+SKIPPED_LEGACY_MIGRATIONS: dict[str, str] = {
+    "2026_04_23_02_add_tenant_credentials.sql": (
+        "Uses SERIAL PK; superseded by 2026_05_04_02_create_full_schema_aws_rds.sql "
+        "which creates tenant_credentials as part of the canonical full-schema migration. "
+        "Applying this file on a database where 2026_05_04_02 has already run would be "
+        "a no-op (IF NOT EXISTS), but on a fresh database it would create the table with "
+        "a SERIAL PK before the full-schema migration can create it correctly."
+    ),
+}
+
+
+def _should_skip_migration(filename: str) -> str | None:
+    """
+    Return the quarantine reason string if *filename* is in SKIPPED_LEGACY_MIGRATIONS,
+    or None if the migration should proceed normally.
+    """
+    return SKIPPED_LEGACY_MIGRATIONS.get(filename)
 
 # ---------------------------------------------------------------------------
 # Explicit dependency graph for migrations that cannot be ordered purely by
@@ -88,9 +136,26 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     id SERIAL PRIMARY KEY,
     migration_name VARCHAR(255) NOT NULL UNIQUE,
     applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    duration_ms INTEGER
+    duration_ms INTEGER,
+    checksum VARCHAR(64),
+    success BOOLEAN NOT NULL DEFAULT TRUE,
+    error_text TEXT
 );
 """
+
+# ALTER statements to add new columns to an existing schema_migrations table
+# that was created before checksums/success/error_text were introduced.
+# These are safe to run repeatedly (IF NOT EXISTS / DO block).
+_SCHEMA_MIGRATIONS_UPGRADE_STMTS = [
+    "ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum VARCHAR(64)",
+    "ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS success BOOLEAN NOT NULL DEFAULT TRUE",
+    "ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS error_text TEXT",
+]
+
+
+def _compute_checksum(content: str) -> str:
+    """Return the SHA-256 hex digest of *content* (UTF-8 encoded)."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _split_statements(sql: str) -> list[str]:
@@ -249,44 +314,74 @@ def _order_migrations(sql_files: list[str]) -> list[str]:
     return repair + ordered_others
 
 
-async def run_migrations() -> list[str]:
+async def run_migrations() -> dict:
     """
     Scan the migrations/ directory, apply any pending .sql files in dependency
     order, and record each applied migration in the schema_migrations table.
 
+    - Migrations in SKIPPED_LEGACY_MIGRATIONS are quarantined and never applied;
+      each is logged with [MIGRATION_SKIPPED_LEGACY].
     - LeafLink repair migrations run first (see ``_order_migrations``).
     - Migrations in MIGRATION_DEPENDENCIES are topologically sorted so base
       tables are always created before the tables that reference them.
     - Migrations in CRITICAL_MIGRATIONS raise immediately on failure, aborting
       startup.  All other migrations are NONCRITICAL — failures are logged and
       the runner continues with the remaining files.
+    - Each applied migration records a SHA-256 checksum; if a previously-applied
+      file has changed on disk, [MIGRATION_CHECKSUM_CHANGED] is logged.
     - A [MIGRATION_SUMMARY] line is logged after all migrations have been
-      attempted, reporting applied/failed_critical/failed_noncritical counts.
+      attempted, reporting discovered/skipped/applied/failed counts.
 
-    Returns a list of migration filenames that were applied in this run.
+    Returns a dict with keys:
+      applied          — list of filenames applied in this run
+      skipped_legacy   — list of filenames quarantined
+      failed_critical  — list of filenames that caused a critical failure
+      failed_noncritical — list of filenames that failed non-critically
     """
     from database import engine
 
     if engine is None:
         logger.warning("[Migration] DATABASE_URL not set — skipping migrations")
-        return []
+        return {
+            "applied": [],
+            "skipped_legacy": [],
+            "failed_critical": [],
+            "failed_noncritical": [],
+        }
 
     applied: list[str] = []
+    skipped_legacy: list[str] = []
     failed_critical: list[str] = []
     failed_noncritical: list[str] = []
+    raw_files: list[str] = []  # populated inside try; used in summary
 
     try:
         # Collect and sort migration files by dependency order.
         if not os.path.isdir(MIGRATIONS_DIR):
             logger.warning("[Migration] migrations directory not found at %s", MIGRATIONS_DIR)
-            return []
+            return {
+                "applied": [],
+                "skipped_legacy": [],
+                "failed_critical": [],
+                "failed_noncritical": [],
+            }
 
         raw_files = [f for f in os.listdir(MIGRATIONS_DIR) if f.endswith(".sql")]
+
+        # Log all discovered files before any filtering.
+        for disc_file in sorted(raw_files):
+            logger.info("[MIGRATION_DISCOVERED] file=%s", disc_file)
+
         sql_files = _order_migrations(raw_files)
 
         if not sql_files:
             logger.info("[Migration] no migration files found")
-            return []
+            return {
+                "applied": [],
+                "skipped_legacy": [],
+                "failed_critical": [],
+                "failed_noncritical": [],
+            }
 
         # Bootstrap: ensure the tracking table exists in its own transaction.
         # This is a CRITICAL step — if it fails, we cannot track migrations at all.
@@ -294,6 +389,9 @@ async def run_migrations() -> list[str]:
             async with engine.connect() as bootstrap_conn:
                 for stmt in _split_statements(CREATE_SCHEMA_MIGRATIONS_TABLE):
                     await bootstrap_conn.exec_driver_sql(stmt)
+                # Upgrade existing table with new columns (idempotent).
+                for upgrade_stmt in _SCHEMA_MIGRATIONS_UPGRADE_STMTS:
+                    await bootstrap_conn.exec_driver_sql(upgrade_stmt)
                 await bootstrap_conn.commit()
         except Exception as bootstrap_exc:
             logger.error(
@@ -305,10 +403,32 @@ async def run_migrations() -> list[str]:
                 f"[Migration] Critical failure: could not bootstrap schema_migrations table: {bootstrap_exc}"
             )
 
+        # Log the execution plan (post-quarantine-filter order).
+        plan_files = [f for f in sql_files if _should_skip_migration(f) is None]
+        for plan_idx, plan_file in enumerate(plan_files, start=1):
+            is_crit = plan_file in CRITICAL_MIGRATIONS
+            logger.info(
+                "[MIGRATION_EXECUTION_PLAN] order=%d file=%s critical=%s",
+                plan_idx,
+                plan_file,
+                is_crit,
+            )
+
         # Apply each migration in an independent top-level transaction so that a
         # failure in one file does not abort the remaining migrations (unless the
         # migration is classified as CRITICAL).
         for order_idx, filename in enumerate(sql_files, start=1):
+            # --- Quarantine check ---
+            skip_reason = _should_skip_migration(filename)
+            if skip_reason is not None:
+                logger.info(
+                    "[MIGRATION_SKIPPED_LEGACY] file=%s reason=%s",
+                    filename,
+                    skip_reason,
+                )
+                skipped_legacy.append(filename)
+                continue
+
             is_critical = filename in CRITICAL_MIGRATIONS
             logger.info(
                 "[MIGRATION_ORDER] executing_migration=%s order=%d critical=%s",
@@ -317,21 +437,37 @@ async def run_migrations() -> list[str]:
                 is_critical,
             )
             try:
-                # Use a plain connection (no implicit transaction) to check whether
-                # this migration has already been applied.
-                async with engine.connect() as check_conn:
-                    row = await check_conn.exec_driver_sql(
-                        "SELECT 1 FROM schema_migrations WHERE migration_name = $1",
-                        (filename,),
-                    )
-                    if row.fetchone() is not None:
-                        logger.debug("[Migration] already applied migration=%s — skipping", filename)
-                        continue
-
-                # Read the migration SQL before opening the transaction connection.
+                # Read the migration SQL before opening any connection.
                 migration_path = os.path.join(MIGRATIONS_DIR, filename)
                 with open(migration_path, "r", encoding="utf-8") as fh:
                     sql = fh.read()
+
+                current_checksum = _compute_checksum(sql)
+
+                # Use a plain connection (no implicit transaction) to check whether
+                # this migration has already been applied and verify its checksum.
+                async with engine.connect() as check_conn:
+                    row = await check_conn.exec_driver_sql(
+                        "SELECT checksum FROM schema_migrations WHERE migration_name = $1",
+                        (filename,),
+                    )
+                    existing = row.fetchone()
+                    if existing is not None:
+                        stored_checksum = existing[0]
+                        if stored_checksum and stored_checksum != current_checksum:
+                            logger.warning(
+                                "[MIGRATION_CHECKSUM_CHANGED] migration=%s "
+                                "stored_checksum=%s current_checksum=%s "
+                                "action=skipping_already_applied",
+                                filename,
+                                stored_checksum,
+                                current_checksum,
+                            )
+                        else:
+                            logger.debug(
+                                "[Migration] already applied migration=%s — skipping", filename
+                            )
+                        continue
 
                 logger.info("[Migration] applying migration=%s", filename)
                 start_ms = time.monotonic()
@@ -356,16 +492,18 @@ async def run_migrations() -> list[str]:
                     # Record the migration as applied inside the same transaction
                     # so it is atomically committed or rolled back with the migration.
                     await conn.exec_driver_sql(
-                        "INSERT INTO schema_migrations (migration_name, duration_ms) "
-                        "VALUES ($1, $2)",
-                        (filename, duration_ms),
+                        "INSERT INTO schema_migrations "
+                        "(migration_name, duration_ms, checksum, success) "
+                        "VALUES ($1, $2, $3, $4)",
+                        (filename, duration_ms, current_checksum, True),
                     )
                 # Transaction is committed automatically when engine.begin() block exits.
 
                 logger.info(
-                    "[MIGRATION_EXECUTED] migration=%s status=success duration_ms=%s",
+                    "[MIGRATION_EXECUTED] migration=%s status=success duration_ms=%s checksum=%s",
                     filename,
                     duration_ms,
+                    current_checksum[:12],
                 )
                 applied.append(filename)
 
@@ -403,10 +541,14 @@ async def run_migrations() -> list[str]:
     except Exception as exc:
         logger.error("[Migration] runner error=%s", exc, exc_info=True)
 
-    total = len(applied) + len(failed_critical) + len(failed_noncritical)
+    discovered_count = len(raw_files) if os.path.isdir(MIGRATIONS_DIR) else 0
+    total_attempted = len(applied) + len(failed_critical) + len(failed_noncritical)
     logger.info(
-        "[MIGRATION_SUMMARY] total=%d applied=%d failed_critical=%d failed_noncritical=%d",
-        total,
+        "[MIGRATION_SUMMARY] discovered=%d skipped_legacy=%d attempted=%d "
+        "applied=%d failed_critical=%d failed_noncritical=%d",
+        discovered_count,
+        len(skipped_legacy),
+        total_attempted,
         len(applied),
         len(failed_critical),
         len(failed_noncritical),
@@ -416,5 +558,15 @@ async def run_migrations() -> list[str]:
             "[MIGRATION_SUMMARY] failed_noncritical_migrations=%s",
             ", ".join(failed_noncritical),
         )
+    if skipped_legacy:
+        logger.info(
+            "[MIGRATION_SUMMARY] skipped_legacy_migrations=%s",
+            ", ".join(skipped_legacy),
+        )
 
-    return applied
+    return {
+        "applied": applied,
+        "skipped_legacy": skipped_legacy,
+        "failed_critical": failed_critical,
+        "failed_noncritical": failed_noncritical,
+    }
