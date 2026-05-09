@@ -15,7 +15,7 @@ from sqlalchemy import DateTime, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from database import Base
+from models.base import Base
 
 
 def utc_now() -> datetime:

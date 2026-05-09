@@ -5,7 +5,11 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase
+
+# Import Base from models.base so that importing database.py does NOT
+# trigger engine creation when models import Base.  Both database.py and
+# models/__init__.py share the same Base instance via this module.
+from models.base import Base  # noqa: F401 — re-exported for backward compat
 
 logger = logging.getLogger("opsyn-backend")
 
@@ -61,10 +65,6 @@ _bootstrap_complete = False
 
 # DATABASE_URL is computed lazily so importing this module never raises.
 DATABASE_URL: str = ""
-
-
-class Base(DeclarativeBase):
-    pass
 
 
 def is_bootstrap_complete() -> bool:
