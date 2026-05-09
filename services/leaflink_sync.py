@@ -26,6 +26,60 @@ if TYPE_CHECKING:
 logger = logging.getLogger("leaflink_sync")
 
 
+def sanitize_json_payload(obj: Any) -> Any:
+    """Recursively sanitize an object for JSON serialization.
+
+    Converts datetime/date/Decimal/UUID objects to JSON-safe primitives.
+    This is ONLY for JSON payload columns (raw_payload, line_items_json).
+    DO NOT apply to DB timestamp columns.
+
+    Args:
+        obj: Any Python object
+
+    Returns:
+        JSON-safe version of obj
+    """
+    if obj is None:
+        return None
+
+    # datetime → ISO UTC string
+    if isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            obj = obj.replace(tzinfo=timezone.utc)
+        return obj.astimezone(timezone.utc).isoformat()
+
+    # date → ISO date string
+    if isinstance(obj, date) and not isinstance(obj, datetime):
+        return obj.isoformat()
+
+    # Decimal → float
+    if isinstance(obj, Decimal):
+        return float(obj)
+
+    # UUID → str
+    if isinstance(obj, UUID):
+        return str(obj)
+
+    # dict → recurse
+    if isinstance(obj, dict):
+        return {k: sanitize_json_payload(v) for k, v in obj.items()}
+
+    # list → recurse
+    if isinstance(obj, list):
+        return [sanitize_json_payload(item) for item in obj]
+
+    # tuple → list (JSON doesn't have tuples)
+    if isinstance(obj, tuple):
+        return [sanitize_json_payload(item) for item in obj]
+
+    # Primitive types pass through
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # Fallback: convert to string
+    return str(obj)
+
+
 def ensure_utc_datetime(value: Any) -> Optional[datetime]:
     """Ensure a datetime value is timezone-aware UTC for DB binding.
 
@@ -2600,6 +2654,30 @@ async def sync_leaflink_orders_headers_only(
     transaction_abort = 0
     datetime_normalization_failures = 0
 
+    # Exception fingerprinting — track dominant failures
+    exception_fingerprints: dict[str, dict] = {}
+
+    def record_exception_fingerprint(exc: Exception, external_id: str, order_number: str, stage: str, field: str = None):
+        """Record exception fingerprint for aggregation."""
+        exc_type = type(exc).__name__
+        exc_msg = str(exc)[:100]
+
+        # Create fingerprint key
+        fingerprint = f"{exc_type}:{exc_msg}"
+
+        if fingerprint not in exception_fingerprints:
+            exception_fingerprints[fingerprint] = {
+                "count": 0,
+                "exception_type": exc_type,
+                "exception_message": exc_msg,
+                "sample_external_id": external_id,
+                "sample_order_number": order_number,
+                "sample_stage": stage,
+                "sample_field": field,
+            }
+
+        exception_fingerprints[fingerprint]["count"] += 1
+
     # Split orders into batches of batch_size
     batches = [
         orders[i : i + batch_size]
@@ -2892,6 +2970,26 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             update_params = normalize_datetime_fields(update_params)
                             update_params = apply_uuid_str_to_params(update_params)
 
+                            # Sanitize JSON payloads — convert datetime/date/Decimal/UUID to JSON-safe strings
+                            # ONLY for JSON columns; DB timestamp columns remain timezone-aware datetime objects
+                            if "raw_payload" in update_params and update_params["raw_payload"] is not None:
+                                try:
+                                    _raw_payload_obj = json.loads(update_params["raw_payload"]) if isinstance(update_params["raw_payload"], str) else update_params["raw_payload"]
+                                    _sanitized = sanitize_json_payload(_raw_payload_obj)
+                                    update_params["raw_payload"] = json.dumps(_sanitized)
+                                    logger.debug("[JSON_PAYLOAD_SANITIZED] field=raw_payload action=update")
+                                except Exception as _san_exc:
+                                    logger.warning("[JSON_SANITIZE_ERROR] field=raw_payload action=update error=%s", str(_san_exc)[:200])
+
+                            if "line_items_json" in update_params and update_params["line_items_json"] is not None:
+                                try:
+                                    _li_obj = json.loads(update_params["line_items_json"]) if isinstance(update_params["line_items_json"], str) else update_params["line_items_json"]
+                                    _sanitized = sanitize_json_payload(_li_obj)
+                                    update_params["line_items_json"] = json.dumps(_sanitized)
+                                    logger.debug("[JSON_PAYLOAD_SANITIZED] field=line_items_json action=update")
+                                except Exception as _san_exc:
+                                    logger.warning("[JSON_SANITIZE_ERROR] field=line_items_json action=update error=%s", str(_san_exc)[:200])
+
                             # Normalize ALL datetime fields to UTC-aware before SQL execution
                             update_params["synced_at"] = ensure_utc_datetime(update_params.get("synced_at"))
                             update_params["last_synced_at"] = ensure_utc_datetime(update_params.get("last_synced_at"))
@@ -2910,6 +3008,28 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                                         datetime_normalization_failures += 1
                                     assert _value.tzinfo is not None, f"[DATETIME_NORMALIZATION_FAILED] {_field} is naive"
                                     logger.debug("[DATETIME_AUDIT] field=%s tzinfo=%s aware=true", _field, _value.tzinfo)
+
+                            # Assertion: verify no datetime/date objects in JSON columns
+                            for _col in ["raw_payload", "line_items_json"]:
+                                if _col in update_params and update_params[_col] is not None:
+                                    _val = update_params[_col]
+                                    if isinstance(_val, str):
+                                        try:
+                                            _obj = json.loads(_val)
+                                            _json_str = json.dumps(_obj)  # Will fail if datetime objects present
+                                        except TypeError as _json_exc:
+                                            logger.error("[JSON_PAYLOAD_CONTAMINATED] field=%s action=update error=%s", _col, str(_json_exc)[:200])
+                                            raise
+
+                            # Assertion: verify all DB datetime columns are timezone-aware
+                            for _dt_col in ["synced_at", "last_synced_at", "created_at", "updated_at", "external_created_at", "external_updated_at"]:
+                                if _dt_col in update_params and update_params[_dt_col] is not None:
+                                    _dt = update_params[_dt_col]
+                                    assert isinstance(_dt, datetime), f"[DB_DATETIME_VALIDATION_FAILED] {_dt_col} is not datetime"
+                                    assert _dt.tzinfo is not None, f"[DB_DATETIME_VALIDATION_FAILED] {_dt_col} is naive"
+
+                            logger.debug("[DB_DATETIME_VALIDATED] all datetime columns are UTC-aware action=update")
+
                             # Hard block: never execute UPDATE with org_id=None
                             if update_params.get("org_id") is None:
                                 logger.error(
@@ -3071,6 +3191,26 @@ INSERT INTO orders (
                             insert_params = normalize_datetime_fields(insert_params)
                             insert_params = apply_uuid_str_to_params(insert_params)
 
+                            # Sanitize JSON payloads — convert datetime/date/Decimal/UUID to JSON-safe strings
+                            # ONLY for JSON columns; DB timestamp columns remain timezone-aware datetime objects
+                            if "raw_payload" in insert_params and insert_params["raw_payload"] is not None:
+                                try:
+                                    _raw_payload_obj = json.loads(insert_params["raw_payload"]) if isinstance(insert_params["raw_payload"], str) else insert_params["raw_payload"]
+                                    _sanitized = sanitize_json_payload(_raw_payload_obj)
+                                    insert_params["raw_payload"] = json.dumps(_sanitized)
+                                    logger.debug("[JSON_PAYLOAD_SANITIZED] field=raw_payload action=insert")
+                                except Exception as _san_exc:
+                                    logger.warning("[JSON_SANITIZE_ERROR] field=raw_payload action=insert error=%s", str(_san_exc)[:200])
+
+                            if "line_items_json" in insert_params and insert_params["line_items_json"] is not None:
+                                try:
+                                    _li_obj = json.loads(insert_params["line_items_json"]) if isinstance(insert_params["line_items_json"], str) else insert_params["line_items_json"]
+                                    _sanitized = sanitize_json_payload(_li_obj)
+                                    insert_params["line_items_json"] = json.dumps(_sanitized)
+                                    logger.debug("[JSON_PAYLOAD_SANITIZED] field=line_items_json action=insert")
+                                except Exception as _san_exc:
+                                    logger.warning("[JSON_SANITIZE_ERROR] field=line_items_json action=insert error=%s", str(_san_exc)[:200])
+
                             # Normalize ALL datetime fields to UTC-aware before SQL execution
                             insert_params["synced_at"] = ensure_utc_datetime(insert_params.get("synced_at"))
                             insert_params["last_synced_at"] = ensure_utc_datetime(insert_params.get("last_synced_at"))
@@ -3089,6 +3229,27 @@ INSERT INTO orders (
                                         datetime_normalization_failures += 1
                                     assert _value.tzinfo is not None, f"[DATETIME_NORMALIZATION_FAILED] {_field} is naive"
                                     logger.debug("[DATETIME_AUDIT] field=%s tzinfo=%s aware=true", _field, _value.tzinfo)
+
+                            # Assertion: verify no datetime/date objects in JSON columns
+                            for _col in ["raw_payload", "line_items_json"]:
+                                if _col in insert_params and insert_params[_col] is not None:
+                                    _val = insert_params[_col]
+                                    if isinstance(_val, str):
+                                        try:
+                                            _obj = json.loads(_val)
+                                            _json_str = json.dumps(_obj)  # Will fail if datetime objects present
+                                        except TypeError as _json_exc:
+                                            logger.error("[JSON_PAYLOAD_CONTAMINATED] field=%s action=insert error=%s", _col, str(_json_exc)[:200])
+                                            raise
+
+                            # Assertion: verify all DB datetime columns are timezone-aware
+                            for _dt_col in ["synced_at", "last_synced_at", "created_at", "updated_at", "external_created_at", "external_updated_at"]:
+                                if _dt_col in insert_params and insert_params[_dt_col] is not None:
+                                    _dt = insert_params[_dt_col]
+                                    assert isinstance(_dt, datetime), f"[DB_DATETIME_VALIDATION_FAILED] {_dt_col} is not datetime"
+                                    assert _dt.tzinfo is not None, f"[DB_DATETIME_VALIDATION_FAILED] {_dt_col} is naive"
+
+                            logger.debug("[DB_DATETIME_VALIDATED] all datetime columns are UTC-aware action=insert")
 
                             # Hard block: never execute INSERT with org_id=None
                             if insert_params.get("org_id") is None:
@@ -3179,6 +3340,35 @@ INSERT INTO orders (
                             )
                             insert_rollback += 1
                             transaction_abort += 1
+
+                            # Exception fingerprinting — detect dominant failure pattern
+                            _fp_exc_type = type(_order_exc).__name__
+                            _fp_exc_msg = str(_order_exc)[:200]
+                            _fp_field = None
+                            if "column" in _fp_exc_msg.lower():
+                                import re as _re
+                                _fp_match = _re.search(r'column "([^"]+)"', _fp_exc_msg)
+                                if _fp_match:
+                                    _fp_field = _fp_match.group(1)
+                            logger.error(
+                                "[ORDER_FAILURE_FINGERPRINT] exception_type=%s message=%s field=%s "
+                                "page=%s external_id=%s order_number=%s stage=%s",
+                                _fp_exc_type,
+                                _fp_exc_msg[:100],
+                                _fp_field or "unknown",
+                                pages_fetched,
+                                _order_ext_id_for_log,
+                                _order_number_for_log,
+                                "header_insert",
+                            )
+                            record_exception_fingerprint(
+                                _order_exc,
+                                _order_ext_id_for_log,
+                                _order_number_for_log or "unknown",
+                                "header_insert",
+                                _fp_field,
+                            )
+
                             logger.error(
                                 "[TRANSACTION_ABORT] external_id=%s error=%s",
                                 _order_ext_id_for_log,
@@ -3428,6 +3618,31 @@ INSERT INTO orders (
             brand_id_value,
             str(_fv_exc)[:200],
         )
+
+    # Aggregate exception fingerprints — log dominant failure patterns
+    if exception_fingerprints:
+        logger.info("[TOP_FAILURE_FINGERPRINTS] total_unique_failures=%s", len(exception_fingerprints))
+
+        # Sort by count descending
+        sorted_fingerprints = sorted(
+            exception_fingerprints.items(),
+            key=lambda x: x[1]["count"],
+            reverse=True,
+        )
+
+        # Log top 5
+        for i, (fingerprint, data) in enumerate(sorted_fingerprints[:5]):
+            logger.error(
+                "[TOP_FAILURE_FINGERPRINTS] rank=%s count=%s exception_type=%s message=%s "
+                "sample_external_id=%s sample_stage=%s sample_field=%s",
+                i + 1,
+                data["count"],
+                data["exception_type"],
+                data["exception_message"][:100],
+                data["sample_external_id"],
+                data["sample_stage"],
+                data["sample_field"] or "unknown",
+            )
 
     logger.info(
         "[SYNC_FINAL_ACCOUNTING] brand_id=%s org_id=%s "
