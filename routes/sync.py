@@ -489,3 +489,99 @@ async def trigger_leaflink_sync(
         "sync_request_id": sync_req.id,
         "brand_id": brand_id,
     }
+
+
+@router.get("/leaflink/webhook-status")
+async def get_webhook_status(
+    brand_id: str = Query(..., description="Brand ID to query webhook status for"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get per-brand webhook configuration and event statistics.
+
+    Returns webhook enablement flags, key configuration, and counts of
+    resolved/unresolved/ambiguous/failed-signature webhook events.
+    """
+    from models import BrandAPICredential, LeafLinkWebhookEvent
+    from sqlalchemy import case, func
+
+    # Load credential
+    cred_result = await db.execute(
+        select(BrandAPICredential).where(
+            BrandAPICredential.brand_id == brand_id,
+            BrandAPICredential.integration_name == "leaflink",
+        )
+    )
+    cred = cred_result.scalar_one_or_none()
+
+    # Aggregate webhook event counts
+    unresolved_events = 0
+    ambiguous_events = 0
+    failed_signature_events = 0
+    duplicates_ignored = 0
+
+    try:
+        event_counts_result = await db.execute(
+            select(
+                LeafLinkWebhookEvent.resolution_status,
+                func.count(LeafLinkWebhookEvent.id).label("cnt"),
+            )
+            .where(LeafLinkWebhookEvent.brand_id == brand_id)
+            .group_by(LeafLinkWebhookEvent.resolution_status)
+        )
+        for row in event_counts_result.fetchall():
+            status, cnt = row
+            if status == "unresolved":
+                unresolved_events = cnt
+            elif status == "ambiguous":
+                ambiguous_events = cnt
+    except Exception as exc:
+        logger.warning(
+            "[WEBHOOK_STATUS] event_count_error brand_id=%s error=%s",
+            brand_id,
+            str(exc)[:200],
+        )
+
+    try:
+        sig_fail_result = await db.execute(
+            select(func.count(LeafLinkWebhookEvent.id)).where(
+                LeafLinkWebhookEvent.brand_id == brand_id,
+                LeafLinkWebhookEvent.signature_valid == False,  # noqa: E712
+            )
+        )
+        failed_signature_events = sig_fail_result.scalar_one() or 0
+    except Exception as exc:
+        logger.warning(
+            "[WEBHOOK_STATUS] sig_fail_count_error brand_id=%s error=%s",
+            brand_id,
+            str(exc)[:200],
+        )
+
+    if cred is None:
+        return {
+            "ok": True,
+            "brand_id": brand_id,
+            "webhook_enabled": False,
+            "webhook_signature_required": True,
+            "webhook_key_configured": False,
+            "webhook_key_last4": None,
+            "leaflink_company_id": None,
+            "unresolved_events": unresolved_events,
+            "ambiguous_events": ambiguous_events,
+            "failed_signature_events": failed_signature_events,
+            "duplicates_ignored": duplicates_ignored,
+            "error": "No LeafLink credential found for this brand",
+        }
+
+    return {
+        "ok": True,
+        "brand_id": brand_id,
+        "webhook_enabled": getattr(cred, "webhook_enabled", False),
+        "webhook_signature_required": getattr(cred, "webhook_signature_required", True),
+        "webhook_key_configured": bool(getattr(cred, "webhook_key_secret_ref", None)),
+        "webhook_key_last4": getattr(cred, "webhook_key_last4", None),
+        "leaflink_company_id": getattr(cred, "leaflink_company_id", None),
+        "unresolved_events": unresolved_events,
+        "ambiguous_events": ambiguous_events,
+        "failed_signature_events": failed_signature_events,
+        "duplicates_ignored": duplicates_ignored,
+    }

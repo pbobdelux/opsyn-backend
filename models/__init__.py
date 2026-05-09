@@ -66,12 +66,36 @@ class BrandAPICredential(Base):
         default=None,
         comment="Auto-detected auth scheme: Bearer, Token, or Raw",
     )
-    # Webhook support
-    webhook_key: Mapped[Optional[str]] = mapped_column(
+    # Webhook support — secrets stored in AWS Secrets Manager, never plaintext
+    webhook_key_secret_ref: Mapped[Optional[str]] = mapped_column(
         String(255),
         nullable=True,
         default=None,
-        comment="LeafLink webhook secret for HMAC-SHA256 signature verification",
+        comment="AWS Secrets Manager secret name/ARN for the LeafLink webhook key",
+    )
+    webhook_key_last4: Mapped[Optional[str]] = mapped_column(
+        String(4),
+        nullable=True,
+        default=None,
+        comment="Last 4 characters of the webhook key for display/verification",
+    )
+    webhook_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="Feature flag: enable webhook-first sync for this brand",
+    )
+    webhook_signature_required: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        comment="Per-brand: require valid LL-Signature on inbound webhooks",
+    )
+    leaflink_company_id: Mapped[Optional[str]] = mapped_column(
+        String(120),
+        nullable=True,
+        default=None,
+        comment="LeafLink company ID used for webhook tenant resolution",
     )
     org_id: Mapped[Optional[str]] = mapped_column(
         String(120),
@@ -688,4 +712,80 @@ class SyncMetricsSnapshot(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
+# =============================================================================
+# LeafLink Webhook Event Model — inbound webhook audit log with tenant resolution
+# =============================================================================
+
+class LeafLinkWebhookEvent(Base):
+    """
+    Audit log for every inbound LeafLink webhook payload.
+
+    Stores the raw payload, tenant resolution outcome, and signature
+    verification result so operators can diagnose delivery failures,
+    unresolved tenants, and signature mismatches without re-processing.
+
+    Resolution statuses:
+      resolved   — brand_id + org_id identified unambiguously
+      unresolved — no matching credential found for the company_id
+      ambiguous  — multiple credentials matched the same company_id
+
+    Signature statuses (signature_valid):
+      None  — signature check was skipped (webhook_signature_required=false)
+      True  — signature verified successfully
+      False — signature missing or invalid
+    """
+
+    __tablename__ = "leaflink_webhook_events"
+    __table_args__ = (
+        Index("ix_webhook_events_brand_resolution", "brand_id", "resolution_status"),
+        Index("ix_webhook_events_resolution_created", "resolution_status", "created_at"),
+        Index("ix_webhook_events_created_at", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    # Raw event metadata
+    event_type: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    raw_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    # Tenant resolution
+    resolution_status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="unresolved",
+        comment="resolved | unresolved | ambiguous",
+    )
+    resolution_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    resolved_brand_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    resolved_org_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+
+    # Convenience alias — populated after resolution for query filtering
+    brand_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True, index=True)
+
+    # Company/seller IDs extracted from the payload for resolution
+    payload_company_id: Mapped[Optional[str]] = mapped_column(
+        String(120),
+        nullable=True,
+        comment="company_id extracted from the webhook payload",
+    )
+    payload_seller_id: Mapped[Optional[str]] = mapped_column(
+        String(120),
+        nullable=True,
+        comment="seller_id extracted from the webhook payload",
+    )
+
+    # Signature verification
+    signature_valid: Mapped[Optional[bool]] = mapped_column(
+        Boolean,
+        nullable=True,
+        comment="null=skipped, true=valid, false=invalid/missing",
+    )
+    signature_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
     )
