@@ -26,8 +26,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger("leaflink_sync")
 
 
-def sanitize_json_payload(obj: Any) -> Any:
-    """Recursively sanitize an object for JSON serialization.
+def sanitize_json_payload(obj: Any, _depth: int = 0, _seen: set = None) -> Any:
+    """Recursively sanitize an object for JSON serialization (with depth/size limits).
 
     Converts datetime/date/Decimal/UUID objects to JSON-safe primitives.
     This is ONLY for JSON payload columns (raw_payload, line_items_json).
@@ -35,10 +35,27 @@ def sanitize_json_payload(obj: Any) -> Any:
 
     Args:
         obj: Any Python object
+        _depth: Current recursion depth (internal use)
+        _seen: Set of object ids already visited (circular reference protection)
 
     Returns:
         JSON-safe version of obj
     """
+    MAX_DEPTH = 10
+    MAX_CONTAINER_SIZE = 1000
+
+    if _seen is None:
+        _seen = set()
+
+    # Depth limit
+    if _depth > MAX_DEPTH:
+        return "[max_depth_exceeded]"
+
+    # Circular reference protection
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return "[circular_reference]"
+
     if obj is None:
         return None
 
@@ -60,24 +77,65 @@ def sanitize_json_payload(obj: Any) -> Any:
     if isinstance(obj, UUID):
         return str(obj)
 
-    # dict → recurse
+    # dict → recurse (with size limit)
     if isinstance(obj, dict):
-        return {k: sanitize_json_payload(v) for k, v in obj.items()}
+        if len(obj) > MAX_CONTAINER_SIZE:
+            return f"[dict_too_large: {len(obj)} items]"
+        _seen.add(obj_id)
+        result = {k: sanitize_json_payload(v, _depth + 1, _seen) for k, v in obj.items()}
+        _seen.discard(obj_id)
+        return result
 
-    # list → recurse
+    # list → recurse (with size limit)
     if isinstance(obj, list):
-        return [sanitize_json_payload(item) for item in obj]
+        if len(obj) > MAX_CONTAINER_SIZE:
+            return f"[list_too_large: {len(obj)} items]"
+        _seen.add(obj_id)
+        result = [sanitize_json_payload(item, _depth + 1, _seen) for item in obj]
+        _seen.discard(obj_id)
+        return result
 
-    # tuple → list (JSON doesn't have tuples)
+    # tuple → list (with size limit)
     if isinstance(obj, tuple):
-        return [sanitize_json_payload(item) for item in obj]
+        if len(obj) > MAX_CONTAINER_SIZE:
+            return f"[tuple_too_large: {len(obj)} items]"
+        _seen.add(obj_id)
+        result = [sanitize_json_payload(item, _depth + 1, _seen) for item in obj]
+        _seen.discard(obj_id)
+        return result
 
     # Primitive types pass through
     if isinstance(obj, (str, int, float, bool)):
         return obj
 
-    # Fallback: convert to string
-    return str(obj)
+    # Fallback: convert to string (with truncation)
+    return str(obj)[:1000]
+
+
+def truncate_payload(payload: Any, max_size_kb: int = 25) -> Any:
+    """Truncate payload if too large to prevent oversized DB writes and log lines."""
+    if payload is None:
+        return None
+
+    payload_str = str(payload) if not isinstance(payload, str) else payload
+    max_bytes = max_size_kb * 1024
+
+    if len(payload_str) > max_bytes:
+        return payload_str[:max_bytes] + f"... [truncated, original size: {len(payload_str)} bytes]"
+
+    return payload
+
+
+def truncate_traceback(tb: str, max_size_kb: int = 8) -> str:
+    """Truncate traceback if too large to prevent log volume explosion."""
+    if not tb:
+        return ""
+
+    max_bytes = max_size_kb * 1024
+    if len(tb) > max_bytes:
+        return tb[:max_bytes] + f"... [truncated, original size: {len(tb)} bytes]"
+
+    return tb
 
 
 def ensure_utc_datetime(value: Any) -> Optional[datetime]:
@@ -2654,11 +2712,24 @@ async def sync_leaflink_orders_headers_only(
     transaction_abort = 0
     datetime_normalization_failures = 0
 
-    # Exception fingerprinting — track dominant failures
+    # Exception fingerprinting — track dominant failures (capped at 100)
     exception_fingerprints: dict[str, dict] = {}
+    MAX_FINGERPRINTS = 100
+
+    # Throttle ORDER_FAILURE_FINGERPRINT log volume — max once per unique fingerprint every 60s
+    _last_fingerprint_log_time: dict[str, float] = {}
+
+    def should_log_fingerprint(fingerprint: str) -> bool:
+        """Check if enough time has passed to log this fingerprint again."""
+        now = time.monotonic()
+        last_time = _last_fingerprint_log_time.get(fingerprint, 0)
+        if now - last_time > 60:
+            _last_fingerprint_log_time[fingerprint] = now
+            return True
+        return False
 
     def record_exception_fingerprint(exc: Exception, external_id: str, order_number: str, stage: str, field: str = None):
-        """Record exception fingerprint for aggregation."""
+        """Record exception fingerprint for aggregation (capped at 100)."""
         exc_type = type(exc).__name__
         exc_msg = str(exc)[:100]
 
@@ -2666,6 +2737,11 @@ async def sync_leaflink_orders_headers_only(
         fingerprint = f"{exc_type}:{exc_msg}"
 
         if fingerprint not in exception_fingerprints:
+            # Evict lowest-count entry if at capacity
+            if len(exception_fingerprints) >= MAX_FINGERPRINTS:
+                oldest_key = min(exception_fingerprints.keys(), key=lambda k: exception_fingerprints[k].get("count", 0))
+                del exception_fingerprints[oldest_key]
+
             exception_fingerprints[fingerprint] = {
                 "count": 0,
                 "exception_type": exc_type,
@@ -2974,21 +3050,31 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             # ONLY for JSON columns; DB timestamp columns remain timezone-aware datetime objects
                             if "raw_payload" in update_params and update_params["raw_payload"] is not None:
                                 try:
+                                    _san_start = time.monotonic()
                                     _raw_payload_obj = json.loads(update_params["raw_payload"]) if isinstance(update_params["raw_payload"], str) else update_params["raw_payload"]
                                     _sanitized = sanitize_json_payload(_raw_payload_obj)
-                                    update_params["raw_payload"] = json.dumps(_sanitized)
-                                    logger.debug("[JSON_PAYLOAD_SANITIZED] field=raw_payload action=update")
+                                    _san_duration = time.monotonic() - _san_start
+                                    if _san_duration > 2:
+                                        logger.warning("[SANITIZER_TIMEOUT] field=raw_payload action=update duration=%.2fs", _san_duration)
+                                    else:
+                                        update_params["raw_payload"] = json.dumps(_sanitized)
+                                        logger.debug("[JSON_PAYLOAD_SANITIZED] field=raw_payload action=update")
                                 except Exception as _san_exc:
-                                    logger.warning("[JSON_SANITIZE_ERROR] field=raw_payload action=update error=%s", str(_san_exc)[:200])
+                                    logger.debug("[JSON_SANITIZE_ERROR] field=raw_payload action=update error=%s", str(_san_exc)[:100])
 
                             if "line_items_json" in update_params and update_params["line_items_json"] is not None:
                                 try:
+                                    _san_start = time.monotonic()
                                     _li_obj = json.loads(update_params["line_items_json"]) if isinstance(update_params["line_items_json"], str) else update_params["line_items_json"]
                                     _sanitized = sanitize_json_payload(_li_obj)
-                                    update_params["line_items_json"] = json.dumps(_sanitized)
-                                    logger.debug("[JSON_PAYLOAD_SANITIZED] field=line_items_json action=update")
+                                    _san_duration = time.monotonic() - _san_start
+                                    if _san_duration > 2:
+                                        logger.warning("[SANITIZER_TIMEOUT] field=line_items_json action=update duration=%.2fs", _san_duration)
+                                    else:
+                                        update_params["line_items_json"] = json.dumps(_sanitized)
+                                        logger.debug("[JSON_PAYLOAD_SANITIZED] field=line_items_json action=update")
                                 except Exception as _san_exc:
-                                    logger.warning("[JSON_SANITIZE_ERROR] field=line_items_json action=update error=%s", str(_san_exc)[:200])
+                                    logger.debug("[JSON_SANITIZE_ERROR] field=line_items_json action=update error=%s", str(_san_exc)[:100])
 
                             # Normalize ALL datetime fields to UTC-aware before SQL execution
                             update_params["synced_at"] = ensure_utc_datetime(update_params.get("synced_at"))
@@ -3122,7 +3208,7 @@ INSERT INTO orders (
                             _sh_status_ins = "partial" if _sh_missing_ins else "ok"
                             _sh_missing_json_ins = json.dumps(_sh_missing_ins) if _sh_missing_ins else None
 
-                            logger.info(
+                            logger.debug(
                                 "[ORDER_INSERT_PREP] org_id=%s brand_id=%s external_order_id=%s"
                                 " customer=%s amount=%s status=%s",
                                 _sql_org_id,
@@ -3195,21 +3281,31 @@ INSERT INTO orders (
                             # ONLY for JSON columns; DB timestamp columns remain timezone-aware datetime objects
                             if "raw_payload" in insert_params and insert_params["raw_payload"] is not None:
                                 try:
+                                    _san_start = time.monotonic()
                                     _raw_payload_obj = json.loads(insert_params["raw_payload"]) if isinstance(insert_params["raw_payload"], str) else insert_params["raw_payload"]
                                     _sanitized = sanitize_json_payload(_raw_payload_obj)
-                                    insert_params["raw_payload"] = json.dumps(_sanitized)
-                                    logger.debug("[JSON_PAYLOAD_SANITIZED] field=raw_payload action=insert")
+                                    _san_duration = time.monotonic() - _san_start
+                                    if _san_duration > 2:
+                                        logger.warning("[SANITIZER_TIMEOUT] field=raw_payload action=insert duration=%.2fs", _san_duration)
+                                    else:
+                                        insert_params["raw_payload"] = json.dumps(_sanitized)
+                                        logger.debug("[JSON_PAYLOAD_SANITIZED] field=raw_payload action=insert")
                                 except Exception as _san_exc:
-                                    logger.warning("[JSON_SANITIZE_ERROR] field=raw_payload action=insert error=%s", str(_san_exc)[:200])
+                                    logger.debug("[JSON_SANITIZE_ERROR] field=raw_payload action=insert error=%s", str(_san_exc)[:100])
 
                             if "line_items_json" in insert_params and insert_params["line_items_json"] is not None:
                                 try:
+                                    _san_start = time.monotonic()
                                     _li_obj = json.loads(insert_params["line_items_json"]) if isinstance(insert_params["line_items_json"], str) else insert_params["line_items_json"]
                                     _sanitized = sanitize_json_payload(_li_obj)
-                                    insert_params["line_items_json"] = json.dumps(_sanitized)
-                                    logger.debug("[JSON_PAYLOAD_SANITIZED] field=line_items_json action=insert")
+                                    _san_duration = time.monotonic() - _san_start
+                                    if _san_duration > 2:
+                                        logger.warning("[SANITIZER_TIMEOUT] field=line_items_json action=insert duration=%.2fs", _san_duration)
+                                    else:
+                                        insert_params["line_items_json"] = json.dumps(_sanitized)
+                                        logger.debug("[JSON_PAYLOAD_SANITIZED] field=line_items_json action=insert")
                                 except Exception as _san_exc:
-                                    logger.warning("[JSON_SANITIZE_ERROR] field=line_items_json action=insert error=%s", str(_san_exc)[:200])
+                                    logger.debug("[JSON_SANITIZE_ERROR] field=line_items_json action=insert error=%s", str(_san_exc)[:100])
 
                             # Normalize ALL datetime fields to UTC-aware before SQL execution
                             insert_params["synced_at"] = ensure_utc_datetime(insert_params.get("synced_at"))
@@ -3350,17 +3446,19 @@ INSERT INTO orders (
                                 _fp_match = _re.search(r'column "([^"]+)"', _fp_exc_msg)
                                 if _fp_match:
                                     _fp_field = _fp_match.group(1)
-                            logger.error(
-                                "[ORDER_FAILURE_FINGERPRINT] exception_type=%s message=%s field=%s "
-                                "page=%s external_id=%s order_number=%s stage=%s",
-                                _fp_exc_type,
-                                _fp_exc_msg[:100],
-                                _fp_field or "unknown",
-                                pages_fetched,
-                                _order_ext_id_for_log,
-                                _order_number_for_log,
-                                "header_insert",
-                            )
+                            _fp_fingerprint = f"{_fp_exc_type}:{_fp_exc_msg[:100]}"
+                            if should_log_fingerprint(_fp_fingerprint):
+                                logger.error(
+                                    "[ORDER_FAILURE_FINGERPRINT] exception_type=%s message=%s field=%s "
+                                    "page=%s external_id=%s order_number=%s stage=%s",
+                                    _fp_exc_type,
+                                    _fp_exc_msg[:100],
+                                    _fp_field or "unknown",
+                                    pages_fetched,
+                                    _order_ext_id_for_log,
+                                    _order_number_for_log,
+                                    "header_insert",
+                                )
                             record_exception_fingerprint(
                                 _order_exc,
                                 _order_ext_id_for_log,
@@ -4145,7 +4243,7 @@ async def sync_leaflink_line_items(
                         retry_items.append((leaflink_order_id, o))
                         continue
 
-                    logger.info(
+                    logger.debug(
                         "[LINE_ITEM_ORDER_LOOKUP] leaflink_order_id=%s matched_order_id=%s",
                         leaflink_order_id,
                         order_row.id,
@@ -4250,7 +4348,7 @@ async def sync_leaflink_line_items(
                             )
                         continue
 
-                    logger.info(
+                    logger.debug(
                         "[LINE_ITEM_RETRY_SUCCESS] leaflink_order_id=%s matched_order_id=%s",
                         leaflink_order_id,
                         order_row.id,
@@ -4959,6 +5057,9 @@ async def sync_leaflink_background_continuous(
     pages_processed = 0
     records_seen_from_leaflink = 0
     next_cursor: Optional[str] = last_next_url
+    # Initialize fingerprint dicts here so the finally block can always reference them
+    exception_fingerprints: dict[str, dict] = {}
+    _last_fingerprint_log_time: dict[str, float] = {}
 
     # ---------------------------------------------------------------------------
     # Watchdog heartbeat — logs every 30s to confirm event loop is alive
@@ -5581,6 +5682,19 @@ async def sync_leaflink_background_continuous(
                 except Exception as _mem_exc:
                     logger.warning("[MEMORY_CHECK_ERROR] error=%s", str(_mem_exc)[:200])
 
+            # Backpressure: check memory every 5 pages and throttle if RSS > 500MB
+            if pages_processed % 5 == 0:
+                try:
+                    import psutil as _psutil
+                    _process = _psutil.Process(os.getpid())
+                    _rss_mb = _process.memory_info().rss / 1024 / 1024
+                    if _rss_mb > 500:
+                        logger.warning("[SYNC_BACKPRESSURE] rss_mb=%.1f reducing batch size", _rss_mb)
+                        batch_size = max(batch_size - 1, _BG_BATCH_MIN)
+                        await asyncio.sleep(1)
+                except Exception:
+                    pass
+
             # Log sampled progress every 10 pages (debug only — heartbeat covers this)
             if pages_processed % 10 == 0:
                 logger.debug(
@@ -5959,6 +6073,46 @@ async def sync_leaflink_background_continuous(
         sys.stdout.flush()
         raise
     finally:
+        # Flush TOP_FAILURE_FINGERPRINTS before exit (if available in outer scope)
+        try:
+            if exception_fingerprints:
+                sorted_fingerprints = sorted(
+                    exception_fingerprints.items(),
+                    key=lambda x: x[1]["count"],
+                    reverse=True,
+                )
+                for i, (fingerprint, data) in enumerate(sorted_fingerprints[:5]):
+                    logger.error(
+                        "[TOP_FAILURE_FINGERPRINTS] rank=%s count=%s exception_type=%s",
+                        i + 1,
+                        data["count"],
+                        data["exception_type"],
+                    )
+        except Exception:
+            pass
+
+        # Persist final sync state
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _final_db:
+                    await _final_db.execute(
+                        text("UPDATE sync_runs SET last_progress_at = :now WHERE id = :id"),
+                        {"now": datetime.now(timezone.utc), "id": sync_run_id},
+                    )
+                    await _final_db.commit()
+            except Exception:
+                pass
+
+        # Clear in-memory structures to release memory
+        try:
+            exception_fingerprints.clear()
+        except Exception:
+            pass
+        try:
+            _last_fingerprint_log_time.clear()
+        except Exception:
+            pass
+
         # Cancel heartbeat task
         _heartbeat.cancel()
         try:
