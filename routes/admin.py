@@ -30,6 +30,73 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 ADMIN_SEED_TOKEN = os.getenv("ADMIN_SEED_TOKEN", "opsyn-seed-2026")
 
 
+# =============================================================================
+# Endpoint: GET /admin/schema-status
+# Internal endpoint — returns live webhook schema health for debugging.
+# =============================================================================
+
+
+@router.get("/schema-status")
+async def get_schema_status(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return the live webhook schema health status.
+
+    Queries information_schema directly so the result always reflects the
+    current database state, not a cached startup snapshot.
+
+    Returns:
+        {
+          "ok": bool,
+          "critical_columns_present": bool,
+          "webhook_columns": {col: bool, ...},
+          "webhook_events_table_exists": bool,
+          "last_recovery_at": str | null,
+          "recovery_status": str,
+        }
+    """
+    from services.migration_recovery import (
+        _CRITICAL_CREDENTIAL_COLUMNS,
+        _get_existing_credential_columns,
+        _webhook_events_table_exists,
+    )
+
+    try:
+        existing_cols = await _get_existing_credential_columns(db)
+        webhook_columns = {c: (c in existing_cols) for c in _CRITICAL_CREDENTIAL_COLUMNS}
+        critical_columns_present = all(webhook_columns.values())
+
+        events_table_exists = await _webhook_events_table_exists(db)
+
+        ok = critical_columns_present and events_table_exists
+
+        logger.info(
+            "[SCHEMA_STATUS] ok=%s critical_columns_present=%s "
+            "events_table_exists=%s",
+            ok,
+            critical_columns_present,
+            events_table_exists,
+        )
+
+        return {
+            "ok": ok,
+            "critical_columns_present": critical_columns_present,
+            "webhook_columns": webhook_columns,
+            "webhook_events_table_exists": events_table_exists,
+            "last_recovery_at": None,
+            "recovery_status": "verified" if ok else "schema_incomplete",
+        }
+
+    except Exception as exc:
+        logger.error(
+            "[SCHEMA_STATUS] check_failed error=%s", exc, exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Schema status check failed: {str(exc)[:300]}",
+        )
+
 
 @router.post("/seed-noble-nectar-credential")
 async def seed_noble_nectar_credential(
