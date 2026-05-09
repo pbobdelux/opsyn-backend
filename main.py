@@ -1,13 +1,38 @@
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+# ============================================================================
+# PHASE 1: BOOTSTRAP RECOVERY (BEFORE ANY ORM/ROUTER IMPORTS)
+#
+# This block runs at module level — before FastAPI, before any router import,
+# and before any ORM model is loaded.  It ensures that all critical schema
+# columns and tables exist in the live database so that SQLAlchemy never
+# encounters an UndefinedColumnError when it validates ORM models.
+#
+# Execution order:
+#   STEP 1: Configure logging
+#   STEP 2: Import database module (creates async engine — no ORM validation)
+#   STEP 3: Execute bootstrap_schema_recovery() via asyncio.run()
+#   STEP 4: ONLY IF SUCCESS → import ORM models and routers
+#   STEP 5: Create FastAPI app
+#   STEP 6: Register routers
+#   STEP 7: Start schedulers
+# ============================================================================
+
 import asyncio
 import logging
 import os
 import traceback
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import Optional
 
-from services.sync_scheduler import run_scheduler
+# Configure logging first so all bootstrap log markers are visible
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
+logger = logging.getLogger("opsyn-backend")
+
+logger.info("[BOOTSTRAP_PRE_APP_START] initializing bootstrap recovery phase")
 
 # ---------------------------------------------------------------------------
 # Feature flags — read once at import time
@@ -18,41 +43,117 @@ LEAFLINK_REPROCESS_ENABLED = os.getenv("LEAFLINK_REPROCESS_ENABLED", "true").low
 LEAFLINK_MAX_RETRY_ATTEMPTS = int(os.getenv("LEAFLINK_MAX_RETRY_ATTEMPTS", "5"))
 LEAFLINK_SYNC_STALE_MINUTES = int(os.getenv("LEAFLINK_SYNC_STALE_MINUTES", "60"))
 
-from fastapi import Depends, FastAPI, HTTPException, Header, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+# ---------------------------------------------------------------------------
+# STEP 2: Import database module.
+# database.py validates DATABASE_URL and creates the async engine.
+# It does NOT import any ORM models — safe to import here.
+# ---------------------------------------------------------------------------
+from database import get_db  # noqa: E402  (also imports engine, AsyncSessionLocal)
 
-from database import get_db
-from models import BrandAPICredential
-from leaflink.orders import router as leaflink_orders_router
-from routes.ai import router as ai_router
-from routes.crm import router as crm_router
-from routes.health import router as health_router
-from routes.integrations import router as integrations_router
-from routes.integrations_health import router as integrations_health_router
-from routes.leaflink_debug import router as leaflink_debug_router
-from routes.orders import router as orders_router
-from routes.voice import router as voice_router
-from routes.voice_brain import router as voice_brain_router
-from routes.admin import router as admin_router
-from routes.debug import router as debug_router
-from routes.auth import router as auth_router
-from routes.webhooks import router as webhooks_router
-from routes.sync import router as sync_router, _webhook_router as webhook_status_router
-from routes.leaflink_webhook_config import router as leaflink_webhook_config_router
-from routes.diagnostics import router as diagnostics_router
-from routes.drivers import router as drivers_router
-from routes.routes import router as routes_router
-from routes.driver_app import router as driver_app_router
-from utils.json_utils import make_json_safe
+logger.info("[BOOTSTRAP_DB_URL_VALID] database module imported — async engine ready")
 
-logger = logging.getLogger("opsyn-backend")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-)
+# ---------------------------------------------------------------------------
+# STEP 3: Execute bootstrap schema recovery BEFORE any ORM imports.
+#
+# We use asyncio.run() to call the existing async bootstrap function with the
+# async engine from database.py.  This runs synchronously at module level and
+# completes before Python continues to the router imports below.
+# ---------------------------------------------------------------------------
+logger.info("[BOOTSTRAP_EXECUTION_BEGIN] starting pre-ORM bootstrap schema recovery")
+
+try:
+    from database import engine as _bootstrap_engine  # noqa: E402
+    from services.bootstrap_schema_recovery import bootstrap_schema_recovery as _bootstrap_fn  # noqa: E402
+
+    _bootstrap_result = asyncio.run(_bootstrap_fn(_bootstrap_engine))
+
+    if not _bootstrap_result["ok"]:
+        logger.error(
+            "[BOOTSTRAP_EXECUTION_FAILED] errors=%s",
+            _bootstrap_result["errors"],
+        )
+        raise RuntimeError(
+            f"Bootstrap schema recovery failed: {_bootstrap_result['errors']}"
+        )
+
+    logger.info(
+        "[BOOTSTRAP_EXECUTION_SUCCESS] columns_added=%s tables_created=%s indexes_created=%s",
+        _bootstrap_result["columns_added"],
+        _bootstrap_result["tables_created"],
+        _bootstrap_result["indexes_created"],
+    )
+
+except RuntimeError:
+    raise
+except Exception as _bootstrap_exc:
+    logger.error(
+        "[BOOTSTRAP_EXECUTION_FAILED] unexpected_error=%s",
+        _bootstrap_exc,
+        exc_info=True,
+    )
+    raise RuntimeError(f"Bootstrap recovery failed: {_bootstrap_exc}")
+
+logger.info("[BOOTSTRAP_PRE_ROUTER_IMPORT] bootstrap complete — safe to import ORM/routers")
+
+# ============================================================================
+# PHASE 2: NOW SAFE TO IMPORT ORM MODELS AND ROUTERS
+# Schema is verified — SQLAlchemy will not encounter UndefinedColumnError.
+# ============================================================================
+
+from fastapi import Depends, FastAPI, HTTPException, Header, Request  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
+from sqlalchemy import select  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
+
+from models import BrandAPICredential  # noqa: E402
+from leaflink.orders import router as leaflink_orders_router  # noqa: E402
+from routes.ai import router as ai_router  # noqa: E402
+from routes.crm import router as crm_router  # noqa: E402
+from routes.health import router as health_router  # noqa: E402
+from routes.integrations import router as integrations_router  # noqa: E402
+from routes.integrations_health import router as integrations_health_router  # noqa: E402
+from routes.leaflink_debug import router as leaflink_debug_router  # noqa: E402
+from routes.orders import router as orders_router  # noqa: E402
+from routes.voice import router as voice_router  # noqa: E402
+from routes.voice_brain import router as voice_brain_router  # noqa: E402
+from routes.admin import router as admin_router  # noqa: E402
+from routes.debug import router as debug_router  # noqa: E402
+from routes.auth import router as auth_router  # noqa: E402
+from routes.webhooks import router as webhooks_router  # noqa: E402
+from routes.sync import router as sync_router, _webhook_router as webhook_status_router  # noqa: E402
+from routes.leaflink_webhook_config import router as leaflink_webhook_config_router  # noqa: E402
+from routes.diagnostics import router as diagnostics_router  # noqa: E402
+from routes.drivers import router as drivers_router  # noqa: E402
+from routes.routes import router as routes_router  # noqa: E402
+from routes.driver_app import router as driver_app_router  # noqa: E402
+from utils.json_utils import make_json_safe  # noqa: E402
+from services.sync_scheduler import run_scheduler  # noqa: E402
+
+logger.info("[BOOTSTRAP_APP_INIT_CONTINUING] ORM/routers imported successfully")
+
+# ---------------------------------------------------------------------------
+# Update global bootstrap status in routes/admin.py so the
+# /admin/bootstrap-status endpoint reflects the module-level result.
+# ---------------------------------------------------------------------------
+try:
+    from routes.admin import _BOOTSTRAP_STATUS  # noqa: E402
+    _BOOTSTRAP_STATUS["executed"] = True
+    _BOOTSTRAP_STATUS["success"] = _bootstrap_result["ok"]
+    _BOOTSTRAP_STATUS["schema_verified"] = _bootstrap_result["ok"]
+    logger.info(
+        "[BOOTSTRAP_STATUS_SET] executed=true success=%s schema_verified=%s",
+        _bootstrap_result["ok"],
+        _bootstrap_result["ok"],
+    )
+except Exception as _status_exc:
+    logger.warning(
+        "[BOOTSTRAP_STATUS_SET] failed to set bootstrap status: %s", _status_exc
+    )
+
+# ============================================================================
+# PHASE 3: APP CONFIGURATION
+# ============================================================================
 
 # Thread pool for running synchronous LeafLink HTTP calls off the event loop.
 # This prevents requests.get() pagination from blocking async request handling.
@@ -308,14 +409,15 @@ async def lifespan(app: FastAPI):
     )
 
     # ---------------------------------------------------------------------------
-    # [BOOTSTRAP] Pure-SQL schema recovery — runs BEFORE any ORM imports.
+    # [BOOTSTRAP] Secondary schema recovery check inside lifespan.
     #
-    # This block repairs missing webhook columns and the leaflink_webhook_events
-    # table using only raw SQL against the engine.  It MUST execute before any
-    # ORM model is imported or queried so that SQLAlchemy never encounters a
-    # schema mismatch (UndefinedColumnError) during startup.
+    # The primary bootstrap already ran at module level (before any ORM imports)
+    # via asyncio.run() in Phase 1 of main.py.  This secondary check is a
+    # belt-and-suspenders pass that runs again inside the async lifespan context
+    # to catch any edge cases where the module-level run was skipped.
+    # It is idempotent — all DDL uses IF NOT EXISTS guards.
     # ---------------------------------------------------------------------------
-    logger.info("[BOOTSTRAP_SCHEMA_CHECK_START] initiating pre-ORM bootstrap schema recovery")
+    logger.info("[BOOTSTRAP_SCHEMA_CHECK_START] secondary lifespan bootstrap schema check")
     try:
         from services.bootstrap_schema_recovery import bootstrap_schema_recovery as _bootstrap_recovery
         from database import engine as _bootstrap_engine
@@ -353,7 +455,6 @@ async def lifespan(app: FastAPI):
             f"Bootstrap schema recovery raised an unexpected error: {_bootstrap_exc}"
         )
 
-    # ---------------------------------------------------------------------------
     # Log migration runner configuration
     # ---------------------------------------------------------------------------
     from services.migration_runner import MIGRATIONS_DIR as _MIGRATIONS_DIR
@@ -956,6 +1057,7 @@ app.include_router(routes_router)
 app.include_router(driver_app_router)
 
 logger.info("[Routes] registered all routers")
+logger.info("[BOOTSTRAP_COMPLETE] application fully initialized and ready")
 
 # Startup route dump
 logger.error("[STARTUP DEBUG] Registered routes:")

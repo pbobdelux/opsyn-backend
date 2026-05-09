@@ -25,6 +25,13 @@ Log markers emitted:
   [BOOTSTRAP_SCHEMA_RECOVERY_SUCCESS] — recovery completed successfully
   [BOOTSTRAP_SCHEMA_RECOVERY_FAILED]  — recovery failed (hard fail)
   [BOOTSTRAP_SCHEMA_CHECK_COMPLETE]   — bootstrap phase complete, safe to import ORM
+
+  Synchronous variant (bootstrap_schema_recovery_sync):
+  [BOOTSTRAP_PRE_APP_START]           — module-level bootstrap starting
+  [BOOTSTRAP_DB_URL_VALID]            — DATABASE_URL validated
+  [BOOTSTRAP_EXECUTION_BEGIN]         — synchronous recovery executing
+  [BOOTSTRAP_EXECUTION_SUCCESS]       — synchronous recovery completed
+  [BOOTSTRAP_EXECUTION_FAILED]        — synchronous recovery failed
 """
 
 import logging
@@ -359,6 +366,245 @@ async def bootstrap_schema_recovery(engine) -> dict:
         len(indexes_created),
         len(errors),
     )
+
+    return {
+        "ok": ok,
+        "columns_added": columns_added,
+        "tables_created": tables_created,
+        "indexes_created": indexes_created,
+        "errors": errors,
+        "recovered_at": recovered_at,
+    }
+
+
+def bootstrap_schema_recovery_sync(engine) -> dict:
+    """
+    Synchronous version of bootstrap schema recovery.
+
+    Runs at module level before any async code or ORM imports.
+    Uses synchronous engine.connect() instead of async.
+
+    This function is called at the very top of main.py — before FastAPI,
+    before any router imports, and before any ORM model is loaded — so that
+    the live schema is guaranteed to have all required columns before
+    SQLAlchemy ever inspects it.
+
+    Args:
+        engine: SQLAlchemy synchronous Engine instance (NOT AsyncEngine).
+
+    Returns:
+        {
+            "ok": bool,
+            "columns_added": list[str],
+            "tables_created": list[str],
+            "indexes_created": list[str],
+            "errors": list[str],
+            "recovered_at": str | None,
+        }
+    """
+    logger.info("[BOOTSTRAP_EXECUTION_BEGIN] starting synchronous bootstrap schema recovery")
+
+    columns_added: list[str] = []
+    tables_created: list[str] = []
+    indexes_created: list[str] = []
+    errors: list[str] = []
+
+    if engine is None:
+        err = "engine is None — cannot run bootstrap schema recovery"
+        logger.error("[BOOTSTRAP_EXECUTION_FAILED] %s", err)
+        return {
+            "ok": False,
+            "columns_added": [],
+            "tables_created": [],
+            "indexes_created": [],
+            "errors": [err],
+            "recovered_at": None,
+        }
+
+    try:
+        with engine.connect() as conn:
+            # ------------------------------------------------------------------
+            # 1. Query existing columns on brand_api_credentials
+            # ------------------------------------------------------------------
+            try:
+                result = conn.execute(
+                    text("""
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'brand_api_credentials'
+                    """)
+                )
+                existing_cols = {row[0] for row in result.fetchall()}
+                logger.info(
+                    "[BOOTSTRAP_EXECUTION_BEGIN] brand_api_credentials existing_columns=%s",
+                    sorted(existing_cols),
+                )
+            except Exception as exc:
+                err = f"column_check_failed error={str(exc)[:300]}"
+                logger.error("[BOOTSTRAP_EXECUTION_FAILED] %s", err, exc_info=True)
+                return {
+                    "ok": False,
+                    "columns_added": [],
+                    "tables_created": [],
+                    "indexes_created": [],
+                    "errors": [err],
+                    "recovered_at": None,
+                }
+
+            # ------------------------------------------------------------------
+            # 2. Check if leaflink_webhook_events table exists
+            # ------------------------------------------------------------------
+            try:
+                result = conn.execute(
+                    text("""
+                        SELECT 1
+                        FROM information_schema.tables
+                        WHERE table_schema = 'public'
+                          AND table_name = 'leaflink_webhook_events'
+                    """)
+                )
+                events_table_exists = result.fetchone() is not None
+            except Exception as exc:
+                err = f"table_check_failed error={str(exc)[:300]}"
+                logger.warning(
+                    "[BOOTSTRAP_EXECUTION_BEGIN] %s — assuming table missing", err
+                )
+                events_table_exists = False  # Assume missing; DDL is idempotent
+
+            # ------------------------------------------------------------------
+            # 3. Determine what needs recovery
+            # ------------------------------------------------------------------
+            missing_cols = [
+                (col_name, col_sql)
+                for col_name, col_sql in _CRITICAL_CREDENTIAL_COLUMNS
+                if col_name not in existing_cols
+            ]
+            recovery_needed = bool(missing_cols) or not events_table_exists
+
+            if not recovery_needed:
+                logger.info(
+                    "[BOOTSTRAP_EXECUTION_SUCCESS] no recovery needed — schema complete "
+                    "all_critical_columns_present=true events_table_exists=true"
+                )
+                return {
+                    "ok": True,
+                    "columns_added": [],
+                    "tables_created": [],
+                    "indexes_created": [],
+                    "errors": [],
+                    "recovered_at": None,
+                }
+
+            # ------------------------------------------------------------------
+            # 4. Recovery needed — log and execute
+            # ------------------------------------------------------------------
+            logger.warning(
+                "[BOOTSTRAP_EXECUTION_BEGIN] recovery_needed=true "
+                "missing_columns=%s events_table_missing=%s",
+                [c for c, _ in missing_cols],
+                not events_table_exists,
+            )
+
+            # Add missing credential columns
+            for col_name, col_sql in missing_cols:
+                try:
+                    conn.execute(text(col_sql))
+                    conn.commit()
+                    columns_added.append(col_name)
+                    logger.info(
+                        "[BOOTSTRAP_EXECUTION_BEGIN] column_added "
+                        "table=brand_api_credentials column=%s",
+                        col_name,
+                    )
+                except Exception as exc:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    err = f"add_column_failed column={col_name} error={str(exc)[:300]}"
+                    errors.append(err)
+                    logger.error("[BOOTSTRAP_EXECUTION_FAILED] %s", err, exc_info=True)
+
+            # Create leaflink_webhook_events table if missing
+            if not events_table_exists:
+                try:
+                    conn.execute(text(_WEBHOOK_EVENTS_TABLE_SQL))
+                    conn.commit()
+                    tables_created.append("leaflink_webhook_events")
+                    logger.info(
+                        "[BOOTSTRAP_EXECUTION_BEGIN] table_created "
+                        "table=leaflink_webhook_events"
+                    )
+                except Exception as exc:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    err = (
+                        f"create_table_failed table=leaflink_webhook_events "
+                        f"error={str(exc)[:300]}"
+                    )
+                    errors.append(err)
+                    logger.error("[BOOTSTRAP_EXECUTION_FAILED] %s", err, exc_info=True)
+
+            # Create indexes (IF NOT EXISTS guards make these safe to always attempt)
+            for idx_name, idx_sql in _WEBHOOK_EVENTS_INDEX_SQL:
+                try:
+                    conn.execute(text(idx_sql))
+                    conn.commit()
+                    indexes_created.append(idx_name)
+                    logger.info(
+                        "[BOOTSTRAP_EXECUTION_BEGIN] index_created index=%s",
+                        idx_name,
+                    )
+                except Exception as exc:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    err = f"create_index_failed index={idx_name} error={str(exc)[:300]}"
+                    errors.append(err)
+                    logger.error("[BOOTSTRAP_EXECUTION_FAILED] %s", err, exc_info=True)
+
+    except Exception as exc:
+        err = f"bootstrap_connection_failed error={str(exc)[:300]}"
+        logger.error("[BOOTSTRAP_EXECUTION_FAILED] %s", err, exc_info=True)
+        return {
+            "ok": False,
+            "columns_added": columns_added,
+            "tables_created": tables_created,
+            "indexes_created": indexes_created,
+            "errors": errors + [err],
+            "recovered_at": None,
+        }
+
+    # ------------------------------------------------------------------
+    # 5. Determine overall result
+    # ------------------------------------------------------------------
+    ok = len(errors) == 0
+    recovered_at = (
+        datetime.now(timezone.utc).isoformat()
+        if (columns_added or tables_created)
+        else None
+    )
+
+    if ok:
+        logger.info(
+            "[BOOTSTRAP_EXECUTION_SUCCESS] columns_added=%s tables_created=%s "
+            "indexes_created=%s",
+            columns_added,
+            tables_created,
+            indexes_created,
+        )
+    else:
+        logger.error(
+            "[BOOTSTRAP_EXECUTION_FAILED] errors=%s columns_added=%s "
+            "tables_created=%s",
+            errors,
+            columns_added,
+            tables_created,
+        )
 
     return {
         "ok": ok,

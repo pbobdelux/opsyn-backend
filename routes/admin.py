@@ -33,6 +33,47 @@ router.include_router(_raw_schema_check_router)
 # Admin seed token from environment
 ADMIN_SEED_TOKEN = os.getenv("ADMIN_SEED_TOKEN", "opsyn-seed-2026")
 
+# ---------------------------------------------------------------------------
+# Bootstrap status — populated by main.py at module level after the
+# synchronous bootstrap recovery completes (before any ORM imports).
+# ---------------------------------------------------------------------------
+_BOOTSTRAP_STATUS: dict = {
+    "executed": False,
+    "success": False,
+    "schema_verified": False,
+}
+
+
+# =============================================================================
+# Endpoint: GET /admin/bootstrap-status
+# Returns the result of the module-level bootstrap schema recovery.
+# =============================================================================
+
+
+@router.get("/bootstrap-status")
+async def get_bootstrap_status():
+    """
+    Return bootstrap recovery status.
+
+    Used for health checks to confirm schema recovery completed before ORM
+    usage.  The status is set at module level in main.py immediately after
+    bootstrap_schema_recovery_sync() succeeds.
+
+    Returns:
+        {
+            "bootstrap_executed": bool,
+            "bootstrap_success": bool,
+            "schema_verified": bool,
+            "critical_columns_present": bool,
+        }
+    """
+    return {
+        "bootstrap_executed": _BOOTSTRAP_STATUS["executed"],
+        "bootstrap_success": _BOOTSTRAP_STATUS["success"],
+        "schema_verified": _BOOTSTRAP_STATUS["schema_verified"],
+        "critical_columns_present": _BOOTSTRAP_STATUS["success"],
+    }
+
 
 # =============================================================================
 # Endpoint: GET /admin/schema-status
