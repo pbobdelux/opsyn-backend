@@ -119,6 +119,104 @@ sys.stdout.flush()
 # ============================================================================
 
 
+# =============================================================================
+# SYNC WORKER BOOTSTRAP & DATABASE INITIALIZATION
+# =============================================================================
+# The sync worker runs independently from the backend main.py, so it must
+# perform its own bootstrap schema recovery and database initialization.
+# This code runs at module import time to ensure the database is ready
+# before run_scheduler() is called.
+# =============================================================================
+
+async def _sync_worker_bootstrap() -> None:
+    """Execute bootstrap schema recovery for the sync worker."""
+    logger.info("[SYNC_WORKER_BOOTSTRAP_START] starting bootstrap schema recovery")
+
+    # Validate DATABASE_URL
+    database_url = os.getenv("DATABASE_URL", "")
+    if not database_url:
+        logger.error("[SYNC_WORKER_BOOTSTRAP_START] DATABASE_URL not set — cannot start")
+        sys.exit(1)
+
+    logger.info("[SYNC_WORKER_BOOTSTRAP_START] DATABASE_URL validated")
+
+    # Create minimal bootstrap engine
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    def _normalize_url(url: str) -> str:
+        """Minimal URL normalizer."""
+        url = url.strip()
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif url.startswith("postgresql://"):
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+        parsed = urlparse(url)
+        filtered = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+                    if k.lower() != "sslmode"]
+        return urlunparse(parsed._replace(query=urlencode(filtered)))
+
+    bootstrap_url = _normalize_url(database_url)
+    bootstrap_engine = create_async_engine(
+        bootstrap_url,
+        echo=False,
+        pool_pre_ping=True,
+        connect_args={"ssl": "require"},
+        execution_options={"compiled_cache": None},
+    )
+
+    try:
+        # Run bootstrap schema recovery
+        from services.bootstrap_schema_recovery import bootstrap_schema_recovery
+        result = await bootstrap_schema_recovery(bootstrap_engine)
+
+        if not result["ok"]:
+            logger.error(
+                "[SYNC_WORKER_BOOTSTRAP_FAILED] bootstrap recovery failed errors=%s",
+                result["errors"],
+            )
+            sys.exit(1)
+
+        logger.info(
+            "[SYNC_WORKER_BOOTSTRAP_SUCCESS] columns_added=%s tables_created=%s",
+            result["columns_added"],
+            result["tables_created"],
+        )
+    finally:
+        await bootstrap_engine.dispose()
+
+
+async def _sync_worker_init_database() -> None:
+    """Initialize database engine for the sync worker."""
+    logger.info("[SYNC_WORKER_DB_INIT_START] initializing database engine")
+
+    try:
+        from database import _initialize_engine
+        await _initialize_engine()
+        logger.info("[SYNC_WORKER_DB_INIT_SUCCESS] database engine initialized")
+    except Exception as e:
+        logger.error(
+            "[SYNC_WORKER_DB_INIT_FAILED] database initialization failed error=%s",
+            str(e)[:500],
+        )
+        sys.exit(1)
+
+
+# Execute bootstrap and database initialization at module load time
+logger.info("[SYNC_WORKER_BOOTSTRAP_START] sync worker bootstrap phase starting")
+try:
+    asyncio.run(_sync_worker_bootstrap())
+    asyncio.run(_sync_worker_init_database())
+    logger.info("[SYNC_WORKER_STARTING_SCHEDULER] bootstrap complete, starting scheduler")
+except Exception as e:
+    logger.error(
+        "[SYNC_WORKER_INIT_FAILED] fatal error during initialization error=%s",
+        str(e)[:500],
+        exc_info=True,
+    )
+    sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Schema validation
 # ---------------------------------------------------------------------------
@@ -505,15 +603,16 @@ async def run_scheduler() -> None:
 
     # ---------------------------------------------------------------------- #
     # Hard gate: database MUST be initialized before scheduler can start.     #
-    # initialize_database_after_bootstrap() must have run in main.py first.  #
+    # _sync_worker_bootstrap() and _sync_worker_init_database() run above at  #
+    # module load time, so this check should always pass.                     #
     # ---------------------------------------------------------------------- #
+    # Verify database was initialized by bootstrap code above
     from database import is_bootstrap_complete, get_async_session_local
-
     if not is_bootstrap_complete():
-        logger.error("[SYNC_WORKER_BLOCKED_DB_UNINITIALIZED] database not initialized — cannot start sync worker")
-        raise RuntimeError("Database not initialized — cannot start sync worker")
+        logger.error("[SYNC_WORKER_BLOCKED] database not initialized — cannot start scheduler")
+        raise RuntimeError("Database not initialized — cannot start scheduler")
 
-    logger.info("[SYNC_WORKER_DB_GATE_PASSED] database initialized, proceeding")
+    logger.info("[SYNC_WORKER_READY] database initialized, scheduler starting")
 
     # ---------------------------------------------------------------------- #
     # Startup diagnostics: log env-var presence and parsed DATABASE_URL       #
