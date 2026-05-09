@@ -1,6 +1,5 @@
 # =============================================================================
-# PHASE 1: Minimal imports only — NO ORM, NO routers, NO database.py yet.
-# Bootstrap schema recovery MUST run before any of those are imported.
+# PHASE 1: Standard library and third-party imports
 # =============================================================================
 import asyncio
 import logging
@@ -17,7 +16,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 # =============================================================================
-# PHASE 2: Configure logging and validate DATABASE_URL
+# PHASE 2: Configure logging
 # =============================================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -25,17 +24,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("opsyn-backend")
 
-logger.info("[BOOTSTRAP_PRE_APP_START] starting bootstrap recovery")
-
-_raw_bootstrap_url = os.getenv("DATABASE_URL", "")
-if not _raw_bootstrap_url:
-    logger.error("[BOOTSTRAP_PRE_APP_START] DATABASE_URL not set — cannot start")
-    sys.exit(1)
-
-logger.info("[BOOTSTRAP_DB_URL_VALID] DATABASE_URL validated")
+logger.info("[BACKEND_IMPORT] main.py imported — bootstrap will run inside lifespan")
 
 # =============================================================================
-# PHASE 3: Create a minimal async engine for bootstrap (NOT database.py engine)
+# PHASE 3: URL normalizer helper for bootstrap engine
 # =============================================================================
 
 def _normalize_url_for_bootstrap(url: str) -> str:
@@ -50,73 +42,61 @@ def _normalize_url_for_bootstrap(url: str) -> str:
                 if k.lower() != "sslmode"]
     return urlunparse(parsed._replace(query=urlencode(filtered)))
 
-_bootstrap_db_url = _normalize_url_for_bootstrap(_raw_bootstrap_url)
 
 # =============================================================================
-# PHASE 4: Run bootstrap_schema_recovery() BEFORE any ORM imports
+# PHASE 4: Async bootstrap helpers — called from lifespan, NOT at module scope
 # =============================================================================
 
 async def _run_bootstrap() -> None:
     """Execute bootstrap schema recovery with a dedicated minimal engine."""
-    logger.info("[BOOTSTRAP_EXECUTION_BEGIN] running bootstrap_schema_recovery")
+    logger.info("[BACKEND_BOOTSTRAP_START] running bootstrap schema recovery")
 
-    _engine = create_async_engine(
-        _bootstrap_db_url,
+    database_url = os.getenv("DATABASE_URL", "")
+    if not database_url:
+        logger.error("[BACKEND_BOOTSTRAP_START] DATABASE_URL not set")
+        raise RuntimeError("DATABASE_URL not set")
+
+    logger.info("[BACKEND_BOOTSTRAP_START] DATABASE_URL validated")
+
+    bootstrap_url = _normalize_url_for_bootstrap(database_url)
+    bootstrap_engine = create_async_engine(
+        bootstrap_url,
         echo=False,
         pool_pre_ping=True,
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},
     )
+
     try:
         from services.bootstrap_schema_recovery import bootstrap_schema_recovery
-        result = await bootstrap_schema_recovery(_engine)
-    finally:
-        await _engine.dispose()
+        result = await bootstrap_schema_recovery(bootstrap_engine)
 
-    if not result["ok"]:
-        logger.error(
-            "[BOOTSTRAP_EXECUTION_FAILED] errors=%s",
-            result["errors"],
+        if not result["ok"]:
+            logger.error("[BACKEND_BOOTSTRAP_FAILED] errors=%s", result["errors"])
+            raise RuntimeError(f"Bootstrap failed: {result['errors']}")
+
+        logger.info(
+            "[BACKEND_BOOTSTRAP_SUCCESS] columns_added=%s tables_created=%s indexes_created=%s",
+            result["columns_added"],
+            result["tables_created"],
+            result["indexes_created"],
         )
-        sys.exit(1)
+    finally:
+        await bootstrap_engine.dispose()
 
-    logger.info(
-        "[BOOTSTRAP_EXECUTION_SUCCESS] columns_added=%s tables_created=%s indexes_created=%s",
-        result["columns_added"],
-        result["tables_created"],
-        result["indexes_created"],
-    )
-
-
-# Run bootstrap synchronously at module level so it completes before any
-# ORM model or router is imported.
-asyncio.run(_run_bootstrap())
-
-# =============================================================================
-# PHASE 5: Initialize database module AFTER bootstrap succeeds
-# =============================================================================
-logger.info("[BOOTSTRAP_DB_INIT] initializing database module after bootstrap")
 
 async def _init_database() -> None:
     """Initialize the database engine after bootstrap completes."""
-    from database import initialize_database_after_bootstrap
-    await initialize_database_after_bootstrap()
+    logger.info("[BACKEND_DB_INIT_START] initializing database engine")
+    try:
+        from database import initialize_database_after_bootstrap
+        await initialize_database_after_bootstrap()
+        logger.info("[DB_INIT_COMPLETE] database engine initialized")
+    except Exception as e:
+        logger.error("[BACKEND_DB_INIT_FAILED] error=%s", str(e)[:500])
+        raise
 
-asyncio.run(_init_database())
-logger.info("[BOOTSTRAP_DB_INIT_COMPLETE] database module initialized")
 
-# =============================================================================
-# PHASE 5b: Bootstrap gate — verify bootstrap completed before importing ORM
-# =============================================================================
-from database import is_bootstrap_complete as _is_bootstrap_complete  # noqa: E402
-if not _is_bootstrap_complete():
-    logger.error("[BOOTSTRAP_GATE] bootstrap not complete — hard exit")
-    sys.exit(1)
-logger.info("[BOOTSTRAP_GATE] bootstrap verified complete")
-
-# =============================================================================
-# PHASE 5c: Raw SQL column verification after bootstrap
-# =============================================================================
 async def _verify_bootstrap_columns() -> None:
     """Verify critical columns exist after bootstrap."""
     logger.info("[BOOTSTRAP_COLUMN_VERIFICATION] verifying critical columns exist")
@@ -136,12 +116,12 @@ async def _verify_bootstrap_columns() -> None:
     except Exception as _col_exc:
         logger.warning("[BOOTSTRAP_COLUMN_VERIFICATION] failed error=%s", _col_exc)
 
-asyncio.run(_verify_bootstrap_columns())
 
 # =============================================================================
-# PHASE 6: Bootstrap succeeded — NOW import ORM models and routers
+# PHASE 5: Import ORM models and routers at module scope
+# (database.py is lazy — engine is None until lifespan initializes it)
 # =============================================================================
-logger.info("[BOOTSTRAP_PRE_ROUTER_IMPORT] importing ORM models and routers")
+logger.info("[BACKEND_IMPORT] importing ORM models and routers")
 
 from fastapi import Depends, FastAPI, HTTPException, Header, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
@@ -353,56 +333,39 @@ async def _resume_interrupted_syncs() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("[BACKEND_LIFESPAN_START] app startup phase")
     logger.error("[BOOT_ACTUAL] LeafLink sync hotfix loaded commit=%s", os.environ.get("RAILWAY_GIT_COMMIT_SHA", "unknown")[:7])
     logger.info("[Boot] opsyn-backend deploy_sha=%s pr=228", DEPLOY_SHA)
 
-    # Validate DATABASE_URL at startup
-    database_url = os.getenv("DATABASE_URL", "")
+    try:
+        # ---------------------------------------------------------------------------
+        # Phase 1: Bootstrap schema recovery (runs inside the event loop)
+        # ---------------------------------------------------------------------------
+        await _run_bootstrap()
 
-    if not database_url:
-        logger.error("[BOOT_DB] DATABASE_URL is empty or not set")
-        raise RuntimeError("DATABASE_URL environment variable is not set")
+        # ---------------------------------------------------------------------------
+        # Phase 2: Initialize database engine
+        # ---------------------------------------------------------------------------
+        await _init_database()
 
-    # Check for common malformations
-    if database_url.startswith("DATABASE_URL"):
+        # ---------------------------------------------------------------------------
+        # Phase 3: Verify critical columns exist
+        # ---------------------------------------------------------------------------
+        await _verify_bootstrap_columns()
+
+        logger.info("[BACKEND_ROUTERS_READY] all routers imported and registered")
+        logger.info("[BACKEND_STARTUP_COMPLETE] bootstrap and database initialization complete")
+
+    except Exception as e:
         logger.error(
-            "[BOOT_DB] invalid_database_url malformed=true reason=starts_with_DATABASE_URL"
+            "[BACKEND_STARTUP_FATAL] startup failed error=%s",
+            str(e)[:500],
+            exc_info=True,
         )
-        raise RuntimeError(
-            "DATABASE_URL is malformed: value starts with 'DATABASE_URL'. "
-            "Remove the 'DATABASE_URL=' prefix from the value."
-        )
-
-    if "\n" in database_url or "\r" in database_url:
-        logger.error(
-            "[BOOT_DB] invalid_database_url malformed=true reason=contains_newlines"
-        )
-        raise RuntimeError(
-            "DATABASE_URL is malformed: contains newlines. "
-            "Ensure the value is a single line with no line breaks."
-        )
-
-    if database_url.startswith('"') or database_url.startswith("'"):
-        logger.error(
-            "[BOOT_DB] invalid_database_url malformed=true reason=starts_with_quote"
-        )
-        raise RuntimeError(
-            "DATABASE_URL is malformed: value starts with a quote. "
-            "Remove quotes from the variable value."
-        )
-
-    # PRODUCTION FAIL-FAST: Ensure AWS RDS is used
-    environment = os.getenv("ENVIRONMENT", "development").lower()
-
-    if environment == "production":
-        if "rds.amazonaws.com" not in database_url:
-            logger.warning(
-                "[BOOT_DB] Production DATABASE_URL is not AWS RDS; allowing Railway Postgres for current deployment"
-            )
-        else:
-            logger.info("[BOOT_DB] PRODUCTION mode using AWS RDS canonical database")
+        raise
 
     # Log active database connection at startup
+    database_url = os.getenv("DATABASE_URL", "")
     try:
         from urllib.parse import urlparse as _urlparse
         _parsed = _urlparse(database_url)
@@ -437,13 +400,6 @@ async def lifespan(app: FastAPI):
         os.getenv("RAILWAY_ENVIRONMENT_NAME", os.getenv("ENVIRONMENT", "unknown")),
         "true" if os.getenv("DATABASE_URL") else "false",
     )
-
-    # ---------------------------------------------------------------------------
-    # NOTE: Bootstrap schema recovery already ran at module level (PHASE 4)
-    # before any ORM models or routers were imported.  It is NOT repeated here.
-    # See the [BOOTSTRAP_EXECUTION_SUCCESS] log line emitted during module load.
-    # ---------------------------------------------------------------------------
-    logger.info("[BOOTSTRAP_SCHEMA_CHECK_COMPLETE] bootstrap already completed at module load — skipping lifespan repeat")
 
     # ---------------------------------------------------------------------------
     # Log migration runner configuration
