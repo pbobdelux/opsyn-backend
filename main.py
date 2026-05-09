@@ -298,11 +298,142 @@ async def lifespan(app: FastAPI):
 
     logger.info(f"Starting {APP_NAME} in {APP_ENV}")
 
+    # ---------------------------------------------------------------------------
+    # Log startup environment for Railway deploy diagnostics
+    # ---------------------------------------------------------------------------
+    logger.info(
+        "[STARTUP_ENV] RAILWAY_ENVIRONMENT_NAME=%s DATABASE_URL_PRESENT=%s",
+        os.getenv("RAILWAY_ENVIRONMENT_NAME", os.getenv("ENVIRONMENT", "unknown")),
+        "true" if os.getenv("DATABASE_URL") else "false",
+    )
+
+    # ---------------------------------------------------------------------------
+    # Log migration runner configuration
+    # ---------------------------------------------------------------------------
+    from services.migration_runner import MIGRATIONS_DIR as _MIGRATIONS_DIR
+    _migrations_dir_exists = os.path.isdir(_MIGRATIONS_DIR)
+    _migration_files_count = (
+        len([f for f in os.listdir(_MIGRATIONS_DIR) if f.endswith(".sql")])
+        if _migrations_dir_exists
+        else 0
+    )
+    logger.info(
+        "[MIGRATION_CONFIG] runner_type=custom_sql migrations_directory=%s "
+        "directory_exists=%s migration_files_found=%d",
+        _MIGRATIONS_DIR,
+        str(_migrations_dir_exists).lower(),
+        _migration_files_count,
+    )
+
+    # Log each discovered migration file
+    if _migrations_dir_exists:
+        _discovered = sorted(f for f in os.listdir(_MIGRATIONS_DIR) if f.endswith(".sql"))
+        for _mf in _discovered:
+            logger.info("[MIGRATION_FILE_DISCOVERED] file=%s", _mf)
+
+    # ---------------------------------------------------------------------------
     # Run migrations FIRST, before any other database operations, to ensure
     # schema is up-to-date before tables are created or queries are executed.
+    # ---------------------------------------------------------------------------
+    logger.info(
+        "[MIGRATION_RUNNER_START] runner_type=custom_sql directory=%s",
+        _MIGRATIONS_DIR,
+    )
     from services.migration_runner import run_migrations
-    applied = await run_migrations()
+    _migration_errors: list[str] = []
+    try:
+        applied = await run_migrations()
+        for _mig_name in applied:
+            logger.info("[MIGRATION_EXECUTED] migration=%s status=success", _mig_name)
+    except Exception as _mig_exc:
+        applied = []
+        _migration_errors.append(str(_mig_exc))
+        logger.error(
+            "[MIGRATION_FAILED] runner_error=%s",
+            _mig_exc,
+            exc_info=True,
+        )
+    logger.info(
+        "[MIGRATION_RUNNER_COMPLETE] total_applied=%d failed_count=%d",
+        len(applied),
+        len(_migration_errors),
+    )
     logger.info("[Startup] migrations_complete count=%s", len(applied))
+
+    # ---------------------------------------------------------------------------
+    # Emergency self-healing: apply any missing webhook schema columns/tables
+    # that the migration runner may have skipped or silently failed on.
+    # ---------------------------------------------------------------------------
+    _recovery_result: dict = {}
+    try:
+        from services.migration_recovery import execute_webhook_schema_recovery
+        from database import AsyncSessionLocal as _RecoverySessionLocal
+
+        if _RecoverySessionLocal is not None:
+            async with _RecoverySessionLocal() as _recovery_db:
+                _recovery_result = await execute_webhook_schema_recovery(_recovery_db)
+
+            logger.info(
+                "[WEBHOOK_SCHEMA_AUTO_RECOVERY] columns_added=%s tables_created=%s "
+                "indexes_created=%s status=%s errors=%d",
+                _recovery_result.get("columns_added", []),
+                _recovery_result.get("tables_created", []),
+                _recovery_result.get("indexes_created", []),
+                _recovery_result.get("status", "unknown"),
+                len(_recovery_result.get("errors", [])),
+            )
+        else:
+            logger.warning(
+                "[WEBHOOK_SCHEMA_AUTO_RECOVERY] skipped reason=no_database_session"
+            )
+    except Exception as _rec_exc:
+        logger.error(
+            "[WEBHOOK_SCHEMA_AUTO_RECOVERY] recovery_exception error=%s",
+            _rec_exc,
+            exc_info=True,
+        )
+
+    # ---------------------------------------------------------------------------
+    # Hard-fail safeguard: verify critical webhook columns exist after recovery.
+    # If any are still missing, crash startup with an actionable error message.
+    # ---------------------------------------------------------------------------
+    try:
+        from services.migration_recovery import verify_critical_webhook_columns
+        from database import AsyncSessionLocal as _VerifySessionLocal
+
+        if _VerifySessionLocal is not None:
+            async with _VerifySessionLocal() as _verify_db:
+                _verify_result = await verify_critical_webhook_columns(_verify_db)
+
+            if _verify_result.get("ok"):
+                logger.info(
+                    "[WEBHOOK_SCHEMA_VERIFIED] critical_columns_present=true "
+                    "column_count=%d",
+                    len(_verify_result.get("column_status", {})),
+                )
+            else:
+                _still_missing = _verify_result.get("missing", [])
+                logger.error(
+                    "[WEBHOOK_SCHEMA_CRITICAL_MISSING] missing_columns=%s action=hard_fail",
+                    _still_missing,
+                )
+                raise RuntimeError(
+                    "Critical webhook schema columns missing after migration recovery. "
+                    "Manual intervention required. "
+                    f"Missing columns: {_still_missing}"
+                )
+        else:
+            logger.warning(
+                "[WEBHOOK_SCHEMA_VERIFIED] skipped reason=no_database_session"
+            )
+    except RuntimeError:
+        raise
+    except Exception as _hf_exc:
+        logger.error(
+            "[WEBHOOK_SCHEMA_VERIFIED] verification_exception error=%s",
+            _hf_exc,
+            exc_info=True,
+        )
 
     # ---------------------------------------------------------------------------
     # Post-migration LeafLink DB verification — confirm credentials were repaired
