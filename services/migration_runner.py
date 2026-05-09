@@ -11,15 +11,21 @@ individually via ``conn.exec_driver_sql()`` (raw SQL, bypasses prepared-statemen
 overhead). Each migration runs in its own transaction so a failure in one file
 does not abort subsequent migrations.
 
-Ordering guarantee: any migration whose filename contains "fix_leaflink" is
-promoted to run first, before all other migrations (alphabetical within that
-group, then alphabetical for the rest).
+Ordering guarantees (applied in priority order):
+  1. LeafLink repair migrations (filenames matching ``fix_leaflink``) run first.
+  2. Migrations listed in MIGRATION_DEPENDENCIES are topologically sorted so
+     that base tables are always created before the tables that reference them.
+     This fixes the ordering problem where 001/002/003 (which reference routes,
+     drivers, route_stops) were executing before
+     2026_05_21_02_add_drivers_routes_stops.sql created those tables.
+  3. All remaining migrations run in alphabetical (timestamp) order.
 """
 
 import logging
 import os
 import re
 import time
+from collections import defaultdict, deque
 
 logger = logging.getLogger("migration_runner")
 
@@ -27,6 +33,55 @@ MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "migra
 
 # Migrations whose filenames match this pattern are promoted to run first.
 _LEAFLINK_REPAIR_PATTERN = re.compile(r"fix_leaflink", re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Explicit dependency graph for migrations that cannot be ordered purely by
+# filename.  Keys are migration filenames; values are lists of filenames that
+# MUST have been applied before the key migration runs.
+#
+# Background: the 001/002/003 files were created before the drivers/routes
+# tables existed (2026_05_21_02).  Alphabetically "001" < "2026_05_21_02",
+# so without this graph the runner would attempt to create route_events,
+# driver_locations, and driver_route_history before the tables they reference
+# exist — causing "relation does not exist" errors.
+# ---------------------------------------------------------------------------
+MIGRATION_DEPENDENCIES: dict[str, list[str]] = {
+    # Base schema — no dependencies
+    "2026_05_04_01_setup_auth_tables.sql": [],
+    "2026_05_04_02_create_full_schema_aws_rds.sql": [],
+
+    # drivers / routes / route_stops must exist before the tables below
+    "001_create_route_events_table.sql": [
+        "2026_05_21_02_add_drivers_routes_stops.sql",
+    ],
+    "002_create_driver_locations_table.sql": [
+        "2026_05_21_02_add_drivers_routes_stops.sql",
+    ],
+    "003_create_driver_route_history_table.sql": [
+        "2026_05_21_02_add_drivers_routes_stops.sql",
+    ],
+
+    # Reconciliation must run after all base tables and the 001/002/003 group
+    "2026_05_30_01_reconcile_uuid_integer_mismatches.sql": [
+        "2026_05_04_02_create_full_schema_aws_rds.sql",
+        "2026_05_21_02_add_drivers_routes_stops.sql",
+        "001_create_route_events_table.sql",
+        "002_create_driver_locations_table.sql",
+        "003_create_driver_route_history_table.sql",
+        "2026_05_28_02_migrate_sync_runs_to_uuid.sql",
+        "2026_05_28_03_migrate_orders_to_uuid.sql",
+        "2026_05_28_04_migrate_remaining_integer_tables.sql",
+    ],
+}
+
+# Migrations that are CRITICAL: a failure in one of these raises immediately
+# and aborts the startup sequence.  All other migrations are NONCRITICAL —
+# failures are logged and the runner continues with the remaining files.
+CRITICAL_MIGRATIONS: frozenset[str] = frozenset({
+    "2026_05_04_01_setup_auth_tables.sql",
+    "2026_05_04_02_create_full_schema_aws_rds.sql",
+    "2026_05_30_01_reconcile_uuid_integer_mismatches.sql",
+})
 
 CREATE_SCHEMA_MIGRATIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -107,26 +162,106 @@ def _split_statements(sql: str) -> list[str]:
     return statements
 
 
+def _topological_sort(files: list[str], deps: dict[str, list[str]]) -> list[str]:
+    """
+    Return *files* in topological order respecting *deps*.
+
+    Files not mentioned in *deps* are treated as having no dependencies and
+    are interleaved in alphabetical order relative to their position in the
+    resolved graph.
+
+    Algorithm: Kahn's BFS (stable — preserves alphabetical order among nodes
+    with equal in-degree so the output is deterministic).
+
+    Raises ``ValueError`` on a dependency cycle.
+    """
+    # Only consider files that are actually present on disk.
+    file_set = set(files)
+
+    # Build adjacency list and in-degree map restricted to present files.
+    # Edge: dep → f  (dep must run before f)
+    in_degree: dict[str, int] = defaultdict(int)
+    dependents: dict[str, list[str]] = defaultdict(list)  # dep → [files that need dep]
+
+    for f in files:
+        if f not in in_degree:
+            in_degree[f] = 0  # ensure every file appears in the map
+
+    for f, prerequisites in deps.items():
+        if f not in file_set:
+            continue
+        for prereq in prerequisites:
+            if prereq not in file_set:
+                # Prerequisite not present on disk — skip (may already be applied
+                # or intentionally absent in this environment).
+                continue
+            dependents[prereq].append(f)
+            in_degree[f] += 1
+
+    # Seed the queue with all nodes that have no unresolved prerequisites,
+    # sorted alphabetically for a stable, deterministic output.
+    queue: deque[str] = deque(sorted(f for f in files if in_degree[f] == 0))
+    result: list[str] = []
+
+    while queue:
+        node = queue.popleft()
+        result.append(node)
+        # Reduce in-degree for every file that depends on this node.
+        newly_free = []
+        for dependent in dependents.get(node, []):
+            in_degree[dependent] -= 1
+            if in_degree[dependent] == 0:
+                newly_free.append(dependent)
+        # Insert newly-freed nodes in alphabetical order to keep output stable.
+        for f in sorted(newly_free):
+            queue.append(f)
+
+    if len(result) != len(files):
+        cycle_nodes = [f for f in files if f not in set(result)]
+        raise ValueError(
+            f"[Migration] Dependency cycle detected among: {cycle_nodes}"
+        )
+
+    return result
+
+
 def _order_migrations(sql_files: list[str]) -> list[str]:
     """
     Return migration filenames in execution order:
       1. LeafLink repair migrations (filenames matching ``fix_leaflink``), sorted.
-      2. All other migrations, sorted alphabetically.
+      2. All other migrations, topologically sorted by MIGRATION_DEPENDENCIES
+         (base tables before dependent tables), then alphabetically within
+         each tier.
+
+    This ensures that e.g. 2026_05_21_02_add_drivers_routes_stops.sql always
+    runs before 001_create_route_events_table.sql even though "001" sorts
+    before "2026" alphabetically.
     """
     repair = sorted(f for f in sql_files if _LEAFLINK_REPAIR_PATTERN.search(f))
-    others = sorted(f for f in sql_files if not _LEAFLINK_REPAIR_PATTERN.search(f))
-    return repair + others
+    others = [f for f in sql_files if not _LEAFLINK_REPAIR_PATTERN.search(f)]
+
+    try:
+        ordered_others = _topological_sort(others, MIGRATION_DEPENDENCIES)
+    except ValueError as exc:
+        logger.error("%s — falling back to alphabetical order", exc)
+        ordered_others = sorted(others)
+
+    return repair + ordered_others
 
 
 async def run_migrations() -> list[str]:
     """
-    Scan the migrations/ directory, apply any pending .sql files in order,
-    and record each applied migration in the schema_migrations table.
+    Scan the migrations/ directory, apply any pending .sql files in dependency
+    order, and record each applied migration in the schema_migrations table.
 
     - LeafLink repair migrations run first (see ``_order_migrations``).
-    - Non-critical migration failures are logged and skipped; the runner
-      continues with the remaining migrations.
-    - A summary is logged after all migrations have been attempted.
+    - Migrations in MIGRATION_DEPENDENCIES are topologically sorted so base
+      tables are always created before the tables that reference them.
+    - Migrations in CRITICAL_MIGRATIONS raise immediately on failure, aborting
+      startup.  All other migrations are NONCRITICAL — failures are logged and
+      the runner continues with the remaining files.
+    - A [MIGRATION_SUMMARY] line is logged after all migrations have been
+      attempted, reporting applied/failed_critical/failed_noncritical counts.
 
     Returns a list of migration filenames that were applied in this run.
     """
@@ -137,10 +272,11 @@ async def run_migrations() -> list[str]:
         return []
 
     applied: list[str] = []
-    failed: list[str] = []
+    failed_critical: list[str] = []
+    failed_noncritical: list[str] = []
 
     try:
-        # Collect and sort migration files by filename (timestamp-based ordering)
+        # Collect and sort migration files by dependency order.
         if not os.path.isdir(MIGRATIONS_DIR):
             logger.warning("[Migration] migrations directory not found at %s", MIGRATIONS_DIR)
             return []
@@ -170,12 +306,15 @@ async def run_migrations() -> list[str]:
             )
 
         # Apply each migration in an independent top-level transaction so that a
-        # failure in one file does not abort the remaining migrations.
+        # failure in one file does not abort the remaining migrations (unless the
+        # migration is classified as CRITICAL).
         for order_idx, filename in enumerate(sql_files, start=1):
+            is_critical = filename in CRITICAL_MIGRATIONS
             logger.info(
-                "[MIGRATION_ORDER] executing_migration=%s order=%d",
+                "[MIGRATION_ORDER] executing_migration=%s order=%d critical=%s",
                 filename,
                 order_idx,
+                is_critical,
             )
             try:
                 # Use a plain connection (no implicit transaction) to check whether
@@ -224,45 +363,58 @@ async def run_migrations() -> list[str]:
                 # Transaction is committed automatically when engine.begin() block exits.
 
                 logger.info(
-                    "[Migration] applied migration=%s duration_ms=%s",
+                    "[MIGRATION_EXECUTED] migration=%s status=success duration_ms=%s",
                     filename,
                     duration_ms,
                 )
                 applied.append(filename)
 
             except Exception as migration_exc:
-                # Transaction is automatically rolled back by the context manager on exception.
-                # Log as non-critical and continue — one broken migration must not abort startup.
-                logger.warning(
-                    "[MIGRATION_FAILED_NONCRITICAL] migration=%s error=%s",
-                    filename,
-                    migration_exc,
-                )
-                logger.debug(
-                    "[Migration] failed migration=%s full traceback",
-                    filename,
-                    exc_info=True,
-                )
-                failed.append(filename)
-                # Continue with remaining migrations rather than aborting startup
+                # Transaction is automatically rolled back by the context manager.
+                if is_critical:
+                    logger.error(
+                        "[MIGRATION_FAILED_CRITICAL] migration=%s error=%s",
+                        filename,
+                        migration_exc,
+                        exc_info=True,
+                    )
+                    failed_critical.append(filename)
+                    raise RuntimeError(
+                        f"[Migration] Critical migration failed: {filename}: {migration_exc}"
+                    ) from migration_exc
+                else:
+                    logger.warning(
+                        "[MIGRATION_FAILED_NONCRITICAL] migration=%s error=%s",
+                        filename,
+                        migration_exc,
+                    )
+                    logger.debug(
+                        "[Migration] failed migration=%s full traceback",
+                        filename,
+                        exc_info=True,
+                    )
+                    failed_noncritical.append(filename)
+                    # Continue with remaining migrations rather than aborting startup
 
     except RuntimeError:
-        # Re-raise critical failures (e.g. bootstrap failure) immediately.
+        # Re-raise critical failures (bootstrap failure or critical migration
+        # failure) immediately so the caller can hard-fail startup.
         raise
     except Exception as exc:
         logger.error("[Migration] runner error=%s", exc, exc_info=True)
 
-    total = len(applied) + len(failed)
+    total = len(applied) + len(failed_critical) + len(failed_noncritical)
     logger.info(
-        "[MIGRATION_SUMMARY] total=%d passed=%d failed=%d",
+        "[MIGRATION_SUMMARY] total=%d applied=%d failed_critical=%d failed_noncritical=%d",
         total,
         len(applied),
-        len(failed),
+        len(failed_critical),
+        len(failed_noncritical),
     )
-    if failed:
+    if failed_noncritical:
         logger.warning(
-            "[MIGRATION_SUMMARY] failed_migrations=%s",
-            ", ".join(failed),
+            "[MIGRATION_SUMMARY] failed_noncritical_migrations=%s",
+            ", ".join(failed_noncritical),
         )
 
     return applied
