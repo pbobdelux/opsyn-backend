@@ -158,17 +158,34 @@ async def _persist_webhook_event(
 
 
 def _log_latency(start: float, event_id: str, outcome: str) -> None:
-    """Log webhook processing latency with [WEBHOOK_LATENCY_MS] marker."""
+    """Log webhook processing latency with structured markers.
+
+    Markers:
+      [WEBHOOK_LATENCY_MS]      -- always logged (INFO)
+      [WEBHOOK_LATENCY_WARNING] -- logged when latency >500ms (WARNING)
+      [WEBHOOK_LATENCY_ERROR]   -- logged when latency >2000ms (ERROR)
+    """
     elapsed_ms = round((time.monotonic() - start) * 1000)
-    level = logging.WARNING if elapsed_ms > 1000 else logging.INFO
-    logger.log(
-        level,
-        "[WEBHOOK_LATENCY_MS] event_id=%s outcome=%s latency_ms=%d target_ms=1000 over_target=%s",
+    logger.info(
+        "[WEBHOOK_LATENCY_MS] event_id=%s outcome=%s latency_ms=%d target_ms=1000",
         event_id,
         outcome,
         elapsed_ms,
-        elapsed_ms > 1000,
     )
+    if elapsed_ms > 2000:
+        logger.error(
+            "[WEBHOOK_LATENCY_ERROR] event_id=%s latency_ms=%d "
+            "threshold_ms=2000 action=investigate_blocking_operations",
+            event_id,
+            elapsed_ms,
+        )
+    elif elapsed_ms > 500:
+        logger.warning(
+            "[WEBHOOK_LATENCY_WARNING] event_id=%s latency_ms=%d "
+            "threshold_ms=500 target_ms=1000",
+            event_id,
+            elapsed_ms,
+        )
 
 
 # ---------------------------------------------------------------------------

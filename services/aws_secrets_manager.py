@@ -63,7 +63,12 @@ def _get_boto3_client():
         )
         return None
     except Exception as exc:
-        logger.error("[AWSSecretsManager] failed to create boto3 client: %s", exc)
+        logger.error(
+            "[WEBHOOK_SECRET_STORE_FAILED] [AWSSecretsManager] client_creation_error "
+            "error_type=%s error=%s",
+            type(exc).__name__,
+            exc,
+        )
         return None
 
 
@@ -158,11 +163,26 @@ async def load_webhook_key_from_aws(secret_ref: str) -> Optional[str]:
             )
             return secret
         except Exception as exc:
-            logger.error(
-                "[WEBHOOK_SECRET_LOAD_FAILED] secret_ref=%s error=%s",
-                secret_ref,
-                exc,
-            )
+            error_type = type(exc).__name__
+            if "ResourceNotFoundException" in error_type or "ResourceNotFoundException" in str(exc):
+                logger.error(
+                    "[WEBHOOK_SECRET_LOAD_FAILED] secret_ref=%s error_type=ResourceNotFoundException "
+                    "details=Secret not found in AWS Secrets Manager",
+                    secret_ref,
+                )
+            elif "AccessDeniedException" in error_type or "AccessDeniedException" in str(exc):
+                logger.error(
+                    "[WEBHOOK_SECRET_LOAD_FAILED] secret_ref=%s error_type=AccessDeniedException "
+                    "details=IAM permissions missing for secretsmanager:GetSecretValue",
+                    secret_ref,
+                )
+            else:
+                logger.error(
+                    "[WEBHOOK_SECRET_LOAD_FAILED] secret_ref=%s error_type=%s error=%s",
+                    secret_ref,
+                    error_type,
+                    str(exc)[:500],
+                )
             return None
 
     try:

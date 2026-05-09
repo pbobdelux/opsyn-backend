@@ -742,11 +742,24 @@ async def replay_webhook_events(
     """
     event_ids = [event_id] if event_id else None
 
+    logger.info(
+        "[WEBHOOK_REPLAY_INITIATED] brand_id=%s event_id=%s status=%s",
+        brand_id,
+        event_id,
+        status,
+    )
+
     replayed_count = await _replay_webhook_events(
         db=db,
         event_ids=event_ids,
         brand_id=brand_id,
         status=status,
+    )
+
+    logger.info(
+        "[WEBHOOK_REPLAY_INITIATED] completed brand_id=%s replayed_count=%d",
+        brand_id,
+        replayed_count,
     )
 
     return {

@@ -89,14 +89,21 @@ Log marker `[WEBHOOK_SECRET_FALLBACK]` is emitted whenever the fallback chain is
 ## Monitoring & Alerts
 Monitor these log markers in production:
 
-| Marker | Meaning | Action |
-|--------|---------|--------|
-| `[WEBHOOK_SECRET_LOAD_FAILED]` | AWS Secrets Manager load failed | Check AWS credentials/permissions |
-| `[WEBHOOK_SECRET_STORE_FAILED]` | AWS Secrets Manager store failed | Check AWS credentials/permissions |
-| `[WEBHOOK_SECRET_FALLBACK]` | Using plaintext key fallback | Migrate brand to AWS storage |
-| `[WEBHOOK_LATENCY_MS] over_target=True` | Webhook >1s response time | Investigate DB query performance |
-| `[PAYLOAD_SANITIZED]` | Large payload truncated | Review LeafLink payload sizes |
-| `[WEBHOOK_JOB_DEDUPED]` | Duplicate job skipped | Normal — deduplication working |
+| Marker | Severity | Meaning | Action |
+|--------|----------|---------|--------|
+| `[WEBHOOK_SECRET_LOAD_FAILED]` | ERROR | AWS Secrets Manager load failed | Check AWS credentials/permissions |
+| `[WEBHOOK_SECRET_STORE_FAILED]` | ERROR | AWS Secrets Manager store failed | Check AWS credentials/permissions |
+| `[WEBHOOK_SECRET_FALLBACK]` | WARNING | Using plaintext key fallback | Migrate brand to AWS storage |
+| `[WEBHOOK_LATENCY_MS]` | INFO | Every webhook request latency | Baseline monitoring |
+| `[WEBHOOK_LATENCY_WARNING]` | WARNING | Webhook >500ms response time | Investigate DB query performance |
+| `[WEBHOOK_LATENCY_ERROR]` | ERROR | Webhook >2000ms response time | Urgent: investigate blocking operations |
+| `[WEBHOOK_PAYLOAD_SANITIZED]` | WARNING | Payload truncated/sanitized | Review LeafLink payload sizes |
+| `[WEBHOOK_PAYLOAD_TRUNCATED]` | WARNING | Payload exceeded 1MB cap | Review LeafLink payload sizes |
+| `[WEBHOOK_JOB_DEDUPED]` | INFO | Duplicate job skipped | Normal -- deduplication working |
+| `[WEBHOOK_REPLAY_INITIATED]` | INFO | Webhook replay started/completed | Operational |
+| `[QUEUE_PRIORITY_ORDER]` | INFO | Worker polling for next job | Operational |
+| `[INCREMENTAL_SYNC_ENQUEUED]` | INFO | Incremental sync lookback window | Operational |
+| `[INCREMENTAL_LOOKBACK_TOO_SHORT]` | WARNING | Lookback < 30 minutes | Increase LEAFLINK_INCREMENTAL_LOOKBACK_MINUTES |
 
 ## Success Criteria
 - ✅ Existing brands without webhook_key_secret_ref continue to work
