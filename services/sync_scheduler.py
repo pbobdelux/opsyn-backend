@@ -202,19 +202,59 @@ async def _sync_worker_init_database() -> None:
         sys.exit(1)
 
 
-# Execute bootstrap and database initialization at module load time
-logger.info("[SYNC_WORKER_BOOTSTRAP_START] sync worker bootstrap phase starting")
-try:
-    asyncio.run(_sync_worker_bootstrap())
-    asyncio.run(_sync_worker_init_database())
-    logger.info("[SYNC_WORKER_STARTING_SCHEDULER] bootstrap complete, starting scheduler")
-except Exception as e:
-    logger.error(
-        "[SYNC_WORKER_INIT_FAILED] fatal error during initialization error=%s",
-        str(e)[:500],
-        exc_info=True,
-    )
-    sys.exit(1)
+async def _verify_db_connection() -> None:
+    """Verify database connection is working."""
+    try:
+        from database import get_async_session_local
+        AsyncSessionLocal = get_async_session_local()
+        async with AsyncSessionLocal() as db:
+            from sqlalchemy import select
+            await db.execute(select(1))
+        logger.info("[SYNC_WORKER_DB_VERIFY] connection test passed")
+    except Exception as e:
+        logger.error("[SYNC_WORKER_DB_VERIFY_FAILED] connection test failed error=%s", str(e)[:200])
+        raise
+
+
+async def worker_main() -> None:
+    """Main entry point for sync worker - runs all async operations in one loop."""
+    logger.info("[SYNC_WORKER_MAIN_START] sync worker starting")
+
+    try:
+        # Phase 1: Bootstrap schema recovery
+        logger.info("[SYNC_WORKER_BOOTSTRAP_START] running bootstrap schema recovery")
+        await _sync_worker_bootstrap()
+        logger.info("[SYNC_WORKER_BOOTSTRAP_COMPLETE] bootstrap schema recovery complete")
+
+        # Phase 2: Initialize database engine
+        logger.info("[SYNC_WORKER_DB_INIT_START] initializing database engine")
+        await _sync_worker_init_database()
+        logger.info("[SYNC_WORKER_DB_INIT_COMPLETE] database engine initialized")
+
+        # Phase 3: Verify database connection
+        logger.info("[SYNC_WORKER_DB_VERIFY_START] verifying database connection")
+        await _verify_db_connection()
+        logger.info("[SYNC_WORKER_DB_VERIFIED] database connection verified")
+
+        # Phase 4: Start scheduler
+        logger.info("[SYNC_WORKER_SCHEDULER_START] starting scheduler")
+        await run_scheduler()
+
+    except Exception as e:
+        logger.error(
+            "[SYNC_WORKER_FATAL] fatal error in worker main error=%s",
+            str(e)[:500],
+            exc_info=True,
+        )
+        # Ensure engine is disposed on fatal error
+        try:
+            from database import _engine
+            if _engine is not None:
+                await _engine.dispose()
+                logger.info("[SYNC_WORKER_FATAL] engine disposed")
+        except Exception as dispose_exc:
+            logger.error("[SYNC_WORKER_FATAL] failed to dispose engine error=%s", dispose_exc)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -743,23 +783,11 @@ async def run_scheduler() -> None:
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
-def main() -> None:
-    print("=== MAIN FUNCTION ENTERED ===")
-    sys.stdout.flush()
-
-    try:
-        import asyncio as _asyncio
-        _asyncio.run(run_scheduler())
-
-    except Exception as main_exc:
-        logger.error(
-            "[SyncWorker] FATAL ERROR in main: %s",
-            str(main_exc)[:500],
-            exc_info=True,
-        )
-        sys.stdout.flush()
-        raise
-
-
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(worker_main())
+    except KeyboardInterrupt:
+        logger.info("[SYNC_WORKER_SHUTDOWN] received SIGINT, shutting down")
+    except Exception as e:
+        logger.error("[SYNC_WORKER_SHUTDOWN] fatal error error=%s", str(e)[:500])
+        sys.exit(1)
