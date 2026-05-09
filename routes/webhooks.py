@@ -350,8 +350,31 @@ async def receive_leaflink_webhook(
     sig_status: Optional[str] = None
     sig_error: Optional[str] = None
 
+    webhook_key: Optional[str] = None
     try:
-        webhook_key = await get_webhook_key_for_brand(brand_id, secret_ref, plaintext_key)
+        if secret_ref:
+            # Load webhook key from unified AWS Secrets Manager service
+            try:
+                from services.integration_secrets import get_integration_secret
+                webhook_key = await get_integration_secret(secret_ref)
+                logger.info(
+                    "[LEAFLINK_WEBHOOK] loaded_webhook_key_from_aws secret_ref=%s brand_id=%s",
+                    secret_ref,
+                    brand_id,
+                )
+            except Exception as _aws_exc:
+                logger.warning(
+                    "[LEAFLINK_WEBHOOK] aws_webhook_key_load_failed brand_id=%s "
+                    "secret_ref=%s error=%s — falling back to legacy resolver",
+                    brand_id,
+                    secret_ref,
+                    str(_aws_exc)[:200],
+                )
+                # Fall back to legacy resolver (handles plaintext fallback)
+                webhook_key = await get_webhook_key_for_brand(brand_id, secret_ref, plaintext_key)
+        else:
+            # No secret ref — use legacy resolver (plaintext fallback chain)
+            webhook_key = await get_webhook_key_for_brand(brand_id, None, plaintext_key)
     except Exception as exc:
         logger.error(
             "[LeafLinkWebhook] webhook_key_resolution_error brand_id=%s error=%s",

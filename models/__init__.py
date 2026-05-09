@@ -66,6 +66,20 @@ class BrandAPICredential(Base):
         default=None,
         comment="Auto-detected auth scheme: Bearer, Token, or Raw",
     )
+    # Secure API key credential fields (AWS Secrets Manager backed)
+    api_key_secret_ref: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        default=None,
+        comment="AWS Secrets Manager ARN/reference for the raw API key",
+    )
+    api_key_last4: Mapped[Optional[str]] = mapped_column(
+        String(4),
+        nullable=True,
+        default=None,
+        comment="Last 4 chars of API key for display/audit (never the full key)",
+    )
+
     # Webhook support — DEPRECATED plaintext key (kept for backward compat)
     webhook_key: Mapped[Optional[str]] = mapped_column(
         String(255),
