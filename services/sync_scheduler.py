@@ -131,8 +131,9 @@ async def validate_schema() -> None:
     raises ValueError if any are missing or if invalid columns (like
     pulled_qty) are present.
     """
-    from database import AsyncSessionLocal
+    from database import get_async_session_local
     from sqlalchemy import text
+    AsyncSessionLocal = get_async_session_local()
 
     try:
         async with AsyncSessionLocal() as db:
@@ -204,8 +205,9 @@ async def poll_and_execute() -> None:
     """
     from sqlalchemy import select
 
-    from database import AsyncSessionLocal
+    from database import get_async_session_local
     from models import BrandAPICredential, SyncRun
+    AsyncSessionLocal = get_async_session_local()
     from services.leaflink_sync import sync_leaflink_background_continuous
     from services.sync_run_manager import detect_stalled, mark_stalled
 
@@ -502,6 +504,18 @@ async def run_scheduler() -> None:
     sys.stdout.flush()
 
     # ---------------------------------------------------------------------- #
+    # Hard gate: database MUST be initialized before scheduler can start.     #
+    # initialize_database_after_bootstrap() must have run in main.py first.  #
+    # ---------------------------------------------------------------------- #
+    from database import is_bootstrap_complete, get_async_session_local
+
+    if not is_bootstrap_complete():
+        logger.error("[SYNC_WORKER_BLOCKED_DB_UNINITIALIZED] database not initialized — cannot start sync worker")
+        raise RuntimeError("Database not initialized — cannot start sync worker")
+
+    logger.info("[SYNC_WORKER_DB_GATE_PASSED] database initialized, proceeding")
+
+    # ---------------------------------------------------------------------- #
     # Startup diagnostics: log env-var presence and parsed DATABASE_URL       #
     # before any database connection attempt.                                 #
     # ---------------------------------------------------------------------- #
@@ -552,7 +566,8 @@ async def run_scheduler() -> None:
         sys.stdout.flush()
 
         from sqlalchemy import select, func
-        from database import AsyncSessionLocal
+        from database import get_async_session_local
+        AsyncSessionLocal = get_async_session_local()
 
         async with AsyncSessionLocal() as test_db:
             await test_db.execute(select(1))
@@ -572,7 +587,8 @@ async def run_scheduler() -> None:
     # Log database identity for verification
     try:
         from sqlalchemy import select, func
-        from database import AsyncSessionLocal
+        from database import get_async_session_local
+        AsyncSessionLocal = get_async_session_local()
 
         async with AsyncSessionLocal() as identity_db:
             result = await identity_db.execute(
