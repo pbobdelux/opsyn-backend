@@ -434,8 +434,45 @@ async def lifespan(app: FastAPI):
         logger.warning("[STARTUP_SCHEMA_WARNING] schema_check_exception error=%s", str(_sc_exc)[:300])
 
     # ---------------------------------------------------------------------------
+    # Webhook schema validation — verify webhook tables/columns exist
+    # Logs [WEBHOOK_SCHEMA_VALIDATION] markers; does NOT crash if missing
+    # (migrations may not have run yet in some environments).
+    # ---------------------------------------------------------------------------
+    try:
+        from services.webhook_schema_validator import validate_webhook_schema
+        from database import AsyncSessionLocal as _WebhookValidSessionLocal
+
+        if _WebhookValidSessionLocal is not None:
+            async with _WebhookValidSessionLocal() as _wv_db:
+                _wv_result = await validate_webhook_schema(_wv_db)
+
+            if _wv_result.get("valid"):
+                logger.info(
+                    "[WEBHOOK_SCHEMA_VALIDATION] startup_check=passed "
+                    "tables_ok=true columns_ok=true"
+                )
+            else:
+                logger.warning(
+                    "[WEBHOOK_SCHEMA_VALIDATION] startup_check=failed "
+                    "missing_tables=%s missing_columns=%s "
+                    "action=webhook_status_will_return_partial_metrics",
+                    _wv_result.get("missing_tables", []),
+                    list(_wv_result.get("missing_columns", {}).keys()),
+                )
+        else:
+            logger.warning(
+                "[WEBHOOK_SCHEMA_VALIDATION] skipped reason=no_database_session"
+            )
+    except Exception as _wv_exc:
+        logger.warning(
+            "[WEBHOOK_SCHEMA_VALIDATION] check_failed error=%s",
+            str(_wv_exc)[:300],
+        )
+
+    # ---------------------------------------------------------------------------
     # Log feature flags at startup
     # ---------------------------------------------------------------------------
+
     logger.info(
         "[FEATURE_FLAGS] LEAFLINK_SYNC_ENABLED=%s LEAFLINK_DEBUG_SQL=%s"
         " LEAFLINK_REPROCESS_ENABLED=%s LEAFLINK_MAX_RETRY_ATTEMPTS=%s"

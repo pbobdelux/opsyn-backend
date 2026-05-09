@@ -502,6 +502,7 @@ async def trigger_leaflink_sync(
 _webhook_router = APIRouter(prefix="/api/leaflink/orders", tags=["leaflink-webhook-status"])
 
 
+
 @_webhook_router.get("/webhook-status")
 async def get_webhook_status(
     db: AsyncSession = Depends(get_db),
@@ -520,35 +521,129 @@ async def get_webhook_status(
       failed_signature_events_count — events with signature_verification_status='invalid'
       duplicates_ignored_count      — events with duplicate_of_event_id set
       webhook_keys_last4_by_brand   — { brand_id: webhook_key_last4 } for all active brands
+
+    Resilience:
+      - Each metric query is wrapped in its own try/except.
+      - If a query fails (e.g. table/column missing), the metric is set to None
+        and added to metrics_failed.
+      - Always returns HTTP 200 with partial=true when some metrics failed.
+      - Structured [WEBHOOK_STATUS_QUERY_FAILED] log markers for every failure.
     """
+    import traceback as _traceback
+
+    metrics_failed: list = []
+
+    # ------------------------------------------------------------------
+    # Helper: emit a structured [WEBHOOK_STATUS_QUERY_FAILED] warning
+    # ------------------------------------------------------------------
+    def _log_metric_failure(
+        section: str,
+        exc: Exception,
+        table: str = "",
+        column: str = "",
+    ) -> None:
+        exc_type = type(exc).__name__
+        exc_msg = str(exc)
+        tb_short = _traceback.format_exc()[:500]
+        logger.warning(
+            "[WEBHOOK_STATUS_QUERY_FAILED] "
+            "exception_type=%s failing_section=%s "
+            "error=%r table=%s column=%s traceback=%s",
+            exc_type,
+            section,
+            exc_msg[:300],
+            table or "unknown",
+            column or "unknown",
+            tb_short,
+        )
+
+    # ------------------------------------------------------------------
+    # Metric 1: webhook_enabled_count
+    # Requires: brand_api_credentials.webhook_enabled
+    # ------------------------------------------------------------------
+    webhook_enabled_count = None
     try:
-        # Count brands with webhook_enabled=true
-        try:
-            enabled_result = await db.execute(
-                select(func.count(BrandAPICredential.id)).where(
-                    BrandAPICredential.webhook_enabled == True,
-                    BrandAPICredential.integration_name == "leaflink",
-                    BrandAPICredential.is_active == True,
-                )
+        enabled_result = await db.execute(
+            select(func.count(BrandAPICredential.id)).where(
+                BrandAPICredential.webhook_enabled == True,
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
             )
-            webhook_enabled_count = enabled_result.scalar_one() or 0
-        except Exception:
-            webhook_enabled_count = 0
+        )
+        webhook_enabled_count = enabled_result.scalar_one() or 0
+    except Exception as exc:
+        _log_metric_failure(
+            "webhook_enabled_count", exc,
+            table="brand_api_credentials", column="webhook_enabled",
+        )
+        metrics_failed.append("webhook_enabled_count")
 
-        # Count brands with webhook_key_secret_ref set
-        try:
-            configured_result = await db.execute(
-                select(func.count(BrandAPICredential.id)).where(
-                    BrandAPICredential.webhook_key_secret_ref.isnot(None),
-                    BrandAPICredential.integration_name == "leaflink",
-                    BrandAPICredential.is_active == True,
-                )
+    # ------------------------------------------------------------------
+    # Metric 2: webhook_configured_count
+    # Requires: brand_api_credentials.webhook_key_secret_ref
+    # ------------------------------------------------------------------
+    webhook_configured_count = None
+    try:
+        configured_result = await db.execute(
+            select(func.count(BrandAPICredential.id)).where(
+                BrandAPICredential.webhook_key_secret_ref.isnot(None),
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
             )
-            webhook_configured_count = configured_result.scalar_one() or 0
-        except Exception:
-            webhook_configured_count = 0
+        )
+        webhook_configured_count = configured_result.scalar_one() or 0
+    except Exception as exc:
+        _log_metric_failure(
+            "webhook_configured_count", exc,
+            table="brand_api_credentials", column="webhook_key_secret_ref",
+        )
+        metrics_failed.append("webhook_configured_count")
 
-        # Count unresolved events
+    # ------------------------------------------------------------------
+    # Metrics 3-6: leaflink_webhook_events queries
+    # Check table existence once; if missing, skip all event metrics.
+    # ------------------------------------------------------------------
+    _webhook_table_ok = True
+    try:
+        _tbl_check = await db.execute(
+            text(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema='public' "
+                "AND table_name='leaflink_webhook_events' LIMIT 1"
+            )
+        )
+        if _tbl_check.fetchone() is None:
+            _webhook_table_ok = False
+            logger.warning(
+                "[WEBHOOK_STATUS_QUERY_FAILED] "
+                "exception_type=MissingTable failing_section=table_existence_check "
+                "error='relation leaflink_webhook_events does not exist' "
+                "table=leaflink_webhook_events column=N/A traceback=N/A"
+            )
+            for _m in [
+                "unresolved_events_count",
+                "ambiguous_events_count",
+                "failed_signature_events_count",
+                "duplicates_ignored_count",
+            ]:
+                metrics_failed.append(_m)
+    except Exception as exc:
+        _webhook_table_ok = False
+        _log_metric_failure(
+            "table_existence_check", exc,
+            table="leaflink_webhook_events",
+        )
+        for _m in [
+            "unresolved_events_count",
+            "ambiguous_events_count",
+            "failed_signature_events_count",
+            "duplicates_ignored_count",
+        ]:
+            metrics_failed.append(_m)
+
+    # Metric 3: unresolved_events_count
+    unresolved_events_count = None
+    if _webhook_table_ok:
         try:
             unresolved_result = await db.execute(
                 select(func.count(LeafLinkWebhookEvent.id)).where(
@@ -556,10 +651,17 @@ async def get_webhook_status(
                 )
             )
             unresolved_events_count = unresolved_result.scalar_one() or 0
-        except Exception:
-            unresolved_events_count = 0
+        except Exception as exc:
+            _log_metric_failure(
+                "unresolved_events_count", exc,
+                table="leaflink_webhook_events",
+                column="tenant_resolution_status",
+            )
+            metrics_failed.append("unresolved_events_count")
 
-        # Count ambiguous events
+    # Metric 4: ambiguous_events_count
+    ambiguous_events_count = None
+    if _webhook_table_ok:
         try:
             ambiguous_result = await db.execute(
                 select(func.count(LeafLinkWebhookEvent.id)).where(
@@ -567,10 +669,17 @@ async def get_webhook_status(
                 )
             )
             ambiguous_events_count = ambiguous_result.scalar_one() or 0
-        except Exception:
-            ambiguous_events_count = 0
+        except Exception as exc:
+            _log_metric_failure(
+                "ambiguous_events_count", exc,
+                table="leaflink_webhook_events",
+                column="tenant_resolution_status",
+            )
+            metrics_failed.append("ambiguous_events_count")
 
-        # Count invalid signature events
+    # Metric 5: failed_signature_events_count
+    failed_signature_events_count = None
+    if _webhook_table_ok:
         try:
             invalid_sig_result = await db.execute(
                 select(func.count(LeafLinkWebhookEvent.id)).where(
@@ -578,10 +687,17 @@ async def get_webhook_status(
                 )
             )
             failed_signature_events_count = invalid_sig_result.scalar_one() or 0
-        except Exception:
-            failed_signature_events_count = 0
+        except Exception as exc:
+            _log_metric_failure(
+                "failed_signature_events_count", exc,
+                table="leaflink_webhook_events",
+                column="signature_verification_status",
+            )
+            metrics_failed.append("failed_signature_events_count")
 
-        # Count deduplicated events
+    # Metric 6: duplicates_ignored_count
+    duplicates_ignored_count = None
+    if _webhook_table_ok:
         try:
             dedup_result = await db.execute(
                 select(func.count(LeafLinkWebhookEvent.id)).where(
@@ -589,44 +705,65 @@ async def get_webhook_status(
                 )
             )
             duplicates_ignored_count = dedup_result.scalar_one() or 0
-        except Exception:
-            duplicates_ignored_count = 0
-
-        # Get webhook_key_last4 by brand
-        try:
-            last4_result = await db.execute(
-                select(
-                    BrandAPICredential.brand_id,
-                    BrandAPICredential.webhook_key_last4,
-                ).where(
-                    BrandAPICredential.integration_name == "leaflink",
-                    BrandAPICredential.is_active == True,
-                    BrandAPICredential.webhook_key_last4.isnot(None),
-                )
+        except Exception as exc:
+            _log_metric_failure(
+                "duplicates_ignored_count", exc,
+                table="leaflink_webhook_events",
+                column="duplicate_of_event_id",
             )
-            webhook_keys_last4_by_brand = {
-                row[0]: row[1] for row in last4_result.fetchall()
-            }
-        except Exception:
-            webhook_keys_last4_by_brand = {}
+            metrics_failed.append("duplicates_ignored_count")
 
-        return {
-            "ok": True,
-            "webhook_enabled_count": webhook_enabled_count,
-            "webhook_configured_count": webhook_configured_count,
-            "unresolved_events_count": unresolved_events_count,
-            "ambiguous_events_count": ambiguous_events_count,
-            "failed_signature_events_count": failed_signature_events_count,
-            "duplicates_ignored_count": duplicates_ignored_count,
-            "webhook_keys_last4_by_brand": webhook_keys_last4_by_brand,
+    # ------------------------------------------------------------------
+    # Metric 7: webhook_keys_last4_by_brand
+    # Requires: brand_api_credentials.webhook_key_last4
+    # ------------------------------------------------------------------
+    webhook_keys_last4_by_brand: dict = {}
+    try:
+        last4_result = await db.execute(
+            select(
+                BrandAPICredential.brand_id,
+                BrandAPICredential.webhook_key_last4,
+            ).where(
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+                BrandAPICredential.webhook_key_last4.isnot(None),
+            )
+        )
+        webhook_keys_last4_by_brand = {
+            row[0]: row[1] for row in last4_result.fetchall()
         }
-
     except Exception as exc:
-        logger.error("[WebhookStatus] error=%s", str(exc)[:300], exc_info=True)
-        return {
-            "ok": False,
-            "error": str(exc)[:300],
-        }
+        _log_metric_failure(
+            "webhook_keys_last4_by_brand", exc,
+            table="brand_api_credentials", column="webhook_key_last4",
+        )
+        metrics_failed.append("webhook_keys_last4_by_brand")
+
+    # ------------------------------------------------------------------
+    # Build response — always HTTP 200; partial=true when metrics failed
+    # ------------------------------------------------------------------
+    is_partial = len(metrics_failed) > 0
+
+    if is_partial:
+        logger.warning(
+            "[WEBHOOK_STATUS_QUERY_FAILED] "
+            "partial_response=true metrics_failed=%s total_failed=%d",
+            metrics_failed,
+            len(metrics_failed),
+        )
+
+    return {
+        "ok": True,
+        "partial": is_partial,
+        "metrics_failed": metrics_failed,
+        "webhook_enabled_count": webhook_enabled_count,
+        "webhook_configured_count": webhook_configured_count,
+        "unresolved_events_count": unresolved_events_count,
+        "ambiguous_events_count": ambiguous_events_count,
+        "failed_signature_events_count": failed_signature_events_count,
+        "duplicates_ignored_count": duplicates_ignored_count,
+        "webhook_keys_last4_by_brand": webhook_keys_last4_by_brand,
+    }
 
 
 async def _replay_webhook_events(
