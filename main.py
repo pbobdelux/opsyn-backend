@@ -308,6 +308,52 @@ async def lifespan(app: FastAPI):
     )
 
     # ---------------------------------------------------------------------------
+    # [BOOTSTRAP] Pure-SQL schema recovery — runs BEFORE any ORM imports.
+    #
+    # This block repairs missing webhook columns and the leaflink_webhook_events
+    # table using only raw SQL against the engine.  It MUST execute before any
+    # ORM model is imported or queried so that SQLAlchemy never encounters a
+    # schema mismatch (UndefinedColumnError) during startup.
+    # ---------------------------------------------------------------------------
+    logger.info("[BOOTSTRAP_SCHEMA_CHECK_START] initiating pre-ORM bootstrap schema recovery")
+    try:
+        from services.bootstrap_schema_recovery import bootstrap_schema_recovery as _bootstrap_recovery
+        from database import engine as _bootstrap_engine
+
+        _bootstrap_result = await _bootstrap_recovery(_bootstrap_engine)
+
+        if not _bootstrap_result["ok"]:
+            logger.error(
+                "[BOOTSTRAP_SCHEMA_RECOVERY_FAILED] errors=%s",
+                _bootstrap_result["errors"],
+            )
+            raise RuntimeError(
+                "Bootstrap schema recovery failed — cannot safely import ORM models. "
+                f"Errors: {_bootstrap_result['errors']}"
+            )
+
+        logger.info(
+            "[BOOTSTRAP_SCHEMA_RECOVERY_SUCCESS] columns_added=%s tables_created=%s "
+            "indexes_created=%s",
+            _bootstrap_result["columns_added"],
+            _bootstrap_result["tables_created"],
+            _bootstrap_result["indexes_created"],
+        )
+        logger.info("[BOOTSTRAP_SCHEMA_CHECK_COMPLETE] schema verified — safe to import ORM models")
+
+    except RuntimeError:
+        raise
+    except Exception as _bootstrap_exc:
+        logger.error(
+            "[BOOTSTRAP_SCHEMA_RECOVERY_FAILED] unexpected_error=%s",
+            _bootstrap_exc,
+            exc_info=True,
+        )
+        raise RuntimeError(
+            f"Bootstrap schema recovery raised an unexpected error: {_bootstrap_exc}"
+        )
+
+    # ---------------------------------------------------------------------------
     # Log migration runner configuration
     # ---------------------------------------------------------------------------
     from services.migration_runner import MIGRATIONS_DIR as _MIGRATIONS_DIR

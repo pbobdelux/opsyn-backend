@@ -26,6 +26,10 @@ from utils.json_utils import make_json_safe
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+# Register the emergency raw schema check endpoint (no ORM dependencies)
+from routes.raw_schema_check import router as _raw_schema_check_router  # noqa: E402
+router.include_router(_raw_schema_check_router)
+
 # Admin seed token from environment
 ADMIN_SEED_TOKEN = os.getenv("ADMIN_SEED_TOKEN", "opsyn-seed-2026")
 
