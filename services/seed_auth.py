@@ -1,4 +1,5 @@
 import logging
+from uuid import UUID as PyUUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from services.auth_service import (
@@ -61,8 +62,9 @@ async def seed_preston_anderson(db: AsyncSession) -> dict:
             }
 
         logger.info(
-            "[Seed] employee_found employee_id=%s name=%s %s",
+            "[Seed] employee_found employee_id=%s type=%s name=%s %s",
             employee.id,
+            type(employee.id).__name__,
             employee.first_name,
             employee.last_name,
         )
@@ -87,7 +89,7 @@ async def seed_preston_anderson(db: AsyncSession) -> dict:
             return {
                 "ok": True,
                 "message": "Passcode already exists",
-                "employee_id": employee.id,
+                "employee_id": str(employee.id),
             }
 
         # 3. Set up passcode
@@ -104,10 +106,31 @@ async def seed_preston_anderson(db: AsyncSession) -> dict:
             return result
 
         employee_id = result.get("employee_id")
-        logger.info("[Seed] passcode_created employee_id=%s", employee_id)
+        logger.info(
+            "[Seed] passcode_created employee_id=%s type=%s",
+            employee_id,
+            type(employee_id).__name__,
+        )
+
+        # Ensure employee_id is a UUID object before passing to service calls
+        if not isinstance(employee_id, PyUUID):
+            try:
+                employee_id = PyUUID(str(employee_id))
+                logger.info("[Seed] converted_employee_id_to_uuid employee_id=%s", employee_id)
+            except (ValueError, TypeError) as e:
+                logger.error(
+                    "[Seed] invalid_employee_id_format employee_id=%s error=%s",
+                    employee_id,
+                    str(e)[:200],
+                )
+                return {"ok": False, "error": "Invalid employee_id format"}
 
         # 4. Grant brand access
-        logger.info("[Seed] granting_brand_access employee_id=%s brand=noble-nectar", employee_id)
+        logger.info(
+            "[Seed] granting_brand_access employee_id=%s type=%s brand=noble-nectar",
+            employee_id,
+            type(employee_id).__name__,
+        )
 
         result = await grant_brand_access(
             db,
@@ -125,7 +148,12 @@ async def seed_preston_anderson(db: AsyncSession) -> dict:
         # 5. Grant app access
         apps = ["brand_app", "driver_app", "crm_app"]
         for app_id in apps:
-            logger.info("[Seed] granting_app_access employee_id=%s app_id=%s", employee_id, app_id)
+            logger.info(
+                "[Seed] granting_app_access employee_id=%s type=%s app_id=%s",
+                employee_id,
+                type(employee_id).__name__,
+                app_id,
+            )
 
             result = await grant_app_access(
                 db,
@@ -149,7 +177,7 @@ async def seed_preston_anderson(db: AsyncSession) -> dict:
         return {
             "ok": True,
             "message": "Preston Anderson setup complete",
-            "employee_id": employee_id,
+            "employee_id": str(employee_id),
         }
 
     except Exception as e:

@@ -1,4 +1,5 @@
 import logging
+from uuid import UUID as PyUUID
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select, text
@@ -46,7 +47,21 @@ async def login_with_passcode(
     try:
         logger.info("[Auth] passcode_login_request app_id=%s org_id=%s", request.app_id, request.org_id)
 
-        result = await passcode_login(db, request.passcode, request.app_id, request.org_id)
+        # Normalise org_id: if it looks like a UUID string, convert to UUID object
+        # so downstream queries use the correct PostgreSQL type.
+        org_id = request.org_id
+        if org_id is not None:
+            logger.info("[Auth] org_id_type org_id=%s type=%s", org_id, type(org_id).__name__)
+            try:
+                org_id_as_uuid = PyUUID(org_id)
+                # Only replace if the string is a valid UUID (not an org_code like "noble")
+                org_id = str(org_id_as_uuid)
+                logger.info("[Auth] org_id_is_uuid org_id=%s", org_id)
+            except (ValueError, AttributeError):
+                # Not a UUID — treat as org_code slug, pass through unchanged
+                logger.info("[Auth] org_id_is_slug org_id=%s", org_id)
+
+        result = await passcode_login(db, request.passcode, request.app_id, org_id)
 
         if not result.get("ok"):
             logger.warning("[Auth] login_failed error=%s", result.get("error"))

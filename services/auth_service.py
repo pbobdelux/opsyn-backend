@@ -1,6 +1,6 @@
 import logging
 import uuid
-from uuid import UUID
+from uuid import UUID as PyUUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from utils.auth_utils import hash_passcode, verify_passcode
@@ -60,11 +60,31 @@ async def setup_employee_passcode(
         passcode_hash = hash_passcode(passcode)
         logger.info("[Auth] passcode_hashed hash_length=%d", len(passcode_hash))
 
+        # Ensure employee.id is a UUID object before inserting
+        logger.info(
+            "[Auth] setup_passcode_employee_id employee_id=%s type=%s",
+            employee.id,
+            type(employee.id).__name__,
+        )
+        if isinstance(employee.id, PyUUID):
+            employee_uuid = employee.id
+        else:
+            try:
+                employee_uuid = PyUUID(str(employee.id))
+                logger.info("[Auth] converted_employee_id_to_uuid employee_id=%s", employee_uuid)
+            except (ValueError, TypeError) as e:
+                logger.error(
+                    "[Auth] invalid_employee_id_format employee_id=%s error=%s",
+                    employee.id,
+                    str(e)[:200],
+                )
+                return {"ok": False, "error": "Invalid employee_id format"}
+
         # Create passcode record
-        passcode_id = str(uuid.uuid4())
+        passcode_id = uuid.uuid4()
         new_passcode = EmployeePasscode(
             id=passcode_id,
-            employee_id=employee.id,
+            employee_id=employee_uuid,
             passcode_hash=passcode_hash,
             is_active=True,
         )
@@ -72,7 +92,7 @@ async def setup_employee_passcode(
         logger.info(
             "[Auth] inserting_passcode passcode_id=%s employee_id=%s",
             passcode_id,
-            employee.id,
+            employee_uuid,
         )
 
         db.add(new_passcode)
@@ -81,12 +101,12 @@ async def setup_employee_passcode(
         logger.info(
             "[Auth] passcode_created passcode_id=%s employee_id=%s",
             passcode_id,
-            employee.id,
+            employee_uuid,
         )
 
         return {
             "ok": True,
-            "employee_id": employee.id,
+            "employee_id": employee_uuid,
             "message": f"Passcode set for {employee.email}",
         }
 
@@ -98,7 +118,7 @@ async def setup_employee_passcode(
 
 async def grant_brand_access(
     db: AsyncSession,
-    employee_id: str,
+    employee_id,
     brand_slug: str,
     role: str = "admin",
 ) -> dict:
@@ -107,7 +127,7 @@ async def grant_brand_access(
 
     Args:
         db: Database session
-        employee_id: Employee ID
+        employee_id: Employee ID (UUID object or UUID string)
         brand_slug: Brand slug
         role: Access role (admin, editor, viewer)
 
@@ -115,6 +135,26 @@ async def grant_brand_access(
         {ok: bool, message: str}
     """
     try:
+        # Ensure employee_id is a UUID object
+        logger.info(
+            "[Auth] grant_brand_access employee_id=%s type=%s",
+            employee_id,
+            type(employee_id).__name__,
+        )
+        if isinstance(employee_id, PyUUID):
+            employee_uuid = employee_id
+        else:
+            try:
+                employee_uuid = PyUUID(str(employee_id))
+                logger.info("[Auth] converted_employee_id_to_uuid employee_id=%s", employee_uuid)
+            except (ValueError, TypeError) as e:
+                logger.error(
+                    "[Auth] invalid_employee_id_format employee_id=%s error=%s",
+                    employee_id,
+                    str(e)[:200],
+                )
+                return {"ok": False, "error": "Invalid employee_id format"}
+
         # Find brand by slug
         result = await db.execute(
             select(Brand).where(Brand.slug == brand_slug)
@@ -126,10 +166,10 @@ async def grant_brand_access(
             return {"ok": False, "error": "Brand not found"}
 
         # Create brand access record
-        access_id = str(uuid.uuid4())
+        access_id = uuid.uuid4()
         brand_access = EmployeeBrandAccess(
             id=access_id,
-            employee_id=employee_id,
+            employee_id=employee_uuid,
             brand_id=brand.id,
             role=role,
             is_active=True,
@@ -140,7 +180,7 @@ async def grant_brand_access(
 
         logger.info(
             "[Auth] brand_access_granted employee_id=%s brand_id=%s role=%s",
-            employee_id,
+            employee_uuid,
             brand.id,
             role,
         )
@@ -158,7 +198,7 @@ async def grant_brand_access(
 
 async def grant_app_access(
     db: AsyncSession,
-    employee_id: str,
+    employee_id,
     app_id: str,
     role: str = "admin",
 ) -> dict:
@@ -167,7 +207,7 @@ async def grant_app_access(
 
     Args:
         db: Database session
-        employee_id: Employee ID
+        employee_id: Employee ID (UUID object or UUID string)
         app_id: App ID (brand_app, driver_app, crm_app)
         role: Access role (admin, editor, viewer)
 
@@ -175,11 +215,31 @@ async def grant_app_access(
         {ok: bool, message: str}
     """
     try:
+        # Ensure employee_id is a UUID object
+        logger.info(
+            "[Auth] grant_app_access employee_id=%s type=%s",
+            employee_id,
+            type(employee_id).__name__,
+        )
+        if isinstance(employee_id, PyUUID):
+            employee_uuid = employee_id
+        else:
+            try:
+                employee_uuid = PyUUID(str(employee_id))
+                logger.info("[Auth] converted_employee_id_to_uuid employee_id=%s", employee_uuid)
+            except (ValueError, TypeError) as e:
+                logger.error(
+                    "[Auth] invalid_employee_id_format employee_id=%s error=%s",
+                    employee_id,
+                    str(e)[:200],
+                )
+                return {"ok": False, "error": "Invalid employee_id format"}
+
         # Create app access record
-        access_id = str(uuid.uuid4())
+        access_id = uuid.uuid4()
         app_access = EmployeeAppAccess(
             id=access_id,
-            employee_id=employee_id,
+            employee_id=employee_uuid,
             app_id=app_id,
             role=role,
             is_active=True,
@@ -190,7 +250,7 @@ async def grant_app_access(
 
         logger.info(
             "[Auth] app_access_granted employee_id=%s app_id=%s role=%s",
-            employee_id,
+            employee_uuid,
             app_id,
             role,
         )
@@ -270,12 +330,17 @@ async def passcode_login(
 
         logger.info("[Auth] passcode_verified passcode_id=%s", matching_passcode.id)
 
-        # Get employee
+        # Get employee — log the Python type of employee_id before querying
+        logger.info(
+            "[Auth] matching_passcode_employee_id employee_id=%s type=%s",
+            matching_passcode.employee_id,
+            type(matching_passcode.employee_id).__name__,
+        )
         employee_id_str = str(matching_passcode.employee_id)
         logger.info("[Auth] extracted_employee_id employee_id=%s", employee_id_str)
 
         try:
-            employee_uuid = UUID(employee_id_str)
+            employee_uuid = PyUUID(employee_id_str)
             logger.info("[Auth] using_uuid employee_id=%s", employee_uuid)
         except (ValueError, TypeError) as uuid_exc:
             logger.error(
@@ -403,11 +468,17 @@ async def passcode_login(
         brand = None
         brand_id = None
         if brand_access:
+            # Log the Python type of brand_id before querying
+            logger.info(
+                "[Auth] brand_access_brand_id brand_id=%s type=%s",
+                brand_access.brand_id,
+                type(brand_access.brand_id).__name__,
+            )
             brand_id_str = str(brand_access.brand_id)
             logger.info("[Auth] querying_brand brand_id=%s", brand_id_str)
 
             try:
-                brand_uuid = UUID(brand_id_str)
+                brand_uuid = PyUUID(brand_id_str)
                 logger.info("[Auth] using_uuid brand_id=%s", brand_uuid)
             except (ValueError, TypeError) as uuid_exc:
                 logger.error(
