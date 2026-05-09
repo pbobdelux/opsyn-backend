@@ -565,9 +565,9 @@ async def lifespan(app: FastAPI):
         logger.warning("[STARTUP_SCHEMA_WARNING] schema_check_exception error=%s", str(_sc_exc)[:300])
 
     # ---------------------------------------------------------------------------
-    # Webhook schema validation — verify webhook tables/columns exist
-    # Logs [WEBHOOK_SCHEMA_VALIDATION] markers; does NOT crash if missing
-    # (migrations may not have run yet in some environments).
+    # Webhook schema validation — final check after auto-recovery.
+    # Logs [WEBHOOK_SCHEMA_VALIDATION_FINAL] marker for confirmation.
+    # Hard-fail is already handled above by verify_critical_webhook_columns.
     # ---------------------------------------------------------------------------
     try:
         from services.webhook_schema_validator import validate_webhook_schema
@@ -579,14 +579,16 @@ async def lifespan(app: FastAPI):
 
             if _wv_result.get("valid"):
                 logger.info(
+                    "[WEBHOOK_SCHEMA_VALIDATION_FINAL] critical_columns_present=true status=ok"
+                )
+                logger.info(
                     "[WEBHOOK_SCHEMA_VALIDATION] startup_check=passed "
                     "tables_ok=true columns_ok=true"
                 )
             else:
                 logger.warning(
                     "[WEBHOOK_SCHEMA_VALIDATION] startup_check=failed "
-                    "missing_tables=%s missing_columns=%s "
-                    "action=webhook_status_will_return_partial_metrics",
+                    "missing_tables=%s missing_columns=%s",
                     _wv_result.get("missing_tables", []),
                     list(_wv_result.get("missing_columns", {}).keys()),
                 )

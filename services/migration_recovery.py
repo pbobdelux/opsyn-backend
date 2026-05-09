@@ -6,6 +6,9 @@ critical webhook schema columns are missing (because migrations were skipped
 or silently failed on Railway), this module executes the required ALTER TABLE
 and CREATE TABLE statements directly via raw SQL and commits them.
 
+This module is the authoritative implementation for webhook schema recovery.
+It is called from main.py lifespan startup after run_migrations() completes.
+
 Design goals:
   - Idempotent: every statement uses IF NOT EXISTS / IF NOT EXISTS guards.
   - Non-destructive: only ADDs columns / tables; never drops or modifies.
