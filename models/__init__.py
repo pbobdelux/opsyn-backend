@@ -746,6 +746,7 @@ class LeafLinkWebhookEvent(Base):
         Index("ix_leaflink_webhook_events_brand_id", "brand_id"),
         Index("ix_leaflink_webhook_events_tenant_status", "tenant_resolution_status"),
         Index("ix_leaflink_webhook_events_received_at", "received_at"),
+        Index("ix_leaflink_webhook_events_sig_status", "signature_verification_status"),
         Index(
             "ix_leaflink_webhook_events_brand_idempotency",
             "brand_id",
@@ -761,6 +762,7 @@ class LeafLinkWebhookEvent(Base):
     )
 
     # Tenant identification (nullable until resolved)
+
     brand_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True, index=True)
     org_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
 
