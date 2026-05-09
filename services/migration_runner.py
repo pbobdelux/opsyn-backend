@@ -132,6 +132,13 @@ async def run_migrations() -> list[str]:
     """
     from database import engine
 
+    runner_start = time.monotonic()
+
+    logger.info(
+        "[MIGRATION_RUNNER_START] runner_type=custom directory=%s",
+        MIGRATIONS_DIR,
+    )
+
     if engine is None:
         logger.warning("[Migration] DATABASE_URL not set — skipping migrations")
         return []
@@ -151,6 +158,13 @@ async def run_migrations() -> list[str]:
         if not sql_files:
             logger.info("[Migration] no migration files found")
             return []
+
+        logger.info(
+            "[MIGRATION_RUNNER_START] migrations_discovered=%d",
+            len(sql_files),
+        )
+        for f in sql_files:
+            logger.info("[MIGRATION_FILE_DISCOVERED] file=%s", f)
 
         # Bootstrap: ensure the tracking table exists in its own transaction.
         # This is a CRITICAL step — if it fails, we cannot track migrations at all.
@@ -224,6 +238,11 @@ async def run_migrations() -> list[str]:
                 # Transaction is committed automatically when engine.begin() block exits.
 
                 logger.info(
+                    "[MIGRATION_EXECUTED] migration=%s status=success duration_ms=%s",
+                    filename,
+                    duration_ms,
+                )
+                logger.info(
                     "[Migration] applied migration=%s duration_ms=%s",
                     filename,
                     duration_ms,
@@ -233,6 +252,11 @@ async def run_migrations() -> list[str]:
             except Exception as migration_exc:
                 # Transaction is automatically rolled back by the context manager on exception.
                 # Log as non-critical and continue — one broken migration must not abort startup.
+                logger.warning(
+                    "[MIGRATION_FAILED] migration=%s error=%s",
+                    filename,
+                    migration_exc,
+                )
                 logger.warning(
                     "[MIGRATION_FAILED_NONCRITICAL] migration=%s error=%s",
                     filename,
@@ -253,6 +277,15 @@ async def run_migrations() -> list[str]:
         logger.error("[Migration] runner error=%s", exc, exc_info=True)
 
     total = len(applied) + len(failed)
+    runner_duration_ms = int((time.monotonic() - runner_start) * 1000)
+
+    logger.info(
+        "[MIGRATION_RUNNER_COMPLETE] total_migrations=%d applied=%d failed=%d duration_ms=%d",
+        total,
+        len(applied),
+        len(failed),
+        runner_duration_ms,
+    )
     logger.info(
         "[MIGRATION_SUMMARY] total=%d passed=%d failed=%d",
         total,
