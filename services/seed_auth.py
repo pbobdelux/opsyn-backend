@@ -6,7 +6,6 @@ from services.auth_service import (
     grant_brand_access,
     grant_app_access,
 )
-from models.auth_models import Employee, EmployeePasscode
 
 logger = logging.getLogger("seed_auth")
 
@@ -21,6 +20,10 @@ async def seed_preston_anderson(db: AsyncSession) -> dict:
     Returns:
         {ok: bool, message: str, employee_id: str}
     """
+    # Lazy imports — models must not be imported at module level to avoid
+    # triggering database.py initialization before bootstrap runs.
+    from models.auth_models import Employee, EmployeePasscode  # noqa: F401
+
     try:
         logger.info("[Seed] starting_preston_anderson_setup")
 

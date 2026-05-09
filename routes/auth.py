@@ -4,7 +4,6 @@ from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
-from models.auth_models import Employee
 from services.auth_service import passcode_login
 from utils.json_utils import make_json_safe
 
@@ -94,6 +93,7 @@ async def debug_employees(db: AsyncSession = Depends(get_db)):
 
     Returns all employees and their details.
     """
+    from models.auth_models import Employee  # lazy import — avoids module-level DB init
     try:
         logger.info("[Auth] debug_employees_requested")
 

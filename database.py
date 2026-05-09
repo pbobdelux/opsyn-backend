@@ -48,17 +48,62 @@ def normalize_database_url(url: str) -> str:
 #   Railway: postgresql+asyncpg://user:pass@postgres.railway.internal:5432/railway
 #   Local:   postgresql+asyncpg://user:pass@localhost:5432/opsyn_dev
 #
-# Production startup will FAIL if DATABASE_URL does not contain 'rds.amazonaws.com'
+# Engine creation is DEFERRED — importing this module does NOT create the engine.
+# Call initialize_database_after_bootstrap() after bootstrap completes.
 # ============================================================================
 
-_raw_database_url = os.getenv("DATABASE_URL", "")
+# ---------------------------------------------------------------------------
+# Lazy engine state — populated by initialize_database_after_bootstrap()
+# ---------------------------------------------------------------------------
+_engine = None
+_AsyncSessionLocal = None
+_bootstrap_complete = False
 
-# Validate DATABASE_URL format before normalization
-if _raw_database_url:
+# DATABASE_URL is computed lazily so importing this module never raises.
+DATABASE_URL: str = ""
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def is_bootstrap_complete() -> bool:
+    """Return True if initialize_database_after_bootstrap() has been called."""
+    return _bootstrap_complete
+
+
+def get_engine():
+    """Return the async engine, raising if bootstrap has not run yet."""
+    if _engine is None:
+        raise RuntimeError(
+            "Database not initialized — bootstrap must run first. "
+            "Call initialize_database_after_bootstrap() before using the engine."
+        )
+    return _engine
+
+
+def get_async_session_local():
+    """Return the session factory, raising if bootstrap has not run yet."""
+    if _AsyncSessionLocal is None:
+        raise RuntimeError(
+            "Database not initialized — bootstrap must run first. "
+            "Call initialize_database_after_bootstrap() before using sessions."
+        )
+    return _AsyncSessionLocal
+
+
+def _build_database_url() -> str:
+    """Normalize and validate DATABASE_URL from the environment."""
+    raw = os.getenv("DATABASE_URL", "")
+
+    if not raw:
+        logger.error("[BOOT_DB] DATABASE_URL is empty or not set")
+        raise ValueError("DATABASE_URL environment variable is not set")
+
     logger.info("[BOOT_DB] validating_database_url")
 
     # Check for common malformations
-    if _raw_database_url.startswith("DATABASE_URL"):
+    if raw.startswith("DATABASE_URL"):
         logger.error(
             "[BOOT_DB] invalid_database_url malformed=true reason=starts_with_DATABASE_URL"
         )
@@ -67,7 +112,7 @@ if _raw_database_url:
             "Remove the 'DATABASE_URL=' prefix from the value."
         )
 
-    if "\n" in _raw_database_url or "\r" in _raw_database_url:
+    if "\n" in raw or "\r" in raw:
         logger.error(
             "[BOOT_DB] invalid_database_url malformed=true reason=contains_newlines"
         )
@@ -76,7 +121,7 @@ if _raw_database_url:
             "Ensure the value is a single line with no line breaks."
         )
 
-    if _raw_database_url.startswith('"') or _raw_database_url.startswith("'"):
+    if raw.startswith('"') or raw.startswith("'"):
         logger.error(
             "[BOOT_DB] invalid_database_url malformed=true reason=starts_with_quote"
         )
@@ -88,8 +133,7 @@ if _raw_database_url:
     # Try to parse as SQLAlchemy URL
     try:
         from sqlalchemy.engine.url import make_url
-        _parsed_url = make_url(_raw_database_url)
-
+        _parsed_url = make_url(raw)
         logger.info(
             "[BOOT_DB] database_url_valid drivername=%s host=%s database=%s",
             _parsed_url.drivername,
@@ -99,100 +143,125 @@ if _raw_database_url:
     except Exception as _parse_exc:
         logger.error(
             "[BOOT_DB] invalid_database_url raw_prefix=%s error=%s",
-            _raw_database_url[:25] if _raw_database_url else "EMPTY",
+            raw[:25] if raw else "EMPTY",
             str(_parse_exc),
         )
         raise ValueError(
             f"DATABASE_URL is not a valid SQLAlchemy URL: {str(_parse_exc)}. "
             f"Expected format: postgresql+asyncpg://user:pass@host:5432/database"
         )
-else:
-    logger.error("[BOOT_DB] DATABASE_URL is empty or not set")
-    raise ValueError("DATABASE_URL environment variable is not set")
 
-# Ensure sslmode=require is in the URL before normalization
-if "sslmode=require" not in _raw_database_url and "ssl=require" not in _raw_database_url:
-    logger.warning("[BOOT_DB] sslmode_not_in_url adding_sslmode=require")
-    if "?" in _raw_database_url:
-        _raw_database_url = _raw_database_url + "&sslmode=require"
-    else:
-        _raw_database_url = _raw_database_url + "?sslmode=require"
-    logger.info("[BOOT_DB] sslmode_added")
+    # Ensure sslmode=require is in the URL before normalization
+    if "sslmode=require" not in raw and "ssl=require" not in raw:
+        logger.warning("[BOOT_DB] sslmode_not_in_url adding_sslmode=require")
+        if "?" in raw:
+            raw = raw + "&sslmode=require"
+        else:
+            raw = raw + "?sslmode=require"
+        logger.info("[BOOT_DB] sslmode_added")
 
-DATABASE_URL = normalize_database_url(_raw_database_url)
+    url = normalize_database_url(raw)
 
-if DATABASE_URL:
-    _parsed = urlparse(DATABASE_URL)
-    _safe_url = f"{_parsed.scheme}://{_parsed.hostname}:{_parsed.port}/{_parsed.path.lstrip('/')}"
-    logger.info("[Database] DATABASE_URL=%s", _safe_url)
+    if url:
+        _parsed = urlparse(url)
+        _safe_url = f"{_parsed.scheme}://{_parsed.hostname}:{_parsed.port}/{_parsed.path.lstrip('/')}"
+        logger.info("[Database] DATABASE_URL=%s", _safe_url)
 
-    # Log AWS RDS connection details at startup
-    _host = _parsed.hostname or "unknown"
-    _port = _parsed.port or 5432
-    _db = _parsed.path.lstrip("/") or "unknown"
+        _host = _parsed.hostname or "unknown"
+        _port = _parsed.port or 5432
+        _db = _parsed.path.lstrip("/") or "unknown"
 
-    logger.info("[DB] AWS_RDS_CONNECTION host=%s port=%s database=%s", _host, _port, _db)
+        logger.info("[DB] AWS_RDS_CONNECTION host=%s port=%s database=%s", _host, _port, _db)
 
-    if "rds.amazonaws.com" in _host:
-        logger.info("[DB] CONNECTED_TO_AWS_RDS")
-    else:
-        logger.warning("[DB] NOT_CONNECTED_TO_AWS_RDS host=%s", _host)
-else:
-    logger.warning("[Database] DATABASE_URL not set")
+        if "rds.amazonaws.com" in _host:
+            logger.info("[DB] CONNECTED_TO_AWS_RDS")
+        else:
+            logger.warning("[DB] NOT_CONNECTED_TO_AWS_RDS host=%s", _host)
+
+    return url
 
 
-class Base(DeclarativeBase):
-    pass
+async def initialize_database_after_bootstrap() -> None:
+    """
+    Create the async engine and session factory AFTER bootstrap has completed.
 
+    This MUST be called by main.py after bootstrap_schema_recovery() succeeds
+    and BEFORE any ORM models or routers are imported.
 
-if DATABASE_URL:
+    Populates the module-level _engine, _AsyncSessionLocal, DATABASE_URL, and
+    _bootstrap_complete flag so all downstream code can use them.
+    """
+    global _engine, _AsyncSessionLocal, DATABASE_URL, _bootstrap_complete
+
+    logger.info("[BOOTSTRAP_DB_INIT] building DATABASE_URL")
+    DATABASE_URL = _build_database_url()
+
     logger.info(
-        "[DB] initializing_engine database_url=%s",
+        "[BOOTSTRAP_DB_INIT] creating engine database_url=%s",
         DATABASE_URL[:50] + "..." if DATABASE_URL else "NOT_SET",
     )
 
-    # Parse URL to extract details for logging
     _parsed_url = urlparse(DATABASE_URL)
     _drivername = _parsed_url.scheme
     _host = _parsed_url.hostname or "unknown"
     _has_ssl_in_url = "ssl" in _parsed_url.query.lower() or "sslmode" in _parsed_url.query.lower()
 
     logger.info(
-        "[DB] drivername=%s host=%s ssl_in_url=%s",
+        "[BOOTSTRAP_DB_INIT] drivername=%s host=%s ssl_in_url=%s",
         _drivername,
         _host,
         _has_ssl_in_url,
     )
 
-    # Force SSL in connect_args for asyncpg
-    # asyncpg only accepts 'ssl' in connect_args, not 'sslmode'
-    engine = create_async_engine(
+    _engine = create_async_engine(
         DATABASE_URL,
         echo=False,
         pool_pre_ping=True,
-        connect_args={"ssl": "require"},  # Force SSL for asyncpg
-        execution_options={"compiled_cache": None},  # Disable statement cache to prevent UUID/VARCHAR type confusion
+        connect_args={"ssl": "require"},
+        execution_options={"compiled_cache": None},
     )
 
-    logger.info("[DB] engine_created with connect_args_ssl=require compiled_cache=disabled")
+    logger.info("[BOOTSTRAP_DB_INIT] engine_created connect_args_ssl=require compiled_cache=disabled")
 
-    AsyncSessionLocal = async_sessionmaker(
-        bind=engine,
+    _AsyncSessionLocal = async_sessionmaker(
+        bind=_engine,
         class_=AsyncSession,
         expire_on_commit=False,
     )
 
-    logger.info("[DB] session_factory_created")
-else:
-    engine = None
-    AsyncSessionLocal = None
+    logger.info("[BOOTSTRAP_DB_INIT] session_factory_created")
+
+    _bootstrap_complete = True
+
+    # Update module-level aliases so `from database import engine` and
+    # `from database import AsyncSessionLocal` work after bootstrap.
+    # Note: code that already did `from database import engine` before bootstrap
+    # will still have None — they must re-import or use `import database; database.engine`.
+    import sys as _sys
+    _mod = _sys.modules[__name__]
+    _mod.engine = _engine
+    _mod.AsyncSessionLocal = _AsyncSessionLocal
+
+    logger.info("[BOOTSTRAP_DB_INIT_COMPLETE] database module initialized bootstrap_complete=true")
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible module-level aliases.
+# These are None until initialize_database_after_bootstrap() is called.
+# initialize_database_after_bootstrap() updates these via sys.modules so that
+# code doing `from database import engine` AFTER bootstrap gets the real engine.
+# ---------------------------------------------------------------------------
+engine = None
+AsyncSessionLocal = None
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    if AsyncSessionLocal is None:
-        raise RuntimeError("DATABASE_URL is not configured")
+    if _AsyncSessionLocal is None:
+        raise RuntimeError(
+            "DATABASE_URL is not configured — bootstrap must run first"
+        )
 
-    async with AsyncSessionLocal() as session:
+    async with _AsyncSessionLocal() as session:
         yield session
 
 
@@ -201,29 +270,33 @@ async def refresh_connection_pool() -> None:
     Dispose of the current connection pool and create a new one.
     Use this after schema changes to ensure new connections see updated schema.
     """
-    global engine, AsyncSessionLocal
+    global _engine, _AsyncSessionLocal, engine, AsyncSessionLocal
 
-    if engine is None:
+    if _engine is None:
         return
 
     logger.info("[Database] disposing_connection_pool")
-    await engine.dispose()
+    await _engine.dispose()
     logger.info("[Database] connection_pool_disposed")
 
     # Recreate engine and session factory with SSL forced
-    engine = create_async_engine(
+    _engine = create_async_engine(
         DATABASE_URL,
         echo=False,
         pool_pre_ping=True,
-        connect_args={"ssl": "require"},  # Force SSL for asyncpg
-        execution_options={"compiled_cache": None},  # Disable statement cache to prevent UUID/VARCHAR type confusion
+        connect_args={"ssl": "require"},
+        execution_options={"compiled_cache": None},
     )
 
-    AsyncSessionLocal = async_sessionmaker(
-        bind=engine,
+    _AsyncSessionLocal = async_sessionmaker(
+        bind=_engine,
         class_=AsyncSession,
         expire_on_commit=False,
     )
+
+    # Keep module-level aliases in sync
+    engine = _engine
+    AsyncSessionLocal = _AsyncSessionLocal
 
     logger.info("[Database] connection_pool_recreated with connect_args_ssl=require compiled_cache=disabled")
 
@@ -265,15 +338,15 @@ async def dispose_and_recreate_engine() -> None:
     statement metadata from a previous deploy is discarded before the first
     sync operation runs.
     """
-    global engine, AsyncSessionLocal
+    global _engine, _AsyncSessionLocal, engine, AsyncSessionLocal
 
-    if engine is None:
+    if _engine is None:
         return
 
     logger.info("[DB_STARTUP] disposing_engine_for_fresh_cache")
-    await engine.dispose()
+    await _engine.dispose()
 
-    engine = create_async_engine(
+    _engine = create_async_engine(
         DATABASE_URL,
         echo=False,
         pool_pre_ping=True,
@@ -281,11 +354,15 @@ async def dispose_and_recreate_engine() -> None:
         execution_options={"compiled_cache": None},  # Disable statement cache to prevent UUID/VARCHAR type confusion
     )
 
-    AsyncSessionLocal = async_sessionmaker(
-        bind=engine,
+    _AsyncSessionLocal = async_sessionmaker(
+        bind=_engine,
         class_=AsyncSession,
         expire_on_commit=False,
     )
+
+    # Keep module-level aliases in sync
+    engine = _engine
+    AsyncSessionLocal = _AsyncSessionLocal
 
     logger.info("[DB_STARTUP] engine_recreated_after_dispose compiled_cache=disabled")
 
@@ -301,12 +378,12 @@ async def confirm_database_identity() -> None:
 
     Logs as [DB_IDENTITY_CONFIRM] for easy grepping.
     """
-    if engine is None:
+    if _engine is None:
         logger.warning("[DB_IDENTITY_CONFIRM] engine not available — skipping identity check")
         return
 
     try:
-        async with engine.connect() as conn:
+        async with _engine.connect() as conn:
             result = await conn.execute(
                 text("""
                     SELECT
@@ -351,12 +428,12 @@ async def inspect_schema_at_startup() -> None:
     """
     global _schema_column_types
 
-    if engine is None:
+    if _engine is None:
         logger.warning("[SCHEMA_INSPECT] engine not available — skipping schema inspection")
         return
 
     try:
-        async with engine.connect() as conn:
+        async with _engine.connect() as conn:
             for table_name in ("orders", "order_lines"):
                 result = await conn.execute(
                     text(
