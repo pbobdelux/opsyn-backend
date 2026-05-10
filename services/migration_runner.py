@@ -124,7 +124,41 @@ SKIPPED_LEGACY_MIGRATIONS: dict[str, str] = {
         "order. Replaced by 2026_05_31_00_canonical_baseline_schema.sql which "
         "establishes the correct schema idempotently without any type conflicts."
     ),
+
+    # -------------------------------------------------------------------------
+    # 2026_05_28_02/03/04/05 — unsafe INTEGER→UUID column-swap chain.
+    # These migrations assume INTEGER PKs exist on sync_runs, orders, and
+    # several other tables.  On any database where the canonical baseline has
+    # run (UUID PKs from the start) they would fail with 'column id_uuid
+    # already exists', DROP COLUMN errors, or FK type mismatches.
+    # Superseded by 2026_05_31_00_canonical_baseline_schema.sql.
+    # -------------------------------------------------------------------------
+    "2026_05_28_02_migrate_sync_runs_to_uuid.sql": (
+        "Unsafe INTEGER-to-UUID column swap on sync_runs; assumes INTEGER PK exists. "
+        "Superseded by 2026_05_31_00_canonical_baseline_schema.sql which creates "
+        "sync_runs with UUID PK from the start. Running this on a UUID-PK database "
+        "would cause 'column id_uuid already exists' or DROP COLUMN errors."
+    ),
+    "2026_05_28_03_migrate_orders_to_uuid.sql": (
+        "Unsafe INTEGER-to-UUID column swap on orders; assumes INTEGER PK exists. "
+        "Superseded by 2026_05_31_00_canonical_baseline_schema.sql which creates "
+        "orders with UUID PK from the start. Running this on a UUID-PK database "
+        "would cause type mismatch errors on FK columns."
+    ),
+    "2026_05_28_04_migrate_remaining_integer_tables.sql": (
+        "Unsafe INTEGER-to-UUID column swaps on brand_api_credentials, tenant_credentials, "
+        "sync_requests, sync_health, sync_dead_letters, sync_metrics_snapshots, "
+        "organization_brand_bindings, order_lines, and dead_letter_line_items. "
+        "Superseded by 2026_05_31_00_canonical_baseline_schema.sql which creates all "
+        "these tables with UUID PKs from the start."
+    ),
+    "2026_05_28_05_verify_schema_standardization.sql": (
+        "Verification-only migration for the broken 2026_05_28_02/03/04 migration chain. "
+        "Those migrations are quarantined; this verification script is therefore moot "
+        "and would fail on a fresh database where the INTEGER PKs never existed."
+    ),
 }
+
 
 
 def _should_skip_migration(filename: str) -> str | None:
@@ -218,55 +252,130 @@ def _compute_checksum(content: str) -> str:
 
 def _split_statements(sql: str) -> list[str]:
     """
-    Split a SQL file into individual statements, correctly handling
-    dollar-quoted blocks (DO $ ... $) so that semicolons inside
-    PL/pgSQL bodies are not treated as statement terminators.
+    Split a SQL file into individual statements, correctly handling:
+      - Dollar-quoted blocks (DO $$ ... $$) so semicolons inside PL/pgSQL
+        bodies are not treated as statement terminators.
+      - Single-line comments (-- ...) so comment text is never executed.
+      - Block comments (/* ... */) so multi-line comment prose is never
+        executed as SQL.
+      - Single-quoted string literals so semicolons inside strings are not
+        treated as statement terminators.
 
     Algorithm:
-      - Scan character-by-character tracking whether we are inside a
-        dollar-quote (e.g. ``$`` or ``$tag`).
-      - Only split on ``;`` when outside a dollar-quote.
-      - Strip comment-only lines and blank lines from each resulting chunk.
+      - Scan character-by-character tracking the current parse context:
+        dollar-quote, block comment, line comment, or string literal.
+      - Only split on ``;`` when in the default (unquoted, uncommented) context.
+      - Strip blank lines from each resulting chunk before appending to output.
     """
     statements: list[str] = []
     current: list[str] = []
-    dollar_tag: str | None = None  # None = not inside a dollar-quote
+    dollar_tag: str | None = None  # non-None when inside a dollar-quote
+    in_block_comment: bool = False
+    in_line_comment: bool = False
+    in_string: bool = False
     i = 0
+    n = len(sql)
 
-    while i < len(sql):
+    while i < n:
         ch = sql[i]
 
-        if dollar_tag is None:
-            # Look for the start of a dollar-quote: $tag$ or $
-            if ch == "$":
-                # Find the closing $ of the opening tag
-                j = sql.find("$", i + 1)
-                if j != -1:
-                    tag = sql[i : j + 1]  # e.g. "$" or "$body$"
-                    dollar_tag = tag
-                    current.append(tag)
-                    i = j + 1
-                    continue
-            if ch == ";":
-                chunk = "".join(current)
-                # Strip comment-only lines and blank lines
-                lines = [
-                    line for line in chunk.splitlines()
-                    if line.strip() and not line.strip().startswith("--")
-                ]
-                stmt = "\n".join(lines).strip()
-                if stmt:
-                    statements.append(stmt)
-                current = []
-                i += 1
-                continue
-        else:
-            # Inside a dollar-quote — look for the matching closing tag
+        # ------------------------------------------------------------------ #
+        # Context: inside a dollar-quoted block                               #
+        # ------------------------------------------------------------------ #
+        if dollar_tag is not None:
             if sql[i : i + len(dollar_tag)] == dollar_tag:
                 current.append(dollar_tag)
                 i += len(dollar_tag)
                 dollar_tag = None
+            else:
+                current.append(ch)
+                i += 1
+            continue
+
+        # ------------------------------------------------------------------ #
+        # Context: inside a /* ... */ block comment                           #
+        # ------------------------------------------------------------------ #
+        if in_block_comment:
+            if ch == "*" and i + 1 < n and sql[i + 1] == "/":
+                # End of block comment — consume both chars, emit nothing
+                i += 2
+                in_block_comment = False
+            else:
+                # Discard comment content entirely
+                i += 1
+            continue
+
+        # ------------------------------------------------------------------ #
+        # Context: inside a -- line comment                                   #
+        # ------------------------------------------------------------------ #
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+                current.append(ch)  # preserve the newline for line counting
+            # Discard comment content
+            i += 1
+            continue
+
+        # ------------------------------------------------------------------ #
+        # Context: inside a single-quoted string literal                      #
+        # ------------------------------------------------------------------ #
+        if in_string:
+            current.append(ch)
+            if ch == "'":
+                # Check for escaped quote ('')
+                if i + 1 < n and sql[i + 1] == "'":
+                    current.append(sql[i + 1])
+                    i += 2
+                else:
+                    in_string = False
+                    i += 1
+            else:
+                i += 1
+            continue
+
+        # ------------------------------------------------------------------ #
+        # Default context — detect transitions                                #
+        # ------------------------------------------------------------------ #
+
+        # Start of a -- line comment
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            in_line_comment = True
+            i += 2
+            continue
+
+        # Start of a /* block comment
+        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            in_block_comment = True
+            i += 2
+            continue
+
+        # Start of a single-quoted string
+        if ch == "'":
+            in_string = True
+            current.append(ch)
+            i += 1
+            continue
+
+        # Start of a dollar-quote: $tag$ or $$
+        if ch == "$":
+            j = sql.find("$", i + 1)
+            if j != -1:
+                tag = sql[i : j + 1]  # e.g. "$$" or "$body$"
+                dollar_tag = tag
+                current.append(tag)
+                i = j + 1
                 continue
+
+        # Statement terminator
+        if ch == ";":
+            chunk = "".join(current)
+            lines = [line for line in chunk.splitlines() if line.strip()]
+            stmt = "\n".join(lines).strip()
+            if stmt:
+                statements.append(stmt)
+            current = []
+            i += 1
+            continue
 
         current.append(ch)
         i += 1
@@ -274,15 +383,13 @@ def _split_statements(sql: str) -> list[str]:
     # Handle any trailing content after the last semicolon
     if current:
         chunk = "".join(current)
-        lines = [
-            line for line in chunk.splitlines()
-            if line.strip() and not line.strip().startswith("--")
-        ]
+        lines = [line for line in chunk.splitlines() if line.strip()]
         stmt = "\n".join(lines).strip()
         if stmt:
             statements.append(stmt)
 
     return statements
+
 
 
 def _topological_sort(files: list[str], deps: dict[str, list[str]]) -> list[str]:

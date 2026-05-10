@@ -15,6 +15,33 @@ recorded in the `schema_migrations` table so it is never applied twice.
 
 ---
 
+## Canonical Baseline Migration
+
+`migrations/2026_05_31_00_canonical_baseline_schema.sql` is the authoritative
+schema definition for all opsyn-backend tables.  It:
+
+- Creates every table with **UUID primary keys** and correct FK types.
+- Establishes tables in dependency order (base tables before dependent tables).
+- Uses `IF NOT EXISTS` guards throughout so it is fully idempotent.
+- Contains **pure SQL only** — no prose, no comments that could be executed.
+- Is marked **critical** so a failure aborts startup immediately.
+
+This migration supersedes nine broken migrations that are now quarantined:
+
+| Quarantined file | Reason |
+|---|---|
+| `001_create_route_events_table.sql` | References `routes(id)` FK before `routes` existed |
+| `002_create_driver_locations_table.sql` | References `drivers(id)` / `routes(id)` before those tables existed |
+| `003_create_driver_route_history_table.sql` | References `drivers`, `routes`, `route_stops` before they existed |
+| `2026_04_23_02_add_tenant_credentials.sql` | Uses SERIAL PK; superseded by baseline |
+| `2026_05_28_02_migrate_sync_runs_to_uuid.sql` | Unsafe INTEGER→UUID swap; assumes INTEGER PK exists |
+| `2026_05_28_03_migrate_orders_to_uuid.sql` | Unsafe INTEGER→UUID swap; assumes INTEGER PK exists |
+| `2026_05_28_04_migrate_remaining_integer_tables.sql` | Unsafe INTEGER→UUID swaps on multiple tables |
+| `2026_05_28_05_verify_schema_standardization.sql` | Verification script for the quarantined migration chain |
+| `2026_05_30_01_reconcile_uuid_integer_mismatches.sql` | Invalid SQL structure; depends on quarantined migrations |
+
+---
+
 ## Migration Ordering Rules
 
 Migrations are executed in the following priority order:
@@ -25,15 +52,6 @@ Migrations are executed in the following priority order:
    in `migration_runner.py` are topologically sorted so that base tables are
    always created before the tables that reference them.
 3. **All remaining migrations** — sorted alphabetically (timestamp order).
-
-### Why dependency ordering matters
-
-The `001_create_route_events_table.sql`, `002_create_driver_locations_table.sql`,
-and `003_create_driver_route_history_table.sql` files reference `routes`,
-`drivers`, and `route_stops` tables.  Those tables are created by
-`2026_05_21_02_add_drivers_routes_stops.sql`.  Alphabetically `001` sorts before
-`2026_05_21`, so without explicit dependencies the runner would fail with
-`relation does not exist`.  The `MIGRATION_DEPENDENCIES` dict fixes this.
 
 ---
 
@@ -52,7 +70,7 @@ Critical migrations are listed in `CRITICAL_MIGRATIONS` in `migration_runner.py`
 CRITICAL_MIGRATIONS: frozenset[str] = frozenset({
     "2026_05_04_01_setup_auth_tables.sql",
     "2026_05_04_02_create_full_schema_aws_rds.sql",
-    "2026_05_30_01_reconcile_uuid_integer_mismatches.sql",
+    "2026_05_31_00_canonical_baseline_schema.sql",
 })
 ```
 
@@ -69,8 +87,8 @@ add it to `SKIPPED_LEGACY_MIGRATIONS` in `migration_runner.py`:
 
 ```python
 SKIPPED_LEGACY_MIGRATIONS: dict[str, str] = {
-    "2026_04_23_02_add_tenant_credentials.sql": (
-        "Uses SERIAL PK; superseded by 2026_05_04_02_create_full_schema_aws_rds.sql"
+    "some_broken_migration.sql": (
+        "Reason why this migration must never run — be specific."
     ),
 }
 ```
@@ -229,23 +247,19 @@ Common causes:
 
 ### Missing parent table errors (`relation does not exist`)
 
-The `001`/`002`/`003` migrations reference `routes`, `drivers`, and
-`route_stops`.  If those tables don't exist yet, add the dependency to
-`MIGRATION_DEPENDENCIES`:
-
-```python
-"001_create_route_events_table.sql": [
-    "2026_05_21_02_add_drivers_routes_stops.sql",
-],
-```
+The `001`/`002`/`003` migrations are quarantined.  The canonical baseline
+(`2026_05_31_00_canonical_baseline_schema.sql`) creates `route_events`,
+`driver_locations`, and `driver_route_history` after all parent tables are
+guaranteed to exist.  No manual dependency wiring is needed.
 
 ### UUID/INTEGER FK mismatch
 
-Run the reconciliation migration:
-`2026_05_30_01_reconcile_uuid_integer_mismatches.sql`
-
-If it has already been applied, check the `[MIGRATION_VALIDATION_FAIL]` log
-entry for the specific table and column, then create a new corrective migration.
+The canonical baseline (`2026_05_31_00_canonical_baseline_schema.sql`) creates
+all tables with UUID PKs and matching FK types from the start.  If a mismatch
+is detected on an existing database, create a new corrective migration that
+uses `ALTER TABLE ... ALTER COLUMN ... TYPE uuid USING ...::uuid` with a
+proper data migration step.  Do not re-enable the quarantined
+`2026_05_28_*` or `2026_05_30_01` migrations.
 
 ---
 
