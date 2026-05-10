@@ -529,6 +529,13 @@ async def leaflink_sync_now(
       POST /leaflink/sync-now?brand_id=<uuid>
       Header: X-OPSyn-Secret: <secret>
     """
+    import time as _time
+    _request_ts = _time.monotonic()
+    logger.info(
+        "[SYNC_NOW_REQUEST] brand_id=%s",
+        brand_id or "all",
+    )
+
     # --- Auth validation ---
     if not _OPSYN_SYNC_SECRET:
         logger.warning(
@@ -543,9 +550,12 @@ async def leaflink_sync_now(
             detail="Missing or invalid X-OPSyn-Secret header",
         )
 
+
+
     # --- Resolve brands to sync ---
     if brand_id:
         # Single brand
+
         cred_result = await db.execute(
             select(BrandAPICredential).where(
                 BrandAPICredential.brand_id == brand_id,
@@ -610,17 +620,34 @@ async def leaflink_sync_now(
     await db.commit()
 
     logger.info(
+        "[SYNC_NOW_ENQUEUED] committed enqueued=%s brand_id=%s elapsed_s=%.3f",
+        len(enqueued),
+        brand_id or "all",
+        _time.monotonic() - _request_ts,
+    )
+
+    logger.info(
         "[SYNC_NOW_COMPLETE] enqueued=%s brand_id=%s",
         len(enqueued),
         brand_id or "all",
     )
 
-    return {
+    _response = {
         "ok": True,
         "message": f"Full backfill enqueued for {len(enqueued)} brand(s)",
         "enqueued": enqueued,
         "sync_request_id": enqueued[0]["sync_run_id"] if len(enqueued) == 1 else None,
     }
+
+    logger.info(
+        "[SYNC_NOW_RESPONSE_SENT] brand_id=%s enqueued=%s elapsed_s=%.3f",
+        brand_id or "all",
+        len(enqueued),
+        _time.monotonic() - _request_ts,
+    )
+
+    return _response
+
 
 
 # ---------------------------------------------------------------------------
