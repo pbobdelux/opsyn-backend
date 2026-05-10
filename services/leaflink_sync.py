@@ -3427,7 +3427,17 @@ RETURNING (xmax = 0) AS was_inserted
     # it by (brand_id, external_order_id).
     # ------------------------------------------------------------------
     async def _background_line_items() -> None:
-        await sync_leaflink_line_items(brand_id_value, orders, org_id=org_id_value)
+        try:
+            await sync_leaflink_line_items(brand_id_value, orders, org_id=org_id_value)
+        except Exception as _bg_exc:
+            # Order headers are already committed above — line item failures must
+            # never propagate back and affect the order header result.
+            logger.error(
+                "[LINE_ITEM_SYNC_ERROR] background_task_crashed brand_id=%s error=%s",
+                brand_id_value,
+                str(_bg_exc)[:300],
+                exc_info=True,
+            )
 
     asyncio.create_task(_background_line_items())
 
@@ -3574,8 +3584,62 @@ async def sync_leaflink_line_items(
     """
     from sqlalchemy import func
 
+    # ------------------------------------------------------------------
+    # Resolve AsyncSessionLocal at call time (not import time) so that
+    # this function works correctly even when leaflink_sync.py was imported
+    # before initialize_database_after_bootstrap() ran and the module-level
+    # AsyncSessionLocal alias was still None.
+    # ------------------------------------------------------------------
+    try:
+        from database import get_async_session_local as _get_session_local
+        _AsyncSessionLocal = _get_session_local()
+        if not callable(_AsyncSessionLocal):
+            logger.error(
+                "[LINE_ITEM_SYNC_ERROR] AsyncSessionLocal is not callable type=%s value=%r",
+                type(_AsyncSessionLocal),
+                _AsyncSessionLocal,
+            )
+            raise ValueError(
+                f"AsyncSessionLocal is not callable: type={type(_AsyncSessionLocal)}"
+            )
+    except Exception as _session_factory_exc:
+        logger.error(
+            "[LINE_ITEM_SYNC_ERROR] failed to resolve AsyncSessionLocal error=%s",
+            str(_session_factory_exc)[:300],
+            exc_info=True,
+        )
+        return {
+            "ok": False,
+            "lines_written": 0,
+            "errors": [f"AsyncSessionLocal unavailable: {str(_session_factory_exc)[:200]}"],
+            "duration_seconds": 0,
+        }
+
+    # Defensive callable checks for all helper functions used in this function
+    _callable_guards = {
+        "_record_sync_error": _record_sync_error,
+        "_update_sync_health_phase2": _update_sync_health_phase2,
+        "_dead_letter_line_item": _dead_letter_line_item,
+        "normalize_line_items": normalize_line_items,
+        "safe_uuid_for_db": safe_uuid_for_db,
+        "safe_str": safe_str,
+        "has_column": has_column,
+    }
+    for _guard_name, _guard_fn in _callable_guards.items():
+        if not callable(_guard_fn):
+            logger.error(
+                "[LINE_ITEM_SYNC_ERROR] helper function is not callable name=%s type=%s",
+                _guard_name,
+                type(_guard_fn),
+            )
+
     # Safety guard: verify orders exist before processing line items
     logger.info("[LINE_ITEM_CHECK_START] checking for parent orders brand=%s", brand_id)
+    logger.info(
+        "[LINE_ITEM_SYNC_START] order_count=%s brand_id=%s",
+        len(orders),
+        brand_id,
+    )
     logger.info(
         "[SYNC_PHASE_2_START] brand_id=%s line_items_to_sync=%s",
         brand_id,
@@ -3601,7 +3665,7 @@ async def sync_leaflink_line_items(
     )
 
     try:
-        async with AsyncSessionLocal() as check_db:
+        async with _AsyncSessionLocal() as check_db:
             result = await check_db.execute(
                 select(func.count()).select_from(Order).where(
                     Order.brand_id == brand_id_value,
@@ -3965,7 +4029,17 @@ async def sync_leaflink_line_items(
         leaflink_order_id = safe_str(external_id)
 
         try:
-            async with AsyncSessionLocal() as db:
+            # Defensive check: ensure _AsyncSessionLocal is still callable before each order
+            if not callable(_AsyncSessionLocal):
+                logger.error(
+                    "[LINE_ITEM_SYNC_ERROR] order_id=%s error=AsyncSessionLocal_not_callable type=%s",
+                    leaflink_order_id,
+                    type(_AsyncSessionLocal),
+                )
+                errors.append(f"AsyncSessionLocal not callable for order {leaflink_order_id}")
+                continue
+
+            async with _AsyncSessionLocal() as db:
                 async with db.begin():
                     result = await db.execute(
                         select(Order).where(
@@ -4001,6 +4075,24 @@ async def sync_leaflink_line_items(
                         continue
 
                     order_id_val = order_row.id
+                    sku_count = len(normalized_line_items)
+
+                    logger.info(
+                        "[LINE_ITEM_SYNC_PROCESSING] order_id=%s sku_count=%s",
+                        order_id_val,
+                        sku_count,
+                    )
+
+                    # Defensive check: ensure _upsert_line_items is callable
+                    if not callable(_upsert_line_items):
+                        logger.error(
+                            "[LINE_ITEM_SYNC_ERROR] order_id=%s error=_upsert_line_items_not_callable type=%s",
+                            order_id_val,
+                            type(_upsert_line_items),
+                        )
+                        errors.append(f"_upsert_line_items not callable for order {order_id_val}")
+                        continue
+
                     inserted_count, skipped_count, failed_items = await _upsert_line_items(
                         db, order_row, normalized_line_items
                     )
@@ -4017,6 +4109,11 @@ async def sync_leaflink_line_items(
                         inserted_count,
                         skipped_count,
                         len(failed_items),
+                    )
+                    logger.info(
+                        "[LINE_ITEM_SYNC_SUCCESS] order_id=%s inserted=%s updated=0",
+                        order_id_val,
+                        inserted_count,
                     )
                     logger.info(
                         "[LINE_ITEMS_SYNCED] order_id=%s count=%s brand_id=%s",
@@ -4045,12 +4142,20 @@ async def sync_leaflink_line_items(
 
         except Exception as line_exc:
             err_msg = str(line_exc)
+            # Non-fatal: log the error and continue to the next order.
+            # Order headers are already committed — line item failures must never
+            # roll back order headers or abort the entire batch.
+            logger.error(
+                "[LINE_ITEM_SYNC_ERROR] order_id=%s error=%s",
+                leaflink_order_id,
+                err_msg[:300],
+                exc_info=True,
+            )
             logger.error(
                 "[OrdersSync] line_items_error brand=%s external_id=%s error=%s",
                 brand_id_value,
                 external_id,
                 err_msg,
-                exc_info=True,
             )
             errors.append(err_msg)
 
@@ -4063,7 +4168,17 @@ async def sync_leaflink_line_items(
         logger.info("[LINE_ITEM_RETRY] leaflink_order_id=%s", leaflink_order_id)
 
         try:
-            async with AsyncSessionLocal() as db:
+            # Defensive check: ensure _AsyncSessionLocal is still callable before retry
+            if not callable(_AsyncSessionLocal):
+                logger.error(
+                    "[LINE_ITEM_SYNC_ERROR] order_id=%s error=AsyncSessionLocal_not_callable_on_retry type=%s",
+                    leaflink_order_id,
+                    type(_AsyncSessionLocal),
+                )
+                errors.append(f"AsyncSessionLocal not callable on retry for order {leaflink_order_id}")
+                continue
+
+            async with _AsyncSessionLocal() as db:
                 async with db.begin():
                     result = await db.execute(
                         select(Order).where(
@@ -4111,6 +4226,14 @@ async def sync_leaflink_line_items(
                         continue
 
                     order_id_val = order_row.id
+                    sku_count = len(normalized_line_items)
+
+                    logger.info(
+                        "[LINE_ITEM_SYNC_PROCESSING] order_id=%s sku_count=%s",
+                        order_id_val,
+                        sku_count,
+                    )
+
                     inserted_count, skipped_count, failed_items = await _upsert_line_items(
                         db, order_row, normalized_line_items
                     )
@@ -4127,6 +4250,11 @@ async def sync_leaflink_line_items(
                         inserted_count,
                         skipped_count,
                         len(failed_items),
+                    )
+                    logger.info(
+                        "[LINE_ITEM_SYNC_SUCCESS] order_id=%s inserted=%s updated=0",
+                        order_id_val,
+                        inserted_count,
                     )
 
                     total_inserted += inserted_count
@@ -4150,17 +4278,31 @@ async def sync_leaflink_line_items(
 
         except Exception as retry_exc:
             err_msg = str(retry_exc)
+            # Non-fatal: log and continue to the next retry item.
+            logger.error(
+                "[LINE_ITEM_SYNC_ERROR] order_id=%s error=%s",
+                leaflink_order_id,
+                err_msg[:300],
+                exc_info=True,
+            )
             logger.error(
                 "[OrdersSync] line_items_retry_error brand=%s external_id=%s error=%s",
                 brand_id_value,
                 leaflink_order_id,
                 err_msg,
-                exc_info=True,
             )
             errors.append(err_msg)
 
     bg_duration = round(time.monotonic() - bg_start, 2)
 
+    logger.info(
+        "[LINE_ITEM_SYNC_COMPLETE] total_processed=%s total_inserted=%s total_errors=%s brand_id=%s duration=%ss",
+        total_orders,
+        total_inserted,
+        len(errors),
+        brand_id_value,
+        bg_duration,
+    )
     logger.info(
         "[SYNC_PHASE_2_COMPLETE] brand_id=%s orders_processed=%s line_items_total=%s inserted=%s skipped=%s failed=%s retried=%s duration=%ss",
         brand_id_value,
