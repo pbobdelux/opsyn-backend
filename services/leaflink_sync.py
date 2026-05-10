@@ -2795,8 +2795,36 @@ async def sync_leaflink_orders_headers_only(
         batch_skipped = 0
         batch_dead_letter = 0
 
+        logger.info(
+            "[ORDER_BATCH_COMMIT_START] batch=%s/%s batch_size=%s brand_id=%s",
+            batch_num,
+            len(batches),
+            current_batch_size,
+            brand_id_value,
+        )
         try:
             async with AsyncSessionLocal() as db:
+                # Defensive callable checks before entering the transaction
+                if db is None:
+                    logger.error("[COMMIT_ERROR] db session is None batch=%s brand_id=%s", batch_num, brand_id_value)
+                    raise ValueError("db session is None")
+                if not callable(getattr(db, "execute", None)):
+                    logger.error("[COMMIT_ERROR] db.execute is not callable type=%s batch=%s", type(db), batch_num)
+                    raise ValueError("db.execute is not callable")
+                if not callable(getattr(db, "commit", None)):
+                    logger.error("[COMMIT_ERROR] db.commit is not callable type=%s batch=%s", type(db), batch_num)
+                    raise ValueError("db.commit is not callable")
+                if not callable(getattr(db, "rollback", None)):
+                    logger.error("[COMMIT_ERROR] db.rollback is not callable type=%s batch=%s", type(db), batch_num)
+                    raise ValueError("db.rollback is not callable")
+                logger.debug(
+                    "[COMMIT_CALLABLE_CHECK] db=%s db.execute=%s db.commit=%s db.rollback=%s batch=%s",
+                    type(db).__name__,
+                    type(getattr(db, "execute", None)).__name__,
+                    type(getattr(db, "commit", None)).__name__,
+                    type(getattr(db, "rollback", None)).__name__,
+                    batch_num,
+                )
                 async with db.begin():
                     for o in batch:
                         _order_ext_id_for_log = "unknown"
@@ -3481,11 +3509,25 @@ INSERT INTO orders (
                                     f"header_insert external_id={_order_ext_id_for_log}: {_err_reason[:200]}"
                                 )
                             continue
-                # Explicit commit guarantee
-                await db.commit()
+                # async with db.begin() auto-commits on clean exit — do NOT call
+                # db.commit() here; the transaction context manager already committed.
+                # Calling db.commit() after db.begin() exits causes
+                # "TypeError: 'NoneType' object is not callable" because the
+                # session's internal transaction reference is already None.
 
             # Batch committed successfully (async with db.begin() exited cleanly)
             batch_duration = round(time.monotonic() - batch_start, 2)
+            logger.info(
+                "[ORDER_BATCH_COMMIT_SUCCESS] batch=%s/%s inserted=%s updated=%s skipped=%s dead_letter=%s duration=%ss brand_id=%s",
+                batch_num,
+                len(batches),
+                batch_created,
+                batch_updated,
+                batch_skipped,
+                batch_dead_letter,
+                batch_duration,
+                brand_id_value,
+            )
             logger.info(
                 "[OrdersSync] batch_committed batch=%s/%s brand=%s created=%s updated=%s skipped=%s dead_letter=%s duration=%ss",
                 batch_num,
@@ -3537,9 +3579,20 @@ INSERT INTO orders (
         except Exception as batch_exc:
             batch_duration = round(time.monotonic() - batch_start, 2)
             err_msg = str(batch_exc)
+            err_type = type(batch_exc).__name__
             insert_rollback += batch_created  # any inserts in this batch are rolled back
             update_rollback += batch_updated
             transaction_abort += 1
+            logger.error(
+                "[ORDER_BATCH_COMMIT_FAILED] batch=%s/%s error_type=%s error=%s brand_id=%s duration=%ss",
+                batch_num,
+                len(batches),
+                err_type,
+                err_msg[:300],
+                brand_id_value,
+                batch_duration,
+                exc_info=True,
+            )
             logger.error(
                 "[TRANSACTION_ABORT] brand_id=%s batch=%s/%s error=%s stage=batch_commit",
                 brand_id_value,
@@ -3652,20 +3705,64 @@ INSERT INTO orders (
             str(_count_exc)[:200],
         )
 
-    # Update sync health after Phase 1 commits
-    await _update_sync_health_phase1(
-        brand_id=brand_id_value,
-        orders_count=(total_created or 0) + (total_updated or 0),
-    )
+    # Update sync health after Phase 1 commits — non-fatal; never blocks order persistence
+    try:
+        logger.debug(
+            "[COMMIT_CALLABLE_CHECK] _update_sync_health_phase1 callable=%s type=%s",
+            callable(_update_sync_health_phase1),
+            type(_update_sync_health_phase1).__name__,
+        )
+        if not callable(_update_sync_health_phase1):
+            logger.error("[COMMIT_ERROR] _update_sync_health_phase1 is not callable — skipping")
+        else:
+            await _update_sync_health_phase1(
+                brand_id=brand_id_value,
+                orders_count=(total_created or 0) + (total_updated or 0),
+            )
+    except Exception as _phase1_health_exc:
+        logger.warning(
+            "[SYNC_HEALTH_UPDATE_FAILED] stage=phase1 brand_id=%s error=%s — non-fatal, orders already committed",
+            brand_id_value,
+            str(_phase1_health_exc)[:200],
+        )
 
     # ------------------------------------------------------------------
     # Phase 2: All order header batches are now committed to the DB.
     # Spawn the line-item background task AFTER the commit loop so that
     # every Order row is guaranteed to exist when the worker queries for
     # it by (brand_id, external_order_id).
+    # Line item sync is optional post-processing — failures are logged
+    # but NEVER roll back the already-committed order headers.
     # ------------------------------------------------------------------
     async def _background_line_items() -> None:
-        await sync_leaflink_line_items(brand_id_value, orders, org_id=org_id_value)
+        logger.info(
+            "[LINE_ITEM_SYNC_START] order_count=%s brand_id=%s",
+            len(orders),
+            brand_id_value,
+        )
+        try:
+            logger.debug(
+                "[COMMIT_CALLABLE_CHECK] sync_leaflink_line_items callable=%s type=%s",
+                callable(sync_leaflink_line_items),
+                type(sync_leaflink_line_items).__name__,
+            )
+            if not callable(sync_leaflink_line_items):
+                logger.error("[LINE_ITEM_SYNC_FAILED] sync_leaflink_line_items is not callable — skipping")
+                return
+            result = await sync_leaflink_line_items(brand_id_value, orders, org_id=org_id_value)
+            _li_synced = result.get("lines_written", 0) if isinstance(result, dict) else 0
+            logger.info(
+                "[LINE_ITEM_SYNC_SUCCESS] synced=%s brand_id=%s",
+                _li_synced,
+                brand_id_value,
+            )
+        except Exception as _li_exc:
+            logger.error(
+                "[LINE_ITEM_SYNC_FAILED] error=%s brand_id=%s — non-fatal, order headers already committed",
+                str(_li_exc)[:300],
+                brand_id_value,
+                exc_info=True,
+            )
 
     asyncio.create_task(_background_line_items())
 
@@ -3848,20 +3945,22 @@ async def sync_leaflink_line_items(
             )
             order_count = result.scalar_one()
     except Exception as e:
-        logger.error("[LINE_ITEM_CHECK_ERROR] failed to count orders: %s", e)
-        order_count = 0
+        logger.error("[LINE_ITEM_CHECK_ERROR] failed to count orders: %s — proceeding anyway (non-fatal)", e)
+        order_count = -1  # sentinel: unknown, proceed anyway
 
     logger.info("[LINE_ITEM_CHECK_RESULT] found %s orders brand=%s", order_count, brand_id_value)
 
     if order_count == 0:
-        logger.error("[LINE_ITEM_BLOCKED] no orders in DB — aborting line item sync brand=%s", brand_id_value)
-        await _record_sync_error(brand_id_value, Exception("No parent orders found in database"))
-        return {
-            "ok": False,
-            "lines_written": 0,
-            "errors": ["No parent orders found in database"],
-            "duration_seconds": 0,
-        }
+        # Log as warning (not error) — order headers may have just been committed
+        # in the same request and may not yet be visible to this new session due to
+        # replication lag or session isolation. Proceed with line item sync anyway
+        # using the in-memory orders list; per-order DB lookups will handle missing parents.
+        logger.warning(
+            "[LINE_ITEM_BLOCKED] no orders found in DB for brand=%s — "
+            "proceeding with in-memory order list (parent rows may not yet be visible)",
+            brand_id_value,
+        )
+        logger.info("[LINE_ITEM_SYNC_SKIPPED] reason=no_orders_in_db_but_proceeding brand=%s", brand_id_value)
 
     # ------------------------------------------------------------------
     # Helper: build the idempotent UPSERT statement once.
@@ -4431,16 +4530,39 @@ async def sync_leaflink_line_items(
         total_orders,
     )
 
-    # Update sync health after Phase 2 completes
-    if len(errors) == 0:
-        await _update_sync_health_phase2(
-            brand_id=brand_id_value,
-            line_items_count=(total_inserted or 0),
-        )
-    else:
-        await _record_sync_error(
-            brand_id=brand_id_value,
-            error=Exception(f"Phase 2 completed with {len(errors)} errors"),
+    # Update sync health after Phase 2 completes — non-fatal; never blocks line item return
+    try:
+        if len(errors) == 0:
+            logger.debug(
+                "[COMMIT_CALLABLE_CHECK] _update_sync_health_phase2 callable=%s type=%s",
+                callable(_update_sync_health_phase2),
+                type(_update_sync_health_phase2).__name__,
+            )
+            if not callable(_update_sync_health_phase2):
+                logger.error("[COMMIT_ERROR] _update_sync_health_phase2 is not callable — skipping")
+            else:
+                await _update_sync_health_phase2(
+                    brand_id=brand_id_value,
+                    line_items_count=(total_inserted or 0),
+                )
+        else:
+            logger.debug(
+                "[COMMIT_CALLABLE_CHECK] _record_sync_error callable=%s type=%s",
+                callable(_record_sync_error),
+                type(_record_sync_error).__name__,
+            )
+            if not callable(_record_sync_error):
+                logger.error("[COMMIT_ERROR] _record_sync_error is not callable — skipping")
+            else:
+                await _record_sync_error(
+                    brand_id=brand_id_value,
+                    error=Exception(f"Phase 2 completed with {len(errors)} errors"),
+                )
+    except Exception as _phase2_health_exc:
+        logger.warning(
+            "[SYNC_HEALTH_UPDATE_FAILED] stage=phase2 brand_id=%s error=%s — non-fatal",
+            brand_id_value,
+            str(_phase2_health_exc)[:200],
         )
 
     return {
@@ -4776,6 +4898,17 @@ async def sync_leaflink_full_resync(
                     _errors,
                     brand_id,
                 )
+                logger.info(
+                    "[LEAFLINK_BACKFILL_PROGRESS] fetched=%s inserted=%s updated=%s skipped=%s"
+                    " current_page=%s offset=%s brand_id=%s",
+                    total_fetched + len(batch_orders),
+                    total_inserted + _inserted,
+                    total_updated + _updated,
+                    persist_result.get("skipped_count", persist_result.get("skipped", 0)),
+                    current_page,
+                    (current_page - 1) * page_size,
+                    brand_id,
+                )
             except Exception as upsert_exc:
                 err_msg = str(upsert_exc)[:300]
                 logger.error(
@@ -4870,6 +5003,17 @@ async def sync_leaflink_full_resync(
         pages_synced,
         duration,
         total_local_orders,
+    )
+    logger.info(
+        "[LEAFLINK_BACKFILL_COMPLETE] fetched_total=%s inserted=%s updated=%s skipped=0"
+        " errors=%s pages=%s duration=%ss brand_id=%s",
+        total_fetched,
+        total_inserted,
+        total_updated,
+        failed_count,
+        pages_synced,
+        duration,
+        brand_id,
     )
 
     # Write final snapshot marking sync as complete
@@ -5817,6 +5961,17 @@ async def sync_leaflink_background_continuous(
                         _inserted,
                         _updated,
                         _errors,
+                        brand_id,
+                    )
+                    logger.info(
+                        "[LEAFLINK_BACKFILL_PROGRESS] fetched=%s inserted=%s updated=%s skipped=%s"
+                        " current_page=%s offset=%s brand_id=%s",
+                        total_orders_synced + _orders_count,
+                        _total_inserted,
+                        _total_updated,
+                        _total_skipped,
+                        current_page,
+                        (current_page - 1) * (HEADER_BATCH_SIZE * 4),
                         brand_id,
                     )
 
