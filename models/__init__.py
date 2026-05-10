@@ -155,7 +155,7 @@ class Order(Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), primary_key=True, index=True)
     brand_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
     org_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True, index=True)
     external_order_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
@@ -266,7 +266,7 @@ class OrderLine(Base):
     __tablename__ = "order_lines"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True)
+    order_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True)
 
     sku: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     product_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
