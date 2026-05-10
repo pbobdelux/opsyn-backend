@@ -479,6 +479,114 @@ def _order_migrations(sql_files: list[str]) -> list[str]:
     return repair + ordered_others
 
 
+# ---------------------------------------------------------------------------
+# Patterns that indicate an unsafe migration — constraint or index creation
+# that does not first verify the referenced column exists.  These patterns
+# are heuristic: they flag the *absence* of a column-existence guard in the
+# same file, not the presence of a specific bad line.
+# ---------------------------------------------------------------------------
+
+# Matches bare ADD CONSTRAINT / ADD FOREIGN KEY / CREATE INDEX statements
+# that are NOT wrapped in a DO $ ... $ block with a column-existence check.
+_UNSAFE_ADD_CONSTRAINT = re.compile(
+    r"\bADD\s+CONSTRAINT\b",
+    re.IGNORECASE,
+)
+_UNSAFE_CREATE_INDEX = re.compile(
+    r"\bCREATE\s+(?:UNIQUE\s+)?INDEX\b(?!\s+IF\s+NOT\s+EXISTS)",
+    re.IGNORECASE,
+)
+_UNSAFE_ADD_FOREIGN_KEY = re.compile(
+    r"\bADD\s+(?:CONSTRAINT\s+\S+\s+)?FOREIGN\s+KEY\b",
+    re.IGNORECASE,
+)
+_UNSAFE_ADD_COLUMN = re.compile(
+    r"\bADD\s+COLUMN\b(?!\s+IF\s+NOT\s+EXISTS)",
+    re.IGNORECASE,
+)
+# The safe guard pattern: a DO block that checks information_schema.columns
+# or information_schema.table_constraints before acting.
+_COLUMN_EXISTENCE_GUARD = re.compile(
+    r"information_schema\.(columns|table_constraints|tables)",
+    re.IGNORECASE,
+)
+# The old broken guard pattern: conrelid cast to regclass (OID vs text mismatch)
+_BROKEN_CONRELID_GUARD = re.compile(
+    r"conrelid\s*=\s*'[^']+'::\s*regclass",
+    re.IGNORECASE,
+)
+
+
+def _validate_migration_file(filename: str, sql: str) -> list[str]:
+    """
+    Heuristically validate a migration file for common unsafe patterns.
+
+    Returns a list of warning strings (empty list = no issues detected).
+    Logs ``[MIGRATION_VALIDATION_FAILED]`` for each issue found.
+
+    Checks performed:
+      1. ADD CONSTRAINT without a prior information_schema column/constraint guard.
+      2. CREATE INDEX (without IF NOT EXISTS) — a missing guard that can fail
+         if the indexed column doesn't exist.
+      3. ADD FOREIGN KEY without a prior information_schema table/column guard.
+      4. ADD COLUMN without IF NOT EXISTS — unsafe on databases where the column
+         may already exist.
+      5. The broken ``conrelid = 'table'::regclass`` guard pattern — this is an
+         OID-vs-string comparison that always evaluates to false in PostgreSQL,
+         causing the constraint creation to proceed unconditionally.
+    """
+    warnings: list[str] = []
+    has_guard = bool(_COLUMN_EXISTENCE_GUARD.search(sql))
+
+    if _BROKEN_CONRELID_GUARD.search(sql):
+        msg = (
+            f"[MIGRATION_VALIDATION_FAILED] file={filename} "
+            "reason=broken_conrelid_guard "
+            "detail='conrelid = <table>::regclass' is an OID-vs-string comparison "
+            "that silently fails — replace with information_schema.table_constraints check"
+        )
+        logger.warning(msg)
+        warnings.append(msg)
+
+    if _UNSAFE_ADD_CONSTRAINT.search(sql) and not has_guard:
+        msg = (
+            f"[MIGRATION_VALIDATION_FAILED] file={filename} "
+            "reason=unguarded_add_constraint "
+            "detail=ADD CONSTRAINT found without a prior information_schema column/constraint existence check"
+        )
+        logger.warning(msg)
+        warnings.append(msg)
+
+    if _UNSAFE_ADD_FOREIGN_KEY.search(sql) and not has_guard:
+        msg = (
+            f"[MIGRATION_VALIDATION_FAILED] file={filename} "
+            "reason=unguarded_add_foreign_key "
+            "detail=ADD FOREIGN KEY found without a prior information_schema table/column existence check"
+        )
+        logger.warning(msg)
+        warnings.append(msg)
+
+    if _UNSAFE_CREATE_INDEX.search(sql):
+        msg = (
+            f"[MIGRATION_VALIDATION_FAILED] file={filename} "
+            "reason=create_index_without_if_not_exists "
+            "detail=CREATE INDEX found without IF NOT EXISTS — use 'CREATE INDEX IF NOT EXISTS' to make it idempotent"
+        )
+        logger.warning(msg)
+        warnings.append(msg)
+
+    if _UNSAFE_ADD_COLUMN.search(sql):
+        msg = (
+            f"[MIGRATION_VALIDATION_FAILED] file={filename} "
+            "reason=add_column_without_if_not_exists "
+            "detail=ADD COLUMN found without IF NOT EXISTS — use 'ADD COLUMN IF NOT EXISTS' to make it idempotent"
+        )
+        logger.warning(msg)
+        warnings.append(msg)
+
+    return warnings
+
+
 async def run_migrations() -> dict:
     """
     Scan the migrations/ directory, apply any pending .sql files in dependency
@@ -608,6 +716,11 @@ async def run_migrations() -> dict:
                     sql = fh.read()
 
                 current_checksum = _compute_checksum(sql)
+
+                # Validate the migration file for common unsafe patterns before
+                # attempting to apply it.  Warnings are logged but never block
+                # execution — the runner always attempts the migration regardless.
+                _validate_migration_file(filename, sql)
 
                 # Use a plain connection (no implicit transaction) to check whether
                 # this migration has already been applied and verify its checksum.

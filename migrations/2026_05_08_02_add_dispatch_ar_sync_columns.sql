@@ -30,17 +30,43 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS driver_note TEXT DEFAULT NULL;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_instructions TEXT DEFAULT NULL;
 
 -- Add check constraint for delivery_status (skip if already exists)
-DO $$
+DO $
 BEGIN
+    -- Verify table exists
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'ck_orders_delivery_status'
-          AND conrelid = 'orders'::regclass
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = 'orders'
+    ) THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping ck_orders_delivery_status';
+        RETURN;
+    END IF;
+
+    -- Verify column exists
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'orders'
+          AND column_name = 'delivery_status'
+    ) THEN
+        RAISE NOTICE '[MIGRATION] delivery_status column does not exist — skipping ck_orders_delivery_status';
+        RETURN;
+    END IF;
+
+    -- Verify constraint doesn't already exist
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_schema = 'public'
+          AND table_name = 'orders'
+          AND constraint_name = 'ck_orders_delivery_status'
     ) THEN
         ALTER TABLE orders ADD CONSTRAINT ck_orders_delivery_status
             CHECK (delivery_status IN ('pending','assigned','out_for_delivery','delivered','failed','needs_reschedule','cancelled'));
+        RAISE NOTICE '[MIGRATION] Created constraint ck_orders_delivery_status';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Constraint ck_orders_delivery_status already exists';
     END IF;
-END$$;
+END$;
 
 -- ============================================================================
 -- Accounts-receivable (AR) fields
@@ -55,17 +81,43 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_number VARCHAR(100) DEFAULT 
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS ar_note TEXT DEFAULT NULL;
 
 -- Add check constraint for payment_status (skip if already exists)
-DO $$
+DO $
 BEGIN
+    -- Verify table exists
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'ck_orders_payment_status'
-          AND conrelid = 'orders'::regclass
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = 'orders'
+    ) THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping ck_orders_payment_status';
+        RETURN;
+    END IF;
+
+    -- Verify column exists
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'orders'
+          AND column_name = 'payment_status'
+    ) THEN
+        RAISE NOTICE '[MIGRATION] payment_status column does not exist — skipping ck_orders_payment_status';
+        RETURN;
+    END IF;
+
+    -- Verify constraint doesn't already exist
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_schema = 'public'
+          AND table_name = 'orders'
+          AND constraint_name = 'ck_orders_payment_status'
     ) THEN
         ALTER TABLE orders ADD CONSTRAINT ck_orders_payment_status
             CHECK (payment_status IN ('unpaid','partial','paid','overdue','collection_issue','write_off'));
+        RAISE NOTICE '[MIGRATION] Created constraint ck_orders_payment_status';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Constraint ck_orders_payment_status already exists';
     END IF;
-END$$;
+END$;
 
 -- ============================================================================
 -- Sync health fields (per-order)
