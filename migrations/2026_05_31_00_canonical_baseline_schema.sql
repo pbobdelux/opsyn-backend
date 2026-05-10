@@ -507,13 +507,39 @@ CREATE TABLE IF NOT EXISTS assistant_sessions (
 
 DO $$
 BEGIN
+    -- Verify table exists
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'assistant_sessions_session_key_key'
-          AND conrelid = 'assistant_sessions'::regclass
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = 'assistant_sessions'
+    ) THEN
+        RAISE NOTICE '[MIGRATION] assistant_sessions table does not exist — skipping constraint';
+        RETURN;
+    END IF;
+
+    -- Verify column exists
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'assistant_sessions'
+          AND column_name = 'session_key'
+    ) THEN
+        RAISE NOTICE '[MIGRATION] session_key column does not exist — skipping constraint';
+        RETURN;
+    END IF;
+
+    -- Verify constraint doesn't already exist
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_schema = 'public'
+          AND table_name = 'assistant_sessions'
+          AND constraint_name = 'assistant_sessions_session_key_key'
     ) THEN
         ALTER TABLE assistant_sessions
             ADD CONSTRAINT assistant_sessions_session_key_key UNIQUE (session_key);
+        RAISE NOTICE '[MIGRATION] Created constraint assistant_sessions_session_key_key';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Constraint assistant_sessions_session_key_key already exists';
     END IF;
 END;
 $$;
@@ -554,13 +580,40 @@ CREATE TABLE IF NOT EXISTS assistant_pending_actions (
 
 DO $$
 BEGIN
+    -- Verify table exists
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'assistant_pending_actions_confirmation_id_key'
-          AND conrelid = 'assistant_pending_actions'::regclass
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = 'assistant_pending_actions'
+    ) THEN
+        RAISE NOTICE '[MIGRATION] assistant_pending_actions table does not exist — skipping constraint';
+        RETURN;
+    END IF;
+
+    -- Verify column exists
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'assistant_pending_actions'
+          AND column_name = 'confirmation_id'
+    ) THEN
+        RAISE NOTICE '[MIGRATION] confirmation_id column does not exist — skipping constraint';
+        RETURN;
+    END IF;
+
+    -- Verify constraint doesn't already exist
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_schema = 'public'
+          AND table_name = 'assistant_pending_actions'
+          AND constraint_name = 'assistant_pending_actions_confirmation_id_key'
     ) THEN
         ALTER TABLE assistant_pending_actions
-            ADD CONSTRAINT assistant_pending_actions_confirmation_id_key UNIQUE (confirmation_id);
+            ADD CONSTRAINT assistant_pending_actions_confirmation_id_key
+            UNIQUE (confirmation_id);
+        RAISE NOTICE '[MIGRATION] Created constraint assistant_pending_actions_confirmation_id_key';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Constraint assistant_pending_actions_confirmation_id_key already exists';
     END IF;
 END;
 $$;
