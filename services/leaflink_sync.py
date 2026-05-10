@@ -2984,27 +2984,15 @@ async def sync_leaflink_orders_headers_only(
                               external_id,
                           )
 
-                          # Hard block: never execute upsert with org_id=None
+                          # Warn if org_id is None but allow the upsert to proceed —
+                          # org_id is nullable and blocking on it causes the entire
+                          # backfill to stall when the credential has no org_id set.
                           if _sql_org_id is None:
-                              logger.error(
-                                  "[ORG_CONTEXT_MISSING_FATAL] brand_id=%s external_id=%s",
+                              logger.warning(
+                                  "[ORG_CONTEXT_MISSING] brand_id=%s external_id=%s"
+                                  " — proceeding with INSERT (org_id is nullable)",
                                   brand_id_value, external_id,
                               )
-                              asyncio.create_task(
-                                  _write_sync_dead_letter(
-                                      brand_id=brand_id_value,
-                                      raw_payload=_raw_payload_ref,
-                                      error_stage="org_context_missing",
-                                      error_message="org_id is None at upsert time",
-                                      org_id=None,
-                                      external_id=external_id,
-                                      failure_category="missing_org_context",
-                                      failure_stage="header_insert",
-                                  )
-                              )
-                              batch_skipped += 1
-                              skipped_org_missing += 1
-                              continue
 
                           # True upsert: ON CONFLICT (brand_id, external_order_id) DO UPDATE
                           # Uses xmax to detect insert vs update for accurate counters.
@@ -3092,16 +3080,16 @@ RETURNING (xmax = 0) AS was_inserted
                           if was_inserted:
                               batch_created += 1
                               insert_success += 1
-                              logger.debug(
-                                  "[ORDER_UPSERT_INSERT] external_id=%s brand_id=%s",
+                              logger.info(
+                                  "[ORDER_INSERTED] external_id=%s order_id=pending status=inserted brand_id=%s",
                                   external_id,
                                   brand_id_value,
                               )
                           else:
                               batch_updated += 1
                               update_success += 1
-                              logger.debug(
-                                  "[ORDER_UPSERT_UPDATE] external_id=%s brand_id=%s",
+                              logger.info(
+                                  "[ORDER_UPSERTED] external_id=%s order_id=pending status=updated brand_id=%s",
                                   external_id,
                                   brand_id_value,
                               )
