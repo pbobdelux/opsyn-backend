@@ -14,10 +14,11 @@ Webhook endpoints (namespace: /api/leaflink/orders):
 """
 
 import logging
+import os
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -492,6 +493,133 @@ async def trigger_leaflink_sync(
         "message": f"Sync enqueued for brand_id={brand_id}",
         "sync_request_id": sync_req.id,
         "brand_id": brand_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Manual full-backfill trigger — POST /leaflink/sync-now
+# ---------------------------------------------------------------------------
+
+_sync_now_router = APIRouter(prefix="/leaflink", tags=["leaflink-sync"])
+
+_OPSYN_SYNC_SECRET = os.getenv("OPSYN_SYNC_SECRET", "")
+
+
+@_sync_now_router.post("/sync-now")
+async def leaflink_sync_now(
+    brand_id: Optional[str] = Query(None, description="Brand UUID to sync (omit to sync all active brands)"),
+    x_opsyn_secret: Optional[str] = Header(None, alias="X-OPSyn-Secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Manually trigger a full LeafLink backfill sync.
+
+    Auth:
+      Header: X-OPSyn-Secret
+      Env var: OPSYN_SYNC_SECRET
+      Returns 401 if the header is missing or does not match the env var.
+
+    Query params:
+      brand_id (optional): UUID of the brand to sync. If omitted, enqueues a
+        sync for every brand that has an active LeafLink credential.
+
+    Returns immediately with sync_request_id(s). The actual sync runs in the
+    background via the SyncRun worker.
+
+    Example:
+      POST /leaflink/sync-now?brand_id=<uuid>
+      Header: X-OPSyn-Secret: <secret>
+    """
+    # --- Auth validation ---
+    if not _OPSYN_SYNC_SECRET:
+        logger.warning(
+            "[SYNC_NOW_AUTH] OPSYN_SYNC_SECRET env var not set — endpoint is unprotected"
+        )
+    elif not x_opsyn_secret or x_opsyn_secret != _OPSYN_SYNC_SECRET:
+        logger.warning(
+            "[SYNC_NOW_AUTH] rejected request — missing or invalid X-OPSyn-Secret header"
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid X-OPSyn-Secret header",
+        )
+
+    # --- Resolve brands to sync ---
+    if brand_id:
+        # Single brand
+        cred_result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.brand_id == brand_id,
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+            )
+        )
+        cred = cred_result.scalar_one_or_none()
+        if cred is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No active LeafLink credential found for brand_id={brand_id}",
+            )
+        brands_to_sync = [cred]
+    else:
+        # All active brands
+        creds_result = await db.execute(
+            select(BrandAPICredential).where(
+                BrandAPICredential.integration_name == "leaflink",
+                BrandAPICredential.is_active == True,
+            )
+        )
+        brands_to_sync = creds_result.scalars().all()
+        if not brands_to_sync:
+            return {
+                "ok": False,
+                "message": "No active LeafLink credentials found",
+                "sync_request_ids": [],
+            }
+
+    # --- Enqueue SyncRun for each brand ---
+    from models import SyncRun
+
+    enqueued = []
+    for cred in brands_to_sync:
+        try:
+            sync_run = SyncRun(
+                brand_id=str(cred.brand_id),
+                status="queued",
+                current_page=1,
+                total_pages=None,
+                total_orders_available=None,
+            )
+            db.add(sync_run)
+            await db.flush()
+            enqueued.append({
+                "brand_id": str(cred.brand_id),
+                "sync_run_id": sync_run.id,
+            })
+            logger.info(
+                "[SYNC_NOW_ENQUEUED] brand_id=%s sync_run_id=%s",
+                cred.brand_id,
+                sync_run.id,
+            )
+        except Exception as enqueue_exc:
+            logger.error(
+                "[SYNC_NOW_ENQUEUE_ERROR] brand_id=%s error=%s",
+                cred.brand_id,
+                str(enqueue_exc)[:200],
+            )
+
+    await db.commit()
+
+    logger.info(
+        "[SYNC_NOW_COMPLETE] enqueued=%s brand_id=%s",
+        len(enqueued),
+        brand_id or "all",
+    )
+
+    return {
+        "ok": True,
+        "message": f"Full backfill enqueued for {len(enqueued)} brand(s)",
+        "enqueued": enqueued,
+        "sync_request_id": enqueued[0]["sync_run_id"] if len(enqueued) == 1 else None,
     }
 
 
