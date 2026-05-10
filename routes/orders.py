@@ -476,18 +476,19 @@ async def get_orders(
         except Exception:
             pass
 
+
     # ------------------------------------------------------------------ #
     # Decode cursor → (cursor_id, cursor_updated_at)                      #
-    # Cursor format: base64("id=<N>&updated_at=<ISO>")                    #
+    # Cursor format: base64("id=<UUID>&updated_at=<ISO>")                 #
     # ------------------------------------------------------------------ #
-    cursor_id: Optional[int] = None
+    cursor_id: Optional[str] = None
     cursor_updated_at: Optional[str] = None
 
     if cursor:
         try:
             decoded = base64.b64decode(cursor).decode()
             parts = dict(p.split("=", 1) for p in decoded.split("&") if "=" in p)
-            cursor_id = int(parts["id"]) if parts.get("id") else None
+            cursor_id = parts.get("id") or None
             cursor_updated_at = parts.get("updated_at") or None
         except Exception as cursor_exc:
             logger.error("[OrdersAPI] cursor_decode_error error=%s", cursor_exc)
@@ -548,6 +549,7 @@ async def get_orders(
         )
     )
 
+
     if sort_order == "asc":
         query = query.order_by(sort_col.asc(), Order.id.asc())
     else:
@@ -571,15 +573,42 @@ async def get_orders(
     else:
         query = query.offset(offset)
 
+
+
     # ------------------------------------------------------------------ #
     # Fetch limit + 1 to detect has_more                                  #
     # ------------------------------------------------------------------ #
     try:
-        result = await db.execute(query.limit(limit + 1))
+        _limited_query = query.limit(limit + 1)
+        logger.info(
+            "[OrdersAPI][SQL_DEBUG] org_id=%s brand_id=%s compiled_query=%s",
+            resolved_org_id,
+            brand_id,
+            str(_limited_query.compile(compile_kwargs={"literal_binds": False}))[:500],
+        )
+        result = await db.execute(_limited_query)
         orders = list(result.scalars().all())
     except Exception as exc:
-        logger.error("[OrdersAPI] db_query_failed org_id=%s brand_id=%s error=%s", resolved_org_id, brand_id, exc, exc_info=True)
-        return {"ok": False, "error": "Database query failed"}
+        logger.error(
+            "[OrdersAPI] db_query_failed org_id=%s brand_id=%s error=%s",
+            resolved_org_id,
+            brand_id,
+            exc,
+            exc_info=True,
+        )
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "error": "Database query failed — type mismatch or schema error",
+            "detail": str(exc)[:500],
+            "hint": (
+                "Check that Order.id and OrderLine.order_id SQLAlchemy types "
+                "match the actual PostgreSQL column types (UUID vs INTEGER)."
+            ),
+        }
 
     has_more = len(orders) > limit
     if has_more:

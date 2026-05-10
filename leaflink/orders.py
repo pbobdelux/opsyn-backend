@@ -622,17 +622,84 @@ def serialize_order(order: Order) -> dict[str, Any]:
 async def get_orders(db: AsyncSession = Depends(get_db)):
     logger.info("[OrdersAPI] request endpoint=/leaflink/orders")
     logger.info("leaflink: get_orders request start")
+
+    # ------------------------------------------------------------------ #
+    # Diagnostics: log actual PostgreSQL column types for orders /        #
+    # order_lines so type mismatches are visible in logs before the query #
+    # ------------------------------------------------------------------ #
+    try:
+        from sqlalchemy import text as _text_diag
+        _col_type_res = await db.execute(
+            _text_diag(
+                """
+                SELECT table_name, column_name, data_type, udt_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name IN ('orders', 'order_lines')
+                  AND column_name IN ('id', 'order_id')
+                ORDER BY table_name, column_name
+                """
+            )
+        )
+        _col_rows = _col_type_res.fetchall()
+        for _row in _col_rows:
+            logger.info(
+                "[OrdersAPI][SCHEMA_DIAG] table=%s column=%s pg_type=%s udt=%s "
+                "sqlalchemy_model_type=%s",
+                _row[0],
+                _row[1],
+                _row[2],
+                _row[3],
+                (
+                    type(Order.id.property.columns[0].type).__name__
+                    if _row[0] == "orders" and _row[1] == "id"
+                    else type(OrderLine.order_id.property.columns[0].type).__name__
+                    if _row[0] == "order_lines" and _row[1] == "order_id"
+                    else "n/a"
+                ),
+            )
+    except Exception as _diag_exc:
+        logger.warning(
+            "[OrdersAPI][SCHEMA_DIAG] schema_diagnostic_failed error=%s",
+            str(_diag_exc)[:200],
+        )
+
     try:
         logger.info("leaflink: get_orders db_query_start")
-        result = await db.execute(
+        _query = (
             select(Order)
             .options(selectinload(Order.lines), *_DEFER_OPTS)
             .order_by(Order.external_updated_at.desc().nullslast(), Order.updated_at.desc())
         )
+        logger.info(
+            "[OrdersAPI][SQL_DEBUG] compiled_query=%s",
+            str(_query.compile(compile_kwargs={"literal_binds": False}))[:500],
+        )
+        result = await db.execute(_query)
         orders = result.scalars().all()
     except Exception as exc:
-        logger.error("leaflink: get_orders db_query_failed error=%s", exc, exc_info=True)
-        raise
+        logger.error(
+            "leaflink: get_orders db_query_failed error=%s",
+            exc,
+            exc_info=True,
+        )
+        # Roll back the failed transaction so the session is reusable
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "success": False,
+            "error": "Database query failed — type mismatch or schema error",
+            "detail": str(exc)[:500],
+            "hint": (
+                "Check that Order.id and OrderLine.order_id SQLAlchemy types "
+                "match the actual PostgreSQL column types (UUID vs INTEGER). "
+                "See [OrdersAPI][SCHEMA_DIAG] log lines for column type details."
+            ),
+        }
+
 
     # Count total orders in DB (all brands)
     try:
@@ -707,7 +774,7 @@ async def get_orders(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/orders/id/{order_id}")
-async def get_order_detail(order_id: int, db: AsyncSession = Depends(get_db)):
+async def get_order_detail(order_id: str, db: AsyncSession = Depends(get_db)):
     logger.info("[OrdersAPI] request endpoint=/leaflink/orders/id/%s", order_id)
     logger.info("leaflink: get_order_detail request order_id=%s", order_id)
     result = await db.execute(
