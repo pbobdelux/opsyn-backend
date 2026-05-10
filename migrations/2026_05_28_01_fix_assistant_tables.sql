@@ -78,18 +78,44 @@ SET confirmation_id = gen_random_uuid()::text
 WHERE confirmation_id IS NULL;
 
 -- Add unique constraint on confirmation_id (only if not already present)
-DO $$
+DO $
 BEGIN
+    -- Verify table exists
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'assistant_pending_actions_confirmation_id_key'
-          AND conrelid = 'assistant_pending_actions'::regclass
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = 'assistant_pending_actions'
+    ) THEN
+        RAISE NOTICE '[MIGRATION] assistant_pending_actions table does not exist — skipping constraint';
+        RETURN;
+    END IF;
+
+    -- Verify column exists
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'assistant_pending_actions'
+          AND column_name = 'confirmation_id'
+    ) THEN
+        RAISE NOTICE '[MIGRATION] confirmation_id column does not exist — skipping constraint';
+        RETURN;
+    END IF;
+
+    -- Verify constraint doesn't already exist
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_schema = 'public'
+          AND table_name = 'assistant_pending_actions'
+          AND constraint_name = 'assistant_pending_actions_confirmation_id_key'
     ) THEN
         ALTER TABLE assistant_pending_actions
             ADD CONSTRAINT assistant_pending_actions_confirmation_id_key
             UNIQUE (confirmation_id);
+        RAISE NOTICE '[MIGRATION] Created constraint assistant_pending_actions_confirmation_id_key';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Constraint assistant_pending_actions_confirmation_id_key already exists';
     END IF;
-END $$;
+END $;
 
 -- ============================================================================
 -- STEP 4: Add missing columns to assistant_audit_logs
