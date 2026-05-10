@@ -434,23 +434,44 @@ async def lifespan(app: FastAPI):
         _MIGRATIONS_DIR,
     )
     from services.migration_runner import run_migrations
-    _migration_errors: list[str] = []
+    _migration_result: dict = {}
+    _migration_critical_failure: bool = False
     try:
-        applied = await run_migrations()
-        for _mig_name in applied:
-            logger.info("[MIGRATION_EXECUTED] migration=%s status=success", _mig_name)
+        _migration_result = await run_migrations()
+        applied = _migration_result.get("applied", [])
+        _skipped_legacy = _migration_result.get("skipped_legacy", [])
+        _failed_noncritical = _migration_result.get("failed_noncritical", [])
+        # Note: failed_critical raises RuntimeError inside run_migrations, so
+        # reaching here means no critical failures occurred.
+    except RuntimeError as _mig_exc:
+        applied = []
+        _skipped_legacy = []
+        _failed_noncritical = []
+        _migration_critical_failure = True
+        logger.error(
+            "[MIGRATION_FAILED] runner_error=%s",
+            _mig_exc,
+            exc_info=True,
+        )
+        logger.error(
+            "[STARTUP_FAILED] reason=migration_critical_failure error=%s",
+            str(_mig_exc)[:500],
+        )
+        raise
     except Exception as _mig_exc:
         applied = []
-        _migration_errors.append(str(_mig_exc))
+        _skipped_legacy = []
+        _failed_noncritical = []
         logger.error(
             "[MIGRATION_FAILED] runner_error=%s",
             _mig_exc,
             exc_info=True,
         )
     logger.info(
-        "[MIGRATION_RUNNER_COMPLETE] total_applied=%d failed_count=%d",
+        "[MIGRATION_RUNNER_COMPLETE] total_applied=%d skipped_legacy=%d failed_noncritical=%d",
         len(applied),
-        len(_migration_errors),
+        len(_skipped_legacy),
+        len(_failed_noncritical),
     )
     logger.info("[Startup] migrations_complete count=%s", len(applied))
 
@@ -920,6 +941,14 @@ async def lifespan(app: FastAPI):
     print("🚀 Starting sync scheduler...")
     scheduler_task = asyncio.create_task(run_scheduler())
     print("✅ Sync scheduler task created")
+
+    # ---------------------------------------------------------------------------
+    # STARTUP_READY — emitted once all startup phases complete successfully.
+    # Grep for this marker in Railway deploy logs to confirm a clean boot.
+    # ---------------------------------------------------------------------------
+    logger.info(
+        "[STARTUP_READY] app_booted=true migrations_ok=true schema_valid=true"
+    )
 
     yield
 

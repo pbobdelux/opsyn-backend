@@ -1,6 +1,13 @@
 -- Migration: 2026_04_23_02_add_tenant_credentials
--- Adds the tenant_credentials table used by the multi-tenant auth layer.
--- Secrets stored in api_secret must be SHA-256 hex digests of the raw secret.
+-- STATUS: SKIPPED_LEGACY_MIGRATION
+-- REASON: Uses SERIAL PK; superseded by 2026_05_04_02_create_full_schema_aws_rds.sql
+--         which creates tenant_credentials with the correct schema (also SERIAL for now,
+--         but managed as part of the canonical full-schema migration).
+--         This file is quarantined to prevent duplicate-table conflicts on fresh databases
+--         where 2026_05_04_02 has already run.
+--
+-- DO NOT REMOVE this file — it is tracked in SKIPPED_LEGACY_MIGRATIONS in migration_runner.py
+-- and must remain on disk so the runner can log its skip reason deterministically.
 
 CREATE TABLE IF NOT EXISTS tenant_credentials (
     id          SERIAL PRIMARY KEY,
