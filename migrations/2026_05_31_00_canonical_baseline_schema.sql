@@ -53,11 +53,95 @@ CREATE TABLE IF NOT EXISTS employee_app_access (
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_employees_email ON employees(email);
-CREATE INDEX IF NOT EXISTS idx_employees_org_id ON employees(org_id);
-CREATE INDEX IF NOT EXISTS idx_employee_passcodes_employee_id ON employee_passcodes(employee_id);
-CREATE INDEX IF NOT EXISTS idx_employee_brand_access_employee_id ON employee_brand_access(employee_id);
-CREATE INDEX IF NOT EXISTS idx_employee_app_access_employee_id ON employee_app_access(employee_id);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'employees') THEN
+        RAISE NOTICE '[MIGRATION] employees table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'employees' AND column_name = 'email') THEN
+        RAISE NOTICE '[MIGRATION] email column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_employees_email') THEN
+        CREATE INDEX idx_employees_email ON employees(email);
+        RAISE NOTICE '[MIGRATION] Created index idx_employees_email';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index idx_employees_email already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'employees') THEN
+        RAISE NOTICE '[MIGRATION] employees table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'employees' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_employees_org_id') THEN
+        CREATE INDEX idx_employees_org_id ON employees(org_id);
+        RAISE NOTICE '[MIGRATION] Created index idx_employees_org_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index idx_employees_org_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'employee_passcodes') THEN
+        RAISE NOTICE '[MIGRATION] employee_passcodes table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'employee_passcodes' AND column_name = 'employee_id') THEN
+        RAISE NOTICE '[MIGRATION] employee_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_employee_passcodes_employee_id') THEN
+        CREATE INDEX idx_employee_passcodes_employee_id ON employee_passcodes(employee_id);
+        RAISE NOTICE '[MIGRATION] Created index idx_employee_passcodes_employee_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index idx_employee_passcodes_employee_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'employee_brand_access') THEN
+        RAISE NOTICE '[MIGRATION] employee_brand_access table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'employee_brand_access' AND column_name = 'employee_id') THEN
+        RAISE NOTICE '[MIGRATION] employee_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_employee_brand_access_employee_id') THEN
+        CREATE INDEX idx_employee_brand_access_employee_id ON employee_brand_access(employee_id);
+        RAISE NOTICE '[MIGRATION] Created index idx_employee_brand_access_employee_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index idx_employee_brand_access_employee_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'employee_app_access') THEN
+        RAISE NOTICE '[MIGRATION] employee_app_access table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'employee_app_access' AND column_name = 'employee_id') THEN
+        RAISE NOTICE '[MIGRATION] employee_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_employee_app_access_employee_id') THEN
+        CREATE INDEX idx_employee_app_access_employee_id ON employee_app_access(employee_id);
+        RAISE NOTICE '[MIGRATION] Created index idx_employee_app_access_employee_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index idx_employee_app_access_employee_id already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS brand_api_credentials (
     id                         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -90,12 +174,113 @@ CREATE TABLE IF NOT EXISTS brand_api_credentials (
     UNIQUE(brand_id, integration_name)
 );
 
-CREATE INDEX IF NOT EXISTS ix_brand_api_credentials_brand_id ON brand_api_credentials(brand_id);
-CREATE INDEX IF NOT EXISTS ix_brand_api_credentials_integration ON brand_api_credentials(integration_name);
-CREATE INDEX IF NOT EXISTS ix_brand_api_credentials_sync_status ON brand_api_credentials(sync_status) WHERE sync_status = 'syncing';
-CREATE INDEX IF NOT EXISTS ix_brand_api_credentials_leaflink_company_id ON brand_api_credentials(leaflink_company_id);
-CREATE INDEX IF NOT EXISTS ix_brand_api_credentials_webhook_enabled ON brand_api_credentials(webhook_enabled) WHERE webhook_enabled = true;
-CREATE INDEX IF NOT EXISTS ix_brand_api_credentials_api_key_secret_ref ON brand_api_credentials(api_key_secret_ref) WHERE api_key_secret_ref IS NOT NULL;
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'brand_api_credentials') THEN
+        RAISE NOTICE '[MIGRATION] brand_api_credentials table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'brand_api_credentials' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_brand_api_credentials_brand_id') THEN
+        CREATE INDEX ix_brand_api_credentials_brand_id ON brand_api_credentials(brand_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_brand_api_credentials_brand_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_brand_api_credentials_brand_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'brand_api_credentials') THEN
+        RAISE NOTICE '[MIGRATION] brand_api_credentials table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'brand_api_credentials' AND column_name = 'integration_name') THEN
+        RAISE NOTICE '[MIGRATION] integration_name column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_brand_api_credentials_integration') THEN
+        CREATE INDEX ix_brand_api_credentials_integration ON brand_api_credentials(integration_name);
+        RAISE NOTICE '[MIGRATION] Created index ix_brand_api_credentials_integration';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_brand_api_credentials_integration already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'brand_api_credentials') THEN
+        RAISE NOTICE '[MIGRATION] brand_api_credentials table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'brand_api_credentials' AND column_name = 'sync_status') THEN
+        RAISE NOTICE '[MIGRATION] sync_status column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_brand_api_credentials_sync_status') THEN
+        CREATE INDEX ix_brand_api_credentials_sync_status ON brand_api_credentials(sync_status) WHERE sync_status = 'syncing';
+        RAISE NOTICE '[MIGRATION] Created index ix_brand_api_credentials_sync_status';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_brand_api_credentials_sync_status already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'brand_api_credentials') THEN
+        RAISE NOTICE '[MIGRATION] brand_api_credentials table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'brand_api_credentials' AND column_name = 'leaflink_company_id') THEN
+        RAISE NOTICE '[MIGRATION] leaflink_company_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_brand_api_credentials_leaflink_company_id') THEN
+        CREATE INDEX ix_brand_api_credentials_leaflink_company_id ON brand_api_credentials(leaflink_company_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_brand_api_credentials_leaflink_company_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_brand_api_credentials_leaflink_company_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'brand_api_credentials') THEN
+        RAISE NOTICE '[MIGRATION] brand_api_credentials table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'brand_api_credentials' AND column_name = 'webhook_enabled') THEN
+        RAISE NOTICE '[MIGRATION] webhook_enabled column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_brand_api_credentials_webhook_enabled') THEN
+        CREATE INDEX ix_brand_api_credentials_webhook_enabled ON brand_api_credentials(webhook_enabled) WHERE webhook_enabled = true;
+        RAISE NOTICE '[MIGRATION] Created index ix_brand_api_credentials_webhook_enabled';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_brand_api_credentials_webhook_enabled already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'brand_api_credentials') THEN
+        RAISE NOTICE '[MIGRATION] brand_api_credentials table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'brand_api_credentials' AND column_name = 'api_key_secret_ref') THEN
+        RAISE NOTICE '[MIGRATION] api_key_secret_ref column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_brand_api_credentials_api_key_secret_ref') THEN
+        CREATE INDEX ix_brand_api_credentials_api_key_secret_ref ON brand_api_credentials(api_key_secret_ref) WHERE api_key_secret_ref IS NOT NULL;
+        RAISE NOTICE '[MIGRATION] Created index ix_brand_api_credentials_api_key_secret_ref';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_brand_api_credentials_api_key_secret_ref already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS sync_runs (
     id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -124,9 +309,67 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS ix_sync_runs_brand_id ON sync_runs(brand_id);
-CREATE INDEX IF NOT EXISTS ix_sync_runs_brand_status ON sync_runs(brand_id, status);
-CREATE INDEX IF NOT EXISTS ix_sync_runs_brand_started ON sync_runs(brand_id, started_at DESC);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_runs') THEN
+        RAISE NOTICE '[MIGRATION] sync_runs table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_runs' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_runs_brand_id') THEN
+        CREATE INDEX ix_sync_runs_brand_id ON sync_runs(brand_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_runs_brand_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_runs_brand_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_runs') THEN
+        RAISE NOTICE '[MIGRATION] sync_runs table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_runs' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_runs' AND column_name = 'status') THEN
+        RAISE NOTICE '[MIGRATION] status column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_runs_brand_status') THEN
+        CREATE INDEX ix_sync_runs_brand_status ON sync_runs(brand_id, status);
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_runs_brand_status';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_runs_brand_status already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_runs') THEN
+        RAISE NOTICE '[MIGRATION] sync_runs table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_runs' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_runs' AND column_name = 'started_at') THEN
+        RAISE NOTICE '[MIGRATION] started_at column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_runs_brand_started') THEN
+        CREATE INDEX ix_sync_runs_brand_started ON sync_runs(brand_id, started_at DESC);
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_runs_brand_started';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_runs_brand_started already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS sync_requests (
     id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -142,9 +385,59 @@ CREATE TABLE IF NOT EXISTS sync_requests (
     completed_at           TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS ix_sync_requests_brand_id ON sync_requests(brand_id);
-CREATE INDEX IF NOT EXISTS ix_sync_requests_status ON sync_requests(status) WHERE status = 'pending';
-CREATE INDEX IF NOT EXISTS ix_sync_requests_org_id ON sync_requests(org_id);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_requests') THEN
+        RAISE NOTICE '[MIGRATION] sync_requests table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_requests' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_requests_brand_id') THEN
+        CREATE INDEX ix_sync_requests_brand_id ON sync_requests(brand_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_requests_brand_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_requests_brand_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_requests') THEN
+        RAISE NOTICE '[MIGRATION] sync_requests table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_requests' AND column_name = 'status') THEN
+        RAISE NOTICE '[MIGRATION] status column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_requests_status') THEN
+        CREATE INDEX ix_sync_requests_status ON sync_requests(status) WHERE status = 'pending';
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_requests_status';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_requests_status already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_requests') THEN
+        RAISE NOTICE '[MIGRATION] sync_requests table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_requests' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_requests_org_id') THEN
+        CREATE INDEX ix_sync_requests_org_id ON sync_requests(org_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_requests_org_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_requests_org_id already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS drivers (
     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -165,9 +458,67 @@ CREATE TABLE IF NOT EXISTS drivers (
     CONSTRAINT ck_drivers_status CHECK (status IN ('active', 'inactive'))
 );
 
-CREATE INDEX IF NOT EXISTS ix_drivers_org_id ON drivers(org_id);
-CREATE INDEX IF NOT EXISTS ix_drivers_org_status ON drivers(org_id, status);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_drivers_org_email_partial ON drivers(org_id, email) WHERE email IS NOT NULL;
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'drivers') THEN
+        RAISE NOTICE '[MIGRATION] drivers table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'drivers' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_drivers_org_id') THEN
+        CREATE INDEX ix_drivers_org_id ON drivers(org_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_drivers_org_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_drivers_org_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'drivers') THEN
+        RAISE NOTICE '[MIGRATION] drivers table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'drivers' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'drivers' AND column_name = 'status') THEN
+        RAISE NOTICE '[MIGRATION] status column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_drivers_org_status') THEN
+        CREATE INDEX ix_drivers_org_status ON drivers(org_id, status);
+        RAISE NOTICE '[MIGRATION] Created index ix_drivers_org_status';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_drivers_org_status already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'drivers') THEN
+        RAISE NOTICE '[MIGRATION] drivers table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'drivers' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'drivers' AND column_name = 'email') THEN
+        RAISE NOTICE '[MIGRATION] email column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'uq_drivers_org_email_partial') THEN
+        CREATE UNIQUE INDEX uq_drivers_org_email_partial ON drivers(org_id, email) WHERE email IS NOT NULL;
+        RAISE NOTICE '[MIGRATION] Created index uq_drivers_org_email_partial';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index uq_drivers_org_email_partial already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS routes (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -188,9 +539,63 @@ CREATE TABLE IF NOT EXISTS routes (
     CONSTRAINT ck_routes_status CHECK (status IN ('draft', 'assigned', 'out_for_delivery', 'completed', 'cancelled'))
 );
 
-CREATE INDEX IF NOT EXISTS ix_routes_org_id ON routes(org_id);
-CREATE INDEX IF NOT EXISTS ix_routes_org_date ON routes(org_id, route_date);
-CREATE INDEX IF NOT EXISTS ix_routes_driver ON routes(assigned_driver_id);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'routes') THEN
+        RAISE NOTICE '[MIGRATION] routes table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'routes' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_routes_org_id') THEN
+        CREATE INDEX ix_routes_org_id ON routes(org_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_routes_org_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_routes_org_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'routes') THEN
+        RAISE NOTICE '[MIGRATION] routes table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'routes' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'routes' AND column_name = 'route_date') THEN
+        RAISE NOTICE '[MIGRATION] route_date column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_routes_org_date') THEN
+        CREATE INDEX ix_routes_org_date ON routes(org_id, route_date);
+        RAISE NOTICE '[MIGRATION] Created index ix_routes_org_date';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_routes_org_date already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'routes') THEN
+        RAISE NOTICE '[MIGRATION] routes table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'routes' AND column_name = 'assigned_driver_id') THEN
+        RAISE NOTICE '[MIGRATION] assigned_driver_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_routes_driver') THEN
+        CREATE INDEX ix_routes_driver ON routes(assigned_driver_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_routes_driver';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_routes_driver already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS route_stops (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -220,8 +625,41 @@ CREATE TABLE IF NOT EXISTS route_stops (
     CONSTRAINT uq_route_stops_order UNIQUE (route_id, stop_order)
 );
 
-CREATE INDEX IF NOT EXISTS ix_route_stops_route_id ON route_stops(route_id);
-CREATE INDEX IF NOT EXISTS ix_route_stops_org_id ON route_stops(org_id);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'route_stops') THEN
+        RAISE NOTICE '[MIGRATION] route_stops table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'route_stops' AND column_name = 'route_id') THEN
+        RAISE NOTICE '[MIGRATION] route_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_route_stops_route_id') THEN
+        CREATE INDEX ix_route_stops_route_id ON route_stops(route_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_route_stops_route_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_route_stops_route_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'route_stops') THEN
+        RAISE NOTICE '[MIGRATION] route_stops table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'route_stops' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_route_stops_org_id') THEN
+        CREATE INDEX ix_route_stops_org_id ON route_stops(org_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_route_stops_org_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_route_stops_org_id already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS orders (
     id                         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -271,20 +709,273 @@ CREATE TABLE IF NOT EXISTS orders (
     CONSTRAINT ck_orders_payment_status CHECK (payment_status IN ('unpaid', 'partial', 'paid', 'overdue', 'collection_issue', 'write_off'))
 );
 
-CREATE INDEX IF NOT EXISTS ix_orders_brand_id ON orders(brand_id);
-CREATE INDEX IF NOT EXISTS ix_orders_order_number ON orders(order_number);
-CREATE INDEX IF NOT EXISTS ix_orders_external_order_id ON orders(external_order_id);
-CREATE INDEX IF NOT EXISTS ix_orders_sync_run_id ON orders(sync_run_id) WHERE sync_run_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS ix_orders_customer_name ON orders(customer_name);
-CREATE INDEX IF NOT EXISTS ix_orders_org_id ON orders(org_id);
-CREATE INDEX IF NOT EXISTS ix_orders_org_brand ON orders(org_id, brand_id);
-CREATE INDEX IF NOT EXISTS ix_orders_assigned_driver ON orders(assigned_driver_id);
-CREATE INDEX IF NOT EXISTS ix_orders_delivery_status ON orders(delivery_status);
-CREATE INDEX IF NOT EXISTS ix_orders_payment_status ON orders(payment_status);
-CREATE INDEX IF NOT EXISTS ix_orders_route_id ON orders(route_id);
-CREATE INDEX IF NOT EXISTS ix_orders_brand_updated_at ON orders(brand_id, updated_at DESC);
-CREATE INDEX IF NOT EXISTS ix_orders_brand_created_at ON orders(brand_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS ix_orders_sync_health_status ON orders(brand_id, sync_health_status) WHERE sync_health_status IS NOT NULL;
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_brand_id') THEN
+        CREATE INDEX ix_orders_brand_id ON orders(brand_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_brand_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_brand_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'order_number') THEN
+        RAISE NOTICE '[MIGRATION] order_number column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_order_number') THEN
+        CREATE INDEX ix_orders_order_number ON orders(order_number);
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_order_number';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_order_number already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'external_order_id') THEN
+        RAISE NOTICE '[MIGRATION] external_order_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_external_order_id') THEN
+        CREATE INDEX ix_orders_external_order_id ON orders(external_order_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_external_order_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_external_order_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'sync_run_id') THEN
+        RAISE NOTICE '[MIGRATION] sync_run_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_sync_run_id') THEN
+        CREATE INDEX ix_orders_sync_run_id ON orders(sync_run_id) WHERE sync_run_id IS NOT NULL;
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_sync_run_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_sync_run_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'customer_name') THEN
+        RAISE NOTICE '[MIGRATION] customer_name column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_customer_name') THEN
+        CREATE INDEX ix_orders_customer_name ON orders(customer_name);
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_customer_name';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_customer_name already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_org_id') THEN
+        CREATE INDEX ix_orders_org_id ON orders(org_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_org_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_org_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_org_brand') THEN
+        CREATE INDEX ix_orders_org_brand ON orders(org_id, brand_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_org_brand';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_org_brand already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'assigned_driver_id') THEN
+        RAISE NOTICE '[MIGRATION] assigned_driver_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_assigned_driver') THEN
+        CREATE INDEX ix_orders_assigned_driver ON orders(assigned_driver_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_assigned_driver';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_assigned_driver already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'delivery_status') THEN
+        RAISE NOTICE '[MIGRATION] delivery_status column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_delivery_status') THEN
+        CREATE INDEX ix_orders_delivery_status ON orders(delivery_status);
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_delivery_status';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_delivery_status already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'payment_status') THEN
+        RAISE NOTICE '[MIGRATION] payment_status column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_payment_status') THEN
+        CREATE INDEX ix_orders_payment_status ON orders(payment_status);
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_payment_status';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_payment_status already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'route_id') THEN
+        RAISE NOTICE '[MIGRATION] route_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_route_id') THEN
+        CREATE INDEX ix_orders_route_id ON orders(route_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_route_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_route_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'updated_at') THEN
+        RAISE NOTICE '[MIGRATION] updated_at column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_brand_updated_at') THEN
+        CREATE INDEX ix_orders_brand_updated_at ON orders(brand_id, updated_at DESC);
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_brand_updated_at';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_brand_updated_at already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'created_at') THEN
+        RAISE NOTICE '[MIGRATION] created_at column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_brand_created_at') THEN
+        CREATE INDEX ix_orders_brand_created_at ON orders(brand_id, created_at DESC);
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_brand_created_at';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_brand_created_at already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
+        RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'sync_health_status') THEN
+        RAISE NOTICE '[MIGRATION] sync_health_status column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_orders_sync_health_status') THEN
+        CREATE INDEX ix_orders_sync_health_status ON orders(brand_id, sync_health_status) WHERE sync_health_status IS NOT NULL;
+        RAISE NOTICE '[MIGRATION] Created index ix_orders_sync_health_status';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_orders_sync_health_status already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS order_lines (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -306,9 +997,67 @@ CREATE TABLE IF NOT EXISTS order_lines (
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS ix_order_lines_order_id ON order_lines(order_id);
-CREATE INDEX IF NOT EXISTS ix_order_lines_sku ON order_lines(sku);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_order_line_identity ON order_lines(order_id, sku, product_name) WHERE sku IS NOT NULL AND product_name IS NOT NULL;
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'order_lines') THEN
+        RAISE NOTICE '[MIGRATION] order_lines table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'order_lines' AND column_name = 'order_id') THEN
+        RAISE NOTICE '[MIGRATION] order_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_order_lines_order_id') THEN
+        CREATE INDEX ix_order_lines_order_id ON order_lines(order_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_order_lines_order_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_order_lines_order_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'order_lines') THEN
+        RAISE NOTICE '[MIGRATION] order_lines table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'order_lines' AND column_name = 'sku') THEN
+        RAISE NOTICE '[MIGRATION] sku column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_order_lines_sku') THEN
+        CREATE INDEX ix_order_lines_sku ON order_lines(sku);
+        RAISE NOTICE '[MIGRATION] Created index ix_order_lines_sku';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_order_lines_sku already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'order_lines') THEN
+        RAISE NOTICE '[MIGRATION] order_lines table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'order_lines' AND column_name = 'order_id') THEN
+        RAISE NOTICE '[MIGRATION] order_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'order_lines' AND column_name = 'sku') THEN
+        RAISE NOTICE '[MIGRATION] sku column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'order_lines' AND column_name = 'product_name') THEN
+        RAISE NOTICE '[MIGRATION] product_name column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'uq_order_line_identity') THEN
+        CREATE UNIQUE INDEX uq_order_line_identity ON order_lines(order_id, sku, product_name) WHERE sku IS NOT NULL AND product_name IS NOT NULL;
+        RAISE NOTICE '[MIGRATION] Created index uq_order_line_identity';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index uq_order_line_identity already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS sync_health (
     id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -328,7 +1077,23 @@ CREATE TABLE IF NOT EXISTS sync_health (
     CONSTRAINT uq_sync_health_brand_id UNIQUE (brand_id)
 );
 
-CREATE INDEX IF NOT EXISTS ix_sync_health_brand_id ON sync_health(brand_id);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_health') THEN
+        RAISE NOTICE '[MIGRATION] sync_health table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_health' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_health_brand_id') THEN
+        CREATE INDEX ix_sync_health_brand_id ON sync_health(brand_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_health_brand_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_health_brand_id already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS sync_dead_letters (
     id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -355,13 +1120,151 @@ CREATE TABLE IF NOT EXISTS sync_dead_letters (
     created_at                TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS ix_sync_dead_letters_brand_id ON sync_dead_letters(brand_id);
-CREATE INDEX IF NOT EXISTS ix_sync_dead_letters_source_brand ON sync_dead_letters(source, brand_id);
-CREATE INDEX IF NOT EXISTS ix_sync_dead_letters_external_id ON sync_dead_letters(external_id) WHERE external_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS ix_sync_dead_letters_unresolved ON sync_dead_letters(brand_id, created_at DESC) WHERE resolved_at IS NULL;
-CREATE INDEX IF NOT EXISTS ix_sync_dead_letters_last_retry ON sync_dead_letters(brand_id, last_retry_at DESC) WHERE resolved_at IS NULL;
-CREATE INDEX IF NOT EXISTS ix_sync_dead_letters_failure_category ON sync_dead_letters(brand_id, failure_category) WHERE resolved_at IS NULL;
-CREATE INDEX IF NOT EXISTS ix_sync_dead_letters_failure_stage ON sync_dead_letters(brand_id, failure_stage) WHERE resolved_at IS NULL;
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
+        RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_dead_letters' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_dead_letters_brand_id') THEN
+        CREATE INDEX ix_sync_dead_letters_brand_id ON sync_dead_letters(brand_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_dead_letters_brand_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_brand_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
+        RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_dead_letters' AND column_name = 'source') THEN
+        RAISE NOTICE '[MIGRATION] source column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_dead_letters' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_dead_letters_source_brand') THEN
+        CREATE INDEX ix_sync_dead_letters_source_brand ON sync_dead_letters(source, brand_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_dead_letters_source_brand';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_source_brand already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
+        RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_dead_letters' AND column_name = 'external_id') THEN
+        RAISE NOTICE '[MIGRATION] external_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_dead_letters_external_id') THEN
+        CREATE INDEX ix_sync_dead_letters_external_id ON sync_dead_letters(external_id) WHERE external_id IS NOT NULL;
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_dead_letters_external_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_external_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
+        RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_dead_letters' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_dead_letters' AND column_name = 'created_at') THEN
+        RAISE NOTICE '[MIGRATION] created_at column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_dead_letters_unresolved') THEN
+        CREATE INDEX ix_sync_dead_letters_unresolved ON sync_dead_letters(brand_id, created_at DESC) WHERE resolved_at IS NULL;
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_dead_letters_unresolved';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_unresolved already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
+        RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_dead_letters' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_dead_letters' AND column_name = 'last_retry_at') THEN
+        RAISE NOTICE '[MIGRATION] last_retry_at column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_dead_letters_last_retry') THEN
+        CREATE INDEX ix_sync_dead_letters_last_retry ON sync_dead_letters(brand_id, last_retry_at DESC) WHERE resolved_at IS NULL;
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_dead_letters_last_retry';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_last_retry already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
+        RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_dead_letters' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_dead_letters' AND column_name = 'failure_category') THEN
+        RAISE NOTICE '[MIGRATION] failure_category column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_dead_letters_failure_category') THEN
+        CREATE INDEX ix_sync_dead_letters_failure_category ON sync_dead_letters(brand_id, failure_category) WHERE resolved_at IS NULL;
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_dead_letters_failure_category';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_failure_category already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
+        RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_dead_letters' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_dead_letters' AND column_name = 'failure_stage') THEN
+        RAISE NOTICE '[MIGRATION] failure_stage column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_dead_letters_failure_stage') THEN
+        CREATE INDEX ix_sync_dead_letters_failure_stage ON sync_dead_letters(brand_id, failure_stage) WHERE resolved_at IS NULL;
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_dead_letters_failure_stage';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_failure_stage already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS sync_metrics_snapshots (
     id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -382,8 +1285,45 @@ CREATE TABLE IF NOT EXISTS sync_metrics_snapshots (
     UNIQUE(brand_id, sync_run_id)
 );
 
-CREATE INDEX IF NOT EXISTS ix_sync_metrics_snapshots_brand_id ON sync_metrics_snapshots(brand_id);
-CREATE INDEX IF NOT EXISTS ix_sync_metrics_snapshots_brand_updated ON sync_metrics_snapshots(brand_id, updated_at DESC);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_metrics_snapshots') THEN
+        RAISE NOTICE '[MIGRATION] sync_metrics_snapshots table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_metrics_snapshots' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_metrics_snapshots_brand_id') THEN
+        CREATE INDEX ix_sync_metrics_snapshots_brand_id ON sync_metrics_snapshots(brand_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_metrics_snapshots_brand_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_metrics_snapshots_brand_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_metrics_snapshots') THEN
+        RAISE NOTICE '[MIGRATION] sync_metrics_snapshots table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_metrics_snapshots' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sync_metrics_snapshots' AND column_name = 'updated_at') THEN
+        RAISE NOTICE '[MIGRATION] updated_at column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_sync_metrics_snapshots_brand_updated') THEN
+        CREATE INDEX ix_sync_metrics_snapshots_brand_updated ON sync_metrics_snapshots(brand_id, updated_at DESC);
+        RAISE NOTICE '[MIGRATION] Created index ix_sync_metrics_snapshots_brand_updated';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_sync_metrics_snapshots_brand_updated already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS dead_letter_line_items (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -400,7 +1340,27 @@ CREATE TABLE IF NOT EXISTS dead_letter_line_items (
     CONSTRAINT uq_dead_letter_brand_order_sku UNIQUE (brand_id, external_order_id, sku)
 );
 
-CREATE INDEX IF NOT EXISTS ix_dead_letter_brand_external_order ON dead_letter_line_items(brand_id, external_order_id);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'dead_letter_line_items') THEN
+        RAISE NOTICE '[MIGRATION] dead_letter_line_items table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'dead_letter_line_items' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'dead_letter_line_items' AND column_name = 'external_order_id') THEN
+        RAISE NOTICE '[MIGRATION] external_order_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_dead_letter_brand_external_order') THEN
+        CREATE INDEX ix_dead_letter_brand_external_order ON dead_letter_line_items(brand_id, external_order_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_dead_letter_brand_external_order';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_dead_letter_brand_external_order already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS organization_brand_bindings (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -415,8 +1375,41 @@ CREATE TABLE IF NOT EXISTS organization_brand_bindings (
     UNIQUE(org_id, brand_id)
 );
 
-CREATE INDEX IF NOT EXISTS ix_org_brand_bindings_org_id ON organization_brand_bindings(org_id);
-CREATE INDEX IF NOT EXISTS ix_org_brand_bindings_brand_id ON organization_brand_bindings(brand_id);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'organization_brand_bindings') THEN
+        RAISE NOTICE '[MIGRATION] organization_brand_bindings table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'organization_brand_bindings' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_org_brand_bindings_org_id') THEN
+        CREATE INDEX ix_org_brand_bindings_org_id ON organization_brand_bindings(org_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_org_brand_bindings_org_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_org_brand_bindings_org_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'organization_brand_bindings') THEN
+        RAISE NOTICE '[MIGRATION] organization_brand_bindings table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'organization_brand_bindings' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_org_brand_bindings_brand_id') THEN
+        CREATE INDEX ix_org_brand_bindings_brand_id ON organization_brand_bindings(brand_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_org_brand_bindings_brand_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_org_brand_bindings_brand_id already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS tenant_credentials (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -427,7 +1420,23 @@ CREATE TABLE IF NOT EXISTS tenant_credentials (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS ix_tenant_credentials_org_id ON tenant_credentials(org_id);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'tenant_credentials') THEN
+        RAISE NOTICE '[MIGRATION] tenant_credentials table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'tenant_credentials' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_tenant_credentials_org_id') THEN
+        CREATE INDEX ix_tenant_credentials_org_id ON tenant_credentials(org_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_tenant_credentials_org_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_tenant_credentials_org_id already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS route_events (
     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -442,9 +1451,59 @@ CREATE TABLE IF NOT EXISTS route_events (
     CONSTRAINT ck_route_events_actor_type CHECK (actor_type IN ('admin', 'driver'))
 );
 
-CREATE INDEX IF NOT EXISTS ix_route_events_route_id ON route_events(route_id);
-CREATE INDEX IF NOT EXISTS ix_route_events_org_id ON route_events(org_id);
-CREATE INDEX IF NOT EXISTS ix_route_events_created_at ON route_events(created_at);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'route_events') THEN
+        RAISE NOTICE '[MIGRATION] route_events table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'route_events' AND column_name = 'route_id') THEN
+        RAISE NOTICE '[MIGRATION] route_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_route_events_route_id') THEN
+        CREATE INDEX ix_route_events_route_id ON route_events(route_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_route_events_route_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_route_events_route_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'route_events') THEN
+        RAISE NOTICE '[MIGRATION] route_events table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'route_events' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_route_events_org_id') THEN
+        CREATE INDEX ix_route_events_org_id ON route_events(org_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_route_events_org_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_route_events_org_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'route_events') THEN
+        RAISE NOTICE '[MIGRATION] route_events table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'route_events' AND column_name = 'created_at') THEN
+        RAISE NOTICE '[MIGRATION] created_at column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_route_events_created_at') THEN
+        CREATE INDEX ix_route_events_created_at ON route_events(created_at);
+        RAISE NOTICE '[MIGRATION] Created index ix_route_events_created_at';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_route_events_created_at already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS driver_locations (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -464,9 +1523,67 @@ CREATE TABLE IF NOT EXISTS driver_locations (
     created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS ix_driver_locations_driver_recorded ON driver_locations(driver_id, recorded_at DESC);
-CREATE INDEX IF NOT EXISTS ix_driver_locations_route ON driver_locations(route_id);
-CREATE INDEX IF NOT EXISTS ix_driver_locations_org_time ON driver_locations(org_id, recorded_at DESC);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'driver_locations') THEN
+        RAISE NOTICE '[MIGRATION] driver_locations table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'driver_locations' AND column_name = 'driver_id') THEN
+        RAISE NOTICE '[MIGRATION] driver_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'driver_locations' AND column_name = 'recorded_at') THEN
+        RAISE NOTICE '[MIGRATION] recorded_at column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_driver_locations_driver_recorded') THEN
+        CREATE INDEX ix_driver_locations_driver_recorded ON driver_locations(driver_id, recorded_at DESC);
+        RAISE NOTICE '[MIGRATION] Created index ix_driver_locations_driver_recorded';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_driver_locations_driver_recorded already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'driver_locations') THEN
+        RAISE NOTICE '[MIGRATION] driver_locations table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'driver_locations' AND column_name = 'route_id') THEN
+        RAISE NOTICE '[MIGRATION] route_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_driver_locations_route') THEN
+        CREATE INDEX ix_driver_locations_route ON driver_locations(route_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_driver_locations_route';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_driver_locations_route already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'driver_locations') THEN
+        RAISE NOTICE '[MIGRATION] driver_locations table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'driver_locations' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'driver_locations' AND column_name = 'recorded_at') THEN
+        RAISE NOTICE '[MIGRATION] recorded_at column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_driver_locations_org_time') THEN
+        CREATE INDEX ix_driver_locations_org_time ON driver_locations(org_id, recorded_at DESC);
+        RAISE NOTICE '[MIGRATION] Created index ix_driver_locations_org_time';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_driver_locations_org_time already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS driver_route_history (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -488,8 +1605,49 @@ CREATE TABLE IF NOT EXISTS driver_route_history (
     created_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS ix_driver_route_history_route ON driver_route_history(route_id, recorded_at ASC);
-CREATE INDEX IF NOT EXISTS ix_driver_route_history_driver ON driver_route_history(driver_id, recorded_at DESC);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'driver_route_history') THEN
+        RAISE NOTICE '[MIGRATION] driver_route_history table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'driver_route_history' AND column_name = 'route_id') THEN
+        RAISE NOTICE '[MIGRATION] route_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'driver_route_history' AND column_name = 'recorded_at') THEN
+        RAISE NOTICE '[MIGRATION] recorded_at column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_driver_route_history_route') THEN
+        CREATE INDEX ix_driver_route_history_route ON driver_route_history(route_id, recorded_at ASC);
+        RAISE NOTICE '[MIGRATION] Created index ix_driver_route_history_route';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_driver_route_history_route already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'driver_route_history') THEN
+        RAISE NOTICE '[MIGRATION] driver_route_history table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'driver_route_history' AND column_name = 'driver_id') THEN
+        RAISE NOTICE '[MIGRATION] driver_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'driver_route_history' AND column_name = 'recorded_at') THEN
+        RAISE NOTICE '[MIGRATION] recorded_at column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_driver_route_history_driver') THEN
+        CREATE INDEX ix_driver_route_history_driver ON driver_route_history(driver_id, recorded_at DESC);
+        RAISE NOTICE '[MIGRATION] Created index ix_driver_route_history_driver';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_driver_route_history_driver already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS assistant_sessions (
     id            VARCHAR(36) PRIMARY KEY,
@@ -544,8 +1702,41 @@ BEGIN
 END;
 $$;
 
-CREATE INDEX IF NOT EXISTS ix_assistant_sessions_org_id ON assistant_sessions(org_id);
-CREATE INDEX IF NOT EXISTS ix_assistant_sessions_session_key ON assistant_sessions(session_key);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_sessions') THEN
+        RAISE NOTICE '[MIGRATION] assistant_sessions table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'assistant_sessions' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_assistant_sessions_org_id') THEN
+        CREATE INDEX ix_assistant_sessions_org_id ON assistant_sessions(org_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_assistant_sessions_org_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_assistant_sessions_org_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_sessions') THEN
+        RAISE NOTICE '[MIGRATION] assistant_sessions table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'assistant_sessions' AND column_name = 'session_key') THEN
+        RAISE NOTICE '[MIGRATION] session_key column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_assistant_sessions_session_key') THEN
+        CREATE INDEX ix_assistant_sessions_session_key ON assistant_sessions(session_key);
+        RAISE NOTICE '[MIGRATION] Created index ix_assistant_sessions_session_key';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_assistant_sessions_session_key already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS assistant_messages (
     id         VARCHAR(36) PRIMARY KEY,
@@ -557,7 +1748,23 @@ CREATE TABLE IF NOT EXISTS assistant_messages (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS ix_assistant_messages_session_id ON assistant_messages(session_id);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_messages') THEN
+        RAISE NOTICE '[MIGRATION] assistant_messages table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'assistant_messages' AND column_name = 'session_id') THEN
+        RAISE NOTICE '[MIGRATION] session_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_assistant_messages_session_id') THEN
+        CREATE INDEX ix_assistant_messages_session_id ON assistant_messages(session_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_assistant_messages_session_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_assistant_messages_session_id already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS assistant_pending_actions (
     id              VARCHAR(36) PRIMARY KEY,
@@ -618,9 +1825,59 @@ BEGIN
 END;
 $$;
 
-CREATE INDEX IF NOT EXISTS ix_assistant_pending_actions_session_id ON assistant_pending_actions(session_id);
-CREATE INDEX IF NOT EXISTS ix_assistant_pending_actions_org_id ON assistant_pending_actions(org_id);
-CREATE UNIQUE INDEX IF NOT EXISTS ix_assistant_pending_actions_confirmation_id ON assistant_pending_actions(confirmation_id) WHERE confirmation_id IS NOT NULL;
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_pending_actions') THEN
+        RAISE NOTICE '[MIGRATION] assistant_pending_actions table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'assistant_pending_actions' AND column_name = 'session_id') THEN
+        RAISE NOTICE '[MIGRATION] session_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_assistant_pending_actions_session_id') THEN
+        CREATE INDEX ix_assistant_pending_actions_session_id ON assistant_pending_actions(session_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_assistant_pending_actions_session_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_assistant_pending_actions_session_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_pending_actions') THEN
+        RAISE NOTICE '[MIGRATION] assistant_pending_actions table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'assistant_pending_actions' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_assistant_pending_actions_org_id') THEN
+        CREATE INDEX ix_assistant_pending_actions_org_id ON assistant_pending_actions(org_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_assistant_pending_actions_org_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_assistant_pending_actions_org_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_pending_actions') THEN
+        RAISE NOTICE '[MIGRATION] assistant_pending_actions table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'assistant_pending_actions' AND column_name = 'confirmation_id') THEN
+        RAISE NOTICE '[MIGRATION] confirmation_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_assistant_pending_actions_confirmation_id') THEN
+        CREATE UNIQUE INDEX ix_assistant_pending_actions_confirmation_id ON assistant_pending_actions(confirmation_id) WHERE confirmation_id IS NOT NULL;
+        RAISE NOTICE '[MIGRATION] Created index ix_assistant_pending_actions_confirmation_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_assistant_pending_actions_confirmation_id already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS assistant_audit_logs (
     id            VARCHAR(36) PRIMARY KEY,
@@ -638,8 +1895,41 @@ CREATE TABLE IF NOT EXISTS assistant_audit_logs (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS ix_assistant_audit_logs_session_id ON assistant_audit_logs(session_id);
-CREATE INDEX IF NOT EXISTS ix_assistant_audit_logs_org_id ON assistant_audit_logs(org_id);
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_audit_logs') THEN
+        RAISE NOTICE '[MIGRATION] assistant_audit_logs table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'assistant_audit_logs' AND column_name = 'session_id') THEN
+        RAISE NOTICE '[MIGRATION] session_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_assistant_audit_logs_session_id') THEN
+        CREATE INDEX ix_assistant_audit_logs_session_id ON assistant_audit_logs(session_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_assistant_audit_logs_session_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_assistant_audit_logs_session_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_audit_logs') THEN
+        RAISE NOTICE '[MIGRATION] assistant_audit_logs table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'assistant_audit_logs' AND column_name = 'org_id') THEN
+        RAISE NOTICE '[MIGRATION] org_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_assistant_audit_logs_org_id') THEN
+        CREATE INDEX ix_assistant_audit_logs_org_id ON assistant_audit_logs(org_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_assistant_audit_logs_org_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_assistant_audit_logs_org_id already exists';
+    END IF;
+END $;
 
 CREATE TABLE IF NOT EXISTS leaflink_webhook_events (
     id                            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -659,7 +1949,78 @@ CREATE TABLE IF NOT EXISTS leaflink_webhook_events (
     created_at                    TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS ix_leaflink_webhook_events_tenant_status ON leaflink_webhook_events(tenant_resolution_status);
-CREATE INDEX IF NOT EXISTS ix_leaflink_webhook_events_brand_id ON leaflink_webhook_events(brand_id);
-CREATE INDEX IF NOT EXISTS ix_leaflink_webhook_events_received_at ON leaflink_webhook_events(received_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS ix_leaflink_webhook_events_brand_idempotency ON leaflink_webhook_events(brand_id, idempotency_key) WHERE brand_id IS NOT NULL;
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'leaflink_webhook_events') THEN
+        RAISE NOTICE '[MIGRATION] leaflink_webhook_events table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'leaflink_webhook_events' AND column_name = 'tenant_resolution_status') THEN
+        RAISE NOTICE '[MIGRATION] tenant_resolution_status column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_leaflink_webhook_events_tenant_status') THEN
+        CREATE INDEX ix_leaflink_webhook_events_tenant_status ON leaflink_webhook_events(tenant_resolution_status);
+        RAISE NOTICE '[MIGRATION] Created index ix_leaflink_webhook_events_tenant_status';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_leaflink_webhook_events_tenant_status already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'leaflink_webhook_events') THEN
+        RAISE NOTICE '[MIGRATION] leaflink_webhook_events table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'leaflink_webhook_events' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_leaflink_webhook_events_brand_id') THEN
+        CREATE INDEX ix_leaflink_webhook_events_brand_id ON leaflink_webhook_events(brand_id);
+        RAISE NOTICE '[MIGRATION] Created index ix_leaflink_webhook_events_brand_id';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_leaflink_webhook_events_brand_id already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'leaflink_webhook_events') THEN
+        RAISE NOTICE '[MIGRATION] leaflink_webhook_events table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'leaflink_webhook_events' AND column_name = 'received_at') THEN
+        RAISE NOTICE '[MIGRATION] received_at column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_leaflink_webhook_events_received_at') THEN
+        CREATE INDEX ix_leaflink_webhook_events_received_at ON leaflink_webhook_events(received_at DESC);
+        RAISE NOTICE '[MIGRATION] Created index ix_leaflink_webhook_events_received_at';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_leaflink_webhook_events_received_at already exists';
+    END IF;
+END $;
+
+DO $
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'leaflink_webhook_events') THEN
+        RAISE NOTICE '[MIGRATION] leaflink_webhook_events table does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'leaflink_webhook_events' AND column_name = 'brand_id') THEN
+        RAISE NOTICE '[MIGRATION] brand_id column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'leaflink_webhook_events' AND column_name = 'idempotency_key') THEN
+        RAISE NOTICE '[MIGRATION] idempotency_key column does not exist — skipping index';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ix_leaflink_webhook_events_brand_idempotency') THEN
+        CREATE UNIQUE INDEX ix_leaflink_webhook_events_brand_idempotency ON leaflink_webhook_events(brand_id, idempotency_key) WHERE brand_id IS NOT NULL;
+        RAISE NOTICE '[MIGRATION] Created index ix_leaflink_webhook_events_brand_idempotency';
+    ELSE
+        RAISE NOTICE '[MIGRATION] Index ix_leaflink_webhook_events_brand_idempotency already exists';
+    END IF;
+END $;
