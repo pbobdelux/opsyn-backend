@@ -15,14 +15,24 @@ Ordering guarantees (applied in priority order):
   1. LeafLink repair migrations (filenames matching ``fix_leaflink``) run first.
   2. Migrations listed in MIGRATION_DEPENDENCIES are topologically sorted so
      that base tables are always created before the tables that reference them.
-     This fixes the ordering problem where 001/002/003 (which reference routes,
-     drivers, route_stops) were executing before
-     2026_05_21_02_add_drivers_routes_stops.sql created those tables.
+     The canonical baseline (2026_05_31_00_canonical_baseline_schema.sql) has
+     no dependencies and runs early, establishing all tables before any additive
+     ALTER TABLE migrations run.
   3. All remaining migrations run in alphabetical (timestamp) order.
 
 Quarantine:
   Migrations listed in SKIPPED_LEGACY_MIGRATIONS are never applied.  They are
   logged with [MIGRATION_SKIPPED_LEGACY] so the skip is always auditable.
+
+  Quarantined migrations (as of 2026-05-31):
+    001_create_route_events_table.sql          — references non-existent routes table
+    002_create_driver_locations_table.sql      — references non-existent drivers/routes tables
+    003_create_driver_route_history_table.sql  — references non-existent drivers/routes tables
+    2026_04_23_02_add_tenant_credentials.sql   — uses SERIAL PK; superseded by canonical baseline
+    2026_05_30_01_reconcile_uuid_integer_mismatches.sql — contains invalid SQL; superseded by canonical baseline
+
+  All five are superseded by 2026_05_31_00_canonical_baseline_schema.sql which
+  creates the correct schema idempotently with UUID PKs and valid FK types.
 
 Checksums:
   Each applied migration records a SHA-256 checksum of its file content in the
@@ -65,12 +75,54 @@ _LEAFLINK_REPAIR_PATTERN = re.compile(r"fix_leaflink", re.IGNORECASE)
 # skip record and potentially attempt to apply them on a fresh database.
 # ---------------------------------------------------------------------------
 SKIPPED_LEGACY_MIGRATIONS: dict[str, str] = {
+    # -------------------------------------------------------------------------
+    # Pre-existing quarantine entry
+    # -------------------------------------------------------------------------
     "2026_04_23_02_add_tenant_credentials.sql": (
-        "Uses SERIAL PK; superseded by 2026_05_04_02_create_full_schema_aws_rds.sql "
-        "which creates tenant_credentials as part of the canonical full-schema migration. "
-        "Applying this file on a database where 2026_05_04_02 has already run would be "
-        "a no-op (IF NOT EXISTS), but on a fresh database it would create the table with "
-        "a SERIAL PK before the full-schema migration can create it correctly."
+        "Uses SERIAL PK; superseded by 2026_05_31_00_canonical_baseline_schema.sql "
+        "which creates tenant_credentials with a UUID PK as part of the canonical "
+        "baseline migration."
+    ),
+
+    # -------------------------------------------------------------------------
+    # 001/002/003 — reference tables that did not exist at the time they were
+    # written (routes, drivers, route_stops).  Superseded by the canonical
+    # baseline which creates all three tables before the dependent tables.
+    # -------------------------------------------------------------------------
+    "001_create_route_events_table.sql": (
+        "Superseded by 2026_05_31_00_canonical_baseline_schema.sql. "
+        "This file references routes(id) but routes did not exist when it was "
+        "written, causing 'relation does not exist' errors on fresh databases. "
+        "The canonical baseline creates route_events with correct UUID FKs after "
+        "routes is guaranteed to exist."
+    ),
+    "002_create_driver_locations_table.sql": (
+        "Superseded by 2026_05_31_00_canonical_baseline_schema.sql. "
+        "This file references drivers(id) and routes(id) but those tables did not "
+        "exist when it was written, causing 'relation does not exist' errors. "
+        "The canonical baseline creates driver_locations with correct UUID FKs after "
+        "drivers and routes are guaranteed to exist."
+    ),
+    "003_create_driver_route_history_table.sql": (
+        "Superseded by 2026_05_31_00_canonical_baseline_schema.sql. "
+        "This file references drivers(id), routes(id), and route_stops(id) but those "
+        "tables did not exist when it was written, causing 'relation does not exist' "
+        "errors. The canonical baseline creates driver_route_history with correct UUID "
+        "FKs after all parent tables are guaranteed to exist."
+    ),
+
+    # -------------------------------------------------------------------------
+    # 2026_05_30_01 — contains invalid SQL (stray prose tokens such as 'rolls',
+    # 'this', 'the', 'print') that cause syntax errors, and tries to create FKs
+    # to tables that may have mismatched types (UUID vs INTEGER).  Replaced by
+    # the canonical baseline which establishes the correct schema from scratch.
+    # -------------------------------------------------------------------------
+    "2026_05_30_01_reconcile_uuid_integer_mismatches.sql": (
+        "Contains invalid SQL (stray prose tokens causing syntax errors) and "
+        "attempts to create FK constraints to tables that may have UUID/INTEGER "
+        "type mismatches on databases where earlier migrations ran in the wrong "
+        "order. Replaced by 2026_05_31_00_canonical_baseline_schema.sql which "
+        "establishes the correct schema idempotently without any type conflicts."
     ),
 }
 
@@ -94,31 +146,34 @@ def _should_skip_migration(filename: str) -> str | None:
 # exist — causing "relation does not exist" errors.
 # ---------------------------------------------------------------------------
 MIGRATION_DEPENDENCIES: dict[str, list[str]] = {
-    # Base schema — no dependencies
+    # -------------------------------------------------------------------------
+    # Base schema migrations — no dependencies
+    # -------------------------------------------------------------------------
     "2026_05_04_01_setup_auth_tables.sql": [],
     "2026_05_04_02_create_full_schema_aws_rds.sql": [],
 
-    # drivers / routes / route_stops must exist before the tables below
+    # -------------------------------------------------------------------------
+    # Canonical baseline — no dependencies; runs early so all subsequent
+    # migrations see the correct schema.  The quarantined 001/002/003 and
+    # reconciliation migrations are listed here only so the topological sorter
+    # knows their intended position; they are skipped by SKIPPED_LEGACY_MIGRATIONS
+    # before any SQL is executed.
+    # -------------------------------------------------------------------------
+    "2026_05_31_00_canonical_baseline_schema.sql": [],
+
+    # Quarantined migrations — dependencies kept for documentation only.
+    # These are never executed (see SKIPPED_LEGACY_MIGRATIONS).
     "001_create_route_events_table.sql": [
-        "2026_05_21_02_add_drivers_routes_stops.sql",
+        "2026_05_31_00_canonical_baseline_schema.sql",
     ],
     "002_create_driver_locations_table.sql": [
-        "2026_05_21_02_add_drivers_routes_stops.sql",
+        "2026_05_31_00_canonical_baseline_schema.sql",
     ],
     "003_create_driver_route_history_table.sql": [
-        "2026_05_21_02_add_drivers_routes_stops.sql",
+        "2026_05_31_00_canonical_baseline_schema.sql",
     ],
-
-    # Reconciliation must run after all base tables and the 001/002/003 group
     "2026_05_30_01_reconcile_uuid_integer_mismatches.sql": [
-        "2026_05_04_02_create_full_schema_aws_rds.sql",
-        "2026_05_21_02_add_drivers_routes_stops.sql",
-        "001_create_route_events_table.sql",
-        "002_create_driver_locations_table.sql",
-        "003_create_driver_route_history_table.sql",
-        "2026_05_28_02_migrate_sync_runs_to_uuid.sql",
-        "2026_05_28_03_migrate_orders_to_uuid.sql",
-        "2026_05_28_04_migrate_remaining_integer_tables.sql",
+        "2026_05_31_00_canonical_baseline_schema.sql",
     ],
 }
 
@@ -128,7 +183,10 @@ MIGRATION_DEPENDENCIES: dict[str, list[str]] = {
 CRITICAL_MIGRATIONS: frozenset[str] = frozenset({
     "2026_05_04_01_setup_auth_tables.sql",
     "2026_05_04_02_create_full_schema_aws_rds.sql",
-    "2026_05_30_01_reconcile_uuid_integer_mismatches.sql",
+    # Canonical baseline — must succeed for the app to function correctly.
+    # Quarantined migrations (001/002/003, 2026_05_30_01) are NOT listed here
+    # because they are skipped before execution and can never fail critically.
+    "2026_05_31_00_canonical_baseline_schema.sql",
 })
 
 CREATE_SCHEMA_MIGRATIONS_TABLE = """
