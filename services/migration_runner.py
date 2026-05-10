@@ -41,15 +41,16 @@ Checksums:
   accidental edits to already-applied migrations.
 
 Log markers emitted:
-  [MIGRATION_DISCOVERED]         — list of all .sql files found on disk
-  [MIGRATION_SKIPPED_LEGACY]     — quarantined migration skipped with reason
-  [MIGRATION_EXECUTION_PLAN]     — ordered list of migrations to attempt
-  [MIGRATION_ORDER]              — per-migration execution start
-  [MIGRATION_EXECUTED]           — per-migration success
-  [MIGRATION_FAILED_CRITICAL]    — critical migration failed (startup aborted)
-  [MIGRATION_FAILED_NONCRITICAL] — noncritical migration failed (startup continues)
-  [MIGRATION_CHECKSUM_CHANGED]   — previously-applied migration file was modified
-  [MIGRATION_SUMMARY]            — final counts after all migrations attempted
+  [MIGRATION_DISCOVERED]          — list of all .sql files found on disk
+  [MIGRATION_SKIPPED_LEGACY]      — quarantined migration skipped with reason
+  [MIGRATION_EXECUTION_PLAN]      — ordered list of migrations to attempt
+  [MIGRATION_ORDER]               — per-migration execution start
+  [MIGRATION_EXECUTED]            — per-migration success
+  [MIGRATION_FAILED_CRITICAL]     — critical migration failed (startup aborted)
+  [MIGRATION_FAILED_NONCRITICAL]  — noncritical migration failed (startup continues)
+  [MIGRATION_CHECKSUM_CHANGED]    — previously-applied migration file was modified
+  [MIGRATION_VALIDATION_FAILED]   — statement rejected after inline-comment stripping
+  [MIGRATION_SUMMARY]             — final counts after all migrations attempted
 """
 
 import hashlib
@@ -157,8 +158,47 @@ SKIPPED_LEGACY_MIGRATIONS: dict[str, str] = {
         "Those migrations are quarantined; this verification script is therefore moot "
         "and would fail on a fresh database where the INTEGER PKs never existed."
     ),
-}
 
+    # -------------------------------------------------------------------------
+    # 2026_05_10_01 — early schema migration superseded by the canonical
+    # baseline.  Contains assumptions about table structure that no longer hold.
+    # -------------------------------------------------------------------------
+    "2026_05_10_01_add_sync_tables.sql": (
+        "Superseded by 2026_05_31_00_canonical_baseline_schema.sql. "
+        "Early sync-tables migration whose column types and FK assumptions are "
+        "incompatible with the canonical baseline schema."
+    ),
+
+    # -------------------------------------------------------------------------
+    # 2026_05_21_02 — adds drivers/routes/stops tables but uses INTEGER PKs;
+    # superseded by the canonical baseline which creates them with UUID PKs.
+    # -------------------------------------------------------------------------
+    "2026_05_21_02_add_drivers_routes_stops.sql": (
+        "Superseded by 2026_05_31_00_canonical_baseline_schema.sql. "
+        "Creates drivers, routes, and route_stops with INTEGER PKs; the canonical "
+        "baseline creates all three tables with UUID PKs from the start."
+    ),
+
+    # -------------------------------------------------------------------------
+    # 2026_05_27_01 — partial schema patch that conflicts with the canonical
+    # baseline; contains prose fragments in comments that cause SQL syntax errors.
+    # -------------------------------------------------------------------------
+    "2026_05_27_01_add_route_id_to_orders.sql": (
+        "Contains prose fragments in SQL comments (e.g. 'orders.route_id references this') "
+        "that were being executed as SQL statements, causing syntax errors. "
+        "Superseded by 2026_05_31_00_canonical_baseline_schema.sql."
+    ),
+
+    # -------------------------------------------------------------------------
+    # 2026_05_29_01 — post-baseline patch that duplicates work already done by
+    # the canonical baseline; would fail with 'column already exists' errors.
+    # -------------------------------------------------------------------------
+    "2026_05_29_01_add_missing_columns.sql": (
+        "Duplicates schema changes already applied by "
+        "2026_05_31_00_canonical_baseline_schema.sql. Running this after the "
+        "canonical baseline would cause 'column already exists' errors."
+    ),
+}
 
 
 def _should_skip_migration(filename: str) -> str | None:
@@ -250,22 +290,90 @@ def _compute_checksum(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _strip_inline_comments(line: str) -> str:
+    """
+    Remove a trailing ``--`` comment from *line*, returning only the SQL portion.
+
+    Handles the common case where a migration line mixes real SQL with a prose
+    comment, e.g.::
+
+        ALTER TABLE orders ADD COLUMN route_id UUID; -- orders.route_id references this
+
+    Returns ``"ALTER TABLE orders ADD COLUMN route_id UUID;"`` in that example.
+
+    Does NOT attempt to handle ``--`` inside string literals on the same line;
+    for full correctness the caller should only invoke this on lines that have
+    already been confirmed to be outside a string context by ``_split_statements``.
+    """
+    idx = line.find("--")
+    if idx == -1:
+        return line
+    return line[:idx].rstrip()
+
+
+def _clean_chunk(chunk: str) -> str:
+    """
+    Clean a raw SQL chunk (the text between two ``;`` terminators) before
+    execution by:
+
+    1. Dropping lines that are *entirely* a ``--`` comment (comment-only lines).
+    2. Stripping trailing ``--`` prose from lines that mix SQL and a comment.
+    3. Dropping lines that become empty after stripping.
+    4. Joining the surviving lines and stripping surrounding whitespace.
+
+    This ensures that prose fragments such as::
+
+        -- orders.route_id references this
+        -- The route_stops table rolls up to routes
+
+    are never passed to the database engine as SQL statements, and that mixed
+    lines like::
+
+        ADD COLUMN route_id UUID -- FK to routes.id
+
+    have the comment portion removed before execution.
+
+    Returns an empty string if no executable SQL remains after cleaning.
+    """
+    cleaned_lines: list[str] = []
+    for line in chunk.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue  # blank line — skip
+        if stripped.startswith("--"):
+            continue  # comment-only line — skip entirely
+        # Mixed line: strip any trailing inline comment
+        sql_part = _strip_inline_comments(stripped)
+        if sql_part:
+            cleaned_lines.append(sql_part)
+    return "\n".join(cleaned_lines).strip()
+
+
 def _split_statements(sql: str) -> list[str]:
     """
     Split a SQL file into individual statements, correctly handling:
-      - Dollar-quoted blocks (DO $$ ... $$) so semicolons inside PL/pgSQL
-        bodies are not treated as statement terminators.
-      - Single-line comments (-- ...) so comment text is never executed.
-      - Block comments (/* ... */) so multi-line comment prose is never
-        executed as SQL.
-      - Single-quoted string literals so semicolons inside strings are not
-        treated as statement terminators.
+      - Line comments (-- ...): semicolons inside ``--`` comments are ignored;
+        the comment text is discarded so prose after ``--`` on a mixed line is
+        never executed as SQL.
+      - Block comments (/* ... */): semicolons inside ``/* */`` block comments
+        are ignored and the comment body is discarded entirely.
+      - String literals ('...'): semicolons inside single-quoted strings are
+        not treated as statement terminators; escaped quotes ('') are handled.
+      - Dollar-quoted blocks ($ ... $ or $tag$ ... $tag$): semicolons inside
+        PL/pgSQL bodies are not treated as statement terminators.
+      - Inline comment stripping: after splitting, each statement is passed
+        through ``_clean_chunk()`` which removes comment-only lines and strips
+        trailing ``--`` prose from mixed lines, ensuring no prose fragment
+        (e.g. "orders.route_id references this") can be executed as SQL.
 
-    Algorithm:
-      - Scan character-by-character tracking the current parse context:
-        dollar-quote, block comment, line comment, or string literal.
-      - Only split on ``;`` when in the default (unquoted, uncommented) context.
-      - Strip blank lines from each resulting chunk before appending to output.
+    Parse states (mutually exclusive, checked in priority order):
+      1. ``dollar_tag is not None`` — inside a dollar-quoted block
+      2. ``in_block_comment``       — inside a /* ... */ block comment
+      3. ``in_line_comment``        — inside a -- line comment (reset on newline)
+      4. ``in_string``              — inside a single-quoted string literal
+      5. normal SQL                 — the only state where ``;`` splits statements
+
+    Only state 5 (normal SQL) treats ``;`` as a statement terminator.
     """
     statements: list[str] = []
     current: list[str] = []
@@ -368,9 +476,7 @@ def _split_statements(sql: str) -> list[str]:
 
         # Statement terminator
         if ch == ";":
-            chunk = "".join(current)
-            lines = [line for line in chunk.splitlines() if line.strip()]
-            stmt = "\n".join(lines).strip()
+            stmt = _clean_chunk("".join(current))
             if stmt:
                 statements.append(stmt)
             current = []
@@ -382,9 +488,7 @@ def _split_statements(sql: str) -> list[str]:
 
     # Handle any trailing content after the last semicolon
     if current:
-        chunk = "".join(current)
-        lines = [line for line in chunk.splitlines() if line.strip()]
-        stmt = "\n".join(lines).strip()
+        stmt = _clean_chunk("".join(current))
         if stmt:
             statements.append(stmt)
 
