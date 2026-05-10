@@ -15,7 +15,39 @@ from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import AsyncSessionLocal, get_schema_column_types, has_column
+from database import get_async_session_local, get_schema_column_types, has_column
+
+
+def _get_session_factory():
+    """Return the AsyncSessionLocal factory, resolved at call time.
+
+    Using a late-binding getter avoids the 'NoneType is not callable' error
+    that occurs when ``from database import AsyncSessionLocal`` is evaluated
+    at import time — before ``initialize_database_after_bootstrap()`` has run
+    and populated the module-level alias.
+    """
+    return get_async_session_local()
+
+
+# Backward-compatible alias so existing ``async with AsyncSessionLocal() as db:``
+# call sites continue to work without modification.  Each call resolves the
+# factory through the getter, so it always returns the live session maker even
+# when the module was imported before bootstrap completed.
+class _LazySessionLocal:
+    """Proxy that forwards ``()`` and ``async with`` to the real session factory."""
+
+    def __call__(self, *args, **kwargs):
+        return _get_session_factory()(*args, **kwargs)
+
+    def __aenter__(self, *args, **kwargs):  # pragma: no cover
+        return _get_session_factory().__aenter__(*args, **kwargs)
+
+    def __aexit__(self, *args, **kwargs):  # pragma: no cover
+        return _get_session_factory().__aexit__(*args, **kwargs)
+
+
+AsyncSessionLocal = _LazySessionLocal()
+
 from models import Order, OrderLine
 from models.sync_health import DeadLetterLineItem, SyncHealth
 from utils.json_utils import make_json_safe
