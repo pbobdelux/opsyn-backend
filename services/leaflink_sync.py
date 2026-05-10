@@ -3116,26 +3116,15 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
 
                             logger.debug("[DB_DATETIME_VALIDATED] all datetime columns are UTC-aware action=update")
 
-                            # Hard block: never execute UPDATE with org_id=None
+                            # Warn if org_id is None but allow the UPDATE to proceed —
+                            # org_id is nullable and blocking on it causes the entire
+                            # backfill to stall when the credential has no org_id set.
                             if update_params.get("org_id") is None:
-                                logger.error(
-                                    "[ORG_CONTEXT_MISSING_FATAL] brand_id=%s external_id=%s",
+                                logger.warning(
+                                    "[ORG_CONTEXT_MISSING] brand_id=%s external_id=%s"
+                                    " — proceeding with UPDATE (org_id is nullable)",
                                     brand_id_value, external_id,
                                 )
-                                asyncio.create_task(
-                                    _write_sync_dead_letter(
-                                        brand_id=brand_id_value,
-                                        raw_payload=_raw_payload_ref,
-                                        error_stage="org_context_missing",
-                                        error_message="org_id is None at update time",
-                                        org_id=None,
-                                        external_id=external_id,
-                                        failure_category="missing_org_context",
-                                        failure_stage="header_insert",
-                                    )
-                                )
-                                batch_skipped += 1
-                                continue
 
                             await db.execute(
                                 text(update_stmt),
@@ -3143,8 +3132,8 @@ WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :
                             )
                             batch_updated += 1
                             update_success += 1
-                            logger.debug(
-                                "[ORDER_UPDATE_COMMIT] external_id=%s brand_id=%s",
+                            logger.info(
+                                "[ORDER_UPSERTED] external_id=%s order_id=pending status=updated brand_id=%s",
                                 external_id,
                                 brand_id_value,
                             )
@@ -3347,34 +3336,23 @@ INSERT INTO orders (
 
                             logger.debug("[DB_DATETIME_VALIDATED] all datetime columns are UTC-aware action=insert")
 
-                            # Hard block: never execute INSERT with org_id=None
+                            # Warn if org_id is None but allow the INSERT to proceed —
+                            # org_id is nullable and blocking on it causes the entire
+                            # backfill to stall when the credential has no org_id set.
                             if insert_params.get("org_id") is None:
-                                logger.error(
-                                    "[ORG_CONTEXT_MISSING_FATAL] brand_id=%s external_id=%s",
+                                logger.warning(
+                                    "[ORG_CONTEXT_MISSING] brand_id=%s external_id=%s"
+                                    " — proceeding with INSERT (org_id is nullable)",
                                     brand_id_value, external_id,
                                 )
-                                asyncio.create_task(
-                                    _write_sync_dead_letter(
-                                        brand_id=brand_id_value,
-                                        raw_payload=_raw_payload_ref,
-                                        error_stage="org_context_missing",
-                                        error_message="org_id is None at insert time",
-                                        org_id=None,
-                                        external_id=external_id,
-                                        failure_category="missing_org_context",
-                                        failure_stage="header_insert",
-                                    )
-                                )
-                                batch_skipped += 1
-                                continue
                             await db.execute(
                                 text(insert_stmt),
                                 insert_params,
                             )
                             batch_created += 1
                             insert_success += 1
-                            logger.debug(
-                                "[ORDER_INSERT_COMMIT] external_id=%s brand_id=%s",
+                            logger.info(
+                                "[ORDER_INSERTED] external_id=%s order_id=pending status=inserted brand_id=%s",
                                 external_id,
                                 brand_id_value,
                             )
@@ -4278,6 +4256,12 @@ async def sync_leaflink_line_items(
                         skipped_count,
                         len(failed_items),
                     )
+                    logger.info(
+                        "[LINE_ITEMS_SYNCED] order_id=%s count=%s brand_id=%s",
+                        order_id_val,
+                        inserted_count,
+                        brand_id_value,
+                    )
 
                     total_inserted += inserted_count
                     total_skipped += skipped_count
@@ -5088,6 +5072,11 @@ async def sync_leaflink_background_continuous(
         current_page = start_page
         batch_size = _BG_BATCH_DEFAULT
         total_orders_synced = 0
+        # Cumulative counters for [LEAFLINK_BACKFILL_COMPLETE] summary
+        _total_inserted = 0
+        _total_updated = 0
+        _total_skipped = 0
+        _total_errors = 0
         # Resume from last_next_url if provided (worker restart recovery)
         resume_url: Optional[str] = last_next_url
         _prev_cursor: Optional[str] = None  # for cursor-loop detection
@@ -5813,6 +5802,12 @@ async def sync_leaflink_background_continuous(
                     _inserted = persist_result.get("inserted_count", persist_result.get("created", 0)) if persist_result else 0
                     _updated = persist_result.get("updated_count", persist_result.get("updated", 0)) if persist_result else 0
                     _errors = persist_result.get("error_count", 0) if persist_result else 0
+                    _skipped_batch = persist_result.get("skipped_count", persist_result.get("skipped", 0)) if persist_result else 0
+                    # Accumulate into run-level totals for [LEAFLINK_BACKFILL_COMPLETE]
+                    _total_inserted += _inserted
+                    _total_updated += _updated
+                    _total_skipped += _skipped_batch
+                    _total_errors += _errors
                     logger.debug(
                         "[LEAFLINK_SYNC_DEBUG] page=%s count=%s running_total=%s"
                         " inserted=%s updated=%s errors=%s brand_id=%s",
@@ -5868,6 +5863,17 @@ async def sync_leaflink_background_continuous(
                 next_cursor is not None,
             )
 
+            # [LEAFLINK_BACKFILL_PAGE] Per-page progress marker for backfill observability
+            logger.info(
+                "[LEAFLINK_BACKFILL_PAGE] page=%s fetched=%s total_inserted=%s"
+                " next_url_present=%s brand_id=%s",
+                pages_processed,
+                _orders_count,
+                records_seen_from_leaflink,
+                "true" if next_cursor else "false",
+                brand_id,
+            )
+
             # ------------------------------------------------------------------ #
             # Adaptive batch sizing based on fetch latency                        #
             # ------------------------------------------------------------------ #
@@ -5894,6 +5900,20 @@ async def sync_leaflink_background_continuous(
         total_duration = round(time.monotonic() - bg_start, 1)
         # When total_pages is None (cursor-based), final_page is simply the last page visited
         final_page = pages_processed
+
+        # [LEAFLINK_BACKFILL_COMPLETE] Final summary for the entire backfill run
+        logger.info(
+            "[LEAFLINK_BACKFILL_COMPLETE] fetched_total=%s inserted=%s updated=%s"
+            " skipped=%s errors=%s pages=%s duration=%ss brand_id=%s",
+            records_seen_from_leaflink,
+            _total_inserted,
+            _total_updated,
+            _total_skipped,
+            _total_errors,
+            pages_processed,
+            total_duration,
+            brand_id,
+        )
 
         # Calculate completion percentage
         completion_percent = 0.0

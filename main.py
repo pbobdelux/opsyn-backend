@@ -145,7 +145,7 @@ from routes.admin import router as admin_router  # noqa: E402
 from routes.debug import router as debug_router  # noqa: E402
 from routes.auth import router as auth_router  # noqa: E402
 from routes.webhooks import router as webhooks_router  # noqa: E402
-from routes.sync import router as sync_router, _webhook_router as webhook_status_router  # noqa: E402
+from routes.sync import router as sync_router, _webhook_router as webhook_status_router, _sync_now_router as sync_now_router  # noqa: E402
 from routes.leaflink_webhook_config import router as leaflink_webhook_config_router  # noqa: E402
 from routes.diagnostics import router as diagnostics_router  # noqa: E402
 from routes.drivers import router as drivers_router  # noqa: E402
@@ -1025,6 +1025,7 @@ app.include_router(leaflink_debug_router, prefix="/leaflink")
 #   /api/leaflink/orders/...      — leaflink_webhook_config_router (webhook config)
 #   /api/leaflink/orders/...      — webhook_status_router (webhook-status + webhook-replay)
 app.include_router(sync_router)
+app.include_router(sync_now_router)
 app.include_router(webhooks_router)
 app.include_router(leaflink_webhook_config_router)
 app.include_router(webhook_status_router)
