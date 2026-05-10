@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS employee_app_access (
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'employees') THEN
         RAISE NOTICE '[MIGRATION] employees table does not exist — skipping index';
@@ -69,9 +69,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index idx_employees_email already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'employees') THEN
         RAISE NOTICE '[MIGRATION] employees table does not exist — skipping index';
@@ -87,9 +87,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index idx_employees_org_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'employee_passcodes') THEN
         RAISE NOTICE '[MIGRATION] employee_passcodes table does not exist — skipping index';
@@ -105,9 +105,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index idx_employee_passcodes_employee_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'employee_brand_access') THEN
         RAISE NOTICE '[MIGRATION] employee_brand_access table does not exist — skipping index';
@@ -123,9 +123,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index idx_employee_brand_access_employee_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'employee_app_access') THEN
         RAISE NOTICE '[MIGRATION] employee_app_access table does not exist — skipping index';
@@ -141,7 +141,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index idx_employee_app_access_employee_id already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS brand_api_credentials (
     id                         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -174,7 +174,7 @@ CREATE TABLE IF NOT EXISTS brand_api_credentials (
     UNIQUE(brand_id, integration_name)
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'brand_api_credentials') THEN
         RAISE NOTICE '[MIGRATION] brand_api_credentials table does not exist — skipping index';
@@ -190,9 +190,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_brand_api_credentials_brand_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'brand_api_credentials') THEN
         RAISE NOTICE '[MIGRATION] brand_api_credentials table does not exist — skipping index';
@@ -208,9 +208,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_brand_api_credentials_integration already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'brand_api_credentials') THEN
         RAISE NOTICE '[MIGRATION] brand_api_credentials table does not exist — skipping index';
@@ -226,9 +226,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_brand_api_credentials_sync_status already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'brand_api_credentials') THEN
         RAISE NOTICE '[MIGRATION] brand_api_credentials table does not exist — skipping index';
@@ -244,9 +244,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_brand_api_credentials_leaflink_company_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'brand_api_credentials') THEN
         RAISE NOTICE '[MIGRATION] brand_api_credentials table does not exist — skipping index';
@@ -262,9 +262,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_brand_api_credentials_webhook_enabled already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'brand_api_credentials') THEN
         RAISE NOTICE '[MIGRATION] brand_api_credentials table does not exist — skipping index';
@@ -280,7 +280,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_brand_api_credentials_api_key_secret_ref already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS sync_runs (
     id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -309,7 +309,7 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_runs') THEN
         RAISE NOTICE '[MIGRATION] sync_runs table does not exist — skipping index';
@@ -325,9 +325,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_runs_brand_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_runs') THEN
         RAISE NOTICE '[MIGRATION] sync_runs table does not exist — skipping index';
@@ -347,9 +347,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_runs_brand_status already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_runs') THEN
         RAISE NOTICE '[MIGRATION] sync_runs table does not exist — skipping index';
@@ -369,7 +369,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_runs_brand_started already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS sync_requests (
     id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -385,7 +385,7 @@ CREATE TABLE IF NOT EXISTS sync_requests (
     completed_at           TIMESTAMPTZ
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_requests') THEN
         RAISE NOTICE '[MIGRATION] sync_requests table does not exist — skipping index';
@@ -401,9 +401,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_requests_brand_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_requests') THEN
         RAISE NOTICE '[MIGRATION] sync_requests table does not exist — skipping index';
@@ -419,9 +419,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_requests_status already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_requests') THEN
         RAISE NOTICE '[MIGRATION] sync_requests table does not exist — skipping index';
@@ -437,7 +437,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_requests_org_id already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS drivers (
     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -458,7 +458,7 @@ CREATE TABLE IF NOT EXISTS drivers (
     CONSTRAINT ck_drivers_status CHECK (status IN ('active', 'inactive'))
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'drivers') THEN
         RAISE NOTICE '[MIGRATION] drivers table does not exist — skipping index';
@@ -474,9 +474,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_drivers_org_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'drivers') THEN
         RAISE NOTICE '[MIGRATION] drivers table does not exist — skipping index';
@@ -496,9 +496,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_drivers_org_status already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'drivers') THEN
         RAISE NOTICE '[MIGRATION] drivers table does not exist — skipping index';
@@ -518,7 +518,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index uq_drivers_org_email_partial already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS routes (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -539,7 +539,7 @@ CREATE TABLE IF NOT EXISTS routes (
     CONSTRAINT ck_routes_status CHECK (status IN ('draft', 'assigned', 'out_for_delivery', 'completed', 'cancelled'))
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'routes') THEN
         RAISE NOTICE '[MIGRATION] routes table does not exist — skipping index';
@@ -555,9 +555,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_routes_org_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'routes') THEN
         RAISE NOTICE '[MIGRATION] routes table does not exist — skipping index';
@@ -577,9 +577,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_routes_org_date already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'routes') THEN
         RAISE NOTICE '[MIGRATION] routes table does not exist — skipping index';
@@ -595,7 +595,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_routes_driver already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS route_stops (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -625,7 +625,7 @@ CREATE TABLE IF NOT EXISTS route_stops (
     CONSTRAINT uq_route_stops_order UNIQUE (route_id, stop_order)
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'route_stops') THEN
         RAISE NOTICE '[MIGRATION] route_stops table does not exist — skipping index';
@@ -641,9 +641,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_route_stops_route_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'route_stops') THEN
         RAISE NOTICE '[MIGRATION] route_stops table does not exist — skipping index';
@@ -659,7 +659,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_route_stops_org_id already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS orders (
     id                         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -709,7 +709,7 @@ CREATE TABLE IF NOT EXISTS orders (
     CONSTRAINT ck_orders_payment_status CHECK (payment_status IN ('unpaid', 'partial', 'paid', 'overdue', 'collection_issue', 'write_off'))
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -725,9 +725,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_brand_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -743,9 +743,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_order_number already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -761,9 +761,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_external_order_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -779,9 +779,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_sync_run_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -797,9 +797,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_customer_name already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -815,9 +815,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_org_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -837,9 +837,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_org_brand already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -855,9 +855,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_assigned_driver already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -873,9 +873,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_delivery_status already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -891,9 +891,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_payment_status already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -909,9 +909,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_route_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -931,9 +931,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_brand_updated_at already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -953,9 +953,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_brand_created_at already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders') THEN
         RAISE NOTICE '[MIGRATION] orders table does not exist — skipping index';
@@ -975,7 +975,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_orders_sync_health_status already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS order_lines (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -997,7 +997,7 @@ CREATE TABLE IF NOT EXISTS order_lines (
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'order_lines') THEN
         RAISE NOTICE '[MIGRATION] order_lines table does not exist — skipping index';
@@ -1013,9 +1013,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_order_lines_order_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'order_lines') THEN
         RAISE NOTICE '[MIGRATION] order_lines table does not exist — skipping index';
@@ -1031,9 +1031,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_order_lines_sku already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'order_lines') THEN
         RAISE NOTICE '[MIGRATION] order_lines table does not exist — skipping index';
@@ -1057,7 +1057,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index uq_order_line_identity already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS sync_health (
     id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1077,7 +1077,7 @@ CREATE TABLE IF NOT EXISTS sync_health (
     CONSTRAINT uq_sync_health_brand_id UNIQUE (brand_id)
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_health') THEN
         RAISE NOTICE '[MIGRATION] sync_health table does not exist — skipping index';
@@ -1093,7 +1093,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_health_brand_id already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS sync_dead_letters (
     id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1120,7 +1120,7 @@ CREATE TABLE IF NOT EXISTS sync_dead_letters (
     created_at                TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
         RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
@@ -1136,9 +1136,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_brand_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
         RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
@@ -1158,9 +1158,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_source_brand already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
         RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
@@ -1176,9 +1176,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_external_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
         RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
@@ -1198,9 +1198,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_unresolved already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
         RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
@@ -1220,9 +1220,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_last_retry already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
         RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
@@ -1242,9 +1242,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_failure_category already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_dead_letters') THEN
         RAISE NOTICE '[MIGRATION] sync_dead_letters table does not exist — skipping index';
@@ -1264,7 +1264,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_dead_letters_failure_stage already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS sync_metrics_snapshots (
     id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1285,7 +1285,7 @@ CREATE TABLE IF NOT EXISTS sync_metrics_snapshots (
     UNIQUE(brand_id, sync_run_id)
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_metrics_snapshots') THEN
         RAISE NOTICE '[MIGRATION] sync_metrics_snapshots table does not exist — skipping index';
@@ -1301,9 +1301,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_metrics_snapshots_brand_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'sync_metrics_snapshots') THEN
         RAISE NOTICE '[MIGRATION] sync_metrics_snapshots table does not exist — skipping index';
@@ -1323,7 +1323,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_sync_metrics_snapshots_brand_updated already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS dead_letter_line_items (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1340,7 +1340,7 @@ CREATE TABLE IF NOT EXISTS dead_letter_line_items (
     CONSTRAINT uq_dead_letter_brand_order_sku UNIQUE (brand_id, external_order_id, sku)
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'dead_letter_line_items') THEN
         RAISE NOTICE '[MIGRATION] dead_letter_line_items table does not exist — skipping index';
@@ -1360,7 +1360,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_dead_letter_brand_external_order already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS organization_brand_bindings (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1375,7 +1375,7 @@ CREATE TABLE IF NOT EXISTS organization_brand_bindings (
     UNIQUE(org_id, brand_id)
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'organization_brand_bindings') THEN
         RAISE NOTICE '[MIGRATION] organization_brand_bindings table does not exist — skipping index';
@@ -1391,9 +1391,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_org_brand_bindings_org_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'organization_brand_bindings') THEN
         RAISE NOTICE '[MIGRATION] organization_brand_bindings table does not exist — skipping index';
@@ -1409,7 +1409,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_org_brand_bindings_brand_id already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS tenant_credentials (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1420,7 +1420,7 @@ CREATE TABLE IF NOT EXISTS tenant_credentials (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'tenant_credentials') THEN
         RAISE NOTICE '[MIGRATION] tenant_credentials table does not exist — skipping index';
@@ -1436,7 +1436,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_tenant_credentials_org_id already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS route_events (
     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1451,7 +1451,7 @@ CREATE TABLE IF NOT EXISTS route_events (
     CONSTRAINT ck_route_events_actor_type CHECK (actor_type IN ('admin', 'driver'))
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'route_events') THEN
         RAISE NOTICE '[MIGRATION] route_events table does not exist — skipping index';
@@ -1467,9 +1467,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_route_events_route_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'route_events') THEN
         RAISE NOTICE '[MIGRATION] route_events table does not exist — skipping index';
@@ -1485,9 +1485,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_route_events_org_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'route_events') THEN
         RAISE NOTICE '[MIGRATION] route_events table does not exist — skipping index';
@@ -1503,7 +1503,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_route_events_created_at already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS driver_locations (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1523,7 +1523,7 @@ CREATE TABLE IF NOT EXISTS driver_locations (
     created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'driver_locations') THEN
         RAISE NOTICE '[MIGRATION] driver_locations table does not exist — skipping index';
@@ -1543,9 +1543,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_driver_locations_driver_recorded already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'driver_locations') THEN
         RAISE NOTICE '[MIGRATION] driver_locations table does not exist — skipping index';
@@ -1561,9 +1561,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_driver_locations_route already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'driver_locations') THEN
         RAISE NOTICE '[MIGRATION] driver_locations table does not exist — skipping index';
@@ -1583,7 +1583,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_driver_locations_org_time already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS driver_route_history (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1605,7 +1605,7 @@ CREATE TABLE IF NOT EXISTS driver_route_history (
     created_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'driver_route_history') THEN
         RAISE NOTICE '[MIGRATION] driver_route_history table does not exist — skipping index';
@@ -1625,9 +1625,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_driver_route_history_route already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'driver_route_history') THEN
         RAISE NOTICE '[MIGRATION] driver_route_history table does not exist — skipping index';
@@ -1647,7 +1647,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_driver_route_history_driver already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS assistant_sessions (
     id            VARCHAR(36) PRIMARY KEY,
@@ -1702,7 +1702,7 @@ BEGIN
 END;
 $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_sessions') THEN
         RAISE NOTICE '[MIGRATION] assistant_sessions table does not exist — skipping index';
@@ -1718,9 +1718,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_assistant_sessions_org_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_sessions') THEN
         RAISE NOTICE '[MIGRATION] assistant_sessions table does not exist — skipping index';
@@ -1736,7 +1736,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_assistant_sessions_session_key already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS assistant_messages (
     id         VARCHAR(36) PRIMARY KEY,
@@ -1748,7 +1748,7 @@ CREATE TABLE IF NOT EXISTS assistant_messages (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_messages') THEN
         RAISE NOTICE '[MIGRATION] assistant_messages table does not exist — skipping index';
@@ -1764,7 +1764,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_assistant_messages_session_id already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS assistant_pending_actions (
     id              VARCHAR(36) PRIMARY KEY,
@@ -1825,7 +1825,7 @@ BEGIN
 END;
 $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_pending_actions') THEN
         RAISE NOTICE '[MIGRATION] assistant_pending_actions table does not exist — skipping index';
@@ -1841,9 +1841,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_assistant_pending_actions_session_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_pending_actions') THEN
         RAISE NOTICE '[MIGRATION] assistant_pending_actions table does not exist — skipping index';
@@ -1859,9 +1859,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_assistant_pending_actions_org_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_pending_actions') THEN
         RAISE NOTICE '[MIGRATION] assistant_pending_actions table does not exist — skipping index';
@@ -1877,7 +1877,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_assistant_pending_actions_confirmation_id already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS assistant_audit_logs (
     id            VARCHAR(36) PRIMARY KEY,
@@ -1895,7 +1895,7 @@ CREATE TABLE IF NOT EXISTS assistant_audit_logs (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_audit_logs') THEN
         RAISE NOTICE '[MIGRATION] assistant_audit_logs table does not exist — skipping index';
@@ -1911,9 +1911,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_assistant_audit_logs_session_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'assistant_audit_logs') THEN
         RAISE NOTICE '[MIGRATION] assistant_audit_logs table does not exist — skipping index';
@@ -1929,7 +1929,7 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_assistant_audit_logs_org_id already exists';
     END IF;
-END $;
+END $$;
 
 CREATE TABLE IF NOT EXISTS leaflink_webhook_events (
     id                            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1949,7 +1949,7 @@ CREATE TABLE IF NOT EXISTS leaflink_webhook_events (
     created_at                    TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'leaflink_webhook_events') THEN
         RAISE NOTICE '[MIGRATION] leaflink_webhook_events table does not exist — skipping index';
@@ -1965,9 +1965,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_leaflink_webhook_events_tenant_status already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'leaflink_webhook_events') THEN
         RAISE NOTICE '[MIGRATION] leaflink_webhook_events table does not exist — skipping index';
@@ -1983,9 +1983,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_leaflink_webhook_events_brand_id already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'leaflink_webhook_events') THEN
         RAISE NOTICE '[MIGRATION] leaflink_webhook_events table does not exist — skipping index';
@@ -2001,9 +2001,9 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_leaflink_webhook_events_received_at already exists';
     END IF;
-END $;
+END $$;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'leaflink_webhook_events') THEN
         RAISE NOTICE '[MIGRATION] leaflink_webhook_events table does not exist — skipping index';
@@ -2023,4 +2023,4 @@ BEGIN
     ELSE
         RAISE NOTICE '[MIGRATION] Index ix_leaflink_webhook_events_brand_idempotency already exists';
     END IF;
-END $;
+END $$;
