@@ -2964,32 +2964,39 @@ async def sync_leaflink_orders_headers_only(
                           # batch transaction and preventing any orders from being written.
                           # ------------------------------------------------------------------
 
-                          # Serialize JSON fields for raw SQL binding
-                          line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
-                          raw_payload_str = json.dumps(make_json_safe(raw_payload)) if raw_payload else None
+                          # Sanitize ALL JSON fields before serialization.
+                          # make_json_safe() normalises every datetime to UTC-aware ISO 8601
+                          # strings, converts Decimal→float and UUID→str, and handles
+                          # circular references — preventing the
+                          # "can't subtract offset-naive and offset-aware datetimes" error
+                          # that occurs when a payload mixes naive and aware datetimes.
+                          # Apply directly to the raw Python objects (not after json.dumps)
+                          # so that no raw datetime ever reaches json.dumps or SQLAlchemy.
+                          try:
+                              _safe_raw_payload = make_json_safe(raw_payload) if raw_payload else None
+                              _safe_line_items = make_json_safe(normalized_line_items) if normalized_line_items else None
+                              logger.debug(
+                                  "[JSON_PAYLOAD_SANITIZED] external_id=%s brand_id=%s"
+                                  " raw_payload_keys=%s line_items_count=%s",
+                                  external_id,
+                                  brand_id_value,
+                                  list(_safe_raw_payload.keys()) if isinstance(_safe_raw_payload, dict) else "n/a",
+                                  len(_safe_line_items) if isinstance(_safe_line_items, list) else "n/a",
+                              )
+                          except Exception as _san_exc:
+                              logger.warning(
+                                  "[JSON_PAYLOAD_SANITIZED] external_id=%s brand_id=%s"
+                                  " sanitize_error=%s — falling back to empty payload",
+                                  external_id,
+                                  brand_id_value,
+                                  str(_san_exc)[:200],
+                              )
+                              _safe_raw_payload = {}
+                              _safe_line_items = []
 
-                          # Sanitize JSON payloads
-                          if raw_payload_str is not None:
-                              try:
-                                  _san_start = time.monotonic()
-                                  _raw_payload_obj = json.loads(raw_payload_str)
-                                  _sanitized = sanitize_json_payload(_raw_payload_obj)
-                                  _san_duration = time.monotonic() - _san_start
-                                  if _san_duration <= 2:
-                                      raw_payload_str = json.dumps(_sanitized)
-                              except Exception as _san_exc:
-                                  logger.debug("[JSON_SANITIZE_ERROR] field=raw_payload error=%s", str(_san_exc)[:100])
-
-                          if line_items_json_str is not None:
-                              try:
-                                  _san_start = time.monotonic()
-                                  _li_obj = json.loads(line_items_json_str)
-                                  _sanitized = sanitize_json_payload(_li_obj)
-                                  _san_duration = time.monotonic() - _san_start
-                                  if _san_duration <= 2:
-                                      line_items_json_str = json.dumps(_sanitized)
-                              except Exception as _san_exc:
-                                  logger.debug("[JSON_SANITIZE_ERROR] field=line_items_json error=%s", str(_san_exc)[:100])
+                          # Serialize sanitized objects to JSON strings for JSONB binding
+                          raw_payload_str = json.dumps(_safe_raw_payload) if _safe_raw_payload is not None else None
+                          line_items_json_str = json.dumps(_safe_line_items) if _safe_line_items is not None else None
 
                           # Compute sync health
                           _sh_missing_u: list[str] = []
@@ -3117,12 +3124,24 @@ RETURNING (xmax = 0) AS was_inserted
                                   external_id,
                                   brand_id_value,
                               )
+                              logger.info(
+                                  "[ORDER_UPSERT_SUCCESS] external_id=%s order_number=%s action=insert brand_id=%s",
+                                  external_id,
+                                  _order_number_for_log,
+                                  brand_id_value,
+                              )
                           else:
                               batch_updated += 1
                               update_success += 1
                               logger.info(
                                   "[ORDER_UPSERTED] external_id=%s order_id=pending status=updated brand_id=%s",
                                   external_id,
+                                  brand_id_value,
+                              )
+                              logger.info(
+                                  "[ORDER_UPSERT_SUCCESS] external_id=%s order_number=%s action=update brand_id=%s",
+                                  external_id,
+                                  _order_number_for_log,
                                   brand_id_value,
                               )
                           # Release savepoint on success — order is committed with the batch
@@ -3154,6 +3173,14 @@ RETURNING (xmax = 0) AS was_inserted
                             batch_skipped += 1
                             dead_letter_written += 1
                             _dl_customer = safe_str(o.get("customer_name")) if isinstance(o, dict) else None
+                            logger.error(
+                                "[ORDER_UPSERT_FAILED] external_id=%s order_number=%s"
+                                " stage=header_insert category=duplicate_external_id error=%s brand_id=%s",
+                                _order_ext_id_for_log,
+                                _order_number_for_log,
+                                _err_reason[:200],
+                                brand_id_value,
+                            )
                             asyncio.create_task(
                                 _write_sync_dead_letter(
                                     brand_id=brand_id_value,
@@ -3236,6 +3263,16 @@ RETURNING (xmax = 0) AS was_inserted
                                 "[ORDER_INSERT_ROLLBACK] external_id=%s error=%s stage=header_insert",
                                 _order_ext_id_for_log,
                                 _err_reason[:200],
+                            )
+                            logger.error(
+                                "[ORDER_UPSERT_FAILED] external_id=%s order_number=%s"
+                                " stage=header_insert category=%s exception_type=%s error=%s brand_id=%s",
+                                _order_ext_id_for_log,
+                                _order_number_for_log,
+                                _batch_category,
+                                _batch_exc_type,
+                                _err_reason[:200],
+                                brand_id_value,
                             )
                             # Write to dead-letter asynchronously (own session, non-blocking)
                             asyncio.create_task(
