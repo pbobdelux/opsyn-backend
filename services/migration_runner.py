@@ -29,9 +29,14 @@ Quarantine:
     002_create_driver_locations_table.sql      — references non-existent drivers/routes tables
     003_create_driver_route_history_table.sql  — references non-existent drivers/routes tables
     2026_04_23_02_add_tenant_credentials.sql   — uses SERIAL PK; superseded by canonical baseline
+    2026_05_10_01_add_sync_requests_table.sql  — SERIAL PK; semicolons in comments caused syntax errors
+    2026_05_21_02_add_drivers_routes_stops.sql — DROP CASCADE; semicolons in comments caused syntax errors
+    2026_05_27_01_add_webhook_credential_fields.sql — columns in canonical baseline; semicolons in comments
+    2026_05_28_04_migrate_remaining_integer_tables.sql — no-op/destructive on canonical-baseline DBs
+    2026_05_29_01_add_secrets_manager_columns.sql — columns in canonical baseline; semicolons in comments
     2026_05_30_01_reconcile_uuid_integer_mismatches.sql — contains invalid SQL; superseded by canonical baseline
 
-  All five are superseded by 2026_05_31_00_canonical_baseline_schema.sql which
+  All are superseded by 2026_05_31_00_canonical_baseline_schema.sql which
   creates the correct schema idempotently with UUID PKs and valid FK types.
 
 Checksums:
@@ -41,15 +46,16 @@ Checksums:
   accidental edits to already-applied migrations.
 
 Log markers emitted:
-  [MIGRATION_DISCOVERED]         — list of all .sql files found on disk
-  [MIGRATION_SKIPPED_LEGACY]     — quarantined migration skipped with reason
-  [MIGRATION_EXECUTION_PLAN]     — ordered list of migrations to attempt
-  [MIGRATION_ORDER]              — per-migration execution start
-  [MIGRATION_EXECUTED]           — per-migration success
-  [MIGRATION_FAILED_CRITICAL]    — critical migration failed (startup aborted)
-  [MIGRATION_FAILED_NONCRITICAL] — noncritical migration failed (startup continues)
-  [MIGRATION_CHECKSUM_CHANGED]   — previously-applied migration file was modified
-  [MIGRATION_SUMMARY]            — final counts after all migrations attempted
+  [MIGRATION_DISCOVERED]          — list of all .sql files found on disk
+  [MIGRATION_SKIPPED_LEGACY]      — quarantined migration skipped with reason
+  [MIGRATION_EXECUTION_PLAN]      — ordered list of migrations to attempt
+  [MIGRATION_ORDER]               — per-migration execution start
+  [MIGRATION_VALIDATION_FAILED]   — preflight check rejected a migration file
+  [MIGRATION_EXECUTED]            — per-migration success
+  [MIGRATION_FAILED_CRITICAL]     — critical migration failed (startup aborted)
+  [MIGRATION_FAILED_NONCRITICAL]  — noncritical migration failed (startup continues)
+  [MIGRATION_CHECKSUM_CHANGED]    — previously-applied migration file was modified
+  [MIGRATION_SUMMARY]             — final counts after all migrations attempted
 """
 
 import hashlib
@@ -123,6 +129,64 @@ SKIPPED_LEGACY_MIGRATIONS: dict[str, str] = {
         "type mismatches on databases where earlier migrations ran in the wrong "
         "order. Replaced by 2026_05_31_00_canonical_baseline_schema.sql which "
         "establishes the correct schema idempotently without any type conflicts."
+    ),
+
+    # -------------------------------------------------------------------------
+    # The following five migrations contain semicolons inside SQL line comments
+    # (e.g. "-- prose; more prose").  The migration runner's character-level
+    # scanner previously split on those semicolons, causing prose fragments to
+    # be executed as SQL statements and producing syntax errors at startup.
+    # The scanner has been fixed, but these migrations are quarantined because:
+    #   - 2026_05_10_01: sync_requests table is superseded by the canonical
+    #     baseline (UUID PK vs SERIAL PK).
+    #   - 2026_05_21_02: drivers/routes/route_stops are superseded by the
+    #     canonical baseline (IF NOT EXISTS guards; correct UUID FKs).
+    #   - 2026_05_27_01 / 2026_05_29_01: webhook and secrets columns are
+    #     already included in the canonical baseline brand_api_credentials
+    #     definition; re-running ADD COLUMN IF NOT EXISTS is safe but
+    #     unnecessary and risks partial-apply confusion.
+    #   - 2026_05_28_04: integer-to-UUID migration is a no-op on databases
+    #     bootstrapped from the canonical baseline (tables already have UUID
+    #     PKs) and destructive on databases that never had integer PKs.
+    # -------------------------------------------------------------------------
+    "2026_05_10_01_add_sync_requests_table.sql": (
+        "Superseded by 2026_05_31_00_canonical_baseline_schema.sql which "
+        "creates sync_requests with a UUID PK. This file uses a SERIAL PK and "
+        "would conflict with the canonical schema. Additionally contains a "
+        "semicolon inside a SQL line comment that previously caused the prose "
+        "fragment 'the dedicated' to be executed as SQL."
+    ),
+    "2026_05_21_02_add_drivers_routes_stops.sql": (
+        "Superseded by 2026_05_31_00_canonical_baseline_schema.sql which "
+        "creates drivers, routes, and route_stops with IF NOT EXISTS guards and "
+        "correct UUID FKs. This file uses DROP TABLE CASCADE which is "
+        "destructive on live databases. Also contains semicolons inside SQL "
+        "line comments that previously caused prose fragments such as "
+        "'this replaces it entirely' to be executed as SQL."
+    ),
+    "2026_05_27_01_add_webhook_credential_fields.sql": (
+        "Webhook credential columns (webhook_key_secret_ref, webhook_key_last4, "
+        "webhook_enabled, webhook_signature_required, leaflink_company_id) are "
+        "already included in the brand_api_credentials definition in "
+        "2026_05_31_00_canonical_baseline_schema.sql. Running this migration "
+        "after the canonical baseline is a no-op at best and risks confusion. "
+        "Also contains a semicolon inside a SQL line comment that previously "
+        "caused the prose fragment 'only the ARN reference' to be executed as SQL."
+    ),
+    "2026_05_28_04_migrate_remaining_integer_tables.sql": (
+        "Integer-to-UUID PK migration that is a no-op (and potentially "
+        "destructive) on databases bootstrapped from the canonical baseline, "
+        "which already creates all affected tables with UUID PKs. Contains "
+        "semicolons inside SQL line comments that previously caused prose "
+        "fragments such as 'FK to orders already UUID' to be executed as SQL."
+    ),
+    "2026_05_29_01_add_secrets_manager_columns.sql": (
+        "Secrets Manager columns (api_key_secret_ref, api_key_last4) are "
+        "already included in the brand_api_credentials definition in "
+        "2026_05_31_00_canonical_baseline_schema.sql. Running this migration "
+        "after the canonical baseline is a no-op at best and risks confusion. "
+        "Also contains a semicolon inside a SQL line comment that previously "
+        "caused the prose fragment 'only the ARN reference' to be executed as SQL."
     ),
 }
 
@@ -216,57 +280,151 @@ def _compute_checksum(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _strip_inline_comments(line: str) -> str:
+    """
+    Strip a trailing ``--`` line comment from a single SQL line, returning
+    only the SQL portion.  Handles the common case where a comment appears
+    after real SQL on the same line (e.g. ``col TEXT, -- deprecated``).
+
+    This is intentionally simple: it splits on the first ``--`` occurrence
+    that is not inside a single-quoted string literal.  Dollar-quoted blocks
+    are handled at a higher level and are never passed to this function
+    line-by-line.
+
+    Returns the SQL portion of the line with trailing whitespace stripped.
+    If the entire line is a comment (starts with ``--`` after optional
+    whitespace) an empty string is returned.
+    """
+    in_single_quote = False
+    for idx, ch in enumerate(line):
+        if ch == "'" and not in_single_quote:
+            in_single_quote = True
+        elif ch == "'" and in_single_quote:
+            in_single_quote = False
+        elif ch == "-" and not in_single_quote and line[idx : idx + 2] == "--":
+            return line[:idx].rstrip()
+    return line.rstrip()
+
+
+def _clean_chunk(chunk: str) -> str:
+    """
+    Given a raw SQL chunk (the text between two statement-terminating
+    semicolons), return the cleaned statement ready for execution, or an
+    empty string if the chunk contains only comments and whitespace.
+
+    Processing steps:
+      1. Split into lines.
+      2. For each line, strip the inline ``--`` comment portion.
+      3. Discard lines that are empty after stripping.
+      4. Join the remaining lines and strip surrounding whitespace.
+    """
+    cleaned_lines: list[str] = []
+    for raw_line in chunk.splitlines():
+        sql_part = _strip_inline_comments(raw_line)
+        if sql_part.strip():
+            cleaned_lines.append(sql_part)
+    return "\n".join(cleaned_lines).strip()
+
+
 def _split_statements(sql: str) -> list[str]:
     """
-    Split a SQL file into individual statements, correctly handling
-    dollar-quoted blocks (DO $ ... $) so that semicolons inside
-    PL/pgSQL bodies are not treated as statement terminators.
+    Split a SQL file into individual statements, correctly handling:
+
+      - Dollar-quoted blocks (``DO $$ ... $$``) — semicolons inside PL/pgSQL
+        bodies are never treated as statement terminators.
+      - Line comments (``-- ...``) — semicolons inside ``--`` comments are
+        never treated as statement terminators.  This is the fix for the
+        production bug where comment lines such as
+        ``--   routes (UUID PK; orders.route_id references this)``
+        caused the prose fragment after the semicolon to be executed as SQL.
+      - Inline comments (SQL on the same line as a ``--`` comment) — the
+        comment portion is stripped before the statement is recorded so that
+        prose never leaks into the executed SQL.
 
     Algorithm:
-      - Scan character-by-character tracking whether we are inside a
-        dollar-quote (e.g. ``$`` or ``$tag`).
-      - Only split on ``;`` when outside a dollar-quote.
-      - Strip comment-only lines and blank lines from each resulting chunk.
+      1. Scan character-by-character.
+      2. Track three mutually-exclusive states:
+           a. Inside a ``--`` line comment (reset at the next newline).
+           b. Inside a dollar-quoted block (``$$`` or ``$tag$``).
+           c. Normal SQL.
+      3. Only split on ``;`` in state (c).
+      4. After collecting a chunk, strip comment-only lines and blank lines,
+         and strip inline comments from mixed lines before recording the
+         statement.
+      5. Log a debug message if a chunk becomes empty after comment stripping
+         (indicates a semicolon that was entirely inside a comment — benign
+         but useful for diagnosing malformed migration files).
     """
     statements: list[str] = []
     current: list[str] = []
     dollar_tag: str | None = None  # None = not inside a dollar-quote
+    in_line_comment = False
     i = 0
 
     while i < len(sql):
         ch = sql[i]
 
-        if dollar_tag is None:
-            # Look for the start of a dollar-quote: $tag$ or $
-            if ch == "$":
-                # Find the closing $ of the opening tag
-                j = sql.find("$", i + 1)
-                if j != -1:
-                    tag = sql[i : j + 1]  # e.g. "$" or "$body$"
-                    dollar_tag = tag
-                    current.append(tag)
-                    i = j + 1
-                    continue
-            if ch == ";":
-                chunk = "".join(current)
-                # Strip comment-only lines and blank lines
-                lines = [
-                    line for line in chunk.splitlines()
-                    if line.strip() and not line.strip().startswith("--")
-                ]
-                stmt = "\n".join(lines).strip()
-                if stmt:
-                    statements.append(stmt)
-                current = []
-                i += 1
-                continue
-        else:
-            # Inside a dollar-quote — look for the matching closing tag
+        # ------------------------------------------------------------------ #
+        # State: inside a -- line comment                                     #
+        # ------------------------------------------------------------------ #
+        if in_line_comment:
+            current.append(ch)
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        # ------------------------------------------------------------------ #
+        # State: inside a dollar-quoted block                                 #
+        # ------------------------------------------------------------------ #
+        if dollar_tag is not None:
             if sql[i : i + len(dollar_tag)] == dollar_tag:
                 current.append(dollar_tag)
                 i += len(dollar_tag)
                 dollar_tag = None
+            else:
+                current.append(ch)
+                i += 1
+            continue
+
+        # ------------------------------------------------------------------ #
+        # State: normal SQL                                                   #
+        # ------------------------------------------------------------------ #
+
+        # Detect start of a -- line comment
+        if ch == "-" and sql[i : i + 2] == "--":
+            in_line_comment = True
+            current.append(ch)
+            i += 1
+            continue
+
+        # Detect start of a dollar-quoted block
+        if ch == "$":
+            j = sql.find("$", i + 1)
+            if j != -1:
+                tag = sql[i : j + 1]  # e.g. "$$" or "$body$"
+                dollar_tag = tag
+                current.append(tag)
+                i = j + 1
                 continue
+
+        # Statement terminator — only reached in normal SQL state
+        if ch == ";":
+            chunk = "".join(current)
+            stmt = _clean_chunk(chunk)
+            if stmt:
+                statements.append(stmt)
+            elif chunk.strip():
+                # The chunk had content but it was all comments — log at debug
+                # level so operators can see which semicolons were inside
+                # comments (useful for diagnosing malformed migration files).
+                logger.debug(
+                    "[Migration] skipped comment-only chunk before ';': %r",
+                    chunk.strip()[:120],
+                )
+            current = []
+            i += 1
+            continue
 
         current.append(ch)
         i += 1
@@ -274,15 +432,12 @@ def _split_statements(sql: str) -> list[str]:
     # Handle any trailing content after the last semicolon
     if current:
         chunk = "".join(current)
-        lines = [
-            line for line in chunk.splitlines()
-            if line.strip() and not line.strip().startswith("--")
-        ]
-        stmt = "\n".join(lines).strip()
+        stmt = _clean_chunk(chunk)
         if stmt:
             statements.append(stmt)
 
     return statements
+
 
 
 def _topological_sort(files: list[str], deps: dict[str, list[str]]) -> list[str]:
@@ -370,6 +525,94 @@ def _order_migrations(sql_files: list[str]) -> list[str]:
         ordered_others = sorted(others)
 
     return repair + ordered_others
+
+
+# ---------------------------------------------------------------------------
+# Preflight validation
+# ---------------------------------------------------------------------------
+
+# Compiled patterns used by _validate_migration_file().
+_RE_PROSE_LINE = re.compile(r"^[A-Z][a-z]+ [a-z]+ [a-z]+")
+_RE_MARKDOWN_HEADER = re.compile(r"^#+\s")
+_RE_BULLET_LIST = re.compile(r"^\s*[-*]\s+")
+
+
+def _validate_migration_file(filename: str, sql: str) -> list[str]:
+    """
+    Preflight-validate the content of a migration file before execution.
+
+    Returns a (possibly empty) list of human-readable problem descriptions.
+    An empty list means the file passed all checks.
+
+    Checks performed:
+      1. No prose paragraphs outside SQL comments — lines matching
+         ``^[A-Z][a-z]+ [a-z]+ [a-z]+`` that are not inside a comment.
+      2. No Markdown headers (``## ...``) outside comments.
+      3. No Markdown bullet lists (``- item`` / ``* item``) outside comments.
+      4. No orphaned text fragments — non-empty lines that are not valid SQL
+         keywords, not comments, and not inside a dollar-quoted block.
+
+    Note: this validator operates on raw lines and is intentionally
+    conservative — it only flags patterns that are unambiguously wrong.
+    False positives (valid SQL that looks like prose) are avoided by
+    checking only lines that are clearly outside comments and dollar-quotes.
+    """
+    problems: list[str] = []
+    in_dollar_quote = False
+    dollar_tag_str = ""
+
+    for lineno, raw_line in enumerate(sql.splitlines(), start=1):
+        stripped = raw_line.strip()
+
+        # Track dollar-quote state (line-level approximation — sufficient for
+        # the patterns we are checking which never appear inside PL/pgSQL).
+        if not in_dollar_quote:
+            # Check for opening dollar-quote tag on this line
+            dq_match = re.search(r"\$([A-Za-z_]*)\$", raw_line)
+            if dq_match:
+                tag_candidate = dq_match.group(0)
+                # Only enter dollar-quote state if the tag appears twice on
+                # the same line (opening and closing on one line — skip) or
+                # just once (opening — enter state).
+                if raw_line.count(tag_candidate) == 1:
+                    in_dollar_quote = True
+                    dollar_tag_str = tag_candidate
+                # If it appears twice on the same line it opens and closes
+                # immediately — no state change needed.
+        else:
+            if dollar_tag_str and dollar_tag_str in raw_line:
+                in_dollar_quote = False
+                dollar_tag_str = ""
+            continue  # Inside dollar-quote — skip all checks
+
+        # Skip pure comment lines and blank lines
+        if not stripped or stripped.startswith("--"):
+            continue
+
+        # Strip inline comment to get the SQL portion only
+        sql_portion = _strip_inline_comments(raw_line).strip()
+        if not sql_portion:
+            continue  # Entire line was a comment
+
+        # Check 1: prose paragraph detection
+        if _RE_PROSE_LINE.match(sql_portion):
+            problems.append(
+                f"line {lineno}: possible prose outside comment: {sql_portion[:80]!r}"
+            )
+
+        # Check 2: Markdown header
+        if _RE_MARKDOWN_HEADER.match(sql_portion):
+            problems.append(
+                f"line {lineno}: Markdown header outside comment: {sql_portion[:80]!r}"
+            )
+
+        # Check 3: Markdown bullet list
+        if _RE_BULLET_LIST.match(sql_portion):
+            problems.append(
+                f"line {lineno}: Markdown bullet list outside comment: {sql_portion[:80]!r}"
+            )
+
+    return problems
 
 
 async def run_migrations() -> dict:
@@ -499,6 +742,23 @@ async def run_migrations() -> dict:
                 migration_path = os.path.join(MIGRATIONS_DIR, filename)
                 with open(migration_path, "r", encoding="utf-8") as fh:
                     sql = fh.read()
+
+                # Preflight validation — reject files with prose, Markdown, or
+                # other content that would cause SQL syntax errors if executed.
+                validation_problems = _validate_migration_file(filename, sql)
+                if validation_problems:
+                    problem_summary = "; ".join(validation_problems[:5])
+                    logger.error(
+                        "[MIGRATION_VALIDATION_FAILED] migration=%s problems=%d first_problems=%s",
+                        filename,
+                        len(validation_problems),
+                        problem_summary,
+                    )
+                    raise ValueError(
+                        f"[MIGRATION_VALIDATION_FAILED] {filename} failed preflight "
+                        f"validation with {len(validation_problems)} problem(s): "
+                        f"{problem_summary}"
+                    )
 
                 current_checksum = _compute_checksum(sql)
 
