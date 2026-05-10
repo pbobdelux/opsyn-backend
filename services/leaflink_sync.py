@@ -2798,7 +2798,14 @@ async def sync_leaflink_orders_headers_only(
         try:
             async with AsyncSessionLocal() as db:
                 async with db.begin():
-                    for o in batch:
+                    for _order_idx, o in enumerate(batch):
+                        # Use a savepoint per order so that an exception on one order
+                        # rolls back only that order's writes, not the entire batch.
+                        # This is the critical fix: without savepoints, any exception
+                        # (IntegrityError, TypeError, etc.) aborts the whole transaction
+                        # and prevents all subsequent orders in the batch from being written.
+                        _sp_name = f"order_sp_{_order_idx}"
+                        await db.execute(text(f"SAVEPOINT {_sp_name}"))
                         _order_ext_id_for_log = "unknown"
                         _order_number_for_log = None
                         _raw_payload_ref: Any = o
@@ -2917,232 +2924,91 @@ async def sync_leaflink_orders_headers_only(
                             else o
                           )
 
-                          existing_result = await db.execute(
-                            select(Order).where(
-                                Order.brand_id == brand_id_value,
-                                Order.external_order_id == external_id,
-                            )
+                          # ------------------------------------------------------------------
+                          # True idempotent upsert: INSERT ... ON CONFLICT (brand_id,
+                          # external_order_id) DO UPDATE SET ...
+                          # This replaces the old SELECT-then-INSERT/UPDATE pattern which
+                          # caused IntegrityError on duplicate keys, aborting the entire
+                          # batch transaction and preventing any orders from being written.
+                          # ------------------------------------------------------------------
+
+                          # Serialize JSON fields for raw SQL binding
+                          line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
+                          raw_payload_str = json.dumps(make_json_safe(raw_payload)) if raw_payload else None
+
+                          # Sanitize JSON payloads
+                          if raw_payload_str is not None:
+                              try:
+                                  _san_start = time.monotonic()
+                                  _raw_payload_obj = json.loads(raw_payload_str)
+                                  _sanitized = sanitize_json_payload(_raw_payload_obj)
+                                  _san_duration = time.monotonic() - _san_start
+                                  if _san_duration <= 2:
+                                      raw_payload_str = json.dumps(_sanitized)
+                              except Exception as _san_exc:
+                                  logger.debug("[JSON_SANITIZE_ERROR] field=raw_payload error=%s", str(_san_exc)[:100])
+
+                          if line_items_json_str is not None:
+                              try:
+                                  _san_start = time.monotonic()
+                                  _li_obj = json.loads(line_items_json_str)
+                                  _sanitized = sanitize_json_payload(_li_obj)
+                                  _san_duration = time.monotonic() - _san_start
+                                  if _san_duration <= 2:
+                                      line_items_json_str = json.dumps(_sanitized)
+                              except Exception as _san_exc:
+                                  logger.debug("[JSON_SANITIZE_ERROR] field=line_items_json error=%s", str(_san_exc)[:100])
+
+                          # Compute sync health
+                          _sh_missing_u: list[str] = []
+                          if not customer_name or customer_name == "Unknown Customer":
+                              _sh_missing_u.append("customer_name")
+                          if amount_decimal is None:
+                              _sh_missing_u.append("amount")
+                          elif _amount_sync_note:
+                              _sh_missing_u.append(_amount_sync_note)
+                          if not normalized_line_items:
+                              _sh_missing_u.append("line_items")
+                          if not status:
+                              _sh_missing_u.append("status")
+                          _sh_status_u = "partial" if _sh_missing_u else "ok"
+                          _sh_missing_json_u = json.dumps(_sh_missing_u) if _sh_missing_u else None
+
+                          # Re-coerce UUIDs immediately before SQL params
+                          _sql_org_id = safe_uuid_for_db(org_id_value, "org_id")
+                          _sql_brand_id = safe_uuid_for_db(brand_id_value, "brand_id") or brand_id_value
+
+                          logger.debug(
+                              "[ORG_ID_BEFORE_SQL] field=org_id value=%s external_id=%s function=sync_leaflink_orders_headers_only action=upsert",
+                              _sql_org_id,
+                              external_id,
                           )
-                          existing = existing_result.scalar_one_or_none()
 
-                          if existing:
-                            # Use raw SQL UPDATE with CAST so PostgreSQL receives
-                            # explicit type coercion for UUID columns instead of
-                            # rejecting a character-varying bound parameter.
-                            # Use server timestamps only — bulletproof mode.
-                            update_stmt = """
-UPDATE orders SET
-    org_id = CAST(:org_id AS uuid),
-    customer_name = :customer_name,
-    status = :status,
-    order_number = :order_number,
-    total_cents = :total_cents,
-    amount = :amount,
-    item_count = :item_count,
-    unit_count = :unit_count,
-    line_items_json = :line_items_json,
-    raw_payload = :raw_payload,
-    review_status = :review_status,
-    sync_status = :sync_status,
-    sync_health_status = :sync_health_status,
-    sync_health_missing_fields = CAST(:sync_health_missing_fields AS jsonb),
-    synced_at = :synced_at,
-    last_synced_at = :last_synced_at,
-    updated_at = :updated_at
-WHERE CAST(brand_id AS uuid) = CAST(:brand_id AS uuid) AND external_order_id = :external_order_id
-"""
+                          # Hard block: never execute upsert with org_id=None
+                          if _sql_org_id is None:
+                              logger.error(
+                                  "[ORG_CONTEXT_MISSING_FATAL] brand_id=%s external_id=%s",
+                                  brand_id_value, external_id,
+                              )
+                              asyncio.create_task(
+                                  _write_sync_dead_letter(
+                                      brand_id=brand_id_value,
+                                      raw_payload=_raw_payload_ref,
+                                      error_stage="org_context_missing",
+                                      error_message="org_id is None at upsert time",
+                                      org_id=None,
+                                      external_id=external_id,
+                                      failure_category="missing_org_context",
+                                      failure_stage="header_insert",
+                                  )
+                              )
+                              batch_skipped += 1
+                              skipped_org_missing += 1
+                              continue
 
-                            # cannot encode Python list/dict directly; it needs strings.
-                            line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
-                            raw_payload_str = json.dumps(make_json_safe(raw_payload)) if raw_payload else None
-
-                            # Use server timestamps — bulletproof mode
-                            synced_at_val = now
-                            updated_at_val = now
-
-                            # Re-coerce immediately before SQL params — belt-and-suspenders guard
-                            _sql_org_id = safe_uuid_for_db(org_id_value, "org_id")
-                            _sql_brand_id = safe_uuid_for_db(brand_id_value, "brand_id") or brand_id_value
-                            logger.debug(
-                                "[ORG_ID_BEFORE_SQL] field=org_id value=%s external_id=%s function=sync_leaflink_orders_headers_only action=update",
-                                _sql_org_id,
-                                external_id,
-                            )
-                            logger.debug(
-                                "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s external_id=%s function=sync_leaflink_orders_headers_only action=update",
-                                _sql_brand_id,
-                                external_id,
-                            )
-
-                            # Compute sync health for this order
-                            _sh_missing: list[str] = []
-                            if not customer_name or customer_name == "Unknown Customer":
-                                _sh_missing.append("customer_name")
-                            if amount_decimal is None:
-                                _sh_missing.append("amount")
-                            elif _amount_sync_note:
-                                _sh_missing.append(_amount_sync_note)
-                            if not normalized_line_items:
-                                _sh_missing.append("line_items")
-                            if not status:
-                                _sh_missing.append("status")
-                            _sh_status = "partial" if _sh_missing else "ok"
-                            _sh_missing_json = json.dumps(_sh_missing) if _sh_missing else None
-
-                            update_params = {
-                                "org_id": _sql_org_id,
-                                "brand_id": _sql_brand_id,
-                                "external_order_id": external_id,
-                                "customer_name": customer_name,
-                                "status": status,
-                                "order_number": order_number,
-                                "total_cents": total_cents,
-                                "amount": amount_decimal,
-                                "item_count": item_count,
-                                "unit_count": unit_count,
-                                "line_items_json": line_items_json_str,
-                                "raw_payload": raw_payload_str,
-                                "review_status": review_status,
-                                "sync_status": _sh_status,
-                                "sync_health_status": _sh_status,
-                                "sync_health_missing_fields": _sh_missing_json,
-                                "synced_at": synced_at_val,
-                                "last_synced_at": synced_at_val,
-                                "updated_at": updated_at_val,
-                            }
-
-                            # FINAL validation — enforce coercion directly into params dict
-                            # immediately before execute() so no mutation after coercion can slip through.
-                            update_params["org_id"] = safe_uuid_for_db(update_params.get("org_id"), "org_id")
-                            update_params["brand_id"] = safe_uuid_for_db(update_params.get("brand_id"), "brand_id") or update_params.get("brand_id")
-                            logger.debug(
-                                "[FINAL_SQL_PARAMS] org_id=%s org_type=%s brand_id=%s brand_type=%s"
-                                " external_id=%s action=update function=sync_leaflink_orders_headers_only",
-                                update_params.get("org_id"),
-                                type(update_params.get("org_id")).__name__,
-                                update_params.get("brand_id"),
-                                type(update_params.get("brand_id")).__name__,
-                                external_id,
-                            )
-
-                            logger.debug("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
-                            logger.debug("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
-                            # Coerce all datetime params to UTC-aware immediately before SQL execution
-                            update_params["synced_at"] = ensure_utc(update_params.get("synced_at"), "synced_at") or utc_now()
-                            update_params["last_synced_at"] = ensure_utc(update_params.get("last_synced_at"), "last_synced_at") or utc_now()
-                            update_params["updated_at"] = ensure_utc(update_params.get("updated_at"), "updated_at") or utc_now()
-                            logger.debug(
-                                "[DATETIME_FINAL_PARAMS] synced_at=%s type=%s last_synced_at=%s type=%s updated_at=%s type=%s",
-                                update_params.get("synced_at"),
-                                type(update_params.get("synced_at")),
-                                update_params.get("last_synced_at"),
-                                type(update_params.get("last_synced_at")),
-                                update_params.get("updated_at"),
-                                type(update_params.get("updated_at")),
-                            )
-
-                            update_params = sanitize_sql_params(update_params, statement="sync_leaflink_orders_headers_only_update")
-                            update_params = normalize_uuid_fields(update_params)
-                            update_params = normalize_datetime_fields(update_params)
-                            update_params = apply_uuid_str_to_params(update_params)
-
-                            # Sanitize JSON payloads — convert datetime/date/Decimal/UUID to JSON-safe strings
-                            # ONLY for JSON columns; DB timestamp columns remain timezone-aware datetime objects
-                            if "raw_payload" in update_params and update_params["raw_payload"] is not None:
-                                try:
-                                    _san_start = time.monotonic()
-                                    _raw_payload_obj = json.loads(update_params["raw_payload"]) if isinstance(update_params["raw_payload"], str) else update_params["raw_payload"]
-                                    _sanitized = sanitize_json_payload(_raw_payload_obj)
-                                    _san_duration = time.monotonic() - _san_start
-                                    if _san_duration > 2:
-                                        logger.warning("[SANITIZER_TIMEOUT] field=raw_payload action=update duration=%.2fs", _san_duration)
-                                    else:
-                                        update_params["raw_payload"] = json.dumps(_sanitized)
-                                        logger.debug("[JSON_PAYLOAD_SANITIZED] field=raw_payload action=update")
-                                except Exception as _san_exc:
-                                    logger.debug("[JSON_SANITIZE_ERROR] field=raw_payload action=update error=%s", str(_san_exc)[:100])
-
-                            if "line_items_json" in update_params and update_params["line_items_json"] is not None:
-                                try:
-                                    _san_start = time.monotonic()
-                                    _li_obj = json.loads(update_params["line_items_json"]) if isinstance(update_params["line_items_json"], str) else update_params["line_items_json"]
-                                    _sanitized = sanitize_json_payload(_li_obj)
-                                    _san_duration = time.monotonic() - _san_start
-                                    if _san_duration > 2:
-                                        logger.warning("[SANITIZER_TIMEOUT] field=line_items_json action=update duration=%.2fs", _san_duration)
-                                    else:
-                                        update_params["line_items_json"] = json.dumps(_sanitized)
-                                        logger.debug("[JSON_PAYLOAD_SANITIZED] field=line_items_json action=update")
-                                except Exception as _san_exc:
-                                    logger.debug("[JSON_SANITIZE_ERROR] field=line_items_json action=update error=%s", str(_san_exc)[:100])
-
-                            # Normalize ALL datetime fields to UTC-aware before SQL execution
-                            update_params["synced_at"] = ensure_utc_datetime(update_params.get("synced_at"))
-                            update_params["last_synced_at"] = ensure_utc_datetime(update_params.get("last_synced_at"))
-                            update_params["updated_at"] = ensure_utc_datetime(update_params.get("updated_at"))
-                            update_params["created_at"] = ensure_utc_datetime(update_params.get("created_at"))
-                            update_params["external_created_at"] = ensure_utc_datetime(update_params.get("external_created_at"))
-                            update_params["external_updated_at"] = ensure_utc_datetime(update_params.get("external_updated_at"))
-                            update_params["due_date"] = ensure_utc_datetime(update_params.get("due_date"))
-                            update_params["payment_date"] = ensure_utc_datetime(update_params.get("payment_date"))
-                            update_params["delivery_date"] = ensure_utc_datetime(update_params.get("delivery_date"))
-
-                            # Assertion: no naive datetimes should remain
-                            for _field, _value in update_params.items():
-                                if isinstance(_value, datetime):
-                                    if _value.tzinfo is None:
-                                        datetime_normalization_failures += 1
-                                    assert _value.tzinfo is not None, f"[DATETIME_NORMALIZATION_FAILED] {_field} is naive"
-                                    logger.debug("[DATETIME_AUDIT] field=%s tzinfo=%s aware=true", _field, _value.tzinfo)
-
-                            # Assertion: verify no datetime/date objects in JSON columns
-                            for _col in ["raw_payload", "line_items_json"]:
-                                if _col in update_params and update_params[_col] is not None:
-                                    _val = update_params[_col]
-                                    if isinstance(_val, str):
-                                        try:
-                                            _obj = json.loads(_val)
-                                            _json_str = json.dumps(_obj)  # Will fail if datetime objects present
-                                        except TypeError as _json_exc:
-                                            logger.error("[JSON_PAYLOAD_CONTAMINATED] field=%s action=update error=%s", _col, str(_json_exc)[:200])
-                                            raise
-
-                            # Assertion: verify all DB datetime columns are timezone-aware
-                            for _dt_col in ["synced_at", "last_synced_at", "created_at", "updated_at", "external_created_at", "external_updated_at"]:
-                                if _dt_col in update_params and update_params[_dt_col] is not None:
-                                    _dt = update_params[_dt_col]
-                                    assert isinstance(_dt, datetime), f"[DB_DATETIME_VALIDATION_FAILED] {_dt_col} is not datetime"
-                                    assert _dt.tzinfo is not None, f"[DB_DATETIME_VALIDATION_FAILED] {_dt_col} is naive"
-
-                            logger.debug("[DB_DATETIME_VALIDATED] all datetime columns are UTC-aware action=update")
-
-                            # Warn if org_id is None but allow the UPDATE to proceed —
-                            # org_id is nullable and blocking on it causes the entire
-                            # backfill to stall when the credential has no org_id set.
-                            if update_params.get("org_id") is None:
-                                logger.warning(
-                                    "[ORG_CONTEXT_MISSING] brand_id=%s external_id=%s"
-                                    " — proceeding with UPDATE (org_id is nullable)",
-                                    brand_id_value, external_id,
-                                )
-
-                            await db.execute(
-                                text(update_stmt),
-                                update_params,
-                            )
-                            batch_updated += 1
-                            update_success += 1
-                            logger.info(
-                                "[ORDER_UPSERTED] external_id=%s order_id=pending status=updated brand_id=%s",
-                                external_id,
-                                brand_id_value,
-                            )
-                          else:
-                            # Use raw SQL INSERT with CAST so PostgreSQL receives
-                            # explicit type coercion for UUID columns instead of
-                            # rejecting a character-varying bound parameter.
-                            # Use server timestamps only — bulletproof mode.
-                            insert_stmt = """
+                          # True upsert: ON CONFLICT (brand_id, external_order_id) DO UPDATE
+                          # Uses xmax to detect insert vs update for accurate counters.
+                          upsert_stmt = """
 INSERT INTO orders (
     org_id, brand_id, external_order_id, order_number, customer_name, status,
     total_cents, amount, item_count, unit_count, line_items_json, raw_payload,
@@ -3157,206 +3023,97 @@ INSERT INTO orders (
     :synced_at, :last_synced_at,
     :created_at, :updated_at
 )
+ON CONFLICT (brand_id, external_order_id) DO UPDATE SET
+    org_id = CAST(:org_id AS uuid),
+    customer_name = EXCLUDED.customer_name,
+    status = EXCLUDED.status,
+    order_number = EXCLUDED.order_number,
+    total_cents = EXCLUDED.total_cents,
+    amount = EXCLUDED.amount,
+    item_count = EXCLUDED.item_count,
+    unit_count = EXCLUDED.unit_count,
+    line_items_json = EXCLUDED.line_items_json,
+    raw_payload = EXCLUDED.raw_payload,
+    review_status = EXCLUDED.review_status,
+    sync_status = EXCLUDED.sync_status,
+    sync_health_status = EXCLUDED.sync_health_status,
+    sync_health_missing_fields = EXCLUDED.sync_health_missing_fields,
+    synced_at = EXCLUDED.synced_at,
+    last_synced_at = EXCLUDED.last_synced_at,
+    updated_at = EXCLUDED.updated_at
+RETURNING (xmax = 0) AS was_inserted
 """
 
-                            # Serialize JSON fields for raw SQL binding — asyncpg
-                            # cannot encode Python list/dict directly; it needs strings.
-                            line_items_json_str = json.dumps(make_json_safe(normalized_line_items)) if normalized_line_items else None
-                            raw_payload_str = json.dumps(make_json_safe(raw_payload)) if raw_payload else None
+                          upsert_params = {
+                              "org_id": _sql_org_id,
+                              "brand_id": _sql_brand_id,
+                              "external_order_id": external_id,
+                              "order_number": order_number,
+                              "customer_name": customer_name,
+                              "status": status,
+                              "total_cents": total_cents,
+                              "amount": amount_decimal,
+                              "item_count": item_count,
+                              "unit_count": unit_count,
+                              "line_items_json": line_items_json_str,
+                              "raw_payload": raw_payload_str,
+                              "source": "leaflink",
+                              "review_status": review_status,
+                              "sync_status": _sh_status_u,
+                              "sync_health_status": _sh_status_u,
+                              "sync_health_missing_fields": _sh_missing_json_u,
+                              "synced_at": now,
+                              "last_synced_at": now,
+                              "created_at": now,
+                              "updated_at": now,
+                          }
 
-                            # Use server timestamps — bulletproof mode
-                            created_at_val = now
-                            synced_at_val = now
+                          # Apply all sanitizers
+                          upsert_params = sanitize_sql_params(upsert_params, statement="sync_leaflink_orders_headers_only_upsert")
+                          upsert_params = normalize_uuid_fields(upsert_params)
+                          upsert_params = normalize_datetime_fields(upsert_params)
+                          upsert_params = apply_uuid_str_to_params(upsert_params)
 
-                            # Re-coerce immediately before SQL params — belt-and-suspenders guard
-                            _sql_org_id = safe_uuid_for_db(org_id_value, "org_id")
-                            _sql_brand_id = safe_uuid_for_db(brand_id_value, "brand_id") or brand_id_value
-                            logger.debug(
-                                "[ORG_ID_BEFORE_SQL] field=org_id value=%s external_id=%s function=sync_leaflink_orders_headers_only action=insert",
-                                _sql_org_id,
-                                external_id,
-                            )
-                            logger.debug(
-                                "[BRAND_ID_BEFORE_SQL] field=brand_id value=%s external_id=%s function=sync_leaflink_orders_headers_only action=insert",
-                                _sql_brand_id,
-                                external_id,
-                            )
+                          # Normalize all datetime fields to UTC-aware
+                          for _dt_field in ["synced_at", "last_synced_at", "created_at", "updated_at"]:
+                              upsert_params[_dt_field] = ensure_utc_datetime(upsert_params.get(_dt_field)) or utc_now()
 
-                            # Compute sync health for insert
-                            _sh_missing_ins: list[str] = []
-                            if not customer_name or customer_name == "Unknown Customer":
-                                _sh_missing_ins.append("customer_name")
-                            if amount_decimal is None:
-                                _sh_missing_ins.append("amount")
-                            elif _amount_sync_note:
-                                _sh_missing_ins.append(_amount_sync_note)
-                            if not normalized_line_items:
-                                _sh_missing_ins.append("line_items")
-                            if not status:
-                                _sh_missing_ins.append("status")
-                            _sh_status_ins = "partial" if _sh_missing_ins else "ok"
-                            _sh_missing_json_ins = json.dumps(_sh_missing_ins) if _sh_missing_ins else None
+                          # Assertion: no naive datetimes should remain
+                          for _field, _value in upsert_params.items():
+                              if isinstance(_value, datetime):
+                                  if _value.tzinfo is None:
+                                      datetime_normalization_failures += 1
+                                  assert _value.tzinfo is not None, f"[DATETIME_NORMALIZATION_FAILED] {_field} is naive"
 
-                            logger.debug(
-                                "[ORDER_INSERT_PREP] org_id=%s brand_id=%s external_order_id=%s"
-                                " customer=%s amount=%s status=%s",
-                                _sql_org_id,
-                                _sql_brand_id,
-                                external_id,
-                                customer_name,
-                                amount_decimal,
-                                status,
-                            )
-                            insert_params = {
-                                "org_id": _sql_org_id,
-                                "brand_id": _sql_brand_id,
-                                "external_order_id": external_id,
-                                "order_number": order_number,
-                                "customer_name": customer_name,
-                                "status": status,
-                                "total_cents": total_cents,
-                                "amount": amount_decimal,
-                                "item_count": item_count,
-                                "unit_count": unit_count,
-                                "line_items_json": line_items_json_str,
-                                "raw_payload": raw_payload_str,
-                                "source": "leaflink",
-                                "review_status": review_status,
-                                "sync_status": _sh_status_ins,
-                                "sync_health_status": _sh_status_ins,
-                                "sync_health_missing_fields": _sh_missing_json_ins,
-                                "synced_at": synced_at_val,
-                                "last_synced_at": synced_at_val,
-                                "created_at": created_at_val,
-                                "updated_at": created_at_val,
-                            }
+                          upsert_result = await db.execute(text(upsert_stmt), upsert_params)
+                          row = upsert_result.fetchone()
+                          was_inserted = row[0] if row else True
 
-                            # FINAL validation — enforce coercion directly into params dict
-                            # immediately before execute() so no mutation after coercion can slip through.
-                            insert_params["org_id"] = safe_uuid_for_db(insert_params.get("org_id"), "org_id")
-                            insert_params["brand_id"] = safe_uuid_for_db(insert_params.get("brand_id"), "brand_id") or insert_params.get("brand_id")
-                            logger.debug(
-                                "[FINAL_SQL_PARAMS] org_id=%s org_type=%s brand_id=%s brand_type=%s"
-                                " external_id=%s action=insert function=sync_leaflink_orders_headers_only",
-                                insert_params.get("org_id"),
-                                type(insert_params.get("org_id")).__name__,
-                                insert_params.get("brand_id"),
-                                type(insert_params.get("brand_id")).__name__,
-                                external_id,
-                            )
-                            logger.debug("[ORG_ID_BEFORE_SQL] org_id=%s", org_id_value)
-                            logger.debug("[BRAND_ID_BEFORE_SQL] brand_id=%s", brand_id_value)
-                            # Coerce all datetime params to UTC-aware immediately before SQL execution
-                            insert_params["synced_at"] = ensure_utc(insert_params.get("synced_at"), "synced_at") or utc_now()
-                            insert_params["last_synced_at"] = ensure_utc(insert_params.get("last_synced_at"), "last_synced_at") or utc_now()
-                            insert_params["created_at"] = ensure_utc(insert_params.get("created_at"), "created_at") or utc_now()
-                            insert_params["updated_at"] = ensure_utc(insert_params.get("updated_at"), "updated_at") or utc_now()
-                            logger.debug(
-                                "[DATETIME_FINAL_PARAMS] synced_at=%s type=%s last_synced_at=%s type=%s updated_at=%s type=%s",
-                                insert_params.get("synced_at"),
-                                type(insert_params.get("synced_at")),
-                                insert_params.get("last_synced_at"),
-                                type(insert_params.get("last_synced_at")),
-                                insert_params.get("updated_at"),
-                                type(insert_params.get("updated_at")),
-                            )
-                            # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
-                            insert_params = sanitize_sql_params(insert_params, statement="sync_leaflink_orders_headers_only_insert")
-                            insert_params = normalize_uuid_fields(insert_params)
-                            insert_params = normalize_datetime_fields(insert_params)
-                            insert_params = apply_uuid_str_to_params(insert_params)
+                          if was_inserted:
+                              batch_created += 1
+                              insert_success += 1
+                              logger.debug(
+                                  "[ORDER_UPSERT_INSERT] external_id=%s brand_id=%s",
+                                  external_id,
+                                  brand_id_value,
+                              )
+                          else:
+                              batch_updated += 1
+                              update_success += 1
+                              logger.debug(
+                                  "[ORDER_UPSERT_UPDATE] external_id=%s brand_id=%s",
+                                  external_id,
+                                  brand_id_value,
+                              )
+                          # Release savepoint on success — order is committed with the batch
+                          await db.execute(text(f"RELEASE SAVEPOINT {_sp_name}"))
 
-                            # Sanitize JSON payloads — convert datetime/date/Decimal/UUID to JSON-safe strings
-                            # ONLY for JSON columns; DB timestamp columns remain timezone-aware datetime objects
-                            if "raw_payload" in insert_params and insert_params["raw_payload"] is not None:
-                                try:
-                                    _san_start = time.monotonic()
-                                    _raw_payload_obj = json.loads(insert_params["raw_payload"]) if isinstance(insert_params["raw_payload"], str) else insert_params["raw_payload"]
-                                    _sanitized = sanitize_json_payload(_raw_payload_obj)
-                                    _san_duration = time.monotonic() - _san_start
-                                    if _san_duration > 2:
-                                        logger.warning("[SANITIZER_TIMEOUT] field=raw_payload action=insert duration=%.2fs", _san_duration)
-                                    else:
-                                        insert_params["raw_payload"] = json.dumps(_sanitized)
-                                        logger.debug("[JSON_PAYLOAD_SANITIZED] field=raw_payload action=insert")
-                                except Exception as _san_exc:
-                                    logger.debug("[JSON_SANITIZE_ERROR] field=raw_payload action=insert error=%s", str(_san_exc)[:100])
-
-                            if "line_items_json" in insert_params and insert_params["line_items_json"] is not None:
-                                try:
-                                    _san_start = time.monotonic()
-                                    _li_obj = json.loads(insert_params["line_items_json"]) if isinstance(insert_params["line_items_json"], str) else insert_params["line_items_json"]
-                                    _sanitized = sanitize_json_payload(_li_obj)
-                                    _san_duration = time.monotonic() - _san_start
-                                    if _san_duration > 2:
-                                        logger.warning("[SANITIZER_TIMEOUT] field=line_items_json action=insert duration=%.2fs", _san_duration)
-                                    else:
-                                        insert_params["line_items_json"] = json.dumps(_sanitized)
-                                        logger.debug("[JSON_PAYLOAD_SANITIZED] field=line_items_json action=insert")
-                                except Exception as _san_exc:
-                                    logger.debug("[JSON_SANITIZE_ERROR] field=line_items_json action=insert error=%s", str(_san_exc)[:100])
-
-                            # Normalize ALL datetime fields to UTC-aware before SQL execution
-                            insert_params["synced_at"] = ensure_utc_datetime(insert_params.get("synced_at"))
-                            insert_params["last_synced_at"] = ensure_utc_datetime(insert_params.get("last_synced_at"))
-                            insert_params["created_at"] = ensure_utc_datetime(insert_params.get("created_at"))
-                            insert_params["updated_at"] = ensure_utc_datetime(insert_params.get("updated_at"))
-                            insert_params["external_created_at"] = ensure_utc_datetime(insert_params.get("external_created_at"))
-                            insert_params["external_updated_at"] = ensure_utc_datetime(insert_params.get("external_updated_at"))
-                            insert_params["due_date"] = ensure_utc_datetime(insert_params.get("due_date"))
-                            insert_params["payment_date"] = ensure_utc_datetime(insert_params.get("payment_date"))
-                            insert_params["delivery_date"] = ensure_utc_datetime(insert_params.get("delivery_date"))
-
-                            # Assertion: no naive datetimes should remain
-                            for _field, _value in insert_params.items():
-                                if isinstance(_value, datetime):
-                                    if _value.tzinfo is None:
-                                        datetime_normalization_failures += 1
-                                    assert _value.tzinfo is not None, f"[DATETIME_NORMALIZATION_FAILED] {_field} is naive"
-                                    logger.debug("[DATETIME_AUDIT] field=%s tzinfo=%s aware=true", _field, _value.tzinfo)
-
-                            # Assertion: verify no datetime/date objects in JSON columns
-                            for _col in ["raw_payload", "line_items_json"]:
-                                if _col in insert_params and insert_params[_col] is not None:
-                                    _val = insert_params[_col]
-                                    if isinstance(_val, str):
-                                        try:
-                                            _obj = json.loads(_val)
-                                            _json_str = json.dumps(_obj)  # Will fail if datetime objects present
-                                        except TypeError as _json_exc:
-                                            logger.error("[JSON_PAYLOAD_CONTAMINATED] field=%s action=insert error=%s", _col, str(_json_exc)[:200])
-                                            raise
-
-                            # Assertion: verify all DB datetime columns are timezone-aware
-                            for _dt_col in ["synced_at", "last_synced_at", "created_at", "updated_at", "external_created_at", "external_updated_at"]:
-                                if _dt_col in insert_params and insert_params[_dt_col] is not None:
-                                    _dt = insert_params[_dt_col]
-                                    assert isinstance(_dt, datetime), f"[DB_DATETIME_VALIDATION_FAILED] {_dt_col} is not datetime"
-                                    assert _dt.tzinfo is not None, f"[DB_DATETIME_VALIDATION_FAILED] {_dt_col} is naive"
-
-                            logger.debug("[DB_DATETIME_VALIDATED] all datetime columns are UTC-aware action=insert")
-
-                            # Warn if org_id is None but allow the INSERT to proceed —
-                            # org_id is nullable and blocking on it causes the entire
-                            # backfill to stall when the credential has no org_id set.
-                            if insert_params.get("org_id") is None:
-                                logger.warning(
-                                    "[ORG_CONTEXT_MISSING] brand_id=%s external_id=%s"
-                                    " — proceeding with INSERT (org_id is nullable)",
-                                    brand_id_value, external_id,
-                                )
-                            await db.execute(
-                                text(insert_stmt),
-                                insert_params,
-                            )
-                            batch_created += 1
-                            insert_success += 1
-                            logger.info(
-                                "[ORDER_INSERTED] external_id=%s order_id=pending status=inserted brand_id=%s",
-                                external_id,
-                                brand_id_value,
-                            )
                         except IntegrityError as _order_exc:
+                            # Roll back to savepoint so the batch transaction remains usable
+                            try:
+                                await db.execute(text(f"ROLLBACK TO SAVEPOINT {_sp_name}"))
+                            except Exception:
+                                pass
                             # Integrity violation — duplicate key or constraint failure
                             _err_reason = str(_order_exc)[:300]
                             insert_rollback += 1
@@ -3399,6 +3156,11 @@ INSERT INTO orders (
                                 )
                             continue
                         except Exception as _order_exc:
+                            # Roll back to savepoint so the batch transaction remains usable
+                            try:
+                                await db.execute(text(f"ROLLBACK TO SAVEPOINT {_sp_name}"))
+                            except Exception:
+                                pass
                             # Per-order failure — log, write dead-letter, continue
                             _err_reason = str(_order_exc)[:300]
                             _batch_payload_size = len(str(_raw_payload_ref)) if _raw_payload_ref else 0
