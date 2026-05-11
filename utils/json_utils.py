@@ -200,6 +200,9 @@ def validate_and_fix_sql_params(params: Any) -> Any:
     - For any ``datetime`` with ``tzinfo is None``:
         * Logs ``[SQL_PARAM_PREBIND_NAIVE_DATETIME]`` at ERROR level.
         * Replaces the value with ``value.replace(tzinfo=timezone.utc)``.
+    - For any plain ``date`` (not datetime):
+        * Logs ``[SQL_PARAM_PREBIND_DATE_COERCED]`` at WARNING level.
+        * Converts to UTC midnight datetime.
     - For any ``datetime`` that is already UTC-aware, normalises to UTC via
       ``astimezone(timezone.utc)`` (no-op if already UTC).
     - Never raises exceptions — all errors are caught and logged.
