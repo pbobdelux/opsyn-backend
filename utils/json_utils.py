@@ -186,6 +186,81 @@ def sanitize_sql_params(params: Any) -> Any:
     return _sanitize_sql_params_recursive(params, path="params")
 
 
+def validate_and_fix_sql_params(params: Any) -> Any:
+    """Pre-bind validator: scan the exact params object passed to db.execute() and fix naive datetimes.
+
+    This is the FINAL defensive check immediately before db.execute().
+    It recursively walks the exact params object and:
+    - Logs [SQL_PARAM_PREBIND_NAIVE_DATETIME] for any naive datetimes found (with path and field name)
+    - Converts them in-place to UTC-aware
+    - Never raises exceptions
+
+    Unlike sanitize_sql_params() which returns a new object, this function is
+    designed to be called as the last step before execute() to catch any naive
+    datetimes that slipped through earlier sanitization stages.
+
+    Returns the sanitized params (new dict/list if input was a container, same
+    primitive if input was a scalar).
+    """
+    try:
+        return _validate_and_fix_recursive(params, path="params")
+    except Exception as exc:
+        logger.error(
+            "[SQL_PARAM_PREBIND_ERROR] validate_and_fix_sql_params failed error=%s — returning params unchanged",
+            str(exc)[:200],
+        )
+        return params
+
+
+def _validate_and_fix_recursive(value: Any, path: str = "params") -> Any:
+    """Internal recursive worker for validate_and_fix_sql_params."""
+    # datetime must be checked before date (datetime is a subclass of date)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            fixed = value.replace(tzinfo=timezone.utc)
+            logger.warning(
+                "[SQL_PARAM_PREBIND_NAIVE_DATETIME] path=%s value=%s action=fixed_to_utc",
+                path,
+                value.isoformat(),
+            )
+            return fixed
+        return value.astimezone(timezone.utc)
+
+    # Plain date (not datetime) → UTC midnight datetime
+    if isinstance(value, date):
+        fixed = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+        logger.warning(
+            "[SQL_PARAM_PREBIND_NAIVE_DATETIME] path=%s value=%s action=date_to_utc_midnight",
+            path,
+            value.isoformat(),
+        )
+        return fixed
+
+    # dict → recurse over values, return new dict
+    if isinstance(value, dict):
+        return {
+            k: _validate_and_fix_recursive(v, path=f"{path}.{k}")
+            for k, v in value.items()
+        }
+
+    # list → recurse over items, return new list
+    if isinstance(value, list):
+        return [
+            _validate_and_fix_recursive(item, path=f"{path}[{i}]")
+            for i, item in enumerate(value)
+        ]
+
+    # tuple → recurse over items, return as list (mutable)
+    if isinstance(value, tuple):
+        return [
+            _validate_and_fix_recursive(item, path=f"{path}[{i}]")
+            for i, item in enumerate(value)
+        ]
+
+    # All other types pass through unchanged
+    return value
+
+
 def _sanitize_sql_params_recursive(value: Any, path: str = "params") -> Any:
     """Internal recursive worker for sanitize_sql_params."""
     # datetime must be checked before date (datetime is a subclass of date)
