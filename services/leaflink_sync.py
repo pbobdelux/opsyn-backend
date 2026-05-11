@@ -66,6 +66,15 @@ logger = logging.getLogger("leaflink_sync")
 _dead_letter_semaphore = asyncio.Semaphore(2)
 _dead_letter_batch_size = 50  # Batch up to 50 items per write
 
+# Maximum number of attempts for a single dead-letter write before giving up.
+_DEAD_LETTER_MAX_RETRIES = 3
+
+# Exponential backoff base (seconds) for dead-letter write retries.
+_DEAD_LETTER_BACKOFF_BASE = 1.0
+
+# Maximum backoff delay (seconds) for dead-letter write retries.
+_DEAD_LETTER_BACKOFF_MAX = 30.0
+
 
 def sanitize_json_payload(obj: Any, _depth: int = 0, _seen: set = None) -> Any:
     """Recursively sanitize an object for JSON serialization (with depth/size limits).
@@ -1035,6 +1044,22 @@ async def log_pool_status(label: str = "unknown") -> None:
         logger.warning("[DB_POOL_STATUS] label=%s error=%s", label, str(_pool_exc)[:200])
 
 
+def _schedule_dead_letter_task(coro) -> None:
+    """Schedule a dead-letter coroutine as a fire-and-forget asyncio task.
+
+    The coroutine MUST already be protected by _dead_letter_semaphore internally
+    (both _dead_letter_line_item and _write_sync_dead_letter acquire the semaphore
+    before opening a session).  This wrapper exists solely to centralise task
+    creation so it is easy to audit all dead-letter task spawning sites.
+
+    Using asyncio.create_task() here is intentional: the dead-letter write must
+    not block the batch transaction that is still in progress.  The semaphore
+    inside the coroutine limits actual concurrency to 2 regardless of how many
+    tasks are queued.
+    """
+    asyncio.create_task(coro)
+
+
 # ---------------------------------------------------------------------------
 # Failure categorization — classify sync errors for structured reporting
 # ---------------------------------------------------------------------------
@@ -1417,16 +1442,19 @@ async def _dead_letter_line_item(
     """Insert or update a dead-letter record for a permanently failed line item.
 
     Uses _dead_letter_semaphore to bound concurrent sessions to 2 at a time.
-    Retries at most once on failure; logs [DEAD_LETTER_WRITE_FAILED_FINAL] if
-    both attempts fail so the error is visible without cascading.
+    Retries up to _DEAD_LETTER_MAX_RETRIES times with exponential backoff;
+    logs [DEAD_LETTER_WRITE_FAILED_FINAL] if all attempts fail so the error
+    is visible without cascading.
     """
+    _sku_label = sku or "unknown"
     async with _dead_letter_semaphore:
-        for _attempt in range(2):  # max 1 retry
+        for _attempt in range(1, _DEAD_LETTER_MAX_RETRIES + 1):
             try:
                 logger.debug(
                     "[DEAD_LETTER_SESSION_OPEN] brand_id=%s external_order_id=%s sku=%s attempt=%s",
-                    brand_id, external_order_id, sku, _attempt,
+                    brand_id, external_order_id, _sku_label, _attempt,
                 )
+                await log_pool_status("dead_letter_line_item_before")
                 async with AsyncSessionLocal() as db:
                     try:
                         _log_pool_status(db, label="dead_letter_line_item_start")
@@ -1439,7 +1467,7 @@ async def _dead_letter_line_item(
                             "brand_id": brand_id,
                             "external_order_id": external_order_id,
                             "order_id": order_id,
-                            "sku": sku or "unknown",
+                            "sku": _sku_label,
                             "product_name": product_name,
                             "raw_payload": raw_payload_str,
                             "reason": failure_reason[:500],
@@ -1469,32 +1497,38 @@ async def _dead_letter_line_item(
                     finally:
                         logger.debug(
                             "[DEAD_LETTER_SESSION_CLOSE] brand_id=%s external_order_id=%s sku=%s attempt=%s",
-                            brand_id, external_order_id, sku, _attempt,
+                            brand_id, external_order_id, _sku_label, _attempt,
                         )
                 logger.warning(
                     "[LINE_ITEM_DEAD_LETTERED] brand_id=%s external_order_id=%s sku=%s failure_count=%s",
                     brand_id,
                     external_order_id,
-                    sku,
+                    _sku_label,
                     failure_count,
                 )
+                await log_pool_status("dead_letter_line_item_after")
                 return  # success — exit retry loop
             except Exception as exc:
                 _exc_str = str(exc)[:300]
-                if _attempt == 0:
-                    _sleep_secs = 1
+                if _attempt < _DEAD_LETTER_MAX_RETRIES:
+                    _delay = min(
+                        _DEAD_LETTER_BACKOFF_BASE * (2 ** (_attempt - 1)),
+                        _DEAD_LETTER_BACKOFF_MAX,
+                    )
                     logger.warning(
                         "[DEAD_LETTER_RETRY_BACKOFF] brand_id=%s external_order_id=%s sku=%s"
-                        " attempt=%s sleep=%ss error=%s",
-                        brand_id, external_order_id, sku, _attempt, _sleep_secs, _exc_str,
+                        " attempt=%s/%s delay=%.1fs error=%s",
+                        brand_id, external_order_id, _sku_label,
+                        _attempt, _DEAD_LETTER_MAX_RETRIES, _delay, _exc_str,
                     )
                     await log_pool_status("dead_letter_line_item_retry_backoff")
-                    await asyncio.sleep(_sleep_secs)
+                    await asyncio.sleep(_delay)
                 else:
-                    logger.error(
+                    logger.critical(
                         "[DEAD_LETTER_WRITE_FAILED_FINAL] brand_id=%s external_order_id=%s"
-                        " sku=%s error=%s",
-                        brand_id, external_order_id, sku, _exc_str,
+                        " sku=%s all_attempts_exhausted=%s error=%s",
+                        brand_id, external_order_id, _sku_label,
+                        _DEAD_LETTER_MAX_RETRIES, _exc_str,
                     )
                     await log_pool_status("dead_letter_line_item_failed_final")
 
@@ -1532,7 +1566,7 @@ async def _write_dead_letter_batch(
         return
 
     async with _dead_letter_semaphore:
-        for _attempt in range(2):  # max 1 retry
+        for _attempt in range(1, _DEAD_LETTER_MAX_RETRIES + 1):
             try:
                 logger.debug(
                     "[DEAD_LETTER_SESSION_OPEN] label=%s brand_id=%s external_order_id=%s"
@@ -1594,20 +1628,25 @@ async def _write_dead_letter_batch(
                 return  # success — exit retry loop
             except Exception as exc:
                 _exc_str = str(exc)[:300]
-                if _attempt == 0:
-                    _sleep_secs = 1
+                if _attempt < _DEAD_LETTER_MAX_RETRIES:
+                    _delay = min(
+                        _DEAD_LETTER_BACKOFF_BASE * (2 ** (_attempt - 1)),
+                        _DEAD_LETTER_BACKOFF_MAX,
+                    )
                     logger.warning(
                         "[DEAD_LETTER_RETRY_BACKOFF] label=%s brand_id=%s external_order_id=%s"
-                        " attempt=%s sleep=%ss error=%s",
-                        label, brand_id, external_order_id, _attempt, _sleep_secs, _exc_str,
+                        " attempt=%s/%s delay=%.1fs error=%s",
+                        label, brand_id, external_order_id,
+                        _attempt, _DEAD_LETTER_MAX_RETRIES, _delay, _exc_str,
                     )
                     await log_pool_status(f"{label}_retry_backoff")
-                    await asyncio.sleep(_sleep_secs)
+                    await asyncio.sleep(_delay)
                 else:
-                    logger.error(
+                    logger.critical(
                         "[DEAD_LETTER_WRITE_FAILED_FINAL] label=%s brand_id=%s"
-                        " external_order_id=%s batch_size=%s error=%s",
-                        label, brand_id, external_order_id, len(items), _exc_str,
+                        " external_order_id=%s batch_size=%s all_attempts_exhausted=%s error=%s",
+                        label, brand_id, external_order_id, len(items),
+                        _DEAD_LETTER_MAX_RETRIES, _exc_str,
                     )
                     await log_pool_status(f"{label}_failed_final")
 
@@ -1674,12 +1713,13 @@ async def _write_sync_dead_letter(
     effective_error_stage = failure_stage or error_stage
 
     async with _dead_letter_semaphore:
-        for _attempt in range(2):  # max 1 retry
+        for _attempt in range(1, _DEAD_LETTER_MAX_RETRIES + 1):
             try:
                 logger.debug(
                     "[DEAD_LETTER_SESSION_OPEN] brand_id=%s external_id=%s error_stage=%s attempt=%s",
                     brand_id, external_id, error_stage, _attempt,
                 )
+                await log_pool_status("dead_letter_write_before")
                 async with AsyncSessionLocal() as db:
                     try:
                         _log_pool_status(db, label="dead_letter_write_start")
@@ -1780,23 +1820,29 @@ async def _write_sync_dead_letter(
                     error_stage,
                     brand_id,
                 )
+                await log_pool_status("dead_letter_write_after")
                 return  # success — exit retry loop
             except Exception as exc:
                 _exc_str = str(exc)[:300]
-                if _attempt == 0:
-                    _sleep_secs = 1
+                if _attempt < _DEAD_LETTER_MAX_RETRIES:
+                    _delay = min(
+                        _DEAD_LETTER_BACKOFF_BASE * (2 ** (_attempt - 1)),
+                        _DEAD_LETTER_BACKOFF_MAX,
+                    )
                     logger.warning(
                         "[DEAD_LETTER_RETRY_BACKOFF] brand_id=%s external_id=%s error_stage=%s"
-                        " attempt=%s sleep=%ss error=%s",
-                        brand_id, external_id, error_stage, _attempt, _sleep_secs, _exc_str,
+                        " attempt=%s/%s delay=%.1fs error=%s",
+                        brand_id, external_id, error_stage,
+                        _attempt, _DEAD_LETTER_MAX_RETRIES, _delay, _exc_str,
                     )
                     await log_pool_status("dead_letter_write_retry_backoff")
-                    await asyncio.sleep(_sleep_secs)
+                    await asyncio.sleep(_delay)
                 else:
-                    logger.error(
+                    logger.critical(
                         "[DEAD_LETTER_WRITE_FAILED_FINAL] brand_id=%s external_id=%s"
-                        " error_stage=%s error=%s",
-                        brand_id, external_id, error_stage, _exc_str,
+                        " error_stage=%s all_attempts_exhausted=%s error=%s",
+                        brand_id, external_id, error_stage,
+                        _DEAD_LETTER_MAX_RETRIES, _exc_str,
                     )
                     await log_pool_status("dead_letter_write_failed_final")
 
