@@ -469,12 +469,13 @@ async def _update_sync_health_phase1(
             _phase1_params = normalize_uuid_fields(_phase1_params)
             _phase1_params = normalize_datetime_fields(_phase1_params)
             _phase1_params = apply_uuid_str_to_params(_phase1_params)
+            # Final recursive sanitization — belt-and-suspenders guard
+            _phase1_params = _recursive_sanitize_sql_params(_phase1_params)
             # Final guard: scan params for raw naive datetimes before execute
             for _param_key, _param_val in _phase1_params.items():
-                if isinstance(_param_val, datetime):
-                    if _param_val.tzinfo is None:
-                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
-                        _phase1_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
+                if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
+                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
+                    _phase1_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, orders_fetched_last_run, updated_at)
@@ -515,12 +516,13 @@ async def _update_sync_health_phase2(
             _phase2_params = normalize_uuid_fields(_phase2_params)
             _phase2_params = normalize_datetime_fields(_phase2_params)
             _phase2_params = apply_uuid_str_to_params(_phase2_params)
+            # Final recursive sanitization — belt-and-suspenders guard
+            _phase2_params = _recursive_sanitize_sql_params(_phase2_params)
             # Final guard: scan params for raw naive datetimes before execute
             for _param_key, _param_val in _phase2_params.items():
-                if isinstance(_param_val, datetime):
-                    if _param_val.tzinfo is None:
-                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
-                        _phase2_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
+                if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
+                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
+                    _phase2_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
             await db.execute(
                 text("""
                     UPDATE sync_health SET
@@ -559,12 +561,13 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
             _sync_error_params = normalize_uuid_fields(_sync_error_params)
             _sync_error_params = normalize_datetime_fields(_sync_error_params)
             _sync_error_params = apply_uuid_str_to_params(_sync_error_params)
+            # Final recursive sanitization — belt-and-suspenders guard
+            _sync_error_params = _recursive_sanitize_sql_params(_sync_error_params)
             # Final guard: scan params for raw naive datetimes before execute
             for _param_key, _param_val in _sync_error_params.items():
-                if isinstance(_param_val, datetime):
-                    if _param_val.tzinfo is None:
-                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
-                        _sync_error_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
+                if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
+                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
+                    _sync_error_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, last_error_at, updated_at)
@@ -598,12 +601,13 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
             _retryable_params = normalize_uuid_fields(_retryable_params)
             _retryable_params = normalize_datetime_fields(_retryable_params)
             _retryable_params = apply_uuid_str_to_params(_retryable_params)
+            # Final recursive sanitization — belt-and-suspenders guard
+            _retryable_params = _recursive_sanitize_sql_params(_retryable_params)
             # Final guard: scan params for raw naive datetimes before execute
             for _param_key, _param_val in _retryable_params.items():
-                if isinstance(_param_val, datetime):
-                    if _param_val.tzinfo is None:
-                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
-                        _retryable_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
+                if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
+                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
+                    _retryable_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
@@ -808,7 +812,7 @@ async def _write_sync_dead_letter(
             for _param_key, _param_val in list(params.items()):
                 if isinstance(_param_val, datetime):
                     if _param_val.tzinfo is None:
-                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
+                        logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
                         params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
                     else:
                         params[_param_key] = _param_val.astimezone(timezone.utc)
@@ -879,7 +883,14 @@ async def _write_sync_dead_letter(
 
 
 def utc_now() -> datetime:
-    """Return current time as timezone-aware UTC datetime."""
+    """Return current UTC time as a timezone-aware datetime.
+
+    Uses datetime.now(timezone.utc) — NOT the deprecated datetime.utcnow()
+    which returns a naive datetime (tzinfo=None).  Naive datetimes cause
+    asyncpg to raise "can't subtract offset-naive and offset-aware datetimes"
+    when binding to TIMESTAMPTZ columns because asyncpg internally computes
+    (dt - UTC_EPOCH).total_seconds() where UTC_EPOCH is timezone-aware.
+    """
     return datetime.now(timezone.utc)
 
 
