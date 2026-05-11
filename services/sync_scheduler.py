@@ -236,7 +236,15 @@ async def worker_main() -> None:
         await _verify_db_connection()
         logger.info("[SYNC_WORKER_DB_VERIFIED] database connection verified")
 
-        # Phase 4: Start scheduler
+        # Phase 4: Startup stale job recovery
+        logger.info("[SYNC_WORKER_STARTUP_RECOVERY_START] running startup stale job recovery")
+        recovered_count = await recover_stale_sync_jobs()
+        logger.info(
+            "[STARTUP_RECOVERY_COMPLETE] recovered_stale_jobs=%d",
+            recovered_count,
+        )
+
+        # Phase 5: Start scheduler
         logger.info("[SYNC_WORKER_SCHEDULER_START] starting scheduler")
         await run_scheduler()
 
@@ -318,6 +326,124 @@ async def validate_schema() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stale job recovery
+# ---------------------------------------------------------------------------
+
+STALE_SYNCING_THRESHOLD_MINUTES = 5
+
+
+async def recover_stale_sync_jobs() -> int:
+    """
+    Find sync_jobs stuck in 'syncing' state for more than STALE_SYNCING_THRESHOLD_MINUTES
+    and reset them to 'queued' so they can be retried.
+
+    Returns the count of recovered jobs.
+
+    Logs [STALE_SYNC_JOB_RECOVERED] for each recovered job and
+    [STARTUP_RECOVERY_COMPLETE] with the total count when called from worker_main().
+    """
+    from sqlalchemy import select, text
+    from database import get_async_session_local
+    from models import SyncRun
+
+    AsyncSessionLocal = get_async_session_local()
+    recovered = 0
+
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                text(
+                    """
+                    SELECT id, brand_id, updated_at
+                    FROM sync_runs
+                    WHERE status = 'syncing'
+                      AND updated_at < NOW() - INTERVAL '5 minutes'
+                    """
+                )
+            )
+            stale_rows = result.fetchall()
+
+            for row in stale_rows:
+                sync_run_id, brand_id, updated_at = row[0], row[1], row[2]
+
+                # Calculate how long the job has been stalled
+                now_utc = datetime.now(timezone.utc)
+                if updated_at is not None:
+                    if updated_at.tzinfo is None:
+                        updated_at = updated_at.replace(tzinfo=timezone.utc)
+                    stalled_seconds = (now_utc - updated_at).total_seconds()
+                    stalled_minutes = round(stalled_seconds / 60, 1)
+                else:
+                    stalled_minutes = "unknown"
+
+                # Reset to queued
+                await db.execute(
+                    text(
+                        """
+                        UPDATE sync_runs
+                        SET status = 'queued',
+                            last_error = 'Recovered stale syncing job after worker crash/pool exhaustion',
+                            updated_at = NOW()
+                        WHERE id = :sync_run_id
+                          AND status = 'syncing'
+                        """
+                    ),
+                    {"sync_run_id": sync_run_id},
+                )
+
+                logger.info(
+                    "[STALE_SYNC_JOB_RECOVERED] sync_run_id=%s brand_id=%s "
+                    "time_stalled_minutes=%s",
+                    sync_run_id,
+                    brand_id,
+                    stalled_minutes,
+                )
+                recovered += 1
+
+            if recovered > 0:
+                await db.commit()
+
+    except Exception as exc:
+        logger.error(
+            "[STALE_SYNC_JOB_RECOVERY_ERROR] failed to recover stale jobs error=%s",
+            str(exc)[:500],
+            exc_info=True,
+        )
+
+    return recovered
+
+
+# ---------------------------------------------------------------------------
+# Pool saturation check
+# ---------------------------------------------------------------------------
+
+# Pool configuration constants (must match engine creation in database.py)
+_POOL_SIZE = 5
+_POOL_MAX_OVERFLOW = 10
+_POOL_TOTAL_CAPACITY = _POOL_SIZE + _POOL_MAX_OVERFLOW  # 15 total connections
+_POOL_SATURATION_THRESHOLD = 0.80  # 80%
+
+
+def _get_pool_saturation() -> float | None:
+    """
+    Return the current pool saturation as a fraction (0.0–1.0), or None if
+    the pool is not available / does not expose checkout stats.
+
+    Uses SQLAlchemy's QueuePool.checkedout() to count active connections.
+    """
+    try:
+        from database import get_engine
+        engine = get_engine()
+        pool = engine.pool
+        # QueuePool exposes checkedout() — number of connections currently in use
+        checked_out = pool.checkedout()
+        saturation = checked_out / _POOL_TOTAL_CAPACITY
+        return saturation
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Core poll-and-execute function
 # ---------------------------------------------------------------------------
 
@@ -353,6 +479,27 @@ async def poll_and_execute() -> None:
         _full_sync_lock,
     )
     from services.sync_run_manager import detect_stalled, mark_stalled
+
+    # ---------------------------------------------------------------------- #
+    # Pool saturation short-circuit: skip this poll cycle entirely if the     #
+    # connection pool is >= 80% saturated to prevent DB thrash.               #
+    # ---------------------------------------------------------------------- #
+    pool_saturation = _get_pool_saturation()
+    if pool_saturation is not None and pool_saturation >= _POOL_SATURATION_THRESHOLD:
+        logger.warning(
+            "[SCHEDULER_SKIPPED_POOL_SATURATED] pool_saturation=%.1f%% "
+            "threshold=%.0f%% skipping_poll_cycle sleeping_10s",
+            pool_saturation * 100,
+            _POOL_SATURATION_THRESHOLD * 100,
+        )
+        await asyncio.sleep(10)
+        return
+
+    # ---------------------------------------------------------------------- #
+    # Stale job recovery: reset any jobs stuck in 'syncing' for > 5 minutes  #
+    # back to 'queued' so they can be retried this poll cycle.                #
+    # ---------------------------------------------------------------------- #
+    await recover_stale_sync_jobs()
 
     # ---------------------------------------------------------------------- #
     # Step 1: Query for queued or syncing jobs                                #
@@ -797,20 +944,56 @@ async def run_scheduler() -> None:
         sys.stdout.flush()
         raise
 
-    # Main polling loop
+    # Backoff configuration
+    _BACKOFF_MAX_SECONDS = 60
+    _BACKOFF_MULTIPLIER = 2
+
+    # Main polling loop with exponential backoff on QueuePool TimeoutError
+    poll_delay = POLL_INTERVAL_SECONDS
     while True:
         try:
             await poll_and_execute()
 
+            # Successful poll — reset backoff if it was elevated
+            if poll_delay != POLL_INTERVAL_SECONDS:
+                logger.info(
+                    "[SCHEDULER_BACKOFF_RESET] poll_delay_reset_to=%ds "
+                    "previous_delay=%ds",
+                    POLL_INTERVAL_SECONDS,
+                    poll_delay,
+                )
+                poll_delay = POLL_INTERVAL_SECONDS
+
         except Exception as loop_exc:
-            logger.error(
-                "[SyncWorker] FATAL ERROR in polling loop: %s",
-                str(loop_exc)[:500],
-                exc_info=True,
+            exc_str = str(loop_exc)
+            # Detect QueuePool TimeoutError (pool exhaustion)
+            is_pool_timeout = (
+                "QueuePool" in exc_str
+                or "TimeoutError" in type(loop_exc).__name__
+                or "pool timeout" in exc_str.lower()
+                or "connection pool" in exc_str.lower()
             )
+
+            if is_pool_timeout:
+                new_delay = min(poll_delay * _BACKOFF_MULTIPLIER, _BACKOFF_MAX_SECONDS)
+                logger.warning(
+                    "[SCHEDULER_BACKOFF] pool_timeout_detected "
+                    "increasing_poll_delay=%ds previous_delay=%ds "
+                    "error=%s",
+                    new_delay,
+                    poll_delay,
+                    exc_str[:200],
+                )
+                poll_delay = new_delay
+            else:
+                logger.error(
+                    "[SyncWorker] FATAL ERROR in polling loop: %s",
+                    exc_str[:500],
+                    exc_info=True,
+                )
             sys.stdout.flush()
 
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        await asyncio.sleep(poll_delay)
 
 
 if __name__ == "__main__":
