@@ -640,6 +640,47 @@ async def safe_execute(
     return await db.execute(text(sql_text), safe_params)
 
 
+def _log_pool_status(db: AsyncSession, label: str = "unknown") -> None:
+    """Log SQLAlchemy connection pool status for leak diagnostics.
+
+    Emits a [DB_POOL_STATUS] log line with checked_out, overflow, and pool
+    size so that connection leaks can be identified from logs during large syncs.
+
+    Tries multiple access paths for compatibility with different SQLAlchemy
+    async session configurations (sync_session.get_bind(), engine.pool, etc.).
+
+    Args:
+        db:    An active AsyncSession whose bind exposes a pool.
+        label: Descriptive label for the log line (e.g. "phase2_start").
+    """
+    try:
+        # AsyncSession wraps a sync session; access pool via the sync session's bind
+        pool = None
+        try:
+            # SQLAlchemy 1.4+ async: db.sync_session.get_bind().pool
+            pool = db.sync_session.get_bind().pool
+        except Exception:
+            pass
+        if pool is None:
+            try:
+                # Fallback: db.get_bind().pool (may work in some configurations)
+                pool = db.get_bind().pool
+            except Exception:
+                pass
+        if pool is not None:
+            logger.info(
+                "[DB_POOL_STATUS] label=%s checked_out=%d overflow=%d pool_size=%d",
+                label,
+                pool.checkedout(),
+                pool.overflow(),
+                pool.size(),
+            )
+        else:
+            logger.debug("[DB_POOL_STATUS] label=%s pool_unavailable", label)
+    except Exception as _pool_exc:
+        logger.debug("[DB_POOL_STATUS] label=%s unavailable error=%s", label, str(_pool_exc)[:100])
+
+
 def _sanitize_params_recursive(
     obj: Any,
     label: str,
@@ -949,6 +990,11 @@ HEADER_BATCH_SIZE = 25
 
 # Maximum retries before a line item is moved to the dead-letter table
 MAX_LINE_ITEM_RETRIES = 3
+
+# Number of orders processed per DB session in sync_leaflink_line_items (Phase 2).
+# Batching orders together avoids opening one session per order, which exhausts
+# the connection pool (size=5 + overflow=10) during large backfill syncs.
+LINE_ITEMS_ORDERS_PER_BATCH = 50
 
 
 # ---------------------------------------------------------------------------
@@ -4492,7 +4538,11 @@ async def sync_leaflink_line_items(
 
     Sync health: updates sync_health table after Phase 2 completes or on error.
 
-    Runs in its own session per order so a single failure never aborts the rest.
+    Session batching: processes LINE_ITEMS_ORDERS_PER_BATCH orders per DB session
+    to prevent connection pool exhaustion during large backfill syncs. The old
+    pattern of one session per order opened thousands of connections for large
+    syncs, exhausting the pool (size=5 + overflow=10). Now each batch of 50
+    orders shares a single session, keeping pool usage bounded.
     """
     from sqlalchemy import func
 
@@ -4939,285 +4989,323 @@ async def sync_leaflink_line_items(
     total_orders = 0
 
     # ------------------------------------------------------------------
-    # First pass: try to upsert line items for orders that exist in DB.
-    # Collect orders whose parent row was not found for a retry pass.
+    # Build a flat list of (leaflink_order_id, raw_order_dict) pairs,
+    # filtering out non-dict entries and orders with no external_id.
     # ------------------------------------------------------------------
-    retry_items: list[tuple[str, dict]] = []  # (leaflink_order_id, raw_order_dict)
-
+    valid_orders: list[tuple[str, dict]] = []
     for o in orders:
         if not isinstance(o, dict):
             continue
-
-        # Use the same external_id resolution as sync_leaflink_orders_headers_only
-        # so the DB lookup always matches the key that was written during Phase 1.
         external_id = safe_str(o.get("id") or o.get("external_id") or o.get("external_order_id"))
         if not external_id:
             continue
+        valid_orders.append((safe_str(external_id), o))
 
-        leaflink_order_id = safe_str(external_id)
+    # ------------------------------------------------------------------
+    # First pass: process orders in batches of LINE_ITEMS_ORDERS_PER_BATCH.
+    # Each batch shares a single DB session + transaction so we never open
+    # more than one connection at a time per batch, preventing pool exhaustion
+    # during large backfill syncs (thousands of orders).
+    #
+    # Orders whose parent row is not found are collected for a retry pass.
+    # ------------------------------------------------------------------
+    retry_items: list[tuple[str, dict]] = []  # (leaflink_order_id, raw_order_dict)
 
+    order_batches = [
+        valid_orders[i : i + LINE_ITEMS_ORDERS_PER_BATCH]
+        for i in range(0, len(valid_orders), LINE_ITEMS_ORDERS_PER_BATCH)
+    ]
+
+    logger.info(
+        "[LINE_ITEM_BATCH_PLAN] brand_id=%s total_orders=%s batch_size=%s total_batches=%s",
+        brand_id_value,
+        len(valid_orders),
+        LINE_ITEMS_ORDERS_PER_BATCH,
+        len(order_batches),
+    )
+
+    for batch_idx, order_batch in enumerate(order_batches, 1):
+        batch_start_time = time.monotonic()
         try:
-            # Defensive check: ensure _AsyncSessionLocal is still callable before each order
-            if not callable(_AsyncSessionLocal):
-                logger.error(
-                    "[LINE_ITEM_SYNC_ERROR] order_id=%s error=AsyncSessionLocal_not_callable type=%s",
-                    leaflink_order_id,
-                    type(_AsyncSessionLocal),
-                )
-                errors.append(f"AsyncSessionLocal not callable for order {leaflink_order_id}")
-                continue
-
             async with _AsyncSessionLocal() as db:
                 async with db.begin():
-                    result = await db.execute(
-                        select(Order).where(
-                            Order.brand_id == brand_id_value,
-                            Order.external_order_id == leaflink_order_id,
-                        )
-                    )
-                    order_row = result.scalar_one_or_none()
+                    _log_pool_status(db, label=f"phase2_batch_{batch_idx}_start")
+                    for leaflink_order_id, o in order_batch:
+                        try:
+                            result = await db.execute(
+                                select(Order).where(
+                                    Order.brand_id == brand_id_value,
+                                    Order.external_order_id == leaflink_order_id,
+                                )
+                            )
+                            order_row = result.scalar_one_or_none()
 
-                    if order_row is None:
-                        logger.warning(
-                            "[LINE_ITEM_ORDER_LOOKUP_FAIL] leaflink_order_id=%s",
-                            leaflink_order_id,
-                        )
-                        retry_items.append((leaflink_order_id, o))
-                        continue
+                            if order_row is None:
+                                logger.warning(
+                                    "[LINE_ITEM_ORDER_LOOKUP_FAIL] leaflink_order_id=%s",
+                                    leaflink_order_id,
+                                )
+                                retry_items.append((leaflink_order_id, o))
+                                continue
 
-                    logger.debug(
-                        "[LINE_ITEM_ORDER_LOOKUP] leaflink_order_id=%s matched_order_id=%s",
-                        leaflink_order_id,
-                        order_row.id,
-                    )
+                            logger.debug(
+                                "[LINE_ITEM_ORDER_LOOKUP] leaflink_order_id=%s matched_order_id=%s",
+                                leaflink_order_id,
+                                order_row.id,
+                            )
 
-                    # Read line items from the DB row (written during Phase 1)
-                    db_line_items = order_row.line_items_json
-                    if isinstance(db_line_items, list):
-                        normalized_line_items = db_line_items
-                    else:
-                        raw_line_items = o.get("line_items", [])
-                        normalized_line_items = normalize_line_items(raw_line_items)
+                            # Read line items from the DB row (written during Phase 1)
+                            db_line_items = order_row.line_items_json
+                            if isinstance(db_line_items, list):
+                                normalized_line_items = db_line_items
+                            else:
+                                raw_line_items = o.get("line_items", [])
+                                normalized_line_items = normalize_line_items(raw_line_items)
 
-                    if not normalized_line_items:
-                        continue
+                            if not normalized_line_items:
+                                continue
 
-                    order_id_val = order_row.id
-                    sku_count = len(normalized_line_items)
+                            order_id_val = order_row.id
+                            sku_count = len(normalized_line_items)
 
-                    logger.info(
-                        "[LINE_ITEM_SYNC_PROCESSING] order_id=%s sku_count=%s",
-                        order_id_val,
-                        sku_count,
-                    )
+                            logger.info(
+                                "[LINE_ITEM_SYNC_PROCESSING] order_id=%s sku_count=%s",
+                                order_id_val,
+                                sku_count,
+                            )
 
-                    # Defensive check: ensure _upsert_line_items is callable
-                    if not callable(_upsert_line_items):
-                        logger.error(
-                            "[LINE_ITEM_SYNC_ERROR] order_id=%s error=_upsert_line_items_not_callable type=%s",
-                            order_id_val,
-                            type(_upsert_line_items),
-                        )
-                        errors.append(f"_upsert_line_items not callable for order {order_id_val}")
-                        continue
+                            inserted_count, skipped_count, failed_items = await _upsert_line_items(
+                                db, order_row, normalized_line_items
+                            )
 
-                    inserted_count, skipped_count, failed_items = await _upsert_line_items(
-                        db, order_row, normalized_line_items
-                    )
+                            logger.debug(
+                                "[LINE_ITEM_UPSERT_COMMIT] brand_id=%s inserted=%s updated=0 duration=0s",
+                                brand_id_value,
+                                inserted_count,
+                            )
+                            logger.debug(
+                                "[LINE_ITEM_BATCH_RESULT] order_id=%s total=%s inserted=%s skipped=%s failed=%s retried=0",
+                                order_id_val,
+                                len(normalized_line_items),
+                                inserted_count,
+                                skipped_count,
+                                len(failed_items),
+                            )
+                            logger.info(
+                                "[LINE_ITEM_SYNC_SUCCESS] order_id=%s inserted=%s updated=0",
+                                order_id_val,
+                                inserted_count,
+                            )
+                            logger.info(
+                                "[LINE_ITEMS_SYNCED] order_id=%s count=%s brand_id=%s",
+                                order_id_val,
+                                inserted_count,
+                                brand_id_value,
+                            )
 
-                    logger.debug(
-                        "[LINE_ITEM_UPSERT_COMMIT] brand_id=%s inserted=%s updated=0 duration=0s",
-                        brand_id_value,
-                        inserted_count,
-                    )
-                    logger.debug(
-                        "[LINE_ITEM_BATCH_RESULT] order_id=%s total=%s inserted=%s skipped=%s failed=%s retried=0",
-                        order_id_val,
-                        len(normalized_line_items),
-                        inserted_count,
-                        skipped_count,
-                        len(failed_items),
-                    )
-                    logger.info(
-                        "[LINE_ITEM_SYNC_SUCCESS] order_id=%s inserted=%s updated=0",
-                        order_id_val,
-                        inserted_count,
-                    )
-                    logger.info(
-                        "[LINE_ITEMS_SYNCED] order_id=%s count=%s brand_id=%s",
-                        order_id_val,
-                        inserted_count,
-                        brand_id_value,
-                    )
+                            total_inserted += inserted_count
+                            total_skipped += skipped_count
+                            total_failed += len(failed_items)
+                            total_orders += 1
 
-                    total_inserted += inserted_count
-                    total_skipped += skipped_count
-                    total_failed += len(failed_items)
-                    total_orders += 1
+                            # Dead-letter permanently failed items (own session, non-blocking)
+                            for failed_item, fail_reason in failed_items:
+                                asyncio.create_task(
+                                    _dead_letter_line_item(
+                                        brand_id=brand_id_value,
+                                        external_order_id=leaflink_order_id,
+                                        order_id=order_id_val,
+                                        sku=failed_item.get("sku"),
+                                        product_name=failed_item.get("product_name"),
+                                        raw_payload=failed_item.get("raw_payload"),
+                                        failure_reason=fail_reason,
+                                        failure_count=1,
+                                    )
+                                )
 
-                    # Dead-letter permanently failed items
-                    for failed_item, fail_reason in failed_items:
-                        await _dead_letter_line_item(
-                            brand_id=brand_id_value,
-                            external_order_id=leaflink_order_id,
-                            order_id=order_id_val,
-                            sku=failed_item.get("sku"),
-                            product_name=failed_item.get("product_name"),
-                            raw_payload=failed_item.get("raw_payload"),
-                            failure_reason=fail_reason,
-                            failure_count=1,
-                        )
+                        except Exception as order_exc:
+                            err_msg = str(order_exc)
+                            # Per-order failure inside the batch — log and continue.
+                            # The savepoints inside _upsert_line_items already isolate
+                            # individual line item failures; this catches order-level errors.
+                            logger.error(
+                                "[LINE_ITEM_SYNC_ERROR] order_id=%s error=%s",
+                                leaflink_order_id,
+                                err_msg[:300],
+                                exc_info=True,
+                            )
+                            errors.append(err_msg)
 
-        except Exception as line_exc:
-            err_msg = str(line_exc)
-            # Non-fatal: log the error and continue to the next order.
-            # Order headers are already committed — line item failures must never
-            # roll back order headers or abort the entire batch.
+                    _log_pool_status(db, label=f"phase2_batch_{batch_idx}_end")
+
+        except Exception as batch_exc:
+            err_msg = str(batch_exc)
+            batch_duration = round(time.monotonic() - batch_start_time, 2)
             logger.error(
-                "[LINE_ITEM_SYNC_ERROR] order_id=%s error=%s",
-                leaflink_order_id,
+                "[LINE_ITEM_BATCH_FAILED] batch=%s/%s brand_id=%s error=%s duration=%ss",
+                batch_idx,
+                len(order_batches),
+                brand_id_value,
                 err_msg[:300],
+                batch_duration,
                 exc_info=True,
             )
-            logger.error(
-                "[OrdersSync] line_items_error brand=%s external_id=%s error=%s",
-                brand_id_value,
-                external_id,
-                err_msg,
-            )
             errors.append(err_msg)
+            # Session auto-closes here, connection returned to pool
+
+        batch_duration = round(time.monotonic() - batch_start_time, 2)
+        logger.info(
+            "[LINE_ITEM_BATCH_COMPLETE] batch=%s/%s brand_id=%s duration=%ss",
+            batch_idx,
+            len(order_batches),
+            brand_id_value,
+            batch_duration,
+        )
 
     # ------------------------------------------------------------------
     # Retry pass: attempt once more for orders whose parent row was not
     # found during the first pass (they may have been committed by now).
     # Items that still fail after retry are dead-lettered.
+    # Retry items are also processed in batches to avoid pool exhaustion.
     # ------------------------------------------------------------------
-    for leaflink_order_id, o in retry_items:
-        logger.info("[LINE_ITEM_RETRY] leaflink_order_id=%s", leaflink_order_id)
+    if retry_items:
+        logger.info(
+            "[LINE_ITEM_RETRY_PASS] brand_id=%s retry_count=%s",
+            brand_id_value,
+            len(retry_items),
+        )
 
+    retry_batches = [
+        retry_items[i : i + LINE_ITEMS_ORDERS_PER_BATCH]
+        for i in range(0, len(retry_items), LINE_ITEMS_ORDERS_PER_BATCH)
+    ]
+
+    for retry_batch_idx, retry_batch in enumerate(retry_batches, 1):
         try:
-            # Defensive check: ensure _AsyncSessionLocal is still callable before retry
-            if not callable(_AsyncSessionLocal):
-                logger.error(
-                    "[LINE_ITEM_SYNC_ERROR] order_id=%s error=AsyncSessionLocal_not_callable_on_retry type=%s",
-                    leaflink_order_id,
-                    type(_AsyncSessionLocal),
-                )
-                errors.append(f"AsyncSessionLocal not callable on retry for order {leaflink_order_id}")
-                continue
-
             async with _AsyncSessionLocal() as db:
                 async with db.begin():
-                    result = await db.execute(
-                        select(Order).where(
-                            Order.brand_id == brand_id_value,
-                            Order.external_order_id == leaflink_order_id,
-                        )
-                    )
-                    order_row = result.scalar_one_or_none()
-
-                    if order_row is None:
-                        logger.warning(
-                            "[LINE_ITEM_RETRY_GIVEUP] leaflink_order_id=%s — dead-lettering all items",
-                            leaflink_order_id,
-                        )
-                        # Dead-letter all items for this order since parent was never found
-                        raw_line_items = o.get("line_items", [])
-                        normalized_line_items = normalize_line_items(raw_line_items)
-                        for item in normalized_line_items:
-                            await _dead_letter_line_item(
-                                brand_id=brand_id_value,
-                                external_order_id=leaflink_order_id,
-                                order_id=None,
-                                sku=item.get("sku"),
-                                product_name=item.get("product_name"),
-                                raw_payload=item.get("raw_payload"),
-                                failure_reason="Parent order not found after retry",
-                                failure_count=MAX_LINE_ITEM_RETRIES,
+                    for leaflink_order_id, o in retry_batch:
+                        logger.info("[LINE_ITEM_RETRY] leaflink_order_id=%s", leaflink_order_id)
+                        try:
+                            result = await db.execute(
+                                select(Order).where(
+                                    Order.brand_id == brand_id_value,
+                                    Order.external_order_id == leaflink_order_id,
+                                )
                             )
-                        continue
+                            order_row = result.scalar_one_or_none()
 
-                    logger.debug(
-                        "[LINE_ITEM_RETRY_SUCCESS] leaflink_order_id=%s matched_order_id=%s",
-                        leaflink_order_id,
-                        order_row.id,
-                    )
+                            if order_row is None:
+                                logger.warning(
+                                    "[LINE_ITEM_RETRY_GIVEUP] leaflink_order_id=%s — dead-lettering all items",
+                                    leaflink_order_id,
+                                )
+                                # Dead-letter all items for this order since parent was never found
+                                raw_line_items = o.get("line_items", [])
+                                normalized_line_items = normalize_line_items(raw_line_items)
+                                for item in normalized_line_items:
+                                    asyncio.create_task(
+                                        _dead_letter_line_item(
+                                            brand_id=brand_id_value,
+                                            external_order_id=leaflink_order_id,
+                                            order_id=None,
+                                            sku=item.get("sku"),
+                                            product_name=item.get("product_name"),
+                                            raw_payload=item.get("raw_payload"),
+                                            failure_reason="Parent order not found after retry",
+                                            failure_count=MAX_LINE_ITEM_RETRIES,
+                                        )
+                                    )
+                                continue
 
-                    db_line_items = order_row.line_items_json
-                    if isinstance(db_line_items, list):
-                        normalized_line_items = db_line_items
-                    else:
-                        raw_line_items = o.get("line_items", [])
-                        normalized_line_items = normalize_line_items(raw_line_items)
+                            logger.debug(
+                                "[LINE_ITEM_RETRY_SUCCESS] leaflink_order_id=%s matched_order_id=%s",
+                                leaflink_order_id,
+                                order_row.id,
+                            )
 
-                    if not normalized_line_items:
-                        continue
+                            db_line_items = order_row.line_items_json
+                            if isinstance(db_line_items, list):
+                                normalized_line_items = db_line_items
+                            else:
+                                raw_line_items = o.get("line_items", [])
+                                normalized_line_items = normalize_line_items(raw_line_items)
 
-                    order_id_val = order_row.id
-                    sku_count = len(normalized_line_items)
+                            if not normalized_line_items:
+                                continue
 
-                    logger.info(
-                        "[LINE_ITEM_SYNC_PROCESSING] order_id=%s sku_count=%s",
-                        order_id_val,
-                        sku_count,
-                    )
+                            order_id_val = order_row.id
+                            sku_count = len(normalized_line_items)
 
-                    inserted_count, skipped_count, failed_items = await _upsert_line_items(
-                        db, order_row, normalized_line_items
-                    )
+                            logger.info(
+                                "[LINE_ITEM_SYNC_PROCESSING] order_id=%s sku_count=%s",
+                                order_id_val,
+                                sku_count,
+                            )
 
-                    logger.debug(
-                        "[LINE_ITEM_UPSERT_COMMIT] brand_id=%s inserted=%s updated=0 duration=0s",
-                        brand_id_value,
-                        inserted_count,
-                    )
-                    logger.debug(
-                        "[LINE_ITEM_BATCH_RESULT] order_id=%s total=%s inserted=%s skipped=%s failed=%s retried=1",
-                        order_id_val,
-                        len(normalized_line_items),
-                        inserted_count,
-                        skipped_count,
-                        len(failed_items),
-                    )
-                    logger.info(
-                        "[LINE_ITEM_SYNC_SUCCESS] order_id=%s inserted=%s updated=0",
-                        order_id_val,
-                        inserted_count,
-                    )
+                            inserted_count, skipped_count, failed_items = await _upsert_line_items(
+                                db, order_row, normalized_line_items
+                            )
 
-                    total_inserted += inserted_count
-                    total_skipped += skipped_count
-                    total_failed += len(failed_items)
-                    total_retried += 1
-                    total_orders += 1
+                            logger.debug(
+                                "[LINE_ITEM_UPSERT_COMMIT] brand_id=%s inserted=%s updated=0 duration=0s",
+                                brand_id_value,
+                                inserted_count,
+                            )
+                            logger.debug(
+                                "[LINE_ITEM_BATCH_RESULT] order_id=%s total=%s inserted=%s skipped=%s failed=%s retried=1",
+                                order_id_val,
+                                len(normalized_line_items),
+                                inserted_count,
+                                skipped_count,
+                                len(failed_items),
+                            )
+                            logger.info(
+                                "[LINE_ITEM_SYNC_SUCCESS] order_id=%s inserted=%s updated=0",
+                                order_id_val,
+                                inserted_count,
+                            )
 
-                    # Dead-letter items that still failed after retry
-                    for failed_item, fail_reason in failed_items:
-                        await _dead_letter_line_item(
-                            brand_id=brand_id_value,
-                            external_order_id=leaflink_order_id,
-                            order_id=order_id_val,
-                            sku=failed_item.get("sku"),
-                            product_name=failed_item.get("product_name"),
-                            raw_payload=failed_item.get("raw_payload"),
-                            failure_reason=fail_reason,
-                            failure_count=MAX_LINE_ITEM_RETRIES,
-                        )
+                            total_inserted += inserted_count
+                            total_skipped += skipped_count
+                            total_failed += len(failed_items)
+                            total_retried += 1
+                            total_orders += 1
 
-        except Exception as retry_exc:
-            err_msg = str(retry_exc)
-            # Non-fatal: log and continue to the next retry item.
+                            # Dead-letter items that still failed after retry
+                            for failed_item, fail_reason in failed_items:
+                                asyncio.create_task(
+                                    _dead_letter_line_item(
+                                        brand_id=brand_id_value,
+                                        external_order_id=leaflink_order_id,
+                                        order_id=order_id_val,
+                                        sku=failed_item.get("sku"),
+                                        product_name=failed_item.get("product_name"),
+                                        raw_payload=failed_item.get("raw_payload"),
+                                        failure_reason=fail_reason,
+                                        failure_count=MAX_LINE_ITEM_RETRIES,
+                                    )
+                                )
+
+                        except Exception as retry_exc:
+                            err_msg = str(retry_exc)
+                            logger.error(
+                                "[LINE_ITEM_SYNC_ERROR] order_id=%s error=%s",
+                                leaflink_order_id,
+                                err_msg[:300],
+                                exc_info=True,
+                            )
+                            errors.append(err_msg)
+
+        except Exception as retry_batch_exc:
+            err_msg = str(retry_batch_exc)
             logger.error(
-                "[LINE_ITEM_SYNC_ERROR] order_id=%s error=%s",
-                leaflink_order_id,
+                "[LINE_ITEM_RETRY_BATCH_FAILED] retry_batch=%s/%s brand_id=%s error=%s",
+                retry_batch_idx,
+                len(retry_batches),
+                brand_id_value,
                 err_msg[:300],
                 exc_info=True,
-            )
-            logger.error(
-                "[OrdersSync] line_items_retry_error brand=%s external_id=%s error=%s",
-                brand_id_value,
-                leaflink_order_id,
-                err_msg,
             )
             errors.append(err_msg)
 
@@ -5874,6 +5962,14 @@ async def sync_leaflink_background_continuous(
         brand_id,
         id(asyncio.current_task()),
     )
+
+    # Log pool status at sync start using a short-lived diagnostic session
+    try:
+        async with AsyncSessionLocal() as _diag_db:
+            _log_pool_status(_diag_db, label="bg_sync_start")
+    except Exception:
+        pass
+
     # Initialize tracking variables before try block so exception handlers can reference them
     pages_processed = 0
     records_seen_from_leaflink = 0
@@ -6623,6 +6719,13 @@ async def sync_leaflink_background_continuous(
                         persist_result.get("updated", 0) if persist_result else 0,
                     )
 
+                    # Log pool status after each page's order batch is committed
+                    try:
+                        async with AsyncSessionLocal() as _pool_db:
+                            _log_pool_status(_pool_db, label=f"after_page_{pages_processed}")
+                    except Exception:
+                        pass
+
                 except Exception as upsert_exc:
                     logger.error(
                         "[FIRST_ORDER_PROCESSING_FAIL] page=%s error=%s",
@@ -6741,6 +6844,13 @@ async def sync_leaflink_background_continuous(
         total_duration = round(time.monotonic() - bg_start, 1)
         # When total_pages is None (cursor-based), final_page is simply the last page visited
         final_page = pages_processed
+
+        # Log pool status at sync end
+        try:
+            async with AsyncSessionLocal() as _end_pool_db:
+                _log_pool_status(_end_pool_db, label="bg_sync_end")
+        except Exception:
+            pass
 
         # [LEAFLINK_BACKFILL_COMPLETE] Final summary for the entire backfill run
         logger.info(
@@ -6923,6 +7033,12 @@ async def sync_leaflink_background_continuous(
             next_cursor is not None,
             exc_info=True,
         )
+        # Log pool status on exception to diagnose leaks
+        try:
+            async with AsyncSessionLocal() as _exc_pool_db:
+                _log_pool_status(_exc_pool_db, label="bg_sync_exception")
+        except Exception:
+            pass
         # Persist final state
         try:
             async with AsyncSessionLocal() as _exc_db:
