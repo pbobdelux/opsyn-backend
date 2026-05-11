@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Optional
@@ -527,6 +528,31 @@ def _sanitize_json_fields_in_params(params: dict, label: str) -> dict:
     return params
 
 
+def _assert_no_naive_datetimes(obj: Any, label: str = "unknown", path: str = "root") -> None:
+    """Hard assertion: raise AssertionError if any naive datetime is found.
+
+    This is the final guard before asyncpg binding. If this passes, we know
+    all datetimes are UTC-aware.
+    """
+    if isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            raise AssertionError(
+                f"[NAIVE_DATETIME_FOUND] label={label} path={path} "
+                f"type={type(obj).__name__} value={obj.isoformat()} tzinfo=None"
+            )
+        return
+
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _assert_no_naive_datetimes(v, label, f"{path}.{k}")
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            _assert_no_naive_datetimes(v, label, f"{path}[{i}]")
+
+
 async def safe_execute(
     db: AsyncSession,
     sql_text: str,
@@ -543,10 +569,9 @@ async def safe_execute(
     - JSON/JSONB payloads with datetime objects → converted to ISO UTC strings
     - Nested in dicts/lists/tuples/sets → recursively sanitized
 
-    JSON/JSONB payload fields (raw_payload, line_items_json, review_status, etc.)
-    receive an explicit pre-sanitization pass via _sanitize_json_fields_in_params()
-    so that any Python datetime objects embedded in those fields are converted to
-    ISO UTC strings before _sanitize_params_recursive runs.
+    CRITICAL: deepcopy params so we NEVER mutate the original. This guarantees
+    that even if the caller reuses the params dict after this call, the original
+    is untouched and the sanitized copy is what reaches asyncpg.
 
     Args:
         db: AsyncSession instance
@@ -558,53 +583,61 @@ async def safe_execute(
         Result of db.execute()
 
     Raises:
-        AssertionError if any datetime object remains in JSON fields or any naive datetime remains
+        AssertionError if any naive datetime remains after sanitization
         Any exception from db.execute() after sanitization
     """
-    if params is None:
-        params = {}
+    # CRITICAL: deepcopy params so we NEVER mutate the original
+    safe_params = deepcopy(params or {})
 
     # Log boundary entry with parameter index mapping
     logger.debug(
         "[SAFE_EXECUTE_BOUNDARY] label=%s param_keys=%s param_count=%d",
         label,
-        list(params.keys()),
-        len(params)
+        list(safe_params.keys()),
+        len(safe_params)
     )
 
     # Log parameter index mapping for debugging (especially for INSERT statements)
-    for i, key in enumerate(params.keys(), 1):
+    for i, key in enumerate(safe_params.keys(), 1):
         logger.debug(
             "[SAFE_EXECUTE_PARAM_INDEX] label=%s index=$%d key=%s type=%s",
             label,
             i,
             key,
-            type(params[key]).__name__
+            type(safe_params[key]).__name__
         )
 
-    # Sanitize JSON fields FIRST (before recursive sanitization)
-    # This converts any nested Python datetime objects to ISO UTC strings
-    params = _sanitize_json_fields_in_params(params, label)
+    # Sanitize JSON fields first (converts nested datetime objects to ISO UTC strings)
+    safe_params = _sanitize_json_fields_in_params(safe_params, label)
 
     # Recursively sanitize all parameters (handles top-level datetimes)
-    sanitized = _sanitize_params_recursive(params, label)
+    safe_params = _sanitize_params_recursive(safe_params, label)
 
-    # Final validation: scan for any remaining naive datetimes
-    _validate_no_naive_datetimes(sanitized, label)
+    # Hard assertion: no naive datetimes allowed
+    _assert_no_naive_datetimes(safe_params, label)
 
     # Log param types after sanitization
-    _log_param_types(sanitized, label)
+    _log_param_types(safe_params, label)
 
     # Log per-param $N → column mapping for INSERT statements
-    _log_insert_param_mapping(sql_text, sanitized, label)
+    _log_insert_param_mapping(sql_text, safe_params, label)
+
+    # Log final state before execute
+    logger.info(
+        "[SAFE_EXECUTE_FINAL_PARAMS] label=%s created_at_type=%s updated_at_type=%s",
+        label,
+        type(safe_params.get("created_at")),
+        type(safe_params.get("updated_at")),
+    )
 
     logger.debug(
         "[SAFE_EXECUTE_PARAMS_READY] label=%s param_keys=%s",
         label,
-        list(sanitized.keys())
+        list(safe_params.keys())
     )
 
-    return await db.execute(text(sql_text), sanitized)
+    # CRITICAL: ALWAYS execute using safe_params, NEVER reference original params again
+    return await db.execute(text(sql_text), safe_params)
 
 
 def _sanitize_params_recursive(
@@ -871,6 +904,7 @@ def _assert_no_direct_db_execute() -> None:
         if (
             'async def safe_execute(' in line
             or 'def _validate_no_naive_datetimes(' in line
+            or 'def _assert_no_naive_datetimes(' in line
             or 'def _log_param_types(' in line
             or 'def sanitize_json_payload_for_binding(' in line
             or 'def assert_no_datetime_objects_in_json(' in line
