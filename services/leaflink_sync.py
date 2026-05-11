@@ -60,20 +60,12 @@ logger = logging.getLogger("leaflink_sync")
 
 # ---------------------------------------------------------------------------
 # Bounded concurrency for dead-letter writes (prevent pool exhaustion).
-# Limits concurrent dead-letter sessions to 2 at a time so that retry storms
-# cannot exhaust the SQLAlchemy pool (size 5, overflow 10).
+# Hard-capped at 1 concurrent dead-letter session so that dead-letter writes
+# can never exhaust the SQLAlchemy pool (size 5, overflow 10).
+# Dead-letter writes are best-effort only — they must never block normal sync.
 # ---------------------------------------------------------------------------
-_dead_letter_semaphore = asyncio.Semaphore(2)
+_dead_letter_semaphore = asyncio.Semaphore(1)
 _dead_letter_batch_size = 50  # Batch up to 50 items per write
-
-# Maximum number of attempts for a single dead-letter write before giving up.
-_DEAD_LETTER_MAX_RETRIES = 3
-
-# Exponential backoff base (seconds) for dead-letter write retries.
-_DEAD_LETTER_BACKOFF_BASE = 1.0
-
-# Maximum backoff delay (seconds) for dead-letter write retries.
-_DEAD_LETTER_BACKOFF_MAX = 30.0
 
 
 def sanitize_json_payload(obj: Any, _depth: int = 0, _seen: set = None) -> Any:
@@ -1698,6 +1690,59 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
         )
 
 
+def _is_db_pool_saturated(db: AsyncSession, threshold: float = 0.8) -> bool:
+    """Check if the DB pool is saturated (approaching limit).
+
+    Returns True if (checked_out + overflow) / (pool_size + overflow_limit) >= threshold.
+    Default threshold is 0.8 (80% capacity).
+
+    Args:
+        db: AsyncSession instance
+        threshold: Saturation threshold (0.0-1.0, default 0.8)
+
+    Returns:
+        True if pool is saturated, False otherwise
+    """
+    try:
+        pool = None
+        try:
+            pool = db.sync_session.get_bind().pool
+        except Exception:
+            pass
+        if pool is None:
+            try:
+                pool = db.get_bind().pool
+            except Exception:
+                pass
+
+        if pool is None:
+            return False  # Can't determine, assume not saturated
+
+        checked_out = pool.checkedout()
+        overflow = pool.overflow()
+        pool_size = pool.size()
+
+        # Total capacity = pool_size + overflow_limit (typically 10)
+        # Current usage = checked_out + overflow
+        total_capacity = pool_size + 10  # overflow_limit is typically 10
+        current_usage = checked_out + overflow
+
+        saturation_ratio = current_usage / total_capacity if total_capacity > 0 else 0
+        is_saturated = saturation_ratio >= threshold
+
+        if is_saturated:
+            logger.warning(
+                "[DB_POOL_SATURATED] checked_out=%d overflow=%d pool_size=%d "
+                "saturation_ratio=%.2f threshold=%.2f",
+                checked_out, overflow, pool_size, saturation_ratio, threshold
+            )
+
+        return is_saturated
+    except Exception as exc:
+        logger.debug("[DB_POOL_SATURATED_CHECK_FAILED] error=%s", str(exc)[:100])
+        return False  # Can't determine, assume not saturated
+
+
 async def _dead_letter_line_item(
     brand_id: str,
     external_order_id: str,
@@ -1710,38 +1755,167 @@ async def _dead_letter_line_item(
 ) -> None:
     """Insert or update a dead-letter record for a permanently failed line item.
 
-    Uses _dead_letter_semaphore to bound concurrent sessions to 2 at a time.
-    Retries up to _DEAD_LETTER_MAX_RETRIES times with exponential backoff;
-    logs [DEAD_LETTER_WRITE_FAILED_FINAL] if all attempts fail so the error
-    is visible without cascading.
+    If the DB pool is saturated, skips the write entirely (circuit-breaker).
+    Dead-letter writes are best-effort only and must never block normal sync.
     """
     _sku_label = sku or "unknown"
+
+    # Check pool pressure BEFORE acquiring semaphore
+    async with AsyncSessionLocal() as db:
+        if _is_db_pool_saturated(db, threshold=0.8):
+            logger.warning(
+                "[DEAD_LETTER_SKIPPED_POOL_SATURATED] brand_id=%s external_order_id=%s sku=%s",
+                brand_id, external_order_id, _sku_label,
+            )
+            return  # Skip dead-letter write, don't retry
+
+    # Only attempt write if pool is healthy
     async with _dead_letter_semaphore:
-        for _attempt in range(1, _DEAD_LETTER_MAX_RETRIES + 1):
-            try:
-                logger.debug(
-                    "[DEAD_LETTER_SESSION_OPEN] brand_id=%s external_order_id=%s sku=%s attempt=%s",
-                    brand_id, external_order_id, _sku_label, _attempt,
-                )
-                await log_pool_status("dead_letter_line_item_before")
-                async with AsyncSessionLocal() as db:
-                    try:
-                        _log_pool_status(db, label="dead_letter_line_item_start")
+        try:
+            logger.debug(
+                "[DEAD_LETTER_SESSION_OPEN] brand_id=%s external_order_id=%s sku=%s",
+                brand_id, external_order_id, _sku_label,
+            )
+            logger.debug(
+                "[DEAD_LETTER_WRITE_ATTEMPT] brand_id=%s external_order_id=%s sku=%s",
+                brand_id, external_order_id, _sku_label,
+            )
+            async with AsyncSessionLocal() as db:
+                try:
+                    _log_pool_status(db, label="dead_letter_line_item_start")
+                    raw_payload_str = (
+                        json.dumps(make_json_safe(raw_payload))
+                        if raw_payload is not None
+                        else None
+                    )
+                    params = {
+                        "brand_id": brand_id,
+                        "external_order_id": external_order_id,
+                        "order_id": order_id,
+                        "sku": _sku_label,
+                        "product_name": product_name,
+                        "raw_payload": raw_payload_str,
+                        "reason": failure_reason[:500],
+                        "count": failure_count,
+                        "now": datetime.now(timezone.utc),
+                    }
+                    await safe_execute(
+                        db,
+                        """
+                            INSERT INTO dead_letter_line_items
+                                (brand_id, external_order_id, order_id, sku, product_name,
+                                 raw_payload, failure_reason, failure_count, last_failed_at, created_at)
+                            VALUES
+                                (CAST(:brand_id AS UUID), :external_order_id, :order_id, :sku, :product_name,
+                                 CAST(:raw_payload AS jsonb), :reason, :count, :now, :now)
+                            ON CONFLICT (brand_id, external_order_id, sku) DO UPDATE SET
+                                failure_count = dead_letter_line_items.failure_count + 1,
+                                failure_reason = :reason,
+                                last_failed_at = :now,
+                                raw_payload = CAST(:raw_payload AS jsonb)
+                        """,
+                        params,
+                        label="dead_letter_line_item_write"
+                    )
+                    await db.commit()
+                    _log_pool_status(db, label="dead_letter_line_item_end")
+                finally:
+                    logger.debug(
+                        "[DEAD_LETTER_SESSION_CLOSE] brand_id=%s external_order_id=%s sku=%s",
+                        brand_id, external_order_id, _sku_label,
+                    )
+            logger.warning(
+                "[LINE_ITEM_DEAD_LETTERED] brand_id=%s external_order_id=%s sku=%s failure_count=%s",
+                brand_id,
+                external_order_id,
+                _sku_label,
+                failure_count,
+            )
+        except Exception as exc:
+            # Log error but don't raise — dead-letter failures must not block sync
+            logger.error(
+                "[DEAD_LETTER_WRITE_FAILED] brand_id=%s external_order_id=%s sku=%s error=%s",
+                brand_id, external_order_id, _sku_label, str(exc)[:300],
+            )
+            # NO RETRY — best-effort only
+
+
+async def _write_dead_letter_batch(
+    items: list,
+    brand_id: str,
+    external_order_id: str,
+    order_id: Optional[int],
+    failure_count: int,
+    label: str = "dead_letter_batch",
+) -> None:
+    """Write a batch of dead-letter line items in a single transaction.
+
+    Collects all (item, fail_reason) tuples and writes them in one session,
+    reducing session count from N (per item) to 1 (per batch).  Protected by
+    _dead_letter_semaphore to prevent concurrent session storms.
+
+    If the DB pool is saturated, skips the write entirely (circuit-breaker).
+    Dead-letter writes are best-effort only and must never block normal sync.
+
+    Args:
+        items:              List of (item_dict, fail_reason_str) tuples.
+        brand_id:           Brand UUID string.
+        external_order_id:  LeafLink order ID.
+        order_id:           Internal DB order PK (may be None).
+        failure_count:      Failure count to record for each item.
+        label:              Descriptive label for logging.
+
+    Logs:
+        [DEAD_LETTER_SESSION_OPEN]       when session opens
+        [DB_POOL_STATUS]                 before/after write
+        [DEAD_LETTER_QUEUE]              with batch size and status
+        [DEAD_LETTER_SESSION_CLOSE]      when session closes
+        [DEAD_LETTER_SKIPPED_POOL_SATURATED] if pool is saturated
+        [DEAD_LETTER_WRITE_FAILED]       if write fails
+    """
+    if not items:
+        return
+
+    # Check pool pressure BEFORE acquiring semaphore
+    async with AsyncSessionLocal() as db:
+        if _is_db_pool_saturated(db, threshold=0.8):
+            logger.warning(
+                "[DEAD_LETTER_SKIPPED_POOL_SATURATED] label=%s brand_id=%s external_order_id=%s batch_size=%d",
+                label, brand_id, external_order_id, len(items),
+            )
+            return  # Skip dead-letter write, don't retry
+
+    # Only attempt write if pool is healthy
+    async with _dead_letter_semaphore:
+        try:
+            logger.debug(
+                "[DEAD_LETTER_SESSION_OPEN] label=%s brand_id=%s external_order_id=%s batch_size=%s",
+                label, brand_id, external_order_id, len(items),
+            )
+            logger.debug(
+                "[DEAD_LETTER_WRITE_ATTEMPT] label=%s brand_id=%s external_order_id=%s batch_size=%d",
+                label, brand_id, external_order_id, len(items),
+            )
+            async with AsyncSessionLocal() as db:
+                try:
+                    _log_pool_status(db, label=f"{label}_start")
+                    _now = datetime.now(timezone.utc)
+                    for failed_item, fail_reason in items:
                         raw_payload_str = (
-                            json.dumps(make_json_safe(raw_payload))
-                            if raw_payload is not None
+                            json.dumps(make_json_safe(failed_item.get("raw_payload")))
+                            if failed_item.get("raw_payload") is not None
                             else None
                         )
                         params = {
                             "brand_id": brand_id,
                             "external_order_id": external_order_id,
                             "order_id": order_id,
-                            "sku": _sku_label,
-                            "product_name": product_name,
+                            "sku": failed_item.get("sku") or "unknown",
+                            "product_name": failed_item.get("product_name"),
                             "raw_payload": raw_payload_str,
-                            "reason": failure_reason[:500],
+                            "reason": fail_reason[:500],
                             "count": failure_count,
-                            "now": datetime.now(timezone.utc),
+                            "now": _now,
                         }
                         await safe_execute(
                             db,
@@ -1759,165 +1933,27 @@ async def _dead_letter_line_item(
                                     raw_payload = CAST(:raw_payload AS jsonb)
                             """,
                             params,
-                            label="dead_letter_line_item_write"
+                            label="dead_letter_batch_item_write",
                         )
-                        await db.commit()
-                        _log_pool_status(db, label="dead_letter_line_item_end")
-                    finally:
-                        logger.debug(
-                            "[DEAD_LETTER_SESSION_CLOSE] brand_id=%s external_order_id=%s sku=%s attempt=%s",
-                            brand_id, external_order_id, _sku_label, _attempt,
-                        )
-                logger.warning(
-                    "[LINE_ITEM_DEAD_LETTERED] brand_id=%s external_order_id=%s sku=%s failure_count=%s",
-                    brand_id,
-                    external_order_id,
-                    _sku_label,
-                    failure_count,
-                )
-                await log_pool_status("dead_letter_line_item_after")
-                return  # success — exit retry loop
-            except Exception as exc:
-                _exc_str = str(exc)[:300]
-                if _attempt < _DEAD_LETTER_MAX_RETRIES:
-                    _delay = min(
-                        _DEAD_LETTER_BACKOFF_BASE * (2 ** (_attempt - 1)),
-                        _DEAD_LETTER_BACKOFF_MAX,
-                    )
-                    logger.warning(
-                        "[DEAD_LETTER_RETRY_BACKOFF] brand_id=%s external_order_id=%s sku=%s"
-                        " attempt=%s/%s delay=%.1fs error=%s",
-                        brand_id, external_order_id, _sku_label,
-                        _attempt, _DEAD_LETTER_MAX_RETRIES, _delay, _exc_str,
-                    )
-                    await log_pool_status("dead_letter_line_item_retry_backoff")
-                    await asyncio.sleep(_delay)
-                else:
-                    logger.critical(
-                        "[DEAD_LETTER_WRITE_FAILED_FINAL] brand_id=%s external_order_id=%s"
-                        " sku=%s all_attempts_exhausted=%s error=%s",
-                        brand_id, external_order_id, _sku_label,
-                        _DEAD_LETTER_MAX_RETRIES, _exc_str,
-                    )
-                    await log_pool_status("dead_letter_line_item_failed_final")
-
-
-async def _write_dead_letter_batch(
-    items: list,
-    brand_id: str,
-    external_order_id: str,
-    order_id: Optional[int],
-    failure_count: int,
-    label: str = "dead_letter_batch",
-) -> None:
-    """Write a batch of dead-letter line items in a single transaction.
-
-    Collects all (item, fail_reason) tuples and writes them in one session,
-    reducing session count from N (per item) to 1 (per batch).  Protected by
-    _dead_letter_semaphore to prevent concurrent session storms.
-
-    Args:
-        items:              List of (item_dict, fail_reason_str) tuples.
-        brand_id:           Brand UUID string.
-        external_order_id:  LeafLink order ID.
-        order_id:           Internal DB order PK (may be None).
-        failure_count:      Failure count to record for each item.
-        label:              Descriptive label for logging.
-
-    Logs:
-        [DEAD_LETTER_SESSION_OPEN]  when session opens
-        [DB_POOL_STATUS]            before/after write
-        [DEAD_LETTER_QUEUE]         with batch size and status
-        [DEAD_LETTER_SESSION_CLOSE] when session closes
-        [DEAD_LETTER_WRITE_FAILED_FINAL] if both attempts fail
-    """
-    if not items:
-        return
-
-    async with _dead_letter_semaphore:
-        for _attempt in range(1, _DEAD_LETTER_MAX_RETRIES + 1):
-            try:
-                logger.debug(
-                    "[DEAD_LETTER_SESSION_OPEN] label=%s brand_id=%s external_order_id=%s"
-                    " batch_size=%s attempt=%s",
-                    label, brand_id, external_order_id, len(items), _attempt,
-                )
-                async with AsyncSessionLocal() as db:
-                    try:
-                        _log_pool_status(db, label=f"{label}_start")
-                        _now = datetime.now(timezone.utc)
-                        for failed_item, fail_reason in items:
-                            raw_payload_str = (
-                                json.dumps(make_json_safe(failed_item.get("raw_payload")))
-                                if failed_item.get("raw_payload") is not None
-                                else None
-                            )
-                            params = {
-                                "brand_id": brand_id,
-                                "external_order_id": external_order_id,
-                                "order_id": order_id,
-                                "sku": failed_item.get("sku") or "unknown",
-                                "product_name": failed_item.get("product_name"),
-                                "raw_payload": raw_payload_str,
-                                "reason": fail_reason[:500],
-                                "count": failure_count,
-                                "now": _now,
-                            }
-                            await safe_execute(
-                                db,
-                                """
-                                    INSERT INTO dead_letter_line_items
-                                        (brand_id, external_order_id, order_id, sku, product_name,
-                                         raw_payload, failure_reason, failure_count, last_failed_at, created_at)
-                                    VALUES
-                                        (CAST(:brand_id AS UUID), :external_order_id, :order_id, :sku, :product_name,
-                                         CAST(:raw_payload AS jsonb), :reason, :count, :now, :now)
-                                    ON CONFLICT (brand_id, external_order_id, sku) DO UPDATE SET
-                                        failure_count = dead_letter_line_items.failure_count + 1,
-                                        failure_reason = :reason,
-                                        last_failed_at = :now,
-                                        raw_payload = CAST(:raw_payload AS jsonb)
-                                """,
-                                params,
-                                label="dead_letter_batch_item_write",
-                            )
-                        await db.commit()
-                        _log_pool_status(db, label=f"{label}_end")
-                    finally:
-                        logger.debug(
-                            "[DEAD_LETTER_SESSION_CLOSE] label=%s brand_id=%s external_order_id=%s"
-                            " batch_size=%s attempt=%s",
-                            label, brand_id, external_order_id, len(items), _attempt,
-                        )
-                logger.warning(
-                    "[DEAD_LETTER_QUEUE] label=%s brand_id=%s external_order_id=%s"
-                    " batch_size=%s status=committed",
-                    label, brand_id, external_order_id, len(items),
-                )
-                return  # success — exit retry loop
-            except Exception as exc:
-                _exc_str = str(exc)[:300]
-                if _attempt < _DEAD_LETTER_MAX_RETRIES:
-                    _delay = min(
-                        _DEAD_LETTER_BACKOFF_BASE * (2 ** (_attempt - 1)),
-                        _DEAD_LETTER_BACKOFF_MAX,
-                    )
-                    logger.warning(
-                        "[DEAD_LETTER_RETRY_BACKOFF] label=%s brand_id=%s external_order_id=%s"
-                        " attempt=%s/%s delay=%.1fs error=%s",
-                        label, brand_id, external_order_id,
-                        _attempt, _DEAD_LETTER_MAX_RETRIES, _delay, _exc_str,
-                    )
-                    await log_pool_status(f"{label}_retry_backoff")
-                    await asyncio.sleep(_delay)
-                else:
-                    logger.critical(
-                        "[DEAD_LETTER_WRITE_FAILED_FINAL] label=%s brand_id=%s"
-                        " external_order_id=%s batch_size=%s all_attempts_exhausted=%s error=%s",
+                    await db.commit()
+                    _log_pool_status(db, label=f"{label}_end")
+                finally:
+                    logger.debug(
+                        "[DEAD_LETTER_SESSION_CLOSE] label=%s brand_id=%s external_order_id=%s batch_size=%s",
                         label, brand_id, external_order_id, len(items),
-                        _DEAD_LETTER_MAX_RETRIES, _exc_str,
                     )
-                    await log_pool_status(f"{label}_failed_final")
+            logger.warning(
+                "[DEAD_LETTER_QUEUE] label=%s brand_id=%s external_order_id=%s"
+                " batch_size=%s status=committed",
+                label, brand_id, external_order_id, len(items),
+            )
+        except Exception as exc:
+            # Log error but don't raise — dead-letter failures must not block sync
+            logger.error(
+                "[DEAD_LETTER_WRITE_FAILED] label=%s brand_id=%s external_order_id=%s batch_size=%d error=%s",
+                label, brand_id, external_order_id, len(items), str(exc)[:300],
+            )
+            # NO RETRY — best-effort only
 
 
 async def _write_sync_dead_letter(
@@ -1981,139 +2017,133 @@ async def _write_sync_dead_letter(
     # Use failure_stage as error_stage if not separately provided (backward compat)
     effective_error_stage = failure_stage or error_stage
 
+    # Check pool pressure BEFORE acquiring semaphore
+    async with AsyncSessionLocal() as db:
+        if _is_db_pool_saturated(db, threshold=0.8):
+            logger.warning(
+                "[DEAD_LETTER_SKIPPED_POOL_SATURATED] brand_id=%s external_id=%s error_stage=%s",
+                brand_id, external_id, error_stage,
+            )
+            return  # Skip dead-letter write, don't retry
+
+    # Only attempt write if pool is healthy
     async with _dead_letter_semaphore:
-        for _attempt in range(1, _DEAD_LETTER_MAX_RETRIES + 1):
-            try:
-                logger.debug(
-                    "[DEAD_LETTER_SESSION_OPEN] brand_id=%s external_id=%s error_stage=%s attempt=%s",
-                    brand_id, external_id, error_stage, _attempt,
-                )
-                await log_pool_status("dead_letter_write_before")
-                async with AsyncSessionLocal() as db:
+        try:
+            logger.debug(
+                "[DEAD_LETTER_SESSION_OPEN] brand_id=%s external_id=%s error_stage=%s",
+                brand_id, external_id, error_stage,
+            )
+            logger.debug(
+                "[DEAD_LETTER_WRITE_ATTEMPT] brand_id=%s external_id=%s error_stage=%s",
+                brand_id, external_id, error_stage,
+            )
+            async with AsyncSessionLocal() as db:
+                try:
+                    _log_pool_status(db, label="dead_letter_write_start")
+                    raw_payload_str = (
+                        json.dumps(make_json_safe(raw_payload))
+                        if raw_payload is not None
+                        else json.dumps({})
+                    )
+                    params = {
+                        "source": source,
+                        "brand_id": safe_uuid_for_db(brand_id, "brand_id") or brand_id,
+                        "org_id": safe_uuid_for_db(org_id, "org_id"),
+                        "external_id": external_id,
+                        "order_number": order_number,
+                        "customer_name": customer_name,
+                        "raw_payload": raw_payload_str,
+                        "error_stage": effective_error_stage,
+                        "error_message": error_message[:2000],
+                        "failure_stage": failure_stage,
+                        "failure_category": failure_category,
+                        "exception_type": exception_type,
+                        "exception_message": (exception_message or "")[:1000] if exception_message else None,
+                        "traceback_summary": (traceback_summary or "")[:500] if traceback_summary else None,
+                        "payload_keys": payload_keys_json,
+                        "problematic_field": problematic_field,
+                        "problematic_value_preview": (problematic_value_preview or "")[:100] if problematic_value_preview else None,
+                        "now": datetime.now(timezone.utc),
+                    }
+                    logger.debug(
+                        "[DEAD_LETTER_FINAL_TYPES] org_id=%s org_type=%s brand_id=%s brand_type=%s",
+                        params.get("org_id"),
+                        type(params.get("org_id")),
+                        params.get("brand_id"),
+                        type(params.get("brand_id")),
+                    )
+                    # Try to write with new detail columns; fall back to legacy schema if columns don't exist yet
                     try:
-                        _log_pool_status(db, label="dead_letter_write_start")
-                        raw_payload_str = (
-                            json.dumps(make_json_safe(raw_payload))
-                            if raw_payload is not None
-                            else json.dumps({})
+                        await safe_execute(
+                            db,
+                            """
+                                INSERT INTO sync_dead_letters
+                                    (source, brand_id, org_id, external_id, order_number,
+                                     customer_name, raw_payload, error_stage, error_message,
+                                     failure_stage, failure_category, exception_type, exception_message,
+                                     traceback_summary, payload_keys, problematic_field,
+                                     problematic_value_preview, retry_count, created_at)
+                                VALUES
+                                    (:source, CAST(:brand_id AS uuid), CAST(:org_id AS uuid),
+                                     :external_id, :order_number,
+                                     :customer_name, CAST(:raw_payload AS jsonb), :error_stage, :error_message,
+                                     :failure_stage, :failure_category, :exception_type, :exception_message,
+                                     :traceback_summary, CAST(:payload_keys AS jsonb), :problematic_field,
+                                     :problematic_value_preview, 0, :now)
+                            """,
+                            params,
+                            label="dead_letter_write"
                         )
-                        params = {
-                            "source": source,
-                            "brand_id": safe_uuid_for_db(brand_id, "brand_id") or brand_id,
-                            "org_id": safe_uuid_for_db(org_id, "org_id"),
-                            "external_id": external_id,
-                            "order_number": order_number,
-                            "customer_name": customer_name,
-                            "raw_payload": raw_payload_str,
-                            "error_stage": effective_error_stage,
-                            "error_message": error_message[:2000],
-                            "failure_stage": failure_stage,
-                            "failure_category": failure_category,
-                            "exception_type": exception_type,
-                            "exception_message": (exception_message or "")[:1000] if exception_message else None,
-                            "traceback_summary": (traceback_summary or "")[:500] if traceback_summary else None,
-                            "payload_keys": payload_keys_json,
-                            "problematic_field": problematic_field,
-                            "problematic_value_preview": (problematic_value_preview or "")[:100] if problematic_value_preview else None,
-                            "now": datetime.now(timezone.utc),
-                        }
-                        logger.debug(
-                            "[DEAD_LETTER_FINAL_TYPES] org_id=%s org_type=%s brand_id=%s brand_type=%s",
-                            params.get("org_id"),
-                            type(params.get("org_id")),
-                            params.get("brand_id"),
-                            type(params.get("brand_id")),
-                        )
-                        # Try to write with new detail columns; fall back to legacy schema if columns don't exist yet
-                        try:
+                    except Exception as _detail_exc:
+                        # New columns may not exist yet (migration pending) — fall back to legacy insert
+                        _detail_err = str(_detail_exc).lower()
+                        if "column" in _detail_err and ("does not exist" in _detail_err or "unknown" in _detail_err):
+                            logger.warning(
+                                "[DEAD_LETTER_FALLBACK] new columns not yet migrated, using legacy schema: %s",
+                                str(_detail_exc)[:200],
+                            )
                             await safe_execute(
                                 db,
                                 """
                                     INSERT INTO sync_dead_letters
                                         (source, brand_id, org_id, external_id, order_number,
-                                         customer_name, raw_payload, error_stage, error_message,
-                                         failure_stage, failure_category, exception_type, exception_message,
-                                         traceback_summary, payload_keys, problematic_field,
-                                         problematic_value_preview, retry_count, created_at)
+                                         raw_payload, error_stage, error_message, retry_count, created_at)
                                     VALUES
                                         (:source, CAST(:brand_id AS uuid), CAST(:org_id AS uuid),
                                          :external_id, :order_number,
-                                         :customer_name, CAST(:raw_payload AS jsonb), :error_stage, :error_message,
-                                         :failure_stage, :failure_category, :exception_type, :exception_message,
-                                         :traceback_summary, CAST(:payload_keys AS jsonb), :problematic_field,
-                                         :problematic_value_preview, 0, :now)
+                                         CAST(:raw_payload AS jsonb), :error_stage, :error_message,
+                                         0, :now)
                                 """,
                                 params,
-                                label="dead_letter_write"
+                                label="dead_letter_write_legacy"
                             )
-                        except Exception as _detail_exc:
-                            # New columns may not exist yet (migration pending) — fall back to legacy insert
-                            _detail_err = str(_detail_exc).lower()
-                            if "column" in _detail_err and ("does not exist" in _detail_err or "unknown" in _detail_err):
-                                logger.warning(
-                                    "[DEAD_LETTER_FALLBACK] new columns not yet migrated, using legacy schema: %s",
-                                    str(_detail_exc)[:200],
-                                )
-                                await safe_execute(
-                                    db,
-                                    """
-                                        INSERT INTO sync_dead_letters
-                                            (source, brand_id, org_id, external_id, order_number,
-                                             raw_payload, error_stage, error_message, retry_count, created_at)
-                                        VALUES
-                                            (:source, CAST(:brand_id AS uuid), CAST(:org_id AS uuid),
-                                             :external_id, :order_number,
-                                             CAST(:raw_payload AS jsonb), :error_stage, :error_message,
-                                             0, :now)
-                                    """,
-                                    params,
-                                    label="dead_letter_write_legacy"
-                                )
-                            else:
-                                raise
-                        await db.commit()
-                        _log_pool_status(db, label="dead_letter_write_end")
-                    finally:
-                        logger.debug(
-                            "[DEAD_LETTER_SESSION_CLOSE] brand_id=%s external_id=%s error_stage=%s attempt=%s",
-                            brand_id, external_id, error_stage, _attempt,
-                        )
-                logger.warning(
-                    "[SYNC_DEAD_LETTER_WRITTEN] external_id=%s order_number=%s customer=%s "
-                    "failure_stage=%s failure_category=%s error_stage=%s brand_id=%s",
-                    external_id,
-                    order_number,
-                    customer_name or "unknown",
-                    failure_stage or error_stage,
-                    failure_category or "unclassified",
-                    error_stage,
-                    brand_id,
-                )
-                await log_pool_status("dead_letter_write_after")
-                return  # success — exit retry loop
-            except Exception as exc:
-                _exc_str = str(exc)[:300]
-                if _attempt < _DEAD_LETTER_MAX_RETRIES:
-                    _delay = min(
-                        _DEAD_LETTER_BACKOFF_BASE * (2 ** (_attempt - 1)),
-                        _DEAD_LETTER_BACKOFF_MAX,
-                    )
-                    logger.warning(
-                        "[DEAD_LETTER_RETRY_BACKOFF] brand_id=%s external_id=%s error_stage=%s"
-                        " attempt=%s/%s delay=%.1fs error=%s",
+                        else:
+                            raise
+                    await db.commit()
+                    _log_pool_status(db, label="dead_letter_write_end")
+                finally:
+                    logger.debug(
+                        "[DEAD_LETTER_SESSION_CLOSE] brand_id=%s external_id=%s error_stage=%s",
                         brand_id, external_id, error_stage,
-                        _attempt, _DEAD_LETTER_MAX_RETRIES, _delay, _exc_str,
                     )
-                    await log_pool_status("dead_letter_write_retry_backoff")
-                    await asyncio.sleep(_delay)
-                else:
-                    logger.critical(
-                        "[DEAD_LETTER_WRITE_FAILED_FINAL] brand_id=%s external_id=%s"
-                        " error_stage=%s all_attempts_exhausted=%s error=%s",
-                        brand_id, external_id, error_stage,
-                        _DEAD_LETTER_MAX_RETRIES, _exc_str,
-                    )
-                    await log_pool_status("dead_letter_write_failed_final")
+            logger.warning(
+                "[SYNC_DEAD_LETTER_WRITTEN] external_id=%s order_number=%s customer=%s "
+                "failure_stage=%s failure_category=%s error_stage=%s brand_id=%s",
+                external_id,
+                order_number,
+                customer_name or "unknown",
+                failure_stage or error_stage,
+                failure_category or "unclassified",
+                error_stage,
+                brand_id,
+            )
+        except Exception as exc:
+            # Log error but don't raise — dead-letter failures must not block sync
+            logger.error(
+                "[DEAD_LETTER_WRITE_FAILED] brand_id=%s external_id=%s error_stage=%s error=%s",
+                brand_id, external_id, error_stage, str(exc)[:300],
+            )
+            # NO RETRY — best-effort only
 
 
 def utc_now() -> datetime:
