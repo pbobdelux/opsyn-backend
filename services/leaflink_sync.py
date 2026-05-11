@@ -217,6 +217,221 @@ def _cursor_hash(cursor: Optional[str]) -> Optional[str]:
         return None
     return hashlib.sha256(cursor.encode()).hexdigest()[:12]
 
+
+async def safe_execute(
+    db: AsyncSession,
+    sql_text: str,
+    params: Optional[dict] = None,
+    label: str = "unknown"
+) -> Any:
+    """Execute SQL with automatic datetime sanitization at the database boundary.
+
+    This is the ONLY function that should call db.execute() in this module.
+    All datetime parameters are recursively sanitized to ensure asyncpg compatibility:
+    - Naive datetimes → UTC-aware (assume UTC)
+    - Aware datetimes → converted to UTC
+    - date objects → UTC midnight datetime
+    - Nested in dicts/lists/tuples/sets → recursively sanitized
+
+    Args:
+        db: AsyncSession instance
+        sql_text: SQL statement as string (will be wrapped in text())
+        params: Dict of bind parameters (or None)
+        label: Descriptive label for logging (e.g., "order_header_upsert")
+
+    Returns:
+        Result of db.execute()
+
+    Raises:
+        Any exception from db.execute() after sanitization
+    """
+    if params is None:
+        params = {}
+
+    # Recursively sanitize all parameters
+    sanitized = _sanitize_params_recursive(params, label)
+
+    logger.debug(
+        "[SAFE_EXECUTE_PARAMS_READY] label=%s param_keys=%s",
+        label,
+        list(sanitized.keys())
+    )
+
+    return await db.execute(text(sql_text), sanitized)
+
+
+def _sanitize_params_recursive(
+    obj: Any,
+    label: str,
+    _path: str = "root",
+    _depth: int = 0,
+    _seen: Optional[set] = None
+) -> Any:
+    """Recursively sanitize parameters for database binding.
+
+    Converts all datetime objects to UTC-aware format and handles nested structures.
+    Logs any naive datetimes that are fixed.
+
+    Args:
+        obj: Object to sanitize (dict, list, tuple, set, datetime, date, or primitive)
+        label: Statement label for logging
+        _path: Current path in nested structure (for logging)
+        _depth: Current recursion depth
+        _seen: Set of visited object ids (circular reference protection)
+
+    Returns:
+        Sanitized version of obj
+    """
+    MAX_DEPTH = 15
+
+    if _seen is None:
+        _seen = set()
+
+    # Depth limit
+    if _depth > MAX_DEPTH:
+        logger.warning("[SAFE_EXECUTE_MAX_DEPTH] label=%s path=%s", label, _path)
+        return obj
+
+    # Circular reference protection
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return obj
+
+    if obj is None:
+        return None
+
+    # datetime → ensure UTC-aware
+    if isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            # Naive datetime — assume UTC
+            fixed = obj.replace(tzinfo=timezone.utc)
+            logger.info(
+                "[SAFE_EXECUTE_NAIVE_DATETIME_FIXED] label=%s path=%s original=%s fixed=%s",
+                label,
+                _path,
+                obj.isoformat(),
+                fixed.isoformat()
+            )
+            return fixed
+        else:
+            # Already aware — convert to UTC
+            return obj.astimezone(timezone.utc)
+
+    # date → UTC midnight datetime
+    if isinstance(obj, date) and not isinstance(obj, datetime):
+        result = datetime(obj.year, obj.month, obj.day, tzinfo=timezone.utc)
+        logger.info(
+            "[SAFE_EXECUTE_DATE_CONVERTED] label=%s path=%s original=%s converted=%s",
+            label,
+            _path,
+            obj.isoformat(),
+            result.isoformat()
+        )
+        return result
+
+    # dict → recurse
+    if isinstance(obj, dict):
+        _seen.add(obj_id)
+        result = {
+            k: _sanitize_params_recursive(v, label, f"{_path}.{k}", _depth + 1, _seen)
+            for k, v in obj.items()
+        }
+        _seen.discard(obj_id)
+        return result
+
+    # list → recurse
+    if isinstance(obj, list):
+        _seen.add(obj_id)
+        result = [
+            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen)
+            for i, item in enumerate(obj)
+        ]
+        _seen.discard(obj_id)
+        return result
+
+    # tuple → recurse (return as list for SQLAlchemy compatibility)
+    if isinstance(obj, tuple):
+        _seen.add(obj_id)
+        result = [
+            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen)
+            for i, item in enumerate(obj)
+        ]
+        _seen.discard(obj_id)
+        return result
+
+    # set → recurse (return as list for SQLAlchemy compatibility)
+    if isinstance(obj, set):
+        _seen.add(obj_id)
+        result = [
+            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen)
+            for i, item in enumerate(obj)
+        ]
+        _seen.discard(obj_id)
+        return result
+
+    # Primitives pass through
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # UUID, Decimal, etc. — convert to string
+    if isinstance(obj, (UUID, Decimal)):
+        return str(obj)
+
+    # Unknown type — convert to string
+    return str(obj)
+
+
+def _assert_no_direct_db_execute() -> None:
+    """Scan this module's source code and fail if direct db.execute calls exist outside safe_execute.
+
+    This prevents future developers from bypassing the datetime sanitization boundary.
+    Runs at module import time.
+
+    Only flags calls that use text() (raw SQL with potential datetime params).
+    ORM calls (select, delete, etc.) and savepoint control statements are excluded.
+    """
+    import inspect
+
+    source = inspect.getsource(sys.modules[__name__])
+
+    # Find all lines with db.execute(text(...)) that are NOT inside safe_execute
+    lines = source.split('\n')
+    in_safe_execute = False
+    errors = []
+
+    for i, line in enumerate(lines, 1):
+        # Track when we enter/exit safe_execute function
+        if 'async def safe_execute(' in line:
+            in_safe_execute = True
+        elif in_safe_execute and line.strip().startswith('async def '):
+            in_safe_execute = False
+        elif in_safe_execute and line.strip().startswith('def '):
+            in_safe_execute = False
+
+        # Check for direct db.execute(text(...)) calls outside safe_execute
+        # Only flag raw SQL calls (text()), not ORM calls (select, delete, etc.)
+        # Also exclude savepoint/release/rollback control statements (no datetime params)
+        if not in_safe_execute and 'db.execute(' in line and 'safe_execute' not in line:
+            # Exclude comments and docstrings
+            stripped = line.strip()
+            if stripped.startswith('#') or stripped.startswith('"""') or stripped.startswith("'''"):
+                continue
+            # Only flag raw SQL text() calls — ORM calls (select/delete) are safe
+            if 'text(' not in line:
+                continue
+            # Exclude savepoint/release/rollback control statements (no datetime params)
+            if 'SAVEPOINT' in line or 'RELEASE SAVEPOINT' in line or 'ROLLBACK TO SAVEPOINT' in line:
+                continue
+            errors.append(f"Line {i}: {line.rstrip()}")
+
+    if errors:
+        error_msg = "Found direct db.execute(text()) calls outside safe_execute():\n" + "\n".join(errors)
+        logger.error("[ASSERTION_FAILED] %s", error_msg)
+        raise AssertionError(error_msg)
+
+    logger.info("[ASSERTION_PASSED] No direct db.execute(text()) calls found outside safe_execute")
+
+
 # Thread pool for running synchronous LeafLink HTTP calls without blocking the event loop
 _leaflink_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="leaflink-bg-sync")
 
@@ -435,9 +650,11 @@ async def acquire_sync_lock(db: AsyncSession, brand_id: str) -> bool:
     running for this brand.
     """
     lock_id = _brand_lock_id(brand_id)
-    result = await db.execute(
-        text("SELECT pg_try_advisory_lock(:lock_id)"),
+    result = await safe_execute(
+        db,
+        "SELECT pg_try_advisory_lock(:lock_id)",
         {"lock_id": lock_id},
+        label="advisory_lock_acquire"
     )
     return result.scalar() is True
 
@@ -445,9 +662,11 @@ async def acquire_sync_lock(db: AsyncSession, brand_id: str) -> bool:
 async def release_sync_lock(db: AsyncSession, brand_id: str) -> None:
     """Release the advisory lock for this brand's sync."""
     lock_id = _brand_lock_id(brand_id)
-    await db.execute(
-        text("SELECT pg_advisory_unlock(:lock_id)"),
+    await safe_execute(
+        db,
+        "SELECT pg_advisory_unlock(:lock_id)",
         {"lock_id": lock_id},
+        label="advisory_lock_release"
     )
 
 
@@ -462,24 +681,14 @@ async def _update_sync_health_phase1(
     """Record that Phase 1 started/completed for this brand."""
     try:
         async with AsyncSessionLocal() as db:
-            _phase1_params = sanitize_sql_params(
-                {"brand_id": brand_id, "now": ensure_utc(utc_now(), "now"), "count": (orders_count or 0)},
-                statement="_update_sync_health_phase1",
-            )
-            _phase1_params = normalize_uuid_fields(_phase1_params)
-            _phase1_params = normalize_datetime_fields(_phase1_params)
-            _phase1_params = apply_uuid_str_to_params(_phase1_params)
-            # Final recursive sanitization — belt-and-suspenders guard
-            _phase1_params = _recursive_sanitize_sql_params(_phase1_params)
-            # Final guard: scan params for raw naive datetimes before execute
-            for _param_key, _param_val in _phase1_params.items():
-                if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
-                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
-                    _phase1_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _phase1_params = _validate_and_fix_sql_params(_phase1_params)
-            await db.execute(
-                text("""
+            params = {
+                "brand_id": brand_id,
+                "now": datetime.now(timezone.utc),
+                "count": orders_count or 0
+            }
+            await safe_execute(
+                db,
+                """
                     INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, orders_fetched_last_run, updated_at)
                     VALUES (CAST(:brand_id AS UUID), :now, :count, 0, 0, :count, :now)
                     ON CONFLICT (brand_id) DO UPDATE SET
@@ -487,16 +696,12 @@ async def _update_sync_health_phase1(
                         total_orders_synced = sync_health.total_orders_synced + :count,
                         orders_fetched_last_run = :count,
                         updated_at = :now
-                """),
-                _phase1_params,
+                """,
+                params,
+                label="sync_health_phase1_update"
             )
             await db.commit()
-
-            logger.info(
-                "[SYNC_HEALTH_UPDATE] brand_id=%s phase=1 orders_delta=%s",
-                brand_id,
-                orders_count,
-            )
+            logger.info("[SYNC_HEALTH_UPDATE] brand_id=%s phase=1 orders_delta=%s", brand_id, orders_count)
     except Exception as exc:
         logger.error(
             "[SYNC_HEALTH_UPDATE_ERROR] brand_id=%s phase=1 error=%s",
@@ -512,25 +717,14 @@ async def _update_sync_health_phase2(
     """Record that Phase 2 completed successfully for this brand."""
     try:
         async with AsyncSessionLocal() as db:
-            _phase2_params = sanitize_sql_params(
-                {"brand_id": brand_id, "now": ensure_utc(utc_now(), "now"), "count": line_items_count},
-                statement="_update_sync_health_phase2",
-            )
-            _phase2_params = normalize_uuid_fields(_phase2_params)
-            _phase2_params = normalize_datetime_fields(_phase2_params)
-
-            _phase2_params = apply_uuid_str_to_params(_phase2_params)
-            # Final recursive sanitization — belt-and-suspenders guard
-            _phase2_params = _recursive_sanitize_sql_params(_phase2_params)
-            # Final guard: scan params for raw naive datetimes before execute
-            for _param_key, _param_val in _phase2_params.items():
-                if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
-                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
-                    _phase2_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _phase2_params = _validate_and_fix_sql_params(_phase2_params)
-            await db.execute(
-                text("""
+            params = {
+                "brand_id": brand_id,
+                "now": datetime.now(timezone.utc),
+                "count": line_items_count
+            }
+            await safe_execute(
+                db,
+                """
                     UPDATE sync_health SET
                         last_successful_sync_at = :now,
                         consecutive_failures = 0,
@@ -539,16 +733,12 @@ async def _update_sync_health_phase2(
                         last_error = NULL,
                         updated_at = :now
                     WHERE brand_id = CAST(:brand_id AS UUID)
-                """),
-                _phase2_params,
+                """,
+                params,
+                label="sync_health_phase2_update"
             )
             await db.commit()
-
-            logger.info(
-                "[SYNC_HEALTH_UPDATE] brand_id=%s phase=2 line_items_delta=%s",
-                brand_id,
-                line_items_count,
-            )
+            logger.info("[SYNC_HEALTH_UPDATE] brand_id=%s phase=2 line_items_delta=%s", brand_id, line_items_count)
     except Exception as exc:
         logger.error(
             "[SYNC_HEALTH_UPDATE_ERROR] brand_id=%s phase=2 error=%s",
@@ -562,24 +752,14 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
     """Increment consecutive_failures and record the last error message."""
     try:
         async with AsyncSessionLocal() as db:
-            _sync_error_params = sanitize_sql_params(
-                {"brand_id": brand_id, "error": str(error)[:500], "now": ensure_utc(utc_now(), "now")},
-                statement="_record_sync_error",
-            )
-            _sync_error_params = normalize_uuid_fields(_sync_error_params)
-            _sync_error_params = normalize_datetime_fields(_sync_error_params)
-            _sync_error_params = apply_uuid_str_to_params(_sync_error_params)
-            # Final recursive sanitization — belt-and-suspenders guard
-            _sync_error_params = _recursive_sanitize_sql_params(_sync_error_params)
-            # Final guard: scan params for raw naive datetimes before execute
-            for _param_key, _param_val in _sync_error_params.items():
-                if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
-                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
-                    _sync_error_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _sync_error_params = _validate_and_fix_sql_params(_sync_error_params)
-            await db.execute(
-                text("""
+            params = {
+                "brand_id": brand_id,
+                "error": str(error)[:500],
+                "now": datetime.now(timezone.utc)
+            }
+            await safe_execute(
+                db,
+                """
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, last_error_at, updated_at)
                     VALUES (CAST(:brand_id AS UUID), :error, 1, :now, :now)
                     ON CONFLICT (brand_id) DO UPDATE SET
@@ -587,11 +767,11 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
                         consecutive_failures = sync_health.consecutive_failures + 1,
                         last_error_at = :now,
                         updated_at = :now
-                """),
-                _sync_error_params,
+                """,
+                params,
+                label="sync_health_record_error"
             )
             await db.commit()
-
     except Exception as exc:
         logger.error(
             "[SYNC_HEALTH_UPDATE_ERROR] brand_id=%s record_error error=%s",
@@ -605,32 +785,22 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
     """Record a retryable (transient) sync error in sync_health without incrementing consecutive_failures."""
     try:
         async with AsyncSessionLocal() as db:
-            _retryable_params = sanitize_sql_params(
-                {"brand_id": brand_id, "error": error_msg[:500], "now": ensure_utc(utc_now(), "now")},
-                statement="_record_retryable_error",
-            )
-            _retryable_params = normalize_uuid_fields(_retryable_params)
-            _retryable_params = normalize_datetime_fields(_retryable_params)
-            _retryable_params = apply_uuid_str_to_params(_retryable_params)
-
-            # Final recursive sanitization — belt-and-suspenders guard
-            _retryable_params = _recursive_sanitize_sql_params(_retryable_params)
-            # Final guard: scan params for raw naive datetimes before execute
-            for _param_key, _param_val in _retryable_params.items():
-                if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
-                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
-                    _retryable_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _retryable_params = _validate_and_fix_sql_params(_retryable_params)
-            await db.execute(
-                text("""
+            params = {
+                "brand_id": brand_id,
+                "error": error_msg[:500],
+                "now": datetime.now(timezone.utc)
+            }
+            await safe_execute(
+                db,
+                """
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
                     VALUES (CAST(:brand_id AS UUID), :error, 0, :now)
                     ON CONFLICT (brand_id) DO UPDATE SET
                         last_error = :error,
                         updated_at = :now
-                """),
-                _retryable_params,
+                """,
+                params,
+                label="sync_health_retryable_error"
             )
             await db.commit()
     except Exception as exc:
@@ -659,7 +829,7 @@ async def _dead_letter_line_item(
                 if raw_payload is not None
                 else None
             )
-            _dead_letter_params = sanitize_sql_params({
+            params = {
                 "brand_id": brand_id,
                 "external_order_id": external_order_id,
                 "order_id": order_id,
@@ -668,25 +838,11 @@ async def _dead_letter_line_item(
                 "raw_payload": raw_payload_str,
                 "reason": failure_reason[:500],
                 "count": failure_count,
-                "now": ensure_utc(utc_now(), "now"),
-            }, statement="_dead_letter_line_item")
-
-            _dead_letter_params = normalize_uuid_fields(_dead_letter_params)
-            _dead_letter_params = normalize_datetime_fields(_dead_letter_params)
-            _dead_letter_params = apply_uuid_str_to_params(_dead_letter_params)
-            # Final guard: scan params for raw naive datetimes before execute
-            for _param_key, _param_val in list(_dead_letter_params.items()):
-                if isinstance(_param_val, datetime):
-                    if _param_val.tzinfo is None:
-                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
-                        _dead_letter_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-                    else:
-                        _dead_letter_params[_param_key] = _param_val.astimezone(timezone.utc)
-            _dead_letter_params = _recursive_sanitize_sql_params(_dead_letter_params)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _dead_letter_params = _validate_and_fix_sql_params(_dead_letter_params)
-            await db.execute(
-                text("""
+                "now": datetime.now(timezone.utc),
+            }
+            await safe_execute(
+                db,
+                """
                     INSERT INTO dead_letter_line_items
                         (brand_id, external_order_id, order_id, sku, product_name,
                          raw_payload, failure_reason, failure_count, last_failed_at, created_at)
@@ -698,8 +854,9 @@ async def _dead_letter_line_item(
                         failure_reason = :reason,
                         last_failed_at = :now,
                         raw_payload = CAST(:raw_payload AS jsonb)
-                """),
-                _dead_letter_params,
+                """,
+                params,
+                label="dead_letter_line_item_write"
             )
             await db.commit()
         logger.warning(
@@ -789,9 +946,7 @@ async def _write_sync_dead_letter(
                 if raw_payload is not None
                 else json.dumps({})
             )
-            now = ensure_utc(utc_now(), "now")
-            # Build params dict and sanitize — centralized sanitizer handles all type coercions
-            params = sanitize_sql_params({
+            params = {
                 "source": source,
                 "brand_id": safe_uuid_for_db(brand_id, "brand_id") or brand_id,
                 "org_id": safe_uuid_for_db(org_id, "org_id"),
@@ -809,13 +964,8 @@ async def _write_sync_dead_letter(
                 "payload_keys": payload_keys_json,
                 "problematic_field": problematic_field,
                 "problematic_value_preview": (problematic_value_preview or "")[:100] if problematic_value_preview else None,
-                "now": now,
-            }, statement="_write_sync_dead_letter")
-            # FINAL coercion — apply safe_uuid_for_db() directly into the params
-            # dict immediately before execute() so no mutation after coercion can
-            # slip through.
-            params["org_id"] = safe_uuid_for_db(params.get("org_id"), "org_id")
-            params["brand_id"] = safe_uuid_for_db(params.get("brand_id"), "brand_id") or params.get("brand_id")
+                "now": datetime.now(timezone.utc),
+            }
             logger.debug(
                 "[DEAD_LETTER_FINAL_TYPES] org_id=%s org_type=%s brand_id=%s brand_type=%s",
                 params.get("org_id"),
@@ -823,24 +973,11 @@ async def _write_sync_dead_letter(
                 params.get("brand_id"),
                 type(params.get("brand_id")),
             )
-            params = normalize_uuid_fields(params)
-            params = normalize_datetime_fields(params)
-            params = apply_uuid_str_to_params(params)
-            # Final guard: scan params for raw naive datetimes before execute
-            for _param_key, _param_val in list(params.items()):
-                if isinstance(_param_val, datetime):
-                    if _param_val.tzinfo is None:
-                        logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
-                        params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-                    else:
-                        params[_param_key] = _param_val.astimezone(timezone.utc)
             # Try to write with new detail columns; fall back to legacy schema if columns don't exist yet
-            params = _recursive_sanitize_sql_params(params)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            params = _validate_and_fix_sql_params(params)
             try:
-                await db.execute(
-                    text("""
+                await safe_execute(
+                    db,
+                    """
                         INSERT INTO sync_dead_letters
                             (source, brand_id, org_id, external_id, order_number,
                              customer_name, raw_payload, error_stage, error_message,
@@ -854,8 +991,9 @@ async def _write_sync_dead_letter(
                              :failure_stage, :failure_category, :exception_type, :exception_message,
                              :traceback_summary, CAST(:payload_keys AS jsonb), :problematic_field,
                              :problematic_value_preview, 0, :now)
-                    """),
+                    """,
                     params,
+                    label="dead_letter_write"
                 )
             except Exception as _detail_exc:
                 # New columns may not exist yet (migration pending) — fall back to legacy insert
@@ -865,8 +1003,9 @@ async def _write_sync_dead_letter(
                         "[DEAD_LETTER_FALLBACK] new columns not yet migrated, using legacy schema: %s",
                         str(_detail_exc)[:200],
                     )
-                    await db.execute(
-                        text("""
+                    await safe_execute(
+                        db,
+                        """
                             INSERT INTO sync_dead_letters
                                 (source, brand_id, org_id, external_id, order_number,
                                  raw_payload, error_stage, error_message, retry_count, created_at)
@@ -875,8 +1014,9 @@ async def _write_sync_dead_letter(
                                  :external_id, :order_number,
                                  CAST(:raw_payload AS jsonb), :error_stage, :error_message,
                                  0, :now)
-                        """),
+                        """,
                         params,
+                        label="dead_letter_write_legacy"
                     )
                 else:
                     raise
@@ -2012,15 +2152,7 @@ async def _insert_line_items_standalone(
                 type(insert_params.get("updated_at")).__name__,
                 getattr(insert_params.get("updated_at"), "tzinfo", None) if isinstance(insert_params.get("updated_at"), datetime) else "N/A",
             )
-            # FINAL recursive sanitization — catches any datetime objects in nested structures
-            insert_params = _recursive_sanitize_sql_params(insert_params)
-            # Final defensive scan: log any remaining naive datetimes
-            for _sf, _sv in insert_params.items():
-                if isinstance(_sv, datetime) and _sv.tzinfo is None:
-                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            insert_params = _validate_and_fix_sql_params(insert_params)
-            await db.execute(text(line_insert_stmt), insert_params)
+            await safe_execute(db, line_insert_stmt, insert_params, label="line_item_upsert")
 
             inserted += 1
 
@@ -2580,15 +2712,7 @@ async def sync_leaflink_orders(
                         type(_li_params.get("updated_at")).__name__,
                         getattr(_li_params.get("updated_at"), "tzinfo", None) if isinstance(_li_params.get("updated_at"), datetime) else "N/A",
                     )
-                    # FINAL recursive sanitization — catches any datetime objects in nested structures
-                    _li_params = _recursive_sanitize_sql_params(_li_params)
-                    # Final defensive scan: log any remaining naive datetimes
-                    for _sf, _sv in _li_params.items():
-                        if isinstance(_sv, datetime) and _sv.tzinfo is None:
-                            logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
-                    # Pre-bind validator: final scan of the EXACT object being passed to execute()
-                    _li_params = _validate_and_fix_sql_params(_li_params)
-                    await db.execute(text(_li_insert_stmt), _li_params)
+                    await safe_execute(db, _li_insert_stmt, _li_params, label="line_item_upsert")
 
 
 
@@ -3333,7 +3457,7 @@ RETURNING (xmax = 0) AS was_inserted
                               {k: type(v).__name__ for k, v in safe_params.items()}
                           )
 
-                          upsert_result = await db.execute(text(upsert_stmt), safe_params)
+                          upsert_result = await safe_execute(db, upsert_stmt, safe_params, label="order_header_upsert")
 
                           row = upsert_result.fetchone()
                           was_inserted = row[0] if row else True
@@ -4232,16 +4356,7 @@ async def sync_leaflink_line_items(
                     type(insert_params.get("updated_at")).__name__,
                     getattr(insert_params.get("updated_at"), "tzinfo", None) if isinstance(insert_params.get("updated_at"), datetime) else "N/A",
                 )
-                # FINAL recursive sanitization — catches any datetime objects in nested structures
-                insert_params = _recursive_sanitize_sql_params(insert_params)
-                # Final defensive scan: log any remaining naive datetimes
-                for _sf, _sv in insert_params.items():
-                    if isinstance(_sv, datetime) and _sv.tzinfo is None:
-                        logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
-                # Pre-bind validator: final scan of the EXACT object being passed to execute()
-                insert_params = _validate_and_fix_sql_params(insert_params)
-
-                await db.execute(text(line_upsert_stmt), insert_params)
+                await safe_execute(db, line_upsert_stmt, insert_params, label="line_item_upsert")
                 inserted += 1
 
                 await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
@@ -4731,7 +4846,7 @@ async def upsert_sync_metrics_snapshot(
                 import json as _json_snap
                 _cat_json = None  # category breakdown not computed here (expensive)
 
-                _snap_params = _validate_and_fix_sql_params({
+                _snap_params = {
                     "brand_id": brand_id,
                     "sync_run_id": _run_id_str,
                     "total_local_orders": total_local,
@@ -4746,9 +4861,10 @@ async def upsert_sync_metrics_snapshot(
                     "estimated_completion": estimated_completion,
                     "last_successful_sync_at": last_successful_sync_at,
                     "updated_at": now,
-                })
-                await _snap_db.execute(
-                    _text_snap("""
+                }
+                await safe_execute(
+                    _snap_db,
+                    """
                         INSERT INTO sync_metrics_snapshots
                             (brand_id, sync_run_id,
                              total_local_orders, total_ok, total_partial, total_failed,
@@ -4776,8 +4892,9 @@ async def upsert_sync_metrics_snapshot(
                             last_successful_sync_at = COALESCE(EXCLUDED.last_successful_sync_at,
                                                                sync_metrics_snapshots.last_successful_sync_at),
                             updated_at              = EXCLUDED.updated_at
-                    """),
+                    """,
                     _snap_params,
+                    label="metrics_snapshot_upsert"
                 )
                 await _snap_db.commit()
 
@@ -5559,8 +5676,9 @@ async def sync_leaflink_background_continuous(
                         try:
                             async with AsyncSessionLocal() as _auth_db:
                                 async with _auth_db.begin():
-                                    await _auth_db.execute(
-                                        text("""
+                                    await safe_execute(
+                                        _auth_db,
+                                        """
                                             UPDATE brand_api_credentials
                                             SET sync_status = 'auth_failed',
                                                 last_error = :error,
@@ -5568,11 +5686,12 @@ async def sync_leaflink_background_continuous(
                                             WHERE brand_id = CAST(:brand_id AS uuid)
                                               AND integration_name = 'leaflink'
                                               AND is_active = true
-                                        """),
-                                        apply_uuid_str_to_params({
+                                        """,
+                                        {
                                             "brand_id": safe_uuid_for_db(brand_id, "brand_id") or brand_id,
                                             "error": _err_str[:500],
-                                        }),
+                                        },
+                                        label="auth_circuit_breaker_update"
                                     )
                         except Exception as _auth_cb_exc:
                             logger.error(
@@ -5809,15 +5928,16 @@ async def sync_leaflink_background_continuous(
                 try:
                     async with AsyncSessionLocal() as _state_db:
                         async with _state_db.begin():
-                            await _state_db.execute(
-                                text("""
+                            await safe_execute(
+                                _state_db,
+                                """
                                     UPDATE sync_runs
                                     SET last_next_url = :next_url,
                                         total_orders_available = COALESCE(:total_count, total_orders_available),
                                         current_page = :page,
                                         last_progress_at = :now
                                     WHERE id = :run_id
-                                """),
+                                """,
                                 {
                                     "next_url": next_cursor,
                                     "total_count": leaflink_total_count,
@@ -5825,6 +5945,7 @@ async def sync_leaflink_background_continuous(
                                     "now": datetime.now(timezone.utc),
                                     "run_id": sync_run_id,
                                 },
+                                label="sync_run_update"
                             )
                         await _state_db.commit()
                     logger.info(
@@ -6251,9 +6372,11 @@ async def sync_leaflink_background_continuous(
         # Persist timeout state
         try:
             async with AsyncSessionLocal() as _timeout_db:
-                await _timeout_db.execute(
-                    text("UPDATE sync_runs SET status='incomplete', last_error=:err WHERE id=:id"),
+                await safe_execute(
+                    _timeout_db,
+                    "UPDATE sync_runs SET status='incomplete', last_error=:err WHERE id=:id",
                     {"err": "timeout", "id": sync_run_id},
+                    label="sync_run_update"
                 )
                 await _timeout_db.commit()
         except Exception:
@@ -6275,9 +6398,11 @@ async def sync_leaflink_background_continuous(
         # Persist final state
         try:
             async with AsyncSessionLocal() as _exc_db:
-                await _exc_db.execute(
-                    text("UPDATE sync_runs SET status='failed', last_error=:err WHERE id=:id"),
+                await safe_execute(
+                    _exc_db,
+                    "UPDATE sync_runs SET status='failed', last_error=:err WHERE id=:id",
                     {"err": str(e)[:500], "id": sync_run_id},
+                    label="sync_run_update"
                 )
                 await _exc_db.commit()
         except Exception:
@@ -6307,9 +6432,11 @@ async def sync_leaflink_background_continuous(
         if sync_run_id:
             try:
                 async with AsyncSessionLocal() as _final_db:
-                    await _final_db.execute(
-                        text("UPDATE sync_runs SET last_progress_at = :now WHERE id = :id"),
+                    await safe_execute(
+                        _final_db,
+                        "UPDATE sync_runs SET last_progress_at = :now WHERE id = :id",
                         {"now": datetime.now(timezone.utc), "id": sync_run_id},
+                        label="sync_run_update"
                     )
                     await _final_db.commit()
             except Exception:
@@ -6332,3 +6459,11 @@ async def sync_leaflink_background_continuous(
         except asyncio.CancelledError:
             pass
         logger.info("[SYNC_SESSION_END] run_id=%s brand_id=%s", sync_run_id, brand_id)
+
+
+# Run assertion at module import time to prevent regressions
+try:
+    _assert_no_direct_db_execute()
+except AssertionError as e:
+    logger.critical("[MODULE_INIT_FAILED] %s", str(e))
+    raise
