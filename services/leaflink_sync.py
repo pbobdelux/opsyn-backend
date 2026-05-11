@@ -58,6 +58,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("leaflink_sync")
 
+# ---------------------------------------------------------------------------
+# Bounded concurrency for dead-letter writes (prevent pool exhaustion).
+# Limits concurrent dead-letter sessions to 2 at a time so that retry storms
+# cannot exhaust the SQLAlchemy pool (size 5, overflow 10).
+# ---------------------------------------------------------------------------
+_dead_letter_semaphore = asyncio.Semaphore(2)
+_dead_letter_batch_size = 50  # Batch up to 50 items per write
+
 
 def sanitize_json_payload(obj: Any, _depth: int = 0, _seen: set = None) -> Any:
     """Recursively sanitize an object for JSON serialization (with depth/size limits).
@@ -1406,61 +1414,202 @@ async def _dead_letter_line_item(
     failure_reason: str,
     failure_count: int,
 ) -> None:
-    """Insert or update a dead-letter record for a permanently failed line item."""
-    try:
-        async with AsyncSessionLocal() as db:
-            raw_payload_str = (
-                json.dumps(make_json_safe(raw_payload))
-                if raw_payload is not None
-                else None
-            )
-            params = {
-                "brand_id": brand_id,
-                "external_order_id": external_order_id,
-                "order_id": order_id,
-                "sku": sku or "unknown",
-                "product_name": product_name,
-                "raw_payload": raw_payload_str,
-                "reason": failure_reason[:500],
-                "count": failure_count,
-                "now": datetime.now(timezone.utc),
-            }
-            await safe_execute(
-                db,
-                """
-                    INSERT INTO dead_letter_line_items
-                        (brand_id, external_order_id, order_id, sku, product_name,
-                         raw_payload, failure_reason, failure_count, last_failed_at, created_at)
-                    VALUES
-                        (CAST(:brand_id AS UUID), :external_order_id, :order_id, :sku, :product_name,
-                         CAST(:raw_payload AS jsonb), :reason, :count, :now, :now)
-                    ON CONFLICT (brand_id, external_order_id, sku) DO UPDATE SET
-                        failure_count = dead_letter_line_items.failure_count + 1,
-                        failure_reason = :reason,
-                        last_failed_at = :now,
-                        raw_payload = CAST(:raw_payload AS jsonb)
-                """,
-                params,
-                label="dead_letter_line_item_write"
-            )
-            await db.commit()
-        logger.warning(
-            "[LINE_ITEM_DEAD_LETTERED] brand_id=%s external_order_id=%s sku=%s failure_count=%s",
-            brand_id,
-            external_order_id,
-            sku,
-            failure_count,
-        )
-    except Exception as exc:
-        logger.error(
-            "[DEAD_LETTER_ERROR] brand_id=%s external_order_id=%s sku=%s error=%s",
-            brand_id,
-            external_order_id,
-            sku,
-            str(exc)[:300],
-        )
+    """Insert or update a dead-letter record for a permanently failed line item.
+
+    Uses _dead_letter_semaphore to bound concurrent sessions to 2 at a time.
+    Retries at most once on failure; logs [DEAD_LETTER_WRITE_FAILED_FINAL] if
+    both attempts fail so the error is visible without cascading.
+    """
+    async with _dead_letter_semaphore:
+        for _attempt in range(2):  # max 1 retry
+            try:
+                logger.debug(
+                    "[DEAD_LETTER_SESSION_OPEN] brand_id=%s external_order_id=%s sku=%s attempt=%s",
+                    brand_id, external_order_id, sku, _attempt,
+                )
+                async with AsyncSessionLocal() as db:
+                    try:
+                        _log_pool_status(db, label="dead_letter_line_item_start")
+                        raw_payload_str = (
+                            json.dumps(make_json_safe(raw_payload))
+                            if raw_payload is not None
+                            else None
+                        )
+                        params = {
+                            "brand_id": brand_id,
+                            "external_order_id": external_order_id,
+                            "order_id": order_id,
+                            "sku": sku or "unknown",
+                            "product_name": product_name,
+                            "raw_payload": raw_payload_str,
+                            "reason": failure_reason[:500],
+                            "count": failure_count,
+                            "now": datetime.now(timezone.utc),
+                        }
+                        await safe_execute(
+                            db,
+                            """
+                                INSERT INTO dead_letter_line_items
+                                    (brand_id, external_order_id, order_id, sku, product_name,
+                                     raw_payload, failure_reason, failure_count, last_failed_at, created_at)
+                                VALUES
+                                    (CAST(:brand_id AS UUID), :external_order_id, :order_id, :sku, :product_name,
+                                     CAST(:raw_payload AS jsonb), :reason, :count, :now, :now)
+                                ON CONFLICT (brand_id, external_order_id, sku) DO UPDATE SET
+                                    failure_count = dead_letter_line_items.failure_count + 1,
+                                    failure_reason = :reason,
+                                    last_failed_at = :now,
+                                    raw_payload = CAST(:raw_payload AS jsonb)
+                            """,
+                            params,
+                            label="dead_letter_line_item_write"
+                        )
+                        await db.commit()
+                        _log_pool_status(db, label="dead_letter_line_item_end")
+                    finally:
+                        logger.debug(
+                            "[DEAD_LETTER_SESSION_CLOSE] brand_id=%s external_order_id=%s sku=%s attempt=%s",
+                            brand_id, external_order_id, sku, _attempt,
+                        )
+                logger.warning(
+                    "[LINE_ITEM_DEAD_LETTERED] brand_id=%s external_order_id=%s sku=%s failure_count=%s",
+                    brand_id,
+                    external_order_id,
+                    sku,
+                    failure_count,
+                )
+                return  # success — exit retry loop
+            except Exception as exc:
+                _exc_str = str(exc)[:300]
+                if _attempt == 0:
+                    _sleep_secs = 1
+                    logger.warning(
+                        "[DEAD_LETTER_RETRY_BACKOFF] brand_id=%s external_order_id=%s sku=%s"
+                        " attempt=%s sleep=%ss error=%s",
+                        brand_id, external_order_id, sku, _attempt, _sleep_secs, _exc_str,
+                    )
+                    await log_pool_status("dead_letter_line_item_retry_backoff")
+                    await asyncio.sleep(_sleep_secs)
+                else:
+                    logger.error(
+                        "[DEAD_LETTER_WRITE_FAILED_FINAL] brand_id=%s external_order_id=%s"
+                        " sku=%s error=%s",
+                        brand_id, external_order_id, sku, _exc_str,
+                    )
+                    await log_pool_status("dead_letter_line_item_failed_final")
 
 
+async def _write_dead_letter_batch(
+    items: list,
+    brand_id: str,
+    external_order_id: str,
+    order_id: Optional[int],
+    failure_count: int,
+    label: str = "dead_letter_batch",
+) -> None:
+    """Write a batch of dead-letter line items in a single transaction.
+
+    Collects all (item, fail_reason) tuples and writes them in one session,
+    reducing session count from N (per item) to 1 (per batch).  Protected by
+    _dead_letter_semaphore to prevent concurrent session storms.
+
+    Args:
+        items:              List of (item_dict, fail_reason_str) tuples.
+        brand_id:           Brand UUID string.
+        external_order_id:  LeafLink order ID.
+        order_id:           Internal DB order PK (may be None).
+        failure_count:      Failure count to record for each item.
+        label:              Descriptive label for logging.
+
+    Logs:
+        [DEAD_LETTER_SESSION_OPEN]  when session opens
+        [DB_POOL_STATUS]            before/after write
+        [DEAD_LETTER_QUEUE]         with batch size and status
+        [DEAD_LETTER_SESSION_CLOSE] when session closes
+        [DEAD_LETTER_WRITE_FAILED_FINAL] if both attempts fail
+    """
+    if not items:
+        return
+
+    async with _dead_letter_semaphore:
+        for _attempt in range(2):  # max 1 retry
+            try:
+                logger.debug(
+                    "[DEAD_LETTER_SESSION_OPEN] label=%s brand_id=%s external_order_id=%s"
+                    " batch_size=%s attempt=%s",
+                    label, brand_id, external_order_id, len(items), _attempt,
+                )
+                async with AsyncSessionLocal() as db:
+                    try:
+                        _log_pool_status(db, label=f"{label}_start")
+                        _now = datetime.now(timezone.utc)
+                        for failed_item, fail_reason in items:
+                            raw_payload_str = (
+                                json.dumps(make_json_safe(failed_item.get("raw_payload")))
+                                if failed_item.get("raw_payload") is not None
+                                else None
+                            )
+                            params = {
+                                "brand_id": brand_id,
+                                "external_order_id": external_order_id,
+                                "order_id": order_id,
+                                "sku": failed_item.get("sku") or "unknown",
+                                "product_name": failed_item.get("product_name"),
+                                "raw_payload": raw_payload_str,
+                                "reason": fail_reason[:500],
+                                "count": failure_count,
+                                "now": _now,
+                            }
+                            await safe_execute(
+                                db,
+                                """
+                                    INSERT INTO dead_letter_line_items
+                                        (brand_id, external_order_id, order_id, sku, product_name,
+                                         raw_payload, failure_reason, failure_count, last_failed_at, created_at)
+                                    VALUES
+                                        (CAST(:brand_id AS UUID), :external_order_id, :order_id, :sku, :product_name,
+                                         CAST(:raw_payload AS jsonb), :reason, :count, :now, :now)
+                                    ON CONFLICT (brand_id, external_order_id, sku) DO UPDATE SET
+                                        failure_count = dead_letter_line_items.failure_count + 1,
+                                        failure_reason = :reason,
+                                        last_failed_at = :now,
+                                        raw_payload = CAST(:raw_payload AS jsonb)
+                                """,
+                                params,
+                                label="dead_letter_batch_item_write",
+                            )
+                        await db.commit()
+                        _log_pool_status(db, label=f"{label}_end")
+                    finally:
+                        logger.debug(
+                            "[DEAD_LETTER_SESSION_CLOSE] label=%s brand_id=%s external_order_id=%s"
+                            " batch_size=%s attempt=%s",
+                            label, brand_id, external_order_id, len(items), _attempt,
+                        )
+                logger.warning(
+                    "[DEAD_LETTER_QUEUE] label=%s brand_id=%s external_order_id=%s"
+                    " batch_size=%s status=committed",
+                    label, brand_id, external_order_id, len(items),
+                )
+                return  # success — exit retry loop
+            except Exception as exc:
+                _exc_str = str(exc)[:300]
+                if _attempt == 0:
+                    _sleep_secs = 1
+                    logger.warning(
+                        "[DEAD_LETTER_RETRY_BACKOFF] label=%s brand_id=%s external_order_id=%s"
+                        " attempt=%s sleep=%ss error=%s",
+                        label, brand_id, external_order_id, _attempt, _sleep_secs, _exc_str,
+                    )
+                    await log_pool_status(f"{label}_retry_backoff")
+                    await asyncio.sleep(_sleep_secs)
+                else:
+                    logger.error(
+                        "[DEAD_LETTER_WRITE_FAILED_FINAL] label=%s brand_id=%s"
+                        " external_order_id=%s batch_size=%s error=%s",
+                        label, brand_id, external_order_id, len(items), _exc_str,
+                    )
+                    await log_pool_status(f"{label}_failed_final")
 
 
 async def _write_sync_dead_letter(
@@ -1524,107 +1673,132 @@ async def _write_sync_dead_letter(
     # Use failure_stage as error_stage if not separately provided (backward compat)
     effective_error_stage = failure_stage or error_stage
 
-    try:
-        async with AsyncSessionLocal() as db:
-            raw_payload_str = (
-                json.dumps(make_json_safe(raw_payload))
-                if raw_payload is not None
-                else json.dumps({})
-            )
-            params = {
-                "source": source,
-                "brand_id": safe_uuid_for_db(brand_id, "brand_id") or brand_id,
-                "org_id": safe_uuid_for_db(org_id, "org_id"),
-                "external_id": external_id,
-                "order_number": order_number,
-                "customer_name": customer_name,
-                "raw_payload": raw_payload_str,
-                "error_stage": effective_error_stage,
-                "error_message": error_message[:2000],
-                "failure_stage": failure_stage,
-                "failure_category": failure_category,
-                "exception_type": exception_type,
-                "exception_message": (exception_message or "")[:1000] if exception_message else None,
-                "traceback_summary": (traceback_summary or "")[:500] if traceback_summary else None,
-                "payload_keys": payload_keys_json,
-                "problematic_field": problematic_field,
-                "problematic_value_preview": (problematic_value_preview or "")[:100] if problematic_value_preview else None,
-                "now": datetime.now(timezone.utc),
-            }
-            logger.debug(
-                "[DEAD_LETTER_FINAL_TYPES] org_id=%s org_type=%s brand_id=%s brand_type=%s",
-                params.get("org_id"),
-                type(params.get("org_id")),
-                params.get("brand_id"),
-                type(params.get("brand_id")),
-            )
-            # Try to write with new detail columns; fall back to legacy schema if columns don't exist yet
+    async with _dead_letter_semaphore:
+        for _attempt in range(2):  # max 1 retry
             try:
-                await safe_execute(
-                    db,
-                    """
-                        INSERT INTO sync_dead_letters
-                            (source, brand_id, org_id, external_id, order_number,
-                             customer_name, raw_payload, error_stage, error_message,
-                             failure_stage, failure_category, exception_type, exception_message,
-                             traceback_summary, payload_keys, problematic_field,
-                             problematic_value_preview, retry_count, created_at)
-                        VALUES
-                            (:source, CAST(:brand_id AS uuid), CAST(:org_id AS uuid),
-                             :external_id, :order_number,
-                             :customer_name, CAST(:raw_payload AS jsonb), :error_stage, :error_message,
-                             :failure_stage, :failure_category, :exception_type, :exception_message,
-                             :traceback_summary, CAST(:payload_keys AS jsonb), :problematic_field,
-                             :problematic_value_preview, 0, :now)
-                    """,
-                    params,
-                    label="dead_letter_write"
+                logger.debug(
+                    "[DEAD_LETTER_SESSION_OPEN] brand_id=%s external_id=%s error_stage=%s attempt=%s",
+                    brand_id, external_id, error_stage, _attempt,
                 )
-            except Exception as _detail_exc:
-                # New columns may not exist yet (migration pending) — fall back to legacy insert
-                _detail_err = str(_detail_exc).lower()
-                if "column" in _detail_err and ("does not exist" in _detail_err or "unknown" in _detail_err):
+                async with AsyncSessionLocal() as db:
+                    try:
+                        _log_pool_status(db, label="dead_letter_write_start")
+                        raw_payload_str = (
+                            json.dumps(make_json_safe(raw_payload))
+                            if raw_payload is not None
+                            else json.dumps({})
+                        )
+                        params = {
+                            "source": source,
+                            "brand_id": safe_uuid_for_db(brand_id, "brand_id") or brand_id,
+                            "org_id": safe_uuid_for_db(org_id, "org_id"),
+                            "external_id": external_id,
+                            "order_number": order_number,
+                            "customer_name": customer_name,
+                            "raw_payload": raw_payload_str,
+                            "error_stage": effective_error_stage,
+                            "error_message": error_message[:2000],
+                            "failure_stage": failure_stage,
+                            "failure_category": failure_category,
+                            "exception_type": exception_type,
+                            "exception_message": (exception_message or "")[:1000] if exception_message else None,
+                            "traceback_summary": (traceback_summary or "")[:500] if traceback_summary else None,
+                            "payload_keys": payload_keys_json,
+                            "problematic_field": problematic_field,
+                            "problematic_value_preview": (problematic_value_preview or "")[:100] if problematic_value_preview else None,
+                            "now": datetime.now(timezone.utc),
+                        }
+                        logger.debug(
+                            "[DEAD_LETTER_FINAL_TYPES] org_id=%s org_type=%s brand_id=%s brand_type=%s",
+                            params.get("org_id"),
+                            type(params.get("org_id")),
+                            params.get("brand_id"),
+                            type(params.get("brand_id")),
+                        )
+                        # Try to write with new detail columns; fall back to legacy schema if columns don't exist yet
+                        try:
+                            await safe_execute(
+                                db,
+                                """
+                                    INSERT INTO sync_dead_letters
+                                        (source, brand_id, org_id, external_id, order_number,
+                                         customer_name, raw_payload, error_stage, error_message,
+                                         failure_stage, failure_category, exception_type, exception_message,
+                                         traceback_summary, payload_keys, problematic_field,
+                                         problematic_value_preview, retry_count, created_at)
+                                    VALUES
+                                        (:source, CAST(:brand_id AS uuid), CAST(:org_id AS uuid),
+                                         :external_id, :order_number,
+                                         :customer_name, CAST(:raw_payload AS jsonb), :error_stage, :error_message,
+                                         :failure_stage, :failure_category, :exception_type, :exception_message,
+                                         :traceback_summary, CAST(:payload_keys AS jsonb), :problematic_field,
+                                         :problematic_value_preview, 0, :now)
+                                """,
+                                params,
+                                label="dead_letter_write"
+                            )
+                        except Exception as _detail_exc:
+                            # New columns may not exist yet (migration pending) — fall back to legacy insert
+                            _detail_err = str(_detail_exc).lower()
+                            if "column" in _detail_err and ("does not exist" in _detail_err or "unknown" in _detail_err):
+                                logger.warning(
+                                    "[DEAD_LETTER_FALLBACK] new columns not yet migrated, using legacy schema: %s",
+                                    str(_detail_exc)[:200],
+                                )
+                                await safe_execute(
+                                    db,
+                                    """
+                                        INSERT INTO sync_dead_letters
+                                            (source, brand_id, org_id, external_id, order_number,
+                                             raw_payload, error_stage, error_message, retry_count, created_at)
+                                        VALUES
+                                            (:source, CAST(:brand_id AS uuid), CAST(:org_id AS uuid),
+                                             :external_id, :order_number,
+                                             CAST(:raw_payload AS jsonb), :error_stage, :error_message,
+                                             0, :now)
+                                    """,
+                                    params,
+                                    label="dead_letter_write_legacy"
+                                )
+                            else:
+                                raise
+                        await db.commit()
+                        _log_pool_status(db, label="dead_letter_write_end")
+                    finally:
+                        logger.debug(
+                            "[DEAD_LETTER_SESSION_CLOSE] brand_id=%s external_id=%s error_stage=%s attempt=%s",
+                            brand_id, external_id, error_stage, _attempt,
+                        )
+                logger.warning(
+                    "[SYNC_DEAD_LETTER_WRITTEN] external_id=%s order_number=%s customer=%s "
+                    "failure_stage=%s failure_category=%s error_stage=%s brand_id=%s",
+                    external_id,
+                    order_number,
+                    customer_name or "unknown",
+                    failure_stage or error_stage,
+                    failure_category or "unclassified",
+                    error_stage,
+                    brand_id,
+                )
+                return  # success — exit retry loop
+            except Exception as exc:
+                _exc_str = str(exc)[:300]
+                if _attempt == 0:
+                    _sleep_secs = 1
                     logger.warning(
-                        "[DEAD_LETTER_FALLBACK] new columns not yet migrated, using legacy schema: %s",
-                        str(_detail_exc)[:200],
+                        "[DEAD_LETTER_RETRY_BACKOFF] brand_id=%s external_id=%s error_stage=%s"
+                        " attempt=%s sleep=%ss error=%s",
+                        brand_id, external_id, error_stage, _attempt, _sleep_secs, _exc_str,
                     )
-                    await safe_execute(
-                        db,
-                        """
-                            INSERT INTO sync_dead_letters
-                                (source, brand_id, org_id, external_id, order_number,
-                                 raw_payload, error_stage, error_message, retry_count, created_at)
-                            VALUES
-                                (:source, CAST(:brand_id AS uuid), CAST(:org_id AS uuid),
-                                 :external_id, :order_number,
-                                 CAST(:raw_payload AS jsonb), :error_stage, :error_message,
-                                 0, :now)
-                        """,
-                        params,
-                        label="dead_letter_write_legacy"
-                    )
+                    await log_pool_status("dead_letter_write_retry_backoff")
+                    await asyncio.sleep(_sleep_secs)
                 else:
-                    raise
-            await db.commit()
-        logger.warning(
-            "[SYNC_DEAD_LETTER_WRITTEN] external_id=%s order_number=%s customer=%s "
-            "failure_stage=%s failure_category=%s error_stage=%s brand_id=%s",
-            external_id,
-            order_number,
-            customer_name or "unknown",
-            failure_stage or error_stage,
-            failure_category or "unclassified",
-            error_stage,
-            brand_id,
-        )
-    except Exception as exc:
-        logger.error(
-            "[SYNC_DEAD_LETTER_WRITE_ERROR] brand_id=%s external_id=%s error_stage=%s write_error=%s",
-            brand_id,
-            external_id,
-            error_stage,
-            str(exc)[:300],
-        )
+                    logger.error(
+                        "[DEAD_LETTER_WRITE_FAILED_FINAL] brand_id=%s external_id=%s"
+                        " error_stage=%s error=%s",
+                        brand_id, external_id, error_stage, _exc_str,
+                    )
+                    await log_pool_status("dead_letter_write_failed_final")
 
 
 def utc_now() -> datetime:
@@ -4112,21 +4286,19 @@ RETURNING (xmax = 0) AS was_inserted
                                 _err_reason[:200],
                                 brand_id_value,
                             )
-                            asyncio.create_task(
-                                _write_sync_dead_letter(
-                                    brand_id=brand_id_value,
-                                    raw_payload=_raw_payload_ref,
-                                    error_stage="header_insert",
-                                    error_message=_err_reason,
-                                    org_id=org_id_value,
-                                    external_id=_order_ext_id_for_log if _order_ext_id_for_log != "unknown" else None,
-                                    order_number=_order_number_for_log,
-                                    customer_name=_dl_customer,
-                                    failure_stage="header_insert",
-                                    failure_category="duplicate_external_id",
-                                    exception_type=type(_order_exc).__name__,
-                                    exception_message=_err_reason,
-                                )
+                            await _write_sync_dead_letter(
+                                brand_id=brand_id_value,
+                                raw_payload=_raw_payload_ref,
+                                error_stage="header_insert",
+                                error_message=_err_reason,
+                                org_id=org_id_value,
+                                external_id=_order_ext_id_for_log if _order_ext_id_for_log != "unknown" else None,
+                                order_number=_order_number_for_log,
+                                customer_name=_dl_customer,
+                                failure_stage="header_insert",
+                                failure_category="duplicate_external_id",
+                                exception_type=type(_order_exc).__name__,
+                                exception_message=_err_reason,
                             )
                             if len(errors) < 10:
                                 errors.append(
@@ -4205,23 +4377,21 @@ RETURNING (xmax = 0) AS was_inserted
                                 _err_reason[:200],
                                 brand_id_value,
                             )
-                            # Write to dead-letter asynchronously (own session, non-blocking)
-                            asyncio.create_task(
-                                _write_sync_dead_letter(
-                                    brand_id=brand_id_value,
-                                    raw_payload=_raw_payload_ref,
-                                    error_stage="header_insert",
-                                    error_message=_err_reason,
-                                    org_id=org_id_value,
-                                    external_id=_order_ext_id_for_log if _order_ext_id_for_log != "unknown" else None,
-                                    order_number=_order_number_for_log,
-                                    customer_name=_dl_customer,
-                                    failure_stage="header_insert",
-                                    failure_category=_batch_category,
-                                    exception_type=_batch_exc_type,
-                                    exception_message=_err_reason,
-                                    traceback_summary=_batch_tb,
-                                )
+                            # Write to dead-letter directly (semaphore-bounded, max 1 retry)
+                            await _write_sync_dead_letter(
+                                brand_id=brand_id_value,
+                                raw_payload=_raw_payload_ref,
+                                error_stage="header_insert",
+                                error_message=_err_reason,
+                                org_id=org_id_value,
+                                external_id=_order_ext_id_for_log if _order_ext_id_for_log != "unknown" else None,
+                                order_number=_order_number_for_log,
+                                customer_name=_dl_customer,
+                                failure_stage="header_insert",
+                                failure_category=_batch_category,
+                                exception_type=_batch_exc_type,
+                                exception_message=_err_reason,
+                                traceback_summary=_batch_tb,
                             )
                             batch_dead_letter += 1
                             dead_letter_written += 1
@@ -5140,19 +5310,15 @@ async def sync_leaflink_line_items(
                                 total_failed += len(failed_items)
                                 total_orders += 1
 
-                                # Dead-letter permanently failed items (own session, non-blocking)
-                                for failed_item, fail_reason in failed_items:
-                                    asyncio.create_task(
-                                        _dead_letter_line_item(
-                                            brand_id=brand_id_value,
-                                            external_order_id=leaflink_order_id,
-                                            order_id=order_id_val,
-                                            sku=failed_item.get("sku"),
-                                            product_name=failed_item.get("product_name"),
-                                            raw_payload=failed_item.get("raw_payload"),
-                                            failure_reason=fail_reason,
-                                            failure_count=1,
-                                        )
+                                # Dead-letter permanently failed items — batched write (semaphore-bounded)
+                                if failed_items:
+                                    await _write_dead_letter_batch(
+                                        items=failed_items,
+                                        brand_id=brand_id_value,
+                                        external_order_id=leaflink_order_id,
+                                        order_id=order_id_val,
+                                        failure_count=1,
+                                        label="phase2_dead_letter",
                                     )
 
                             except Exception as order_exc:
@@ -5252,18 +5418,18 @@ async def sync_leaflink_line_items(
                                     # Dead-letter all items for this order since parent was never found
                                     raw_line_items = o.get("line_items", [])
                                     normalized_line_items = normalize_line_items(raw_line_items)
-                                    for item in normalized_line_items:
-                                        asyncio.create_task(
-                                            _dead_letter_line_item(
-                                                brand_id=brand_id_value,
-                                                external_order_id=leaflink_order_id,
-                                                order_id=None,
-                                                sku=item.get("sku"),
-                                                product_name=item.get("product_name"),
-                                                raw_payload=item.get("raw_payload"),
-                                                failure_reason="Parent order not found after retry",
-                                                failure_count=MAX_LINE_ITEM_RETRIES,
-                                            )
+                                    if normalized_line_items:
+                                        _giveup_items = [
+                                            (item, "Parent order not found after retry")
+                                            for item in normalized_line_items
+                                        ]
+                                        await _write_dead_letter_batch(
+                                            items=_giveup_items,
+                                            brand_id=brand_id_value,
+                                            external_order_id=leaflink_order_id,
+                                            order_id=None,
+                                            failure_count=MAX_LINE_ITEM_RETRIES,
+                                            label="retry_giveup_dead_letter",
                                         )
                                     continue
 
@@ -5321,19 +5487,15 @@ async def sync_leaflink_line_items(
                                 total_retried += 1
                                 total_orders += 1
 
-                                # Dead-letter items that still failed after retry
-                                for failed_item, fail_reason in failed_items:
-                                    asyncio.create_task(
-                                        _dead_letter_line_item(
-                                            brand_id=brand_id_value,
-                                            external_order_id=leaflink_order_id,
-                                            order_id=order_id_val,
-                                            sku=failed_item.get("sku"),
-                                            product_name=failed_item.get("product_name"),
-                                            raw_payload=failed_item.get("raw_payload"),
-                                            failure_reason=fail_reason,
-                                            failure_count=MAX_LINE_ITEM_RETRIES,
-                                        )
+                                # Dead-letter items that still failed after retry — batched write
+                                if failed_items:
+                                    await _write_dead_letter_batch(
+                                        items=failed_items,
+                                        brand_id=brand_id_value,
+                                        external_order_id=leaflink_order_id,
+                                        order_id=order_id_val,
+                                        failure_count=MAX_LINE_ITEM_RETRIES,
+                                        label="retry_dead_letter",
                                     )
 
                             except Exception as retry_exc:
