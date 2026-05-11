@@ -570,6 +570,253 @@ def _assert_no_naive_datetimes(obj: Any, label: str = "unknown", path: str = "ro
             _assert_no_naive_datetimes(v, label, f"{path}[{i}]")
 
 
+def _recursive_json_safe_convert(obj: Any, path: str = "root", _seen: Optional[set] = None) -> Any:
+    """Recursively convert all non-JSON-primitive objects to JSON-safe primitives.
+
+    Converts:
+    - datetime → ISO UTC string (ensures UTC-aware first)
+    - date → ISO date string
+    - Decimal → float
+    - UUID → string
+    - set/tuple → list
+    - dict/list → recurse
+
+    Args:
+        obj: Object to convert
+        path: Current path in nested structure (for logging)
+        _seen: Set of visited object ids (circular reference protection)
+
+    Returns:
+        JSON-safe version of obj
+    """
+    MAX_DEPTH = 20
+    MAX_CONTAINER_SIZE = 10000
+
+    if _seen is None:
+        _seen = set()
+
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return "[circular_reference]"
+
+    if obj is None:
+        return None
+
+    # datetime → ISO UTC string
+    if isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            fixed = obj.replace(tzinfo=timezone.utc)
+            logger.info(
+                "[JSON_DATETIME_FOUND] path=%s original_type=datetime value=%s tzinfo=None fixed=%s",
+                path, obj.isoformat(), fixed.isoformat()
+            )
+            return fixed.isoformat()
+        else:
+            utc_dt = obj.astimezone(timezone.utc)
+            logger.info(
+                "[JSON_DATETIME_FOUND] path=%s original_type=datetime value=%s tzinfo=%s converted=%s",
+                path, obj.isoformat(), obj.tzinfo, utc_dt.isoformat()
+            )
+            return utc_dt.isoformat()
+
+    # date → ISO date string
+    if isinstance(obj, date) and not isinstance(obj, datetime):
+        iso_str = obj.isoformat()
+        logger.info(
+            "[JSON_DATETIME_FOUND] path=%s original_type=date value=%s converted=%s",
+            path, obj.isoformat(), iso_str
+        )
+        return iso_str
+
+    # Decimal → float
+    if isinstance(obj, Decimal):
+        return float(obj)
+
+    # UUID → str
+    if isinstance(obj, UUID):
+        return str(obj)
+
+    # Primitives pass through
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # dict → recurse
+    if isinstance(obj, dict):
+        if len(obj) > MAX_CONTAINER_SIZE:
+            logger.warning("[JSON_PAYLOAD_DICT_TOO_LARGE] path=%s size=%d", path, len(obj))
+            return f"[dict_too_large: {len(obj)} items]"
+        _seen.add(obj_id)
+        result = {
+            k: _recursive_json_safe_convert(v, f"{path}.{k}", _seen)
+            for k, v in obj.items()
+        }
+        _seen.discard(obj_id)
+        return result
+
+    # list → recurse
+    if isinstance(obj, list):
+        if len(obj) > MAX_CONTAINER_SIZE:
+            logger.warning("[JSON_PAYLOAD_LIST_TOO_LARGE] path=%s size=%d", path, len(obj))
+            return f"[list_too_large: {len(obj)} items]"
+        _seen.add(obj_id)
+        result = [
+            _recursive_json_safe_convert(item, f"{path}[{i}]", _seen)
+            for i, item in enumerate(obj)
+        ]
+        _seen.discard(obj_id)
+        return result
+
+    # tuple → list
+    if isinstance(obj, tuple):
+        if len(obj) > MAX_CONTAINER_SIZE:
+            return f"[tuple_too_large: {len(obj)} items]"
+        _seen.add(obj_id)
+        result = [
+            _recursive_json_safe_convert(item, f"{path}[{i}]", _seen)
+            for i, item in enumerate(obj)
+        ]
+        _seen.discard(obj_id)
+        return result
+
+    # set → list
+    if isinstance(obj, set):
+        if len(obj) > MAX_CONTAINER_SIZE:
+            return f"[set_too_large: {len(obj)} items]"
+        _seen.add(obj_id)
+        result = [
+            _recursive_json_safe_convert(item, f"{path}[{i}]", _seen)
+            for i, item in enumerate(obj)
+        ]
+        _seen.discard(obj_id)
+        return result
+
+    # Fallback: convert to string
+    return str(obj)[:1000]
+
+
+def _ensure_json_safe_params(params: dict, label: str) -> dict:
+    """Convert all JSONB-like params to pure JSON-safe primitives.
+
+    Unconditionally sanitizes all known JSONB fields and any field matching
+    JSONB-like naming patterns. Unlike _sanitize_json_fields_in_params() which
+    only sanitizes when datetimes are detected, this function ALWAYS converts
+    every JSONB field to guarantee no Python objects slip through to asyncpg.
+
+    Recursively converts:
+    - datetime/date → ISO UTC string
+    - Decimal → float
+    - UUID → string
+    - set/tuple → list
+    - dict/list → recurse
+
+    Logs [JSON_FIELD_CONVERTED] for each field processed.
+    Returns fully JSON-safe params dict (deep-copied, never mutates original).
+    """
+    safe_params = deepcopy(params or {})
+
+    JSON_FIELD_PATTERNS = {
+        'raw_payload', 'line_items_json', 'review_status',
+        'sync_health_status', 'sync_health_missing_fields',
+        'payload_keys', 'category_breakdown',
+    }
+
+    for key, value in safe_params.items():
+        is_json_field = (
+            key in JSON_FIELD_PATTERNS or
+            key.endswith('_json') or key.endswith('_payload') or
+            key.endswith('_status') or key.endswith('_fields')
+        )
+
+        if is_json_field and value is not None:
+            type_before = type(value).__name__
+            converted = _recursive_json_safe_convert(value, path=f"params.{key}")
+            safe_params[key] = converted
+            logger.info(
+                "[JSON_FIELD_CONVERTED] label=%s field=%s type_before=%s type_after=%s",
+                label, key, type_before, type(converted).__name__
+            )
+
+    return safe_params
+
+
+def assert_no_datetime_anywhere(obj: Any, label: str = "unknown", path: str = "root") -> None:
+    """Fail fast if ANY datetime/date object is found anywhere in params.
+
+    Recursively scans all nested dicts/lists/tuples.
+    Raises AssertionError with exact path and SQL label if datetime found.
+    This is the hard boundary guard — called immediately before db.execute().
+
+    Args:
+        obj: Object to scan (params dict or any nested value)
+        label: SQL statement label for error messages
+        path: Current path in nested structure (for error messages)
+
+    Raises:
+        AssertionError if any datetime or date object is found
+    """
+    if isinstance(obj, (datetime, date)):
+        error_msg = (
+            f"[DATETIME_FOUND_IN_PARAMS] label={label} path={path} "
+            f"type={type(obj).__name__} value={repr(obj)}"
+        )
+        logger.error(error_msg)
+        raise AssertionError(
+            f"Python {type(obj).__name__} object found in params at '{path}' "
+            f"for SQL label '{label}'. All datetime objects must be converted to ISO strings "
+            f"before database binding."
+        )
+
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            assert_no_datetime_anywhere(v, label, f"{path}.{k}")
+    elif isinstance(obj, (list, tuple)):
+        for i, item in enumerate(obj):
+            assert_no_datetime_anywhere(item, label, f"{path}[{i}]")
+
+
+def _log_sql_bind_mapping(sql_text: str, params: dict, label: str) -> None:
+    """Log SQL bind parameter mapping ($1 → key, $2 → key, etc.).
+
+    Parses all $N placeholders from the SQL statement and maps each to the
+    corresponding param key (by position in the ordered dict). Helps debug
+    asyncpg binding errors like 'query argument $18' by showing exactly which
+    param key corresponds to which positional placeholder.
+
+    Example log output:
+        [SQL_BIND_MAPPING] label=order_header_upsert $18=raw_payload $19=line_items_json
+
+    Args:
+        sql_text: The SQL statement string
+        params: Dict of bind parameters (ordered)
+        label: Statement label for logging
+    """
+    import re
+
+    # Find all $N placeholders in SQL
+    placeholders = sorted(set(re.findall(r'\$(\d+)', sql_text)), key=int)
+
+    if not placeholders:
+        return
+
+    # Map $N to param keys (SQLAlchemy binds in order of dict keys)
+    param_keys = list(params.keys())
+    mapping = {}
+    for placeholder in placeholders:
+        idx = int(placeholder) - 1
+        if idx < len(param_keys):
+            mapping[f"${placeholder}"] = param_keys[idx]
+
+    if mapping:
+        mapping_str = " ".join(f"{k}={v}" for k, v in mapping.items())
+        logger.info(
+            "[SQL_BIND_MAPPING] label=%s param_count=%d mapping=%s",
+            label, len(params), mapping_str
+        )
+
+
 async def safe_execute(
     db: AsyncSession,
     sql_text: str,
@@ -649,6 +896,24 @@ async def safe_execute(
 
     logger.debug(
         "[SAFE_EXECUTE_PARAMS_READY] label=%s param_keys=%s",
+        label,
+        list(safe_params.keys())
+    )
+
+    # Hard boundary: unconditionally convert ALL JSONB fields to pure JSON-safe primitives.
+    # This catches any datetime/date/Decimal/UUID objects that slipped through the earlier
+    # sanitization steps (e.g. fields not detected by _count_datetime_objects).
+    safe_params = _ensure_json_safe_params(safe_params, label)
+
+    # Log SQL bind mapping ($N → param key) for debugging asyncpg binding errors
+    _log_sql_bind_mapping(sql_text, safe_params, label)
+
+    # Hard assertion: no datetime/date objects anywhere in params (including nested in JSONB)
+    assert_no_datetime_anywhere(safe_params, label)
+
+    # Log final check before execute
+    logger.info(
+        "[SAFE_EXECUTE_FINAL_CHECK] label=%s param_keys=%s all_json_safe=true",
         label,
         list(safe_params.keys())
     )
@@ -971,6 +1236,10 @@ def _assert_no_direct_db_execute() -> None:
             or 'def _log_insert_param_mapping(' in line
             or 'def _sanitize_params_recursive(' in line
             or 'def _assert_no_direct_db_execute(' in line
+            or 'def _recursive_json_safe_convert(' in line
+            or 'def _ensure_json_safe_params(' in line
+            or 'def assert_no_datetime_anywhere(' in line
+            or 'def _log_sql_bind_mapping(' in line
         ):
             in_safe_execute = True
         elif (in_safe_execute or in_validate_function) and (line.strip().startswith('async def ') or line.strip().startswith('def ')):
