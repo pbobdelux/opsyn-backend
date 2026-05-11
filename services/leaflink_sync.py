@@ -4843,17 +4843,33 @@ async def sync_leaflink_line_items(
                         if isinstance(v, datetime) else None,
                     )
 
-                # Apply final hard sanitization
-                insert_params = final_sanitize_order_lines_params(insert_params)
 
-                # Convert created_at and updated_at to UTC-naive for TIMESTAMP WITHOUT TIME ZONE columns
-                if "created_at" in insert_params:
-                    insert_params["created_at"] = to_utc_naive(insert_params["created_at"])
-                if "updated_at" in insert_params:
-                    insert_params["updated_at"] = to_utc_naive(insert_params["updated_at"])
+                # Explicitly normalize created_at/updated_at to UTC-aware datetimes.
+                # Do NOT use to_utc_naive() here — safe_execute() expects UTC-aware
+                # datetimes and will re-add tzinfo to any naive value, which causes
+                # asyncpg to attempt an offset subtraction that fails when the column
+                # type is TIMESTAMP WITHOUT TIME ZONE.
+                insert_params['created_at'] = ensure_utc_datetime(insert_params.get('created_at')) or datetime.now(timezone.utc)
+                insert_params['updated_at'] = ensure_utc_datetime(insert_params.get('updated_at')) or datetime.now(timezone.utc)
 
                 # Final barrier: ensure all UUID objects are strings before asyncpg execute()
                 insert_params = apply_uuid_str_to_params(insert_params)
+
+                # Pre-execute assertions: created_at/updated_at must be UTC-aware
+                if insert_params.get('created_at') and insert_params['created_at'].tzinfo is None:
+                    raise AssertionError(f"[LINE_ITEM_NAIVE_DATETIME] created_at is naive: {insert_params['created_at']}")
+                if insert_params.get('updated_at') and insert_params['updated_at'].tzinfo is None:
+                    raise AssertionError(f"[LINE_ITEM_NAIVE_DATETIME] updated_at is naive: {insert_params['updated_at']}")
+
+                # Diagnostic log immediately before execute so UTC-awareness is visible in logs
+                logger.info(
+                    "[LINE_ITEM_FINAL_PARAMS] line_number=%s created_at=%s created_at_tz=%s updated_at=%s updated_at_tz=%s",
+                    line_number,
+                    insert_params.get('created_at'),
+                    insert_params.get('created_at').tzinfo if insert_params.get('created_at') else None,
+                    insert_params.get('updated_at'),
+                    insert_params.get('updated_at').tzinfo if insert_params.get('updated_at') else None,
+                )
 
                 # Log the final bind values
                 logger.debug(
@@ -4866,6 +4882,7 @@ async def sync_leaflink_line_items(
                     getattr(insert_params.get("updated_at"), "tzinfo", None) if isinstance(insert_params.get("updated_at"), datetime) else "N/A",
                 )
                 await safe_execute(db, line_upsert_stmt, insert_params, label="line_item_upsert")
+
                 inserted += 1
 
                 await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
@@ -4907,8 +4924,10 @@ async def sync_leaflink_line_items(
                         "created_at": str(now_val) if now_val else None,
                         "updated_at": str(now_val) if now_val else None,
                     }, default=str)[:1000],
-                )
                 failed_items.append((item, str(line_error)[:500]))
+
+        return inserted, skipped, failed_items
+
 
     # ------------------------------------------------------------------
     # Aggregate counters across all orders
