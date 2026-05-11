@@ -552,6 +552,45 @@ async def leaflink_sync_now(
 
 
 
+    # --- Concurrency guard: reject if a full sync is already running ---
+    try:
+        import services.leaflink_sync as _ll_sync
+        if _ll_sync._full_sync_lock.locked():
+            _running_brand = _ll_sync.current_full_sync_brand_id or "unknown"
+            _running_since = (
+                _ll_sync.current_full_sync_started_at.isoformat()
+                if _ll_sync.current_full_sync_started_at
+                else "unknown"
+            )
+            logger.warning(
+                "[SYNC_NOW_REJECTED_ALREADY_RUNNING] brand_id=%s "
+                "already_running_brand=%s running_since=%s",
+                brand_id or "all",
+                _running_brand,
+                _running_since,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_code": "sync_already_running",
+                    "message": (
+                        f"A full backfill for brand {_running_brand} is already running "
+                        f"(started at {_running_since}). "
+                        "Wait for it to complete before triggering another sync."
+                    ),
+                    "already_running_brand": _running_brand,
+                    "running_since": _running_since,
+                },
+            )
+    except HTTPException:
+        raise
+    except Exception as _lock_check_exc:
+        # If the lock check itself fails (e.g. module not yet loaded), log and continue
+        logger.warning(
+            "[SYNC_NOW_LOCK_CHECK_ERROR] error=%s — proceeding without lock check",
+            str(_lock_check_exc)[:200],
+        )
+
     # --- Resolve brands to sync ---
     if brand_id:
         # Single brand

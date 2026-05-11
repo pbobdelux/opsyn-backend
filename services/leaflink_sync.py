@@ -67,6 +67,16 @@ logger = logging.getLogger("leaflink_sync")
 _dead_letter_semaphore = asyncio.Semaphore(1)
 _dead_letter_batch_size = 50  # Batch up to 50 items per write
 
+# ---------------------------------------------------------------------------
+# Full-sync concurrency control (prevent overlapping full backfill runs).
+# Only ONE full backfill may execute at a time. Concurrent requests are
+# rejected immediately with error_code="sync_already_running" rather than
+# queuing, which would exhaust the SQLAlchemy connection pool.
+# ---------------------------------------------------------------------------
+_full_sync_lock = asyncio.Lock()
+current_full_sync_started_at: Optional[datetime] = None
+current_full_sync_brand_id: Optional[str] = None
+
 
 def sanitize_json_payload(obj: Any, _depth: int = 0, _seen: set = None) -> Any:
     """Recursively sanitize an object for JSON serialization (with depth/size limits).
@@ -6474,6 +6484,92 @@ async def sync_leaflink_background_continuous(
                                 orders are inserted with the correct org_id and are visible
                                 through the GET /orders endpoint which filters by org_id.
         last_next_url:          LeafLink cursor URL to resume from (from a previous interrupted run).
+    """
+    global current_full_sync_started_at, current_full_sync_brand_id
+
+    # ---------------------------------------------------------------------------
+    # Full-sync concurrency guard: only one full backfill may run at a time.
+    # If the lock is already held, reject immediately rather than queuing —
+    # queuing concurrent syncs is what exhausts the SQLAlchemy connection pool.
+    # ---------------------------------------------------------------------------
+    if _full_sync_lock.locked():
+        _running_since = (
+            current_full_sync_started_at.isoformat()
+            if current_full_sync_started_at
+            else "unknown"
+        )
+        _running_brand = current_full_sync_brand_id or "unknown"
+        logger.warning(
+            "[FULL_SYNC_LOCK_SKIPPED_ALREADY_RUNNING] brand_id=%s sync_run_id=%s "
+            "already_running_brand=%s running_since=%s",
+            brand_id,
+            sync_run_id,
+            _running_brand,
+            _running_since,
+        )
+        raise RuntimeError(
+            f"sync_already_running: full backfill for brand {_running_brand} "
+            f"started at {_running_since} is still active. "
+            f"Rejected new request for brand {brand_id} (sync_run_id={sync_run_id})."
+        )
+
+    async with _full_sync_lock:
+        current_full_sync_started_at = datetime.now(timezone.utc)
+        current_full_sync_brand_id = brand_id
+        logger.info(
+            "[FULL_SYNC_LOCK_ACQUIRED] brand_id=%s sync_run_id=%s started_at=%s",
+            brand_id,
+            sync_run_id,
+            current_full_sync_started_at.isoformat(),
+        )
+        _lock_acquired_at = current_full_sync_started_at
+        try:
+            await _sync_leaflink_background_continuous_inner(
+                brand_id=brand_id,
+                api_key=api_key,
+                company_id=company_id,
+                start_page=start_page,
+                total_pages=total_pages,
+                manager=manager,
+                total_orders_available=total_orders_available,
+                sync_run_id=sync_run_id,
+                auth_scheme=auth_scheme,
+                base_url=base_url,
+                org_id=org_id,
+                last_next_url=last_next_url,
+            )
+        finally:
+            _lock_duration = round(
+                (datetime.now(timezone.utc) - _lock_acquired_at).total_seconds(), 1
+            )
+            current_full_sync_started_at = None
+            current_full_sync_brand_id = None
+            logger.info(
+                "[FULL_SYNC_LOCK_RELEASED] brand_id=%s sync_run_id=%s duration_seconds=%s",
+                brand_id,
+                sync_run_id,
+                _lock_duration,
+            )
+
+
+async def _sync_leaflink_background_continuous_inner(
+    brand_id: str,
+    api_key: str,
+    company_id: str,
+    start_page: int,
+    total_pages: Optional[int],
+    manager: Optional["BackgroundSyncManager"] = None,
+    total_orders_available: Optional[int] = None,
+    sync_run_id: Optional[int] = None,
+    auth_scheme: str = "Token",
+    base_url: Optional[str] = None,
+    org_id: Optional[str] = None,
+    last_next_url: Optional[str] = None,
+) -> None:
+    """Inner implementation of sync_leaflink_background_continuous.
+
+    Called exclusively by sync_leaflink_background_continuous after the
+    _full_sync_lock has been acquired. Do not call this function directly.
     """
     from services.leaflink_client import LeafLinkClient
     from services.sync_run_manager import (

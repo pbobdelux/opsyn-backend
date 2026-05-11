@@ -346,7 +346,12 @@ async def poll_and_execute() -> None:
     from database import get_async_session_local
     from models import BrandAPICredential, SyncRun
     AsyncSessionLocal = get_async_session_local()
-    from services.leaflink_sync import sync_leaflink_background_continuous
+    from services.leaflink_sync import (
+        sync_leaflink_background_continuous,
+        current_full_sync_brand_id,
+        current_full_sync_started_at,
+        _full_sync_lock,
+    )
     from services.sync_run_manager import detect_stalled, mark_stalled
 
     # ---------------------------------------------------------------------- #
@@ -509,6 +514,31 @@ async def poll_and_execute() -> None:
         )
         sys.stdout.flush()
         raise
+
+    # ---------------------------------------------------------------------- #
+    # Step 3.5: Overlapping full-sync guard                                   #
+    # If a full backfill is already running (lock held), skip this job rather #
+    # than launching a second concurrent sync that would exhaust the DB pool. #
+    # ---------------------------------------------------------------------- #
+    import services.leaflink_sync as _leaflink_sync_module
+    if _full_sync_lock.locked():
+        _running_brand = _leaflink_sync_module.current_full_sync_brand_id or "unknown"
+        _running_since = (
+            _leaflink_sync_module.current_full_sync_started_at.isoformat()
+            if _leaflink_sync_module.current_full_sync_started_at
+            else "unknown"
+        )
+        logger.warning(
+            "[QUEUE_SCHEDULER_SKIPPED_OVERLAPPING_SYNC] sync_run_id=%s brand_id=%s "
+            "already_running_brand=%s running_since=%s — skipping to prevent pool exhaustion",
+            sync_run_id,
+            brand_id,
+            _running_brand,
+            _running_since,
+        )
+        # Leave the job in "syncing" state — it will be retried on the next poll
+        # once the active sync completes and releases the lock.
+        return
 
     # ---------------------------------------------------------------------- #
     # Step 4: Execute sync                                                    #
