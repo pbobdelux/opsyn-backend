@@ -3217,6 +3217,75 @@ RETURNING (xmax = 0) AS was_inserted
                           # Pre-bind validator: final scan of the EXACT object being passed to execute()
                           safe_params = _validate_and_fix_sql_params(safe_params)
 
+                          # [FINAL_EXECUTE_PARAMS] Deep recursive datetime audit
+                          def _audit_params_for_naive_datetimes(params: Any, path: str = "params", depth: int = 0) -> None:
+                              """Recursively audit params for naive datetimes and log findings."""
+                              if depth > 20:
+                                  return
+
+                              if isinstance(params, dict):
+                                  for k, v in params.items():
+                                      _audit_params_for_naive_datetimes(v, path=f"{path}.{k}", depth=depth+1)
+                              elif isinstance(params, (list, tuple)):
+                                  for i, item in enumerate(params):
+                                      _audit_params_for_naive_datetimes(item, path=f"{path}[{i}]", depth=depth+1)
+                              elif isinstance(params, datetime):
+                                  if params.tzinfo is None:
+                                      logger.error(
+                                          "[NAIVE_DATETIME_FOUND] path=%s type=%s repr=%s tzinfo=None",
+                                          path,
+                                          type(params).__name__,
+                                          repr(params)
+                                      )
+                                  else:
+                                      logger.info(
+                                          "[DATETIME_OK] path=%s type=%s tzinfo=%s",
+                                          path,
+                                          type(params).__name__,
+                                          params.tzinfo
+                                      )
+
+                          # Call audit before execute
+                          _audit_params_for_naive_datetimes(safe_params)
+
+                          # Log the exact params object
+                          logger.info(
+                              "[FINAL_EXECUTE_PARAMS] order_header_upsert params_keys=%s params_count=%d",
+                              list(safe_params.keys()) if isinstance(safe_params, dict) else "not_dict",
+                              len(safe_params) if isinstance(safe_params, dict) else 0
+                          )
+
+                          # Hard-force conversion: if ANY datetime has tzinfo is None, fix it
+                          def _force_utc_all_datetimes(params: Any) -> Any:
+                              """Final hard-force conversion: ensure NO naive datetimes reach execute()."""
+                              if isinstance(params, dict):
+                                  for k, v in params.items():
+                                      if isinstance(v, datetime) and v.tzinfo is None:
+                                          logger.error(
+                                              "[NAIVE_DATETIME_FIXED] key=%s value=%s action=force_utc",
+                                              k,
+                                              v.isoformat()
+                                          )
+                                          params[k] = v.replace(tzinfo=timezone.utc)
+                                      elif isinstance(v, (dict, list, tuple)):
+                                          _force_utc_all_datetimes(v)
+                              elif isinstance(params, (list, tuple)):
+                                  for i, item in enumerate(params):
+                                      if isinstance(item, datetime) and item.tzinfo is None:
+                                          logger.error(
+                                              "[NAIVE_DATETIME_FIXED] index=%d value=%s action=force_utc",
+                                              i,
+                                              item.isoformat()
+                                          )
+                                          params[i] = item.replace(tzinfo=timezone.utc)
+                                      elif isinstance(item, (dict, list, tuple)):
+                                          _force_utc_all_datetimes(item)
+
+                          _force_utc_all_datetimes(safe_params)
+
+                          # Final validation before execute
+                          _audit_params_for_naive_datetimes(safe_params)
+
                           upsert_result = await db.execute(text(upsert_stmt), safe_params)
 
                           row = upsert_result.fetchone()
