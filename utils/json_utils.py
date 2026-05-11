@@ -1,7 +1,10 @@
+import logging
 from decimal import Decimal
 from datetime import date, datetime, timezone
 from uuid import UUID
-from typing import Any
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def make_json_safe(value: Any, _depth: int = 0, _seen: set = None) -> Any:
@@ -83,3 +86,86 @@ def make_json_safe(value: Any, _depth: int = 0, _seen: set = None) -> Any:
 
     # Fallback: stringify unknown types (truncated to avoid oversized payloads)
     return str(value)[:500]
+
+
+def normalize_datetime(value: Any) -> Optional[datetime]:
+    """Normalize any datetime value to UTC-aware datetime.
+
+    Handles:
+    - datetime objects (naive → UTC-aware, aware → UTC)
+    - ISO 8601 strings (parsed to UTC-aware datetime)
+    - date objects (converted to UTC midnight datetime)
+    - None (returned as None)
+
+    Returns UTC-aware datetime or None.
+    Never raises exceptions — logs and returns None on parse failure.
+    """
+    if value is None:
+        return None
+
+    # ISO string → parse to datetime
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            # Ensure UTC-aware
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+                logger.debug(
+                    "[DATETIME_NORMALIZED] source=string value=%s result=utc_aware (was naive after parse)",
+                    value,
+                )
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+                logger.debug(
+                    "[DATETIME_NORMALIZED] source=string value=%s result=utc",
+                    value,
+                )
+            return parsed
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "[DATETIME_PARSE_FAILED] value=%r error=%s — returning None",
+                value[:100] if len(value) > 100 else value,
+                str(exc),
+            )
+            return None
+
+    # date (but NOT datetime) → UTC midnight
+    if isinstance(value, date) and not isinstance(value, datetime):
+        result = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+        logger.debug(
+            "[DATETIME_NORMALIZED] source=date value=%s result=%s",
+            value.isoformat(),
+            result.isoformat(),
+        )
+        return result
+
+    # datetime → ensure UTC-aware
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            # Naive datetime — assume UTC
+            result = value.replace(tzinfo=timezone.utc)
+            logger.debug(
+                "[DATETIME_NORMALIZED] source=datetime value=%s (naive) result=%s (utc_aware)",
+                value.isoformat(),
+                result.isoformat(),
+            )
+            return result
+        # Already aware — convert to UTC
+        result = value.astimezone(timezone.utc)
+        if result != value:
+            logger.debug(
+                "[DATETIME_NORMALIZED] source=datetime value=%s result=%s (converted_to_utc)",
+                value.isoformat(),
+                result.isoformat(),
+            )
+        return result
+
+    # Unsupported type — log and return None
+    logger.warning(
+        "[DATETIME_PARSE_FAILED] value=%r type=%s — unsupported type, returning None",
+        str(value)[:100],
+        type(value).__name__,
+    )
+    return None

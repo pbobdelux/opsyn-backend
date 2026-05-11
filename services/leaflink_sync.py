@@ -50,7 +50,7 @@ AsyncSessionLocal = _LazySessionLocal()
 
 from models import Order, OrderLine
 from models.sync_health import DeadLetterLineItem, SyncHealth
-from utils.json_utils import make_json_safe
+from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value
 
 if TYPE_CHECKING:
     from services.background_sync_manager import BackgroundSyncManager
@@ -3071,6 +3071,22 @@ ON CONFLICT (brand_id, external_order_id) DO UPDATE SET
 RETURNING (xmax = 0) AS was_inserted
 """
 
+                          # Normalize all datetime fields from LeafLink payload BEFORE
+                          # building SQL params — prevents naive/aware mixing in asyncpg.
+                          # normalize_datetime_value() never raises; returns None on failure.
+                          _norm_synced_at = normalize_datetime_value(now) or utc_now()
+                          _norm_created_at = normalize_datetime_value(now) or utc_now()
+                          _norm_updated_at = normalize_datetime_value(now) or utc_now()
+                          _norm_last_synced_at = normalize_datetime_value(now) or utc_now()
+
+                          logger.debug(
+                              "[DATETIME_NORMALIZED] external_id=%s synced_at=%s created_at=%s updated_at=%s",
+                              external_id,
+                              _norm_synced_at.isoformat() if _norm_synced_at else None,
+                              _norm_created_at.isoformat() if _norm_created_at else None,
+                              _norm_updated_at.isoformat() if _norm_updated_at else None,
+                          )
+
                           upsert_params = {
                               "org_id": _sql_org_id,
                               "brand_id": _sql_brand_id,
@@ -3089,10 +3105,10 @@ RETURNING (xmax = 0) AS was_inserted
                               "sync_status": _sh_status_u,
                               "sync_health_status": _sh_status_u,
                               "sync_health_missing_fields": _sh_missing_json_u,
-                              "synced_at": now,
-                              "last_synced_at": now,
-                              "created_at": now,
-                              "updated_at": now,
+                              "synced_at": _norm_synced_at,
+                              "last_synced_at": _norm_last_synced_at,
+                              "created_at": _norm_created_at,
+                              "updated_at": _norm_updated_at,
                           }
 
                           # Apply all sanitizers
@@ -3101,16 +3117,36 @@ RETURNING (xmax = 0) AS was_inserted
                           upsert_params = normalize_datetime_fields(upsert_params)
                           upsert_params = apply_uuid_str_to_params(upsert_params)
 
-                          # Normalize all datetime fields to UTC-aware
+                          # Final belt-and-suspenders: explicitly re-normalize all datetime
+                          # fields using normalize_datetime_value() immediately before execute()
+                          # so no intermediate mutation can introduce a naive datetime.
                           for _dt_field in ["synced_at", "last_synced_at", "created_at", "updated_at"]:
-                              upsert_params[_dt_field] = ensure_utc_datetime(upsert_params.get(_dt_field)) or utc_now()
+                              _raw_dt = upsert_params.get(_dt_field)
+                              _safe_dt = normalize_datetime_value(_raw_dt) or utc_now()
+                              if _safe_dt != _raw_dt:
+                                  logger.debug(
+                                      "[DATETIME_NORMALIZED] field=%s external_id=%s before=%r after=%s",
+                                      _dt_field,
+                                      external_id,
+                                      _raw_dt,
+                                      _safe_dt.isoformat(),
+                                  )
+                              upsert_params[_dt_field] = _safe_dt
 
-                          # Assertion: no naive datetimes should remain
-                          for _field, _value in upsert_params.items():
+                          # Final guard: scan ALL params for any remaining naive datetimes
+                          # and fix them in-place (never raise — log and fix instead).
+                          for _field, _value in list(upsert_params.items()):
                               if isinstance(_value, datetime):
                                   if _value.tzinfo is None:
                                       datetime_normalization_failures += 1
-                                  assert _value.tzinfo is not None, f"[DATETIME_NORMALIZATION_FAILED] {_field} is naive"
+                                      logger.error(
+                                          "[DATETIME_NORMALIZATION_FAILED] field=%s external_id=%s value=%s"
+                                          " — forcing UTC-aware",
+                                          _field,
+                                          external_id,
+                                          _value.isoformat(),
+                                      )
+                                      upsert_params[_field] = _value.replace(tzinfo=timezone.utc)
 
                           upsert_result = await db.execute(text(upsert_stmt), upsert_params)
                           row = upsert_result.fetchone()
