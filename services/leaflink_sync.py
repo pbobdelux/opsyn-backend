@@ -4974,6 +4974,7 @@ async def sync_leaflink_line_items(
                         "created_at": str(now_val) if now_val else None,
                         "updated_at": str(now_val) if now_val else None,
                     }, default=str)[:1000],
+                )
                 failed_items.append((item, str(line_error)[:500]))
 
         return inserted, skipped, failed_items
