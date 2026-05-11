@@ -3286,6 +3286,53 @@ RETURNING (xmax = 0) AS was_inserted
                           # Final validation before execute
                           _audit_params_for_naive_datetimes(safe_params)
 
+                          # CRITICAL: Force ALL datetime fields to UTC-aware before execute
+                          # This is the last line of defense against naive datetimes
+                          _critical_datetime_fields = [
+                              'created_at', 'updated_at', 'external_created_at', 'estimated_completion',
+                              'last_successful_sync_at', 'last_attempted_sync_at', 'last_error_at'
+                          ]
+
+                          for _field in _critical_datetime_fields:
+                              if _field in safe_params and isinstance(safe_params[_field], datetime):
+                                  if safe_params[_field].tzinfo is None:
+                                      logger.error(
+                                          "[CRITICAL_NAIVE_DATETIME] field=%s value=%s — forcing UTC",
+                                          _field,
+                                          safe_params[_field].isoformat()
+                                      )
+                                      safe_params[_field] = safe_params[_field].replace(tzinfo=timezone.utc)
+
+                          # Also recursively check raw_payload and line_items_json for embedded datetimes
+                          if 'raw_payload' in safe_params and isinstance(safe_params['raw_payload'], str):
+                              # raw_payload should be a JSON string, not a dict with datetime objects
+                              pass  # JSON strings are safe
+                          elif 'raw_payload' in safe_params and isinstance(safe_params['raw_payload'], dict):
+                              # If it's still a dict, it shouldn't contain datetime objects
+                              logger.warning("[RAW_PAYLOAD_NOT_JSON] raw_payload is dict, not string")
+
+                          if 'line_items_json' in safe_params and isinstance(safe_params['line_items_json'], str):
+                              # line_items_json should be a JSON string, not a dict with datetime objects
+                              pass  # JSON strings are safe
+                          elif 'line_items_json' in safe_params and isinstance(safe_params['line_items_json'], dict):
+                              # If it's still a dict, it shouldn't contain datetime objects
+                              logger.warning("[LINE_ITEMS_JSON_NOT_JSON] line_items_json is dict, not string")
+
+                          # Final check: iterate ALL params and force UTC on any remaining naive datetimes
+                          for _key, _val in safe_params.items():
+                              if isinstance(_val, datetime) and _val.tzinfo is None:
+                                  logger.error(
+                                      "[FINAL_FORCE_UTC] key=%s value=%s — forcing UTC",
+                                      _key,
+                                      _val.isoformat()
+                                  )
+                                  safe_params[_key] = _val.replace(tzinfo=timezone.utc)
+
+                          logger.info(
+                              "[ORDER_UPSERT_PARAMS] keys=%s",
+                              {k: type(v).__name__ for k, v in safe_params.items()}
+                          )
+
                           upsert_result = await db.execute(text(upsert_stmt), safe_params)
 
                           row = upsert_result.fetchone()
