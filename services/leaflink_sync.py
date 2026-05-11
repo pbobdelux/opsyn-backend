@@ -218,6 +218,42 @@ def _cursor_hash(cursor: Optional[str]) -> Optional[str]:
     return hashlib.sha256(cursor.encode()).hexdigest()[:12]
 
 
+def _sanitize_json_payload(obj: Any, _depth: int = 0) -> Any:
+    """Recursively convert a value to be JSON-safe for JSONB/JSON columns.
+
+    Converts datetime/date objects to ISO UTC strings so that no Python
+    datetime object ever reaches asyncpg through a JSON payload field.
+    This is intentionally different from the SQL-param rules: inside a JSONB
+    column we always want ISO strings, never Python datetime objects.
+
+    Args:
+        obj: Any Python object (dict, list, datetime, date, str, etc.)
+        _depth: Current recursion depth (internal use, max 15)
+
+    Returns:
+        JSON-safe version of obj with all datetimes converted to ISO strings
+    """
+    MAX_DEPTH = 15
+    if _depth > MAX_DEPTH:
+        return obj
+
+    if isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            obj = obj.replace(tzinfo=timezone.utc)
+        return obj.astimezone(timezone.utc).isoformat()
+
+    if isinstance(obj, date) and not isinstance(obj, datetime):
+        return obj.isoformat()
+
+    if isinstance(obj, dict):
+        return {k: _sanitize_json_payload(v, _depth + 1) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json_payload(item, _depth + 1) for item in obj]
+
+    return obj
+
+
 async def safe_execute(
     db: AsyncSession,
     sql_text: str,
@@ -233,6 +269,11 @@ async def safe_execute(
     - date objects → UTC midnight datetime
     - JSON/JSONB payloads with datetime objects → converted to ISO UTC strings
     - Nested in dicts/lists/tuples/sets → recursively sanitized
+
+    JSON/JSONB payload fields (raw_payload, line_items_json, payload_keys) receive
+    an explicit pre-sanitization pass via _sanitize_json_payload() so that any
+    Python datetime objects embedded in those fields are converted to ISO UTC strings
+    before _sanitize_params_recursive runs.
 
     Args:
         db: AsyncSession instance
@@ -256,6 +297,22 @@ async def safe_execute(
         label,
         list(params.keys())
     )
+
+    # Explicit pre-sanitization of JSON/JSONB payload fields so that any Python
+    # datetime objects embedded in those fields are converted to ISO UTC strings
+    # before _sanitize_params_recursive runs.  Only applied when the value is
+    # still a Python object (dict/list) — JSON strings are already safe.
+    _json_payload_keys = {"raw_payload", "line_items_json", "payload_keys"}
+    for _json_key in _json_payload_keys:
+        if _json_key in params and params[_json_key] is not None:
+            _val = params[_json_key]
+            if isinstance(_val, (dict, list)):
+                params[_json_key] = _sanitize_json_payload(_val)
+                logger.debug(
+                    "[SAFE_EXECUTE_JSON_SANITIZED] label=%s key=%s",
+                    label,
+                    _json_key,
+                )
 
     # Recursively sanitize all parameters
     sanitized = _sanitize_params_recursive(params, label)
@@ -506,8 +563,15 @@ def _assert_no_direct_db_execute() -> None:
     errors = []
 
     for i, line in enumerate(lines, 1):
-        # Track when we enter/exit safe_execute and validation functions
-        if 'async def safe_execute(' in line or 'def _validate_no_naive_datetimes(' in line or 'def _log_param_types(' in line:
+        # Track when we enter/exit safe_execute and its helper functions
+        # All of these are allowed to contain db.execute(text(...)) internally
+        if (
+            'async def safe_execute(' in line
+            or 'def _validate_no_naive_datetimes(' in line
+            or 'def _log_param_types(' in line
+            or 'def _sanitize_json_payload(' in line
+            or 'def _sanitize_params_recursive(' in line
+        ):
             in_safe_execute = True
         elif (in_safe_execute or in_validate_function) and (line.strip().startswith('async def ') or line.strip().startswith('def ')):
             in_safe_execute = False
