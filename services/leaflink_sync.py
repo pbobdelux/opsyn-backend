@@ -231,6 +231,7 @@ async def safe_execute(
     - Naive datetimes → UTC-aware (assume UTC)
     - Aware datetimes → converted to UTC
     - date objects → UTC midnight datetime
+    - JSON/JSONB payloads with datetime objects → converted to ISO UTC strings
     - Nested in dicts/lists/tuples/sets → recursively sanitized
 
     Args:
@@ -243,13 +244,27 @@ async def safe_execute(
         Result of db.execute()
 
     Raises:
+        AssertionError if any naive datetime remains after sanitization
         Any exception from db.execute() after sanitization
     """
     if params is None:
         params = {}
 
+    # Log boundary entry
+    logger.debug(
+        "[SAFE_EXECUTE_BOUNDARY] label=%s param_keys=%s",
+        label,
+        list(params.keys())
+    )
+
     # Recursively sanitize all parameters
     sanitized = _sanitize_params_recursive(params, label)
+
+    # Final validation: scan for any remaining naive datetimes
+    _validate_no_naive_datetimes(sanitized, label)
+
+    # Log param types after sanitization
+    _log_param_types(sanitized, label)
 
     logger.debug(
         "[SAFE_EXECUTE_PARAMS_READY] label=%s param_keys=%s",
@@ -265,11 +280,15 @@ def _sanitize_params_recursive(
     label: str,
     _path: str = "root",
     _depth: int = 0,
-    _seen: Optional[set] = None
+    _seen: Optional[set] = None,
+    _is_json_payload: bool = False
 ) -> Any:
     """Recursively sanitize parameters for database binding.
 
     Converts all datetime objects to UTC-aware format and handles nested structures.
+    For JSON/JSONB payloads (raw_payload, line_items_json, etc.), converts datetime
+    objects to ISO UTC strings instead of datetime objects.
+
     Logs any naive datetimes that are fixed.
 
     Args:
@@ -278,6 +297,7 @@ def _sanitize_params_recursive(
         _path: Current path in nested structure (for logging)
         _depth: Current recursion depth
         _seen: Set of visited object ids (circular reference protection)
+        _is_json_payload: If True, convert datetimes to ISO strings instead of datetime objects
 
     Returns:
         Sanitized version of obj
@@ -300,7 +320,10 @@ def _sanitize_params_recursive(
     if obj is None:
         return None
 
-    # datetime → ensure UTC-aware
+    # Detect JSON payload fields by name
+    is_json = _is_json_payload or _path.endswith(('raw_payload', 'line_items_json', 'payload_keys'))
+
+    # datetime → ensure UTC-aware (or ISO string if in JSON payload)
     if isinstance(obj, datetime):
         if obj.tzinfo is None:
             # Naive datetime — assume UTC
@@ -312,12 +335,19 @@ def _sanitize_params_recursive(
                 obj.isoformat(),
                 fixed.isoformat()
             )
+            # If this is a JSON payload, convert to ISO string
+            if is_json:
+                return fixed.isoformat()
             return fixed
         else:
             # Already aware — convert to UTC
-            return obj.astimezone(timezone.utc)
+            utc_dt = obj.astimezone(timezone.utc)
+            # If this is a JSON payload, convert to ISO string
+            if is_json:
+                return utc_dt.isoformat()
+            return utc_dt
 
-    # date → UTC midnight datetime
+    # date → UTC midnight datetime (or ISO string if in JSON payload)
     if isinstance(obj, date) and not isinstance(obj, datetime):
         result = datetime(obj.year, obj.month, obj.day, tzinfo=timezone.utc)
         logger.info(
@@ -327,13 +357,16 @@ def _sanitize_params_recursive(
             obj.isoformat(),
             result.isoformat()
         )
+        # If this is a JSON payload, convert to ISO string
+        if is_json:
+            return result.isoformat()
         return result
 
     # dict → recurse
     if isinstance(obj, dict):
         _seen.add(obj_id)
         result = {
-            k: _sanitize_params_recursive(v, label, f"{_path}.{k}", _depth + 1, _seen)
+            k: _sanitize_params_recursive(v, label, f"{_path}.{k}", _depth + 1, _seen, is_json)
             for k, v in obj.items()
         }
         _seen.discard(obj_id)
@@ -343,7 +376,7 @@ def _sanitize_params_recursive(
     if isinstance(obj, list):
         _seen.add(obj_id)
         result = [
-            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen)
+            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen, is_json)
             for i, item in enumerate(obj)
         ]
         _seen.discard(obj_id)
@@ -353,7 +386,7 @@ def _sanitize_params_recursive(
     if isinstance(obj, tuple):
         _seen.add(obj_id)
         result = [
-            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen)
+            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen, is_json)
             for i, item in enumerate(obj)
         ]
         _seen.discard(obj_id)
@@ -363,7 +396,7 @@ def _sanitize_params_recursive(
     if isinstance(obj, set):
         _seen.add(obj_id)
         result = [
-            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen)
+            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen, is_json)
             for i, item in enumerate(obj)
         ]
         _seen.discard(obj_id)
@@ -381,55 +414,126 @@ def _sanitize_params_recursive(
     return str(obj)
 
 
+def _validate_no_naive_datetimes(obj: Any, label: str, _path: str = "root", _seen: Optional[set] = None) -> None:
+    """Scan object tree for any remaining naive datetimes and raise AssertionError if found.
+
+    This is the final guard before asyncpg binding.
+    """
+    if _seen is None:
+        _seen = set()
+
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return
+
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return
+
+    # Check datetime objects
+    if isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            error_msg = (
+                f"[NAIVE_DATETIME_FOUND] label={label} path={_path} "
+                f"type={type(obj).__name__} repr={repr(obj)} tzinfo=None"
+            )
+            logger.error(error_msg)
+            raise AssertionError(
+                f"Naive datetime found at {_path} in {label}: {obj.isoformat()}. "
+                "All datetimes must be UTC-aware before asyncpg binding."
+            )
+        return
+
+    # Recurse into containers
+    if isinstance(obj, dict):
+        _seen.add(obj_id)
+        for k, v in obj.items():
+            _validate_no_naive_datetimes(v, label, f"{_path}.{k}", _seen)
+        _seen.discard(obj_id)
+    elif isinstance(obj, (list, tuple)):
+        _seen.add(obj_id)
+        for i, item in enumerate(obj):
+            _validate_no_naive_datetimes(item, label, f"{_path}[{i}]", _seen)
+        _seen.discard(obj_id)
+
+
+def _log_param_types(params: dict, label: str) -> None:
+    """Log the type and tzinfo of all parameters for debugging."""
+    for i, (key, value) in enumerate(params.items()):
+        if isinstance(value, datetime):
+            tzinfo = getattr(value, 'tzinfo', None)
+            logger.debug(
+                "[SAFE_EXECUTE_PARAM_TYPES] label=%s index=%d key=%s type=%s tzinfo=%s",
+                label,
+                i,
+                key,
+                type(value).__name__,
+                tzinfo
+            )
+        elif isinstance(value, (dict, list)):
+            logger.debug(
+                "[SAFE_EXECUTE_PARAM_TYPES] label=%s index=%d key=%s type=%s",
+                label,
+                i,
+                key,
+                type(value).__name__
+            )
+
+
 def _assert_no_direct_db_execute() -> None:
     """Scan this module's source code and fail if direct db.execute calls exist outside safe_execute.
 
     This prevents future developers from bypassing the datetime sanitization boundary.
     Runs at module import time.
 
-    Only flags calls that use text() (raw SQL with potential datetime params).
-    ORM calls (select, delete, etc.) and savepoint control statements are excluded.
+    Catches patterns:
+    - db / session / _snap_db / conn .execute( text( ... ) )
+    - bare execute( text( ... ) )
+
+    Excludes:
+    - ORM calls (select, delete, etc.)
+    - Savepoint/release/rollback control statements
+    - Comments and docstrings
     """
     import inspect
+    import re
 
     source = inspect.getsource(sys.modules[__name__])
 
-    # Find all lines with db.execute(text(...)) that are NOT inside safe_execute
+    # Find all lines with direct execute(text(...)) that are NOT inside safe_execute
     lines = source.split('\n')
     in_safe_execute = False
+    in_validate_function = False
     errors = []
 
     for i, line in enumerate(lines, 1):
-        # Track when we enter/exit safe_execute function
-        if 'async def safe_execute(' in line:
+        # Track when we enter/exit safe_execute and validation functions
+        if 'async def safe_execute(' in line or 'def _validate_no_naive_datetimes(' in line or 'def _log_param_types(' in line:
             in_safe_execute = True
-        elif in_safe_execute and line.strip().startswith('async def '):
+        elif (in_safe_execute or in_validate_function) and (line.strip().startswith('async def ') or line.strip().startswith('def ')):
             in_safe_execute = False
-        elif in_safe_execute and line.strip().startswith('def '):
-            in_safe_execute = False
+            in_validate_function = False
 
-        # Check for direct db.execute(text(...)) calls outside safe_execute
-        # Only flag raw SQL calls (text()), not ORM calls (select, delete, etc.)
-        # Also exclude savepoint/release/rollback control statements (no datetime params)
-        if not in_safe_execute and 'db.execute(' in line and 'safe_execute' not in line:
-            # Exclude comments and docstrings
+        # Check for direct execute(text(...)) calls outside safe_execute
+        if not in_safe_execute and not in_validate_function:
             stripped = line.strip()
+
+            # Skip comments and docstrings
             if stripped.startswith('#') or stripped.startswith('"""') or stripped.startswith("'''"):
                 continue
-            # Only flag raw SQL text() calls — ORM calls (select/delete) are safe
-            if 'text(' not in line:
-                continue
-            # Exclude savepoint/release/rollback control statements (no datetime params)
-            if 'SAVEPOINT' in line or 'RELEASE SAVEPOINT' in line or 'ROLLBACK TO SAVEPOINT' in line:
-                continue
-            errors.append(f"Line {i}: {line.rstrip()}")
+
+            # Check for any execute(text(...)) pattern
+            if re.search(r'(db|session|_snap_db|conn|execute)\s*\.\s*execute\s*\(\s*text\s*\(', line):
+                # Exclude savepoint/release/rollback control statements
+                if 'SAVEPOINT' in line or 'RELEASE SAVEPOINT' in line or 'ROLLBACK TO SAVEPOINT' in line:
+                    continue
+                errors.append(f"Line {i}: {line.rstrip()}")
 
     if errors:
-        error_msg = "Found direct db.execute(text()) calls outside safe_execute():\n" + "\n".join(errors)
+        error_msg = "Found direct execute(text()) calls outside safe_execute():\n" + "\n".join(errors)
         logger.error("[ASSERTION_FAILED] %s", error_msg)
         raise AssertionError(error_msg)
 
-    logger.info("[ASSERTION_PASSED] No direct db.execute(text()) calls found outside safe_execute")
+    logger.info("[ASSERTION_PASSED] No direct execute(text()) calls found outside safe_execute")
 
 
 # Thread pool for running synchronous LeafLink HTTP calls without blocking the event loop
@@ -4830,12 +4934,12 @@ async def upsert_sync_metrics_snapshot(
                 total_failed = None
 
             try:
-                _dl_res = await _snap_db.execute(
-                    _text_snap(
-                        "SELECT COUNT(*) FROM sync_dead_letters "
-                        "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL"
-                    ),
+                _dl_res = await safe_execute(
+                    _snap_db,
+                    "SELECT COUNT(*) FROM sync_dead_letters "
+                    "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL",
                     {"brand_id": brand_id},
+                    label="dead_letter_count_select",
                 )
                 dead_letter_count = _dl_res.scalar() or 0
             except Exception:
