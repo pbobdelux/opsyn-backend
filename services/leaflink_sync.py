@@ -50,7 +50,7 @@ AsyncSessionLocal = _LazySessionLocal()
 
 from models import Order, OrderLine
 from models.sync_health import DeadLetterLineItem, SyncHealth
-from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value, sanitize_sql_params as _recursive_sanitize_sql_params
+from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value, sanitize_sql_params as _recursive_sanitize_sql_params, validate_and_fix_sql_params as _validate_and_fix_sql_params
 
 if TYPE_CHECKING:
     from services.background_sync_manager import BackgroundSyncManager
@@ -476,6 +476,8 @@ async def _update_sync_health_phase1(
                 if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
                     logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
                     _phase1_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
+            # Pre-bind validator: final scan of the EXACT object being passed to execute()
+            _phase1_params = _validate_and_fix_sql_params(_phase1_params)
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, orders_fetched_last_run, updated_at)
@@ -489,6 +491,7 @@ async def _update_sync_health_phase1(
                 _phase1_params,
             )
             await db.commit()
+
             logger.info(
                 "[SYNC_HEALTH_UPDATE] brand_id=%s phase=1 orders_delta=%s",
                 brand_id,
@@ -515,6 +518,7 @@ async def _update_sync_health_phase2(
             )
             _phase2_params = normalize_uuid_fields(_phase2_params)
             _phase2_params = normalize_datetime_fields(_phase2_params)
+
             _phase2_params = apply_uuid_str_to_params(_phase2_params)
             # Final recursive sanitization — belt-and-suspenders guard
             _phase2_params = _recursive_sanitize_sql_params(_phase2_params)
@@ -523,6 +527,8 @@ async def _update_sync_health_phase2(
                 if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
                     logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
                     _phase2_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
+            # Pre-bind validator: final scan of the EXACT object being passed to execute()
+            _phase2_params = _validate_and_fix_sql_params(_phase2_params)
             await db.execute(
                 text("""
                     UPDATE sync_health SET
@@ -537,6 +543,7 @@ async def _update_sync_health_phase2(
                 _phase2_params,
             )
             await db.commit()
+
             logger.info(
                 "[SYNC_HEALTH_UPDATE] brand_id=%s phase=2 line_items_delta=%s",
                 brand_id,
@@ -548,6 +555,7 @@ async def _update_sync_health_phase2(
             brand_id,
             str(exc)[:300],
         )
+
 
 
 async def _record_sync_error(brand_id: str, error: Exception) -> None:
@@ -568,6 +576,8 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
                 if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
                     logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
                     _sync_error_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
+            # Pre-bind validator: final scan of the EXACT object being passed to execute()
+            _sync_error_params = _validate_and_fix_sql_params(_sync_error_params)
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, last_error_at, updated_at)
@@ -590,6 +600,7 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
         )
 
 
+
 async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
     """Record a retryable (transient) sync error in sync_health without incrementing consecutive_failures."""
     try:
@@ -601,6 +612,7 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
             _retryable_params = normalize_uuid_fields(_retryable_params)
             _retryable_params = normalize_datetime_fields(_retryable_params)
             _retryable_params = apply_uuid_str_to_params(_retryable_params)
+
             # Final recursive sanitization — belt-and-suspenders guard
             _retryable_params = _recursive_sanitize_sql_params(_retryable_params)
             # Final guard: scan params for raw naive datetimes before execute
@@ -608,6 +620,8 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
                 if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
                     logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
                     _retryable_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
+            # Pre-bind validator: final scan of the EXACT object being passed to execute()
+            _retryable_params = _validate_and_fix_sql_params(_retryable_params)
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
@@ -625,7 +639,6 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
             brand_id,
             str(exc)[:300],
         )
-
 
 
 async def _dead_letter_line_item(
@@ -657,6 +670,7 @@ async def _dead_letter_line_item(
                 "count": failure_count,
                 "now": ensure_utc(utc_now(), "now"),
             }, statement="_dead_letter_line_item")
+
             _dead_letter_params = normalize_uuid_fields(_dead_letter_params)
             _dead_letter_params = normalize_datetime_fields(_dead_letter_params)
             _dead_letter_params = apply_uuid_str_to_params(_dead_letter_params)
@@ -669,6 +683,8 @@ async def _dead_letter_line_item(
                     else:
                         _dead_letter_params[_param_key] = _param_val.astimezone(timezone.utc)
             _dead_letter_params = _recursive_sanitize_sql_params(_dead_letter_params)
+            # Pre-bind validator: final scan of the EXACT object being passed to execute()
+            _dead_letter_params = _validate_and_fix_sql_params(_dead_letter_params)
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -701,6 +717,8 @@ async def _dead_letter_line_item(
             sku,
             str(exc)[:300],
         )
+
+
 
 
 async def _write_sync_dead_letter(
@@ -818,6 +836,8 @@ async def _write_sync_dead_letter(
                         params[_param_key] = _param_val.astimezone(timezone.utc)
             # Try to write with new detail columns; fall back to legacy schema if columns don't exist yet
             params = _recursive_sanitize_sql_params(params)
+            # Pre-bind validator: final scan of the EXACT object being passed to execute()
+            params = _validate_and_fix_sql_params(params)
             try:
                 await db.execute(
                     text("""
@@ -1998,7 +2018,10 @@ async def _insert_line_items_standalone(
             for _sf, _sv in insert_params.items():
                 if isinstance(_sv, datetime) and _sv.tzinfo is None:
                     logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
+            # Pre-bind validator: final scan of the EXACT object being passed to execute()
+            insert_params = _validate_and_fix_sql_params(insert_params)
             await db.execute(text(line_insert_stmt), insert_params)
+
             inserted += 1
 
             await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
@@ -2563,7 +2586,10 @@ async def sync_leaflink_orders(
                     for _sf, _sv in _li_params.items():
                         if isinstance(_sv, datetime) and _sv.tzinfo is None:
                             logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
+                    # Pre-bind validator: final scan of the EXACT object being passed to execute()
+                    _li_params = _validate_and_fix_sql_params(_li_params)
                     await db.execute(text(_li_insert_stmt), _li_params)
+
 
 
                 total_lines_written += len(normalized_line_items)
@@ -3158,6 +3184,7 @@ RETURNING (xmax = 0) AS was_inserted
                                   )
                               upsert_params[_dt_field] = _safe_dt
 
+
                           # Final guard: scan ALL params for any remaining naive datetimes
                           # and fix them in-place (never raise — log and fix instead).
                           for _field, _value in list(upsert_params.items()):
@@ -3187,8 +3214,11 @@ RETURNING (xmax = 0) AS was_inserted
                                       _sf,
                                       _sv.isoformat(),
                                   )
+                          # Pre-bind validator: final scan of the EXACT object being passed to execute()
+                          safe_params = _validate_and_fix_sql_params(safe_params)
 
                           upsert_result = await db.execute(text(upsert_stmt), safe_params)
+
                           row = upsert_result.fetchone()
                           was_inserted = row[0] if row else True
 
@@ -4092,6 +4122,8 @@ async def sync_leaflink_line_items(
                 for _sf, _sv in insert_params.items():
                     if isinstance(_sv, datetime) and _sv.tzinfo is None:
                         logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
+                # Pre-bind validator: final scan of the EXACT object being passed to execute()
+                insert_params = _validate_and_fix_sql_params(insert_params)
 
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
@@ -4137,8 +4169,6 @@ async def sync_leaflink_line_items(
                     }, default=str)[:1000],
                 )
                 failed_items.append((item, str(line_error)[:500]))
-
-        return inserted, skipped, failed_items
 
     # ------------------------------------------------------------------
     # Aggregate counters across all orders
@@ -4585,6 +4615,22 @@ async def upsert_sync_metrics_snapshot(
                 import json as _json_snap
                 _cat_json = None  # category breakdown not computed here (expensive)
 
+                _snap_params = _validate_and_fix_sql_params({
+                    "brand_id": brand_id,
+                    "sync_run_id": _run_id_str,
+                    "total_local_orders": total_local,
+                    "total_ok": total_ok,
+                    "total_partial": total_partial,
+                    "total_failed": total_failed,
+                    "dead_letter_count": dead_letter_count,
+                    "count_by_failure_category": _cat_json,
+                    "pages_processed": pages_processed,
+                    "records_processed": records_processed,
+                    "sync_rate": sync_rate,
+                    "estimated_completion": estimated_completion,
+                    "last_successful_sync_at": last_successful_sync_at,
+                    "updated_at": now,
+                })
                 await _snap_db.execute(
                     _text_snap("""
                         INSERT INTO sync_metrics_snapshots
@@ -4615,24 +4661,10 @@ async def upsert_sync_metrics_snapshot(
                                                                sync_metrics_snapshots.last_successful_sync_at),
                             updated_at              = EXCLUDED.updated_at
                     """),
-                    {
-                        "brand_id": brand_id,
-                        "sync_run_id": _run_id_str,
-                        "total_local_orders": total_local,
-                        "total_ok": total_ok,
-                        "total_partial": total_partial,
-                        "total_failed": total_failed,
-                        "dead_letter_count": dead_letter_count,
-                        "count_by_failure_category": _cat_json,
-                        "pages_processed": pages_processed,
-                        "records_processed": records_processed,
-                        "sync_rate": sync_rate,
-                        "estimated_completion": estimated_completion,
-                        "last_successful_sync_at": last_successful_sync_at,
-                        "updated_at": now,
-                    },
+                    _snap_params,
                 )
                 await _snap_db.commit()
+
                 logger.info(
                     "[SyncMetricsSnapshot] upserted brand_id=%s run_id=%s"
                     " total=%s ok=%s partial=%s failed=%s dl=%s pages=%s records=%s",
@@ -4745,6 +4777,7 @@ async def sync_leaflink_full_resync(
         }
 
     loop = asyncio.get_event_loop()
+
     current_page = 1
     resume_url: Optional[str] = None
     page_size = 100
