@@ -595,6 +595,9 @@ async def safe_execute(
     # Log param types after sanitization
     _log_param_types(sanitized, label)
 
+    # Log per-param $N → column mapping for INSERT statements
+    _log_insert_param_mapping(sql_text, sanitized, label)
+
     logger.debug(
         "[SAFE_EXECUTE_PARAMS_READY] label=%s param_keys=%s",
         label,
@@ -794,6 +797,48 @@ def _log_param_types(params: dict, label: str) -> None:
             )
 
 
+def _log_insert_param_mapping(sql_text: str, params: dict, label: str) -> None:
+    """Log which $N parameter maps to which column name in INSERT statements.
+
+    Parses the column list from INSERT INTO ... (...columns...) VALUES (...)
+    and emits one [SAFE_EXECUTE_PARAM_INDEX] log line per parameter so that
+    asyncpg binding errors like 'query argument $18' can be traced to a column.
+
+    Args:
+        sql_text: The SQL statement string
+        params: Dict of bind parameters (ordered)
+        label: Statement label for logging
+    """
+    import re
+
+    # Only process INSERT statements
+    if not re.search(r'\bINSERT\b', sql_text, re.IGNORECASE):
+        return
+
+    # Extract column list from INSERT INTO table (col1, col2, ...) VALUES
+    col_match = re.search(
+        r'INSERT\s+INTO\s+\S+\s*\(([^)]+)\)\s*VALUES',
+        sql_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not col_match:
+        return
+
+    columns = [c.strip() for c in col_match.group(1).split(',')]
+    param_items = list(params.items())
+
+    for idx, (key, value) in enumerate(param_items):
+        col_name = columns[idx] if idx < len(columns) else "?"
+        logger.debug(
+            "[SAFE_EXECUTE_PARAM_INDEX] label=%s $%d key=%s column=%s type=%s",
+            label,
+            idx + 1,
+            key,
+            col_name,
+            type(value).__name__,
+        )
+
+
 def _assert_no_direct_db_execute() -> None:
     """Scan this module's source code and fail if direct db.execute calls exist outside safe_execute.
 
@@ -831,6 +876,7 @@ def _assert_no_direct_db_execute() -> None:
             or 'def assert_no_datetime_objects_in_json(' in line
             or 'def _count_datetime_objects(' in line
             or 'def _sanitize_json_fields_in_params(' in line
+            or 'def _log_insert_param_mapping(' in line
             or 'def _sanitize_params_recursive(' in line
         ):
             in_safe_execute = True
