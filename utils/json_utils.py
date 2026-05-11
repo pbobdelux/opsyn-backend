@@ -169,3 +169,99 @@ def normalize_datetime(value: Any) -> Optional[datetime]:
         type(value).__name__,
     )
     return None
+
+
+def sanitize_sql_params(params: Any) -> Any:
+    """Recursively sanitize SQL parameters to ensure no naive datetimes reach asyncpg.
+
+    Walks all dicts/lists/tuples and converts:
+    - datetime (naive) → UTC-aware (replace tzinfo=timezone.utc)
+    - datetime (aware) → UTC (astimezone(timezone.utc))
+    - date (not datetime) → UTC-aware datetime at midnight
+    - ISO strings → attempt parse to UTC-aware datetime (only if value looks like a datetime string)
+
+    Never raises exceptions. Logs all fixes with [SQL_PARAM_DATETIME_FIXED].
+    Returns sanitized copy of params.
+    """
+    return _sanitize_sql_params_recursive(params, path="params")
+
+
+def _sanitize_sql_params_recursive(value: Any, path: str = "params") -> Any:
+    """Internal recursive worker for sanitize_sql_params."""
+    # datetime must be checked before date (datetime is a subclass of date)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            fixed = value.replace(tzinfo=timezone.utc)
+            logger.info(
+                "[SQL_PARAM_DATETIME_FIXED] path=%s action=naive_to_utc original=%s fixed=%s",
+                path,
+                value.isoformat(),
+                fixed.isoformat(),
+            )
+            return fixed
+        utc_val = value.astimezone(timezone.utc)
+        if utc_val != value:
+            logger.info(
+                "[SQL_PARAM_DATETIME_FIXED] path=%s action=aware_to_utc original=%s fixed=%s",
+                path,
+                value.isoformat(),
+                utc_val.isoformat(),
+            )
+        return utc_val
+
+    # Plain date (not datetime) → UTC midnight datetime
+    if isinstance(value, date):
+        fixed = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+        logger.info(
+            "[SQL_PARAM_DATETIME_FIXED] path=%s action=date_to_utc_midnight original=%s fixed=%s",
+            path,
+            value.isoformat(),
+            fixed.isoformat(),
+        )
+        return fixed
+
+    # dict → recurse over values
+    if isinstance(value, dict):
+        return {
+            k: _sanitize_sql_params_recursive(v, path=f"{path}.{k}")
+            for k, v in value.items()
+        }
+
+    # list → recurse over items
+    if isinstance(value, list):
+        return [
+            _sanitize_sql_params_recursive(item, path=f"{path}[{i}]")
+            for i, item in enumerate(value)
+        ]
+
+    # tuple → recurse over items, return as list (mutable)
+    if isinstance(value, tuple):
+        return [
+            _sanitize_sql_params_recursive(item, path=f"{path}[{i}]")
+            for i, item in enumerate(value)
+        ]
+
+    # str → attempt ISO datetime parse only for strings that look like timestamps
+    if isinstance(value, str) and value and len(value) >= 10:
+        # Only attempt parse if the string starts with a 4-digit year (YYYY-)
+        # to avoid expensive parse attempts on arbitrary strings.
+        if len(value) >= 19 and value[4] == "-" and value[7] == "-":
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                else:
+                    parsed = parsed.astimezone(timezone.utc)
+                logger.info(
+                    "[SQL_PARAM_DATETIME_FIXED] path=%s action=iso_string_to_utc original=%s fixed=%s",
+                    path,
+                    value,
+                    parsed.isoformat(),
+                )
+                return parsed
+            except (ValueError, TypeError):
+                # Not a datetime string — pass through unchanged
+                pass
+
+    # All other types (str, int, float, bool, None, Decimal, UUID, etc.) pass through
+    return value

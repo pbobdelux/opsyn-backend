@@ -50,7 +50,7 @@ AsyncSessionLocal = _LazySessionLocal()
 
 from models import Order, OrderLine
 from models.sync_health import DeadLetterLineItem, SyncHealth
-from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value
+from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value, sanitize_sql_params as _recursive_sanitize_sql_params
 
 if TYPE_CHECKING:
     from services.background_sync_manager import BackgroundSyncManager
@@ -664,6 +664,7 @@ async def _dead_letter_line_item(
                         _dead_letter_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
                     else:
                         _dead_letter_params[_param_key] = _param_val.astimezone(timezone.utc)
+            _dead_letter_params = _recursive_sanitize_sql_params(_dead_letter_params)
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -812,6 +813,7 @@ async def _write_sync_dead_letter(
                     else:
                         params[_param_key] = _param_val.astimezone(timezone.utc)
             # Try to write with new detail columns; fall back to legacy schema if columns don't exist yet
+            params = _recursive_sanitize_sql_params(params)
             try:
                 await db.execute(
                     text("""
@@ -1979,6 +1981,12 @@ async def _insert_line_items_standalone(
                 type(insert_params.get("updated_at")).__name__,
                 getattr(insert_params.get("updated_at"), "tzinfo", None) if isinstance(insert_params.get("updated_at"), datetime) else "N/A",
             )
+            # FINAL recursive sanitization — catches any datetime objects in nested structures
+            insert_params = _recursive_sanitize_sql_params(insert_params)
+            # Final defensive scan: log any remaining naive datetimes
+            for _sf, _sv in insert_params.items():
+                if isinstance(_sv, datetime) and _sv.tzinfo is None:
+                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
             await db.execute(text(line_insert_stmt), insert_params)
             inserted += 1
 
@@ -2538,6 +2546,12 @@ async def sync_leaflink_orders(
                         type(_li_params.get("updated_at")).__name__,
                         getattr(_li_params.get("updated_at"), "tzinfo", None) if isinstance(_li_params.get("updated_at"), datetime) else "N/A",
                     )
+                    # FINAL recursive sanitization — catches any datetime objects in nested structures
+                    _li_params = _recursive_sanitize_sql_params(_li_params)
+                    # Final defensive scan: log any remaining naive datetimes
+                    for _sf, _sv in _li_params.items():
+                        if isinstance(_sv, datetime) and _sv.tzinfo is None:
+                            logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
                     await db.execute(text(_li_insert_stmt), _li_params)
 
 
@@ -3148,7 +3162,22 @@ RETURNING (xmax = 0) AS was_inserted
                                       )
                                       upsert_params[_field] = _value.replace(tzinfo=timezone.utc)
 
-                          upsert_result = await db.execute(text(upsert_stmt), upsert_params)
+                          # FINAL recursive sanitization — belt-and-suspenders guard that
+                          # recursively walks all nested structures (dicts, lists, tuples)
+                          # and converts every datetime/date to UTC-aware.  This catches
+                          # any datetime objects that slipped through earlier normalization
+                          # stages or were created/modified after them.
+                          safe_params = _recursive_sanitize_sql_params(upsert_params)
+                          # Final defensive scan: log any remaining naive datetimes
+                          for _sf, _sv in safe_params.items():
+                              if isinstance(_sv, datetime) and _sv.tzinfo is None:
+                                  logger.error(
+                                      "[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s",
+                                      _sf,
+                                      _sv.isoformat(),
+                                  )
+
+                          upsert_result = await db.execute(text(upsert_stmt), safe_params)
                           row = upsert_result.fetchone()
                           was_inserted = row[0] if row else True
 
@@ -4046,6 +4075,12 @@ async def sync_leaflink_line_items(
                     type(insert_params.get("updated_at")).__name__,
                     getattr(insert_params.get("updated_at"), "tzinfo", None) if isinstance(insert_params.get("updated_at"), datetime) else "N/A",
                 )
+                # FINAL recursive sanitization — catches any datetime objects in nested structures
+                insert_params = _recursive_sanitize_sql_params(insert_params)
+                # Final defensive scan: log any remaining naive datetimes
+                for _sf, _sv in insert_params.items():
+                    if isinstance(_sv, datetime) and _sv.tzinfo is None:
+                        logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
 
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
