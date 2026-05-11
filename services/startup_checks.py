@@ -194,6 +194,7 @@ async def run_startup_schema_checks() -> dict:
     # -----------------------------------------------------------------------
     # Summary
     # -----------------------------------------------------------------------
+
     overall_ok = tables_ok and len(errors) == 0
 
     if warnings:
@@ -209,6 +210,42 @@ async def run_startup_schema_checks() -> dict:
             columns_ok,
             index_ok,
         )
+
+    # -----------------------------------------------------------------------
+    # 4. Datetime self-check — verify utc_now() returns UTC-aware datetimes
+    # -----------------------------------------------------------------------
+    try:
+        from datetime import datetime as _dt_check, timezone as _tz_check
+        _test_dt = _dt_check.now(_tz_check.utc)
+        if _test_dt.tzinfo is None:
+            msg = "datetime.now(timezone.utc) returned a naive datetime — UTC-aware datetimes broken"
+            warnings.append(msg)
+            logger.error("[STARTUP_DATETIME_WARNING] %s", msg)
+        else:
+            logger.info(
+                "[STARTUP_DATETIME_OK] utc_now_check passed tzinfo=%s value=%s",
+                _test_dt.tzinfo,
+                _test_dt.isoformat(),
+            )
+
+        # Verify validate_and_fix_sql_params is importable and works
+        from utils.json_utils import validate_and_fix_sql_params as _vfsp
+        _naive = _dt_check(2024, 1, 1, 12, 0, 0)  # naive datetime
+        _fixed = _vfsp({"ts": _naive})
+        if isinstance(_fixed, dict) and _fixed.get("ts") is not None and _fixed["ts"].tzinfo is not None:
+            logger.info(
+                "[STARTUP_DATETIME_OK] validate_and_fix_sql_params self-check passed"
+                " — naive datetime correctly fixed to UTC-aware"
+            )
+        else:
+            msg = "validate_and_fix_sql_params self-check failed — naive datetime not fixed"
+            warnings.append(msg)
+            logger.error("[STARTUP_DATETIME_WARNING] %s", msg)
+
+    except Exception as exc:
+        msg = f"Datetime self-check failed: {str(exc)[:300]}"
+        warnings.append(msg)
+        logger.warning("[STARTUP_DATETIME_WARNING] %s", msg)
 
     return {
         "ok": overall_ok,
