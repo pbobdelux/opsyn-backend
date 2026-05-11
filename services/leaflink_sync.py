@@ -144,6 +144,313 @@ def sanitize_json_payload(obj: Any, _depth: int = 0, _seen: set = None) -> Any:
     return str(obj)[:1000]
 
 
+def sanitize_json_payload_for_binding(obj: Any, _depth: int = 0, _seen: Optional[set] = None, _path: str = "root") -> Any:
+    """Recursively sanitize an object for JSONB binding to PostgreSQL.
+
+    Converts ALL datetime/date/Decimal/UUID objects to JSON-safe primitives.
+    This MUST be applied to any parameter that will be stored in a JSONB column.
+
+    Key difference from sanitize_json_payload():
+    - Logs every datetime conversion with [JSON_DATETIME_FOUND]
+    - Raises AssertionError if any datetime object remains after sanitization
+    - Tracks datetime count for [JSON_PAYLOAD_SANITIZED] logging
+
+    Args:
+        obj: Any Python object (typically a dict from LeafLink API)
+        _depth: Current recursion depth (internal use)
+        _seen: Set of object ids already visited (circular reference protection)
+        _path: Current path in nested structure (for logging)
+
+    Returns:
+        JSON-safe version of obj with all datetimes as ISO UTC strings
+    """
+    MAX_DEPTH = 20
+    MAX_CONTAINER_SIZE = 10000
+
+    if _seen is None:
+        _seen = set()
+
+    # Depth limit
+    if _depth > MAX_DEPTH:
+        logger.warning("[JSON_PAYLOAD_MAX_DEPTH] path=%s depth=%d", _path, _depth)
+        return "[max_depth_exceeded]"
+
+    # Circular reference protection
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return "[circular_reference]"
+
+    if obj is None:
+        return None
+
+    # datetime → ISO UTC string (ALWAYS convert, never return datetime object)
+    if isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            # Naive datetime — assume UTC
+            fixed = obj.replace(tzinfo=timezone.utc)
+            logger.info(
+                "[JSON_DATETIME_FOUND] path=%s original_type=datetime value=%s tzinfo=None fixed=%s",
+                _path,
+                obj.isoformat(),
+                fixed.isoformat()
+            )
+            return fixed.isoformat()
+        else:
+            # Already aware — convert to UTC
+            utc_dt = obj.astimezone(timezone.utc)
+            logger.info(
+                "[JSON_DATETIME_FOUND] path=%s original_type=datetime value=%s tzinfo=%s converted=%s",
+                _path,
+                obj.isoformat(),
+                obj.tzinfo,
+                utc_dt.isoformat()
+            )
+            return utc_dt.isoformat()
+
+    # date → ISO date string (ALWAYS convert, never return date object)
+    if isinstance(obj, date) and not isinstance(obj, datetime):
+        iso_str = obj.isoformat()
+        logger.info(
+            "[JSON_DATETIME_FOUND] path=%s original_type=date value=%s converted=%s",
+            _path,
+            obj.isoformat(),
+            iso_str
+        )
+        return iso_str
+
+    # Decimal → float
+    if isinstance(obj, Decimal):
+        return float(obj)
+
+    # UUID → str
+    if isinstance(obj, UUID):
+        return str(obj)
+
+    # dict → recurse (with size limit)
+    if isinstance(obj, dict):
+        if len(obj) > MAX_CONTAINER_SIZE:
+            logger.warning("[JSON_PAYLOAD_DICT_TOO_LARGE] path=%s size=%d", _path, len(obj))
+            return f"[dict_too_large: {len(obj)} items]"
+        _seen.add(obj_id)
+        result = {
+            k: sanitize_json_payload_for_binding(v, _depth + 1, _seen, f"{_path}.{k}")
+            for k, v in obj.items()
+        }
+        _seen.discard(obj_id)
+        return result
+
+    # list → recurse (with size limit)
+    if isinstance(obj, list):
+        if len(obj) > MAX_CONTAINER_SIZE:
+            logger.warning("[JSON_PAYLOAD_LIST_TOO_LARGE] path=%s size=%d", _path, len(obj))
+            return f"[list_too_large: {len(obj)} items]"
+        _seen.add(obj_id)
+        result = [
+            sanitize_json_payload_for_binding(item, _depth + 1, _seen, f"{_path}[{i}]")
+            for i, item in enumerate(obj)
+        ]
+        _seen.discard(obj_id)
+        return result
+
+    # tuple → list (with size limit)
+    if isinstance(obj, tuple):
+        if len(obj) > MAX_CONTAINER_SIZE:
+            logger.warning("[JSON_PAYLOAD_TUPLE_TOO_LARGE] path=%s size=%d", _path, len(obj))
+            return f"[tuple_too_large: {len(obj)} items]"
+        _seen.add(obj_id)
+        result = [
+            sanitize_json_payload_for_binding(item, _depth + 1, _seen, f"{_path}[{i}]")
+            for i, item in enumerate(obj)
+        ]
+        _seen.discard(obj_id)
+        return result
+
+    # set → list (with size limit)
+    if isinstance(obj, set):
+        if len(obj) > MAX_CONTAINER_SIZE:
+            logger.warning("[JSON_PAYLOAD_SET_TOO_LARGE] path=%s size=%d", _path, len(obj))
+            return f"[set_too_large: {len(obj)} items]"
+        _seen.add(obj_id)
+        result = [
+            sanitize_json_payload_for_binding(item, _depth + 1, _seen, f"{_path}[{i}]")
+            for i, item in enumerate(obj)
+        ]
+        _seen.discard(obj_id)
+        return result
+
+    # Primitive types pass through
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # Fallback: convert to string (with truncation)
+    return str(obj)[:1000]
+
+
+def assert_no_datetime_objects_in_json(obj: Any, field_name: str = "unknown", _path: str = "root", _seen: Optional[set] = None) -> None:
+    """Scan a JSON payload and raise AssertionError if any Python datetime objects are found.
+
+    This is the final guard before JSONB binding to PostgreSQL.
+
+    Args:
+        obj: Object to scan (typically a dict from LeafLink API)
+        field_name: Name of the field being checked (for logging)
+        _path: Current path in nested structure (for logging)
+        _seen: Set of visited object ids (circular reference protection)
+
+    Raises:
+        AssertionError if any datetime, date, or time object is found
+    """
+    if _seen is None:
+        _seen = set()
+
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return
+
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return
+
+    # Check for datetime/date/time objects
+    if isinstance(obj, (datetime, date)):
+        error_msg = (
+            f"[DATETIME_OBJECT_IN_JSON] field={field_name} path={_path} "
+            f"type={type(obj).__name__} value={repr(obj)}"
+        )
+        logger.error(error_msg)
+        raise AssertionError(
+            f"Python {type(obj).__name__} object found in JSON field '{field_name}' at path '{_path}'. "
+            "All datetime objects must be converted to ISO strings before JSONB binding."
+        )
+
+    # Recurse into containers
+    if isinstance(obj, dict):
+        _seen.add(obj_id)
+        for k, v in obj.items():
+            assert_no_datetime_objects_in_json(v, field_name, f"{_path}.{k}", _seen)
+        _seen.discard(obj_id)
+    elif isinstance(obj, (list, tuple)):
+        _seen.add(obj_id)
+        for i, item in enumerate(obj):
+            assert_no_datetime_objects_in_json(item, field_name, f"{_path}[{i}]", _seen)
+        _seen.discard(obj_id)
+
+
+def _sanitize_json_fields_in_params(params: dict, label: str) -> dict:
+    """Sanitize all known JSON/JSONB fields in a parameter dict.
+
+    Applies sanitize_json_payload_for_binding() to:
+    - raw_payload
+    - line_items_json
+    - review_status
+    - sync_health_missing_fields
+    - payload_keys
+    - category_breakdown
+    - Any field ending with _json or _payload
+
+    Args:
+        params: Parameter dict to sanitize
+        label: Statement label for logging
+
+    Returns:
+        Sanitized params dict
+    """
+    JSON_FIELDS = {
+        'raw_payload',
+        'line_items_json',
+        'review_status',
+        'sync_health_missing_fields',
+        'payload_keys',
+        'category_breakdown',
+    }
+
+    datetime_counts = {}
+
+    for key, value in params.items():
+        # Check if this is a known JSON field or ends with _json/_payload
+        is_json_field = (
+            key in JSON_FIELDS or
+            key.endswith('_json') or
+            key.endswith('_payload')
+        )
+
+        if is_json_field and value is not None:
+            # Count datetimes before sanitization
+            datetime_count_before = _count_datetime_objects(value)
+
+            # Sanitize the JSON field
+            sanitized = sanitize_json_payload_for_binding(value, _path=f"params.{key}")
+
+            # Count datetimes after sanitization (should be 0)
+            datetime_count_after = _count_datetime_objects(sanitized)
+
+            # Log the sanitization
+            logger.info(
+                "[JSON_PAYLOAD_SANITIZED] label=%s field=%s datetime_count_before=%d datetime_count_after=%d",
+                label,
+                key,
+                datetime_count_before,
+                datetime_count_after
+            )
+
+            # Assert no datetimes remain
+            assert_no_datetime_objects_in_json(sanitized, field_name=key)
+
+            # Update params with sanitized value
+            params[key] = sanitized
+            datetime_counts[key] = datetime_count_before
+
+    # Log summary
+    if datetime_counts:
+        logger.info(
+            "[JSON_FIELDS_SANITIZED_SUMMARY] label=%s total_fields=%d total_datetimes_fixed=%d",
+            label,
+            len(datetime_counts),
+            sum(datetime_counts.values())
+        )
+
+    return params
+
+
+def _count_datetime_objects(obj: Any, _seen: Optional[set] = None) -> int:
+    """Count the number of datetime/date objects in a nested structure.
+
+    Args:
+        obj: Object to scan
+        _seen: Set of visited object ids (circular reference protection)
+
+    Returns:
+        Count of datetime/date objects found
+    """
+    if _seen is None:
+        _seen = set()
+
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return 0
+
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return 0
+
+    # Count datetime/date objects
+    if isinstance(obj, (datetime, date)):
+        return 1
+
+    # Recurse into containers
+    count = 0
+    if isinstance(obj, dict):
+        _seen.add(obj_id)
+        for v in obj.values():
+            count += _count_datetime_objects(v, _seen)
+        _seen.discard(obj_id)
+    elif isinstance(obj, (list, tuple)):
+        _seen.add(obj_id)
+        for item in obj:
+            count += _count_datetime_objects(item, _seen)
+        _seen.discard(obj_id)
+
+    return count
+
+
 def truncate_payload(payload: Any, max_size_kb: int = 25) -> Any:
     """Truncate payload if too large to prevent oversized DB writes and log lines."""
     if payload is None:
@@ -244,20 +551,34 @@ async def safe_execute(
         Result of db.execute()
 
     Raises:
-        AssertionError if any naive datetime remains after sanitization
+        AssertionError if any datetime object remains in JSON fields or any naive datetime remains
         Any exception from db.execute() after sanitization
     """
     if params is None:
         params = {}
 
-    # Log boundary entry
+    # Log boundary entry with parameter index mapping
     logger.debug(
-        "[SAFE_EXECUTE_BOUNDARY] label=%s param_keys=%s",
+        "[SAFE_EXECUTE_BOUNDARY] label=%s param_keys=%s param_count=%d",
         label,
-        list(params.keys())
+        list(params.keys()),
+        len(params)
     )
 
-    # Recursively sanitize all parameters
+    # Log parameter index mapping for debugging (especially for INSERT statements)
+    for i, key in enumerate(params.keys(), 1):
+        logger.debug(
+            "[SAFE_EXECUTE_PARAM_INDEX] label=%s index=$%d key=%s type=%s",
+            label,
+            i,
+            key,
+            type(params[key]).__name__
+        )
+
+    # Sanitize JSON fields FIRST (before recursive sanitization)
+    params = _sanitize_json_fields_in_params(params, label)
+
+    # Recursively sanitize all parameters (handles top-level datetimes)
     sanitized = _sanitize_params_recursive(params, label)
 
     # Final validation: scan for any remaining naive datetimes
@@ -280,14 +601,12 @@ def _sanitize_params_recursive(
     label: str,
     _path: str = "root",
     _depth: int = 0,
-    _seen: Optional[set] = None,
-    _is_json_payload: bool = False
+    _seen: Optional[set] = None
 ) -> Any:
     """Recursively sanitize parameters for database binding.
 
     Converts all datetime objects to UTC-aware format and handles nested structures.
-    For JSON/JSONB payloads (raw_payload, line_items_json, etc.), converts datetime
-    objects to ISO UTC strings instead of datetime objects.
+    JSON fields are pre-sanitized by _sanitize_json_fields_in_params() and skipped here.
 
     Logs any naive datetimes that are fixed.
 
@@ -297,7 +616,6 @@ def _sanitize_params_recursive(
         _path: Current path in nested structure (for logging)
         _depth: Current recursion depth
         _seen: Set of visited object ids (circular reference protection)
-        _is_json_payload: If True, convert datetimes to ISO strings instead of datetime objects
 
     Returns:
         Sanitized version of obj
@@ -320,10 +638,7 @@ def _sanitize_params_recursive(
     if obj is None:
         return None
 
-    # Detect JSON payload fields by name
-    is_json = _is_json_payload or _path.endswith(('raw_payload', 'line_items_json', 'payload_keys'))
-
-    # datetime → ensure UTC-aware (or ISO string if in JSON payload)
+    # datetime → ensure UTC-aware
     if isinstance(obj, datetime):
         if obj.tzinfo is None:
             # Naive datetime — assume UTC
@@ -335,19 +650,12 @@ def _sanitize_params_recursive(
                 obj.isoformat(),
                 fixed.isoformat()
             )
-            # If this is a JSON payload, convert to ISO string
-            if is_json:
-                return fixed.isoformat()
             return fixed
         else:
             # Already aware — convert to UTC
-            utc_dt = obj.astimezone(timezone.utc)
-            # If this is a JSON payload, convert to ISO string
-            if is_json:
-                return utc_dt.isoformat()
-            return utc_dt
+            return obj.astimezone(timezone.utc)
 
-    # date → UTC midnight datetime (or ISO string if in JSON payload)
+    # date → UTC midnight datetime
     if isinstance(obj, date) and not isinstance(obj, datetime):
         result = datetime(obj.year, obj.month, obj.day, tzinfo=timezone.utc)
         logger.info(
@@ -357,16 +665,13 @@ def _sanitize_params_recursive(
             obj.isoformat(),
             result.isoformat()
         )
-        # If this is a JSON payload, convert to ISO string
-        if is_json:
-            return result.isoformat()
         return result
 
     # dict → recurse
     if isinstance(obj, dict):
         _seen.add(obj_id)
         result = {
-            k: _sanitize_params_recursive(v, label, f"{_path}.{k}", _depth + 1, _seen, is_json)
+            k: _sanitize_params_recursive(v, label, f"{_path}.{k}", _depth + 1, _seen)
             for k, v in obj.items()
         }
         _seen.discard(obj_id)
@@ -376,7 +681,7 @@ def _sanitize_params_recursive(
     if isinstance(obj, list):
         _seen.add(obj_id)
         result = [
-            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen, is_json)
+            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen)
             for i, item in enumerate(obj)
         ]
         _seen.discard(obj_id)
@@ -386,7 +691,7 @@ def _sanitize_params_recursive(
     if isinstance(obj, tuple):
         _seen.add(obj_id)
         result = [
-            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen, is_json)
+            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen)
             for i, item in enumerate(obj)
         ]
         _seen.discard(obj_id)
@@ -396,7 +701,7 @@ def _sanitize_params_recursive(
     if isinstance(obj, set):
         _seen.add(obj_id)
         result = [
-            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen, is_json)
+            _sanitize_params_recursive(item, label, f"{_path}[{i}]", _depth + 1, _seen)
             for i, item in enumerate(obj)
         ]
         _seen.discard(obj_id)
@@ -476,6 +781,40 @@ def _log_param_types(params: dict, label: str) -> None:
                 i,
                 key,
                 type(value).__name__
+            )
+
+
+def _log_insert_param_mapping(sql_text: str, params: dict, label: str) -> None:
+    """Log the mapping of SQL parameter indices to parameter names.
+
+    For INSERT statements, this helps identify which $N corresponds to which column.
+
+    Args:
+        sql_text: SQL statement
+        params: Parameter dict
+        label: Statement label for logging
+    """
+    # Only log for INSERT statements
+    if 'INSERT' not in sql_text.upper():
+        return
+
+    # Extract column names from INSERT statement if possible
+    import re
+    match = re.search(r'INSERT INTO \w+ \((.*?)\)', sql_text, re.IGNORECASE)
+    if not match:
+        return
+
+    columns = [col.strip() for col in match.group(1).split(',')]
+    param_keys = list(params.keys())
+
+    if len(columns) == len(param_keys):
+        for i, (col, key) in enumerate(zip(columns, param_keys), 1):
+            logger.debug(
+                "[INSERT_PARAM_MAPPING] label=%s $%d=%s (key=%s)",
+                label,
+                i,
+                col,
+                key
             )
 
 
