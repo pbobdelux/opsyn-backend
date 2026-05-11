@@ -953,6 +953,7 @@ def _assert_no_direct_db_execute() -> None:
             or 'def _sanitize_json_fields_in_params(' in line
             or 'def _log_insert_param_mapping(' in line
             or 'def _sanitize_params_recursive(' in line
+            or 'def _assert_no_direct_db_execute(' in line
         ):
             in_safe_execute = True
         elif (in_safe_execute or in_validate_function) and (line.strip().startswith('async def ') or line.strip().startswith('def ')):
