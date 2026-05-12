@@ -6442,7 +6442,7 @@ _BG_SYNC_TIMEOUT = 1800
 
 
 async def sync_leaflink_background_continuous(
-    brand_id: str,
+    brand_id: str,  # noqa: E501 — engine_id logged below for pool audit
     api_key: str,
     company_id: str,
     start_page: int,
@@ -6522,6 +6522,22 @@ async def sync_leaflink_background_continuous(
             sync_run_id,
             current_full_sync_started_at.isoformat(),
         )
+
+        # Log engine_id so we can confirm all sync operations use the
+        # canonical engine (pool_size=20, max_overflow=40) and not a
+        # rogue engine created with default settings (5/10).
+        try:
+            from database import get_engine_id as _get_eid
+            _sync_engine_id = _get_eid()
+            logger.info(
+                "[DB_ENGINE_ID] sync_leaflink_background_continuous "
+                "brand_id=%s sync_run_id=%s engine_id=%s",
+                brand_id,
+                sync_run_id,
+                _sync_engine_id,
+            )
+        except Exception:
+            pass
         _lock_acquired_at = current_full_sync_started_at
         try:
             await _sync_leaflink_background_continuous_inner(

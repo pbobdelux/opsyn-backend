@@ -237,11 +237,23 @@ async def worker_main() -> None:
 
         # Phase 2.5: Validate and log engine pool configuration
         try:
-            from database import get_engine
+            from database import get_engine, get_engine_id, validate_single_engine
             _eng = get_engine()
             _pool = _eng.pool
             _ps = _pool.size()
             _mo = _pool._max_overflow
+            _eid = get_engine_id()
+            logger.info(
+                "[DB_ENGINE_VALIDATION] engine_id=%s pool_size=%d max_overflow=%d "
+                "total_capacity=%d pool_timeout=%s pool_recycle=%s pool_pre_ping=true "
+                "database_url_source=DATABASE_URL",
+                _eid,
+                _ps,
+                _mo,
+                _ps + _mo,
+                getattr(_pool, "_timeout", "unknown"),
+                getattr(_pool, "_recycle", "unknown"),
+            )
             logger.info(
                 "[DB_ENGINE_CONFIG] pool_size=%d max_overflow=%d total_capacity=%d "
                 "pool_timeout=%s pool_recycle=%s pool_pre_ping=true "
@@ -265,9 +277,14 @@ async def worker_main() -> None:
                 "Ensure initialize_database_after_bootstrap() is the only engine creation path."
             )
             logger.info(
-                "[DB_ENGINE_CONFIG_VALIDATED] pool_size=20 max_overflow=40 — "
-                "pool configuration is correct"
+                "[DB_ENGINE_CONFIG_VALIDATED] engine_id=%s pool_size=20 max_overflow=40 — "
+                "pool configuration is correct",
+                _eid,
             )
+
+            # Validate singleton — raises RuntimeError if a second engine was created
+            await validate_single_engine()
+
         except AssertionError:
             raise
         except Exception as _cfg_exc:
@@ -563,9 +580,18 @@ async def poll_and_execute() -> int:
     """
     from sqlalchemy import select
 
-    from database import get_async_session_local
+    from database import get_async_session_local, get_engine_id
     from models import BrandAPICredential, SyncRun
     AsyncSessionLocal = get_async_session_local()
+
+    # Log engine_id at the start of each poll cycle so we can verify
+    # all sync operations use the canonical engine throughout the run.
+    try:
+        _poll_engine_id = get_engine_id()
+        logger.debug("[DB_ENGINE_ID] poll_and_execute engine_id=%s", _poll_engine_id)
+    except Exception:
+        pass
+
     from services.leaflink_sync import (
         sync_leaflink_background_continuous,
         current_full_sync_brand_id,
