@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from typing import AsyncGenerator
@@ -59,6 +60,19 @@ _engine = None
 _AsyncSessionLocal = None
 _bootstrap_complete = False
 
+# ---------------------------------------------------------------------------
+# Singleton engine tracking — prevents double initialization.
+# ---------------------------------------------------------------------------
+_engine_id: str | None = None
+_engine_creation_lock: asyncio.Lock | None = None
+
+
+def _get_engine_creation_lock() -> asyncio.Lock:
+    global _engine_creation_lock
+    if _engine_creation_lock is None:
+        _engine_creation_lock = asyncio.Lock()
+    return _engine_creation_lock
+
 # DATABASE_URL is computed lazily so importing this module never raises.
 DATABASE_URL: str = ""
 
@@ -92,6 +106,60 @@ def get_async_session_local():
         )
     logger.info("[DB_SESSION_FACTORY_REQUESTED] returning AsyncSessionLocal")
     return _AsyncSessionLocal
+
+
+def get_engine_id() -> str | None:
+    """Return the hex engine_id of the canonical engine, or None if not yet initialized."""
+    return _engine_id
+
+
+async def validate_single_engine() -> None:
+    """Verify that only one engine exists and it matches the canonical engine_id.
+
+    Raises RuntimeError if:
+    - No engine has been initialized yet.
+    - The current engine's id does not match the recorded _engine_id.
+    - The pool settings are not pool_size=20, max_overflow=40.
+
+    Logs [DB_ENGINE_SINGLETON_VERIFIED] on success.
+    """
+    if _engine is None:
+        raise RuntimeError(
+            "[DB_ENGINE_SINGLETON_VIOLATION] validate_single_engine() called but "
+            "_engine is None — initialize_database_after_bootstrap() has not run."
+        )
+    if _engine_id is None:
+        raise RuntimeError(
+            "[DB_ENGINE_SINGLETON_VIOLATION] validate_single_engine() called but "
+            "_engine_id is None — engine was created outside initialize_database_after_bootstrap()."
+        )
+    current_id = hex(id(_engine))
+    if current_id != _engine_id:
+        raise RuntimeError(
+            f"[DB_ENGINE_SINGLETON_VIOLATION] engine_id mismatch: "
+            f"current={current_id} canonical={_engine_id} — "
+            "a second engine was created outside initialize_database_after_bootstrap()."
+        )
+    _pool = _engine.pool
+    _ps = _pool.size()
+    _mo = _pool._max_overflow
+    if _ps != 20:
+        raise RuntimeError(
+            f"[DB_ENGINE_SINGLETON_VIOLATION] pool_size={_ps} expected=20 — "
+            "engine has wrong pool settings."
+        )
+    if _mo != 40:
+        raise RuntimeError(
+            f"[DB_ENGINE_SINGLETON_VIOLATION] max_overflow={_mo} expected=40 — "
+            "engine has wrong pool settings."
+        )
+    logger.info(
+        "[DB_ENGINE_SINGLETON_VERIFIED] engine_id=%s pool_size=%d max_overflow=%d — "
+        "single canonical engine confirmed",
+        _engine_id,
+        _ps,
+        _mo,
+    )
 
 
 def _build_database_url() -> str:
@@ -192,135 +260,162 @@ async def initialize_database_after_bootstrap() -> None:
 
     Populates the module-level _engine, _AsyncSessionLocal, DATABASE_URL, and
     _bootstrap_complete flag so all downstream code can use them.
+
+    Raises RuntimeError if called more than once (singleton guard).
     """
-    global _engine, _AsyncSessionLocal, DATABASE_URL, _bootstrap_complete
+    global _engine, _AsyncSessionLocal, DATABASE_URL, _bootstrap_complete, _engine_id
 
     logger.info("[DB_INIT_START] initializing database module")
 
-    logger.info("[BOOTSTRAP_DB_INIT] building DATABASE_URL")
-    DATABASE_URL = _build_database_url()
+    async with _get_engine_creation_lock():
+        if _engine is not None:
+            raise RuntimeError(
+                f"[DB_ENGINE_SINGLETON_VIOLATION] initialize_database_after_bootstrap() called "
+                f"twice — engine already exists with engine_id={hex(id(_engine))}. "
+                "Only one canonical engine is allowed."
+            )
 
-    logger.info(
-        "[BOOTSTRAP_DB_INIT] creating engine database_url=%s",
-        DATABASE_URL[:50] + "..." if DATABASE_URL else "NOT_SET",
-    )
+        logger.info("[BOOTSTRAP_DB_INIT] building DATABASE_URL")
+        DATABASE_URL = _build_database_url()
 
-    _parsed_url = urlparse(DATABASE_URL)
-    _drivername = _parsed_url.scheme
-    _host = _parsed_url.hostname or "unknown"
-    _has_ssl_in_url = "ssl" in _parsed_url.query.lower() or "sslmode" in _parsed_url.query.lower()
+        logger.info(
+            "[BOOTSTRAP_DB_INIT] creating engine database_url=%s",
+            DATABASE_URL[:50] + "..." if DATABASE_URL else "NOT_SET",
+        )
 
-    logger.info(
-        "[BOOTSTRAP_DB_INIT] drivername=%s host=%s ssl_in_url=%s",
-        _drivername,
-        _host,
-        _has_ssl_in_url,
-    )
+        _parsed_url = urlparse(DATABASE_URL)
+        _drivername = _parsed_url.scheme
+        _host = _parsed_url.hostname or "unknown"
+        _has_ssl_in_url = "ssl" in _parsed_url.query.lower() or "sslmode" in _parsed_url.query.lower()
 
-    _engine = create_async_engine(
-        DATABASE_URL,
-        echo=False,
-        pool_pre_ping=True,
-        pool_size=20,
-        max_overflow=40,
-        pool_timeout=60,
-        pool_recycle=1800,
-        connect_args={"ssl": "require"},
-        execution_options={"compiled_cache": None},
-    )
+        logger.info(
+            "[BOOTSTRAP_DB_INIT] drivername=%s host=%s ssl_in_url=%s",
+            _drivername,
+            _host,
+            _has_ssl_in_url,
+        )
 
-    logger.info("[DB_INIT_ENGINE_CREATED] async engine created")
-    logger.info("[BOOTSTRAP_DB_INIT] engine_created connect_args_ssl=require compiled_cache=disabled pool_size=20 max_overflow=40 pool_timeout=60 pool_recycle=1800")
+        _engine = create_async_engine(
+            DATABASE_URL,
+            echo=False,
+            pool_pre_ping=True,
+            pool_size=20,
+            max_overflow=40,
+            pool_timeout=60,
+            pool_recycle=1800,
+            connect_args={"ssl": "require"},
+            execution_options={"compiled_cache": None},
+        )
 
-    # ---------------------------------------------------------------------------
-    # [DB_ENGINE_CANONICAL] — log that this is the ONE canonical engine.
-    # [DB_ENGINE_ID]        — log hex(id(engine)) so all startup paths can verify
-    #                         they share the same engine object.
-    # [DB_POOL_CONFIG]      — log pool settings for production observability.
-    # ---------------------------------------------------------------------------
-    logger.info(
-        "[DB_ENGINE_CANONICAL] canonical async engine created in database.py "
-        "engine_id=%s pool_size=20 max_overflow=40 pool_timeout=60 "
-        "pool_recycle=1800 pool_pre_ping=true",
-        hex(id(_engine)),
-    )
-    logger.info(
-        "[DB_ENGINE_ID] engine_id=%s source=database.initialize_database_after_bootstrap",
-        hex(id(_engine)),
-    )
-    logger.info(
-        "[DB_POOL_CONFIG] pool_size=20 max_overflow=40 pool_timeout=60 "
-        "pool_recycle=1800 pool_pre_ping=true engine_id=%s",
-        hex(id(_engine)),
-    )
+        # Record the canonical engine_id immediately after creation.
+        _engine_id = hex(id(_engine))
 
-    # ---------------------------------------------------------------------------
-    # Pool config assertions — fail startup immediately if the engine was somehow
-    # created with wrong settings (e.g. SQLAlchemy defaults: pool_size=5, max_overflow=10).
-    # ---------------------------------------------------------------------------
-    _init_pool = _engine.pool
-    _init_pool_size = _init_pool.size()
-    _init_max_overflow = _init_pool._max_overflow
-    if _init_pool_size != 20:
-        logger.error(
-            "[POOL_CONFIG_MISMATCH] pool_size=%d expected=20 engine_id=%s",
+        logger.info("[DB_INIT_ENGINE_CREATED] async engine created")
+        logger.info("[BOOTSTRAP_DB_INIT] engine_created connect_args_ssl=require compiled_cache=disabled pool_size=20 max_overflow=40 pool_timeout=60 pool_recycle=1800")
+
+        # ---------------------------------------------------------------------------
+        # [DB_ENGINE_CANONICAL] — log that this is the ONE canonical engine.
+        # [DB_ENGINE_ID]        — log hex(id(engine)) so all startup paths can verify
+        #                         they share the same engine object.
+        # [DB_POOL_CONFIG]      — log pool settings for production observability.
+        # ---------------------------------------------------------------------------
+        logger.info(
+            "[DB_ENGINE_CANONICAL] canonical async engine created in database.py "
+            "engine_id=%s pool_size=20 max_overflow=40 pool_timeout=60 "
+            "pool_recycle=1800 pool_pre_ping=true",
+            _engine_id,
+        )
+        logger.info(
+            "[DB_ENGINE_ID] engine_id=%s source=database.initialize_database_after_bootstrap",
+            _engine_id,
+        )
+        logger.info(
+            "[DB_POOL_CONFIG] pool_size=20 max_overflow=40 pool_timeout=60 "
+            "pool_recycle=1800 pool_pre_ping=true engine_id=%s",
+            _engine_id,
+        )
+
+        # ---------------------------------------------------------------------------
+        # Pool config assertions — fail startup immediately if the engine was somehow
+        # created with wrong settings (e.g. SQLAlchemy defaults: pool_size=5, max_overflow=10).
+        # ---------------------------------------------------------------------------
+        _init_pool = _engine.pool
+        _init_pool_size = _init_pool.size()
+        _init_max_overflow = _init_pool._max_overflow
+        if _init_pool_size != 20:
+            logger.error(
+                "[POOL_CONFIG_MISMATCH] pool_size=%d expected=20 engine_id=%s",
+                _init_pool_size,
+                _engine_id,
+            )
+            raise RuntimeError(
+                f"[POOL_CONFIG_MISMATCH] pool_size={_init_pool_size} expected=20 — "
+                "engine was created with wrong pool settings"
+            )
+        if _init_max_overflow != 40:
+            logger.error(
+                "[POOL_CONFIG_MISMATCH] max_overflow=%d expected=40 engine_id=%s",
+                _init_max_overflow,
+                _engine_id,
+            )
+            raise RuntimeError(
+                f"[POOL_CONFIG_MISMATCH] max_overflow={_init_max_overflow} expected=40 — "
+                "engine was created with wrong pool settings"
+            )
+        logger.info(
+            "[DB_POOL_CONFIG_VALIDATED] pool_size=%d max_overflow=%d engine_id=%s — "
+            "pool configuration matches expected values",
             _init_pool_size,
-            hex(id(_engine)),
-        )
-        raise RuntimeError(
-            f"[POOL_CONFIG_MISMATCH] pool_size={_init_pool_size} expected=20 — "
-            "engine was created with wrong pool settings"
-        )
-    if _init_max_overflow != 40:
-        logger.error(
-            "[POOL_CONFIG_MISMATCH] max_overflow=%d expected=40 engine_id=%s",
             _init_max_overflow,
-            hex(id(_engine)),
+            _engine_id,
         )
-        raise RuntimeError(
-            f"[POOL_CONFIG_MISMATCH] max_overflow={_init_max_overflow} expected=40 — "
-            "engine was created with wrong pool settings"
+        logger.info(
+            "[DB_ENGINE_VALIDATION] pool_size=%d max_overflow=%d engine_id=%s — "
+            "engine settings confirmed correct",
+            _init_pool_size,
+            _init_max_overflow,
+            _engine_id,
         )
-    logger.info(
-        "[DB_POOL_CONFIG_VALIDATED] pool_size=%d max_overflow=%d engine_id=%s — "
-        "pool configuration matches expected values",
-        _init_pool_size,
-        _init_max_overflow,
-        hex(id(_engine)),
-    )
 
-    _AsyncSessionLocal = async_sessionmaker(
-        bind=_engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-    )
+        _AsyncSessionLocal = async_sessionmaker(
+            bind=_engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
 
-    logger.info("[DB_INIT_SESSION_FACTORY_CREATED] session factory created")
-    logger.info("[BOOTSTRAP_DB_INIT] session_factory_created")
-    logger.info(
-        "[DB_SESSION_FACTORY] AsyncSessionLocal created engine_id=%s "
-        "source=database.initialize_database_after_bootstrap",
-        hex(id(_engine)),
-    )
+        logger.info("[DB_INIT_SESSION_FACTORY_CREATED] session factory created")
+        logger.info("[BOOTSTRAP_DB_INIT] session_factory_created")
+        logger.info(
+            "[DB_SESSION_FACTORY] AsyncSessionLocal created engine_id=%s "
+            "source=database.initialize_database_after_bootstrap",
+            _engine_id,
+        )
 
-    # Verify connection works
-    logger.info("[DB_INIT_CONNECTION_VERIFIED] testing database connection")
-    async with _engine.connect() as conn:
-        await conn.execute(text("SELECT 1"))
+        # Verify connection works
+        logger.info("[DB_INIT_CONNECTION_VERIFIED] testing database connection")
+        async with _engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
 
-    _bootstrap_complete = True
-    logger.info("[DB_INIT_COMPLETE] database initialization complete")
+        _bootstrap_complete = True
+        logger.info("[DB_INIT_COMPLETE] database initialization complete")
 
-    # Update module-level aliases so `from database import engine` and
-    # `from database import AsyncSessionLocal` work after bootstrap.
-    # Note: code that already did `from database import engine` before bootstrap
-    # will still have None — they must re-import or use `import database; database.engine`.
-    import sys as _sys
-    _mod = _sys.modules[__name__]
-    _mod.engine = _engine
-    _mod.AsyncSessionLocal = _AsyncSessionLocal
+        # Update module-level aliases so `from database import engine` and
+        # `from database import AsyncSessionLocal` work after bootstrap.
+        # Note: code that already did `from database import engine` before bootstrap
+        # will still have None — they must re-import or use `import database; database.engine`.
+        import sys as _sys
+        _mod = _sys.modules[__name__]
+        _mod.engine = _engine
+        _mod.AsyncSessionLocal = _AsyncSessionLocal
 
-    logger.info("[BOOTSTRAP_DB_INIT_COMPLETE] database module initialized bootstrap_complete=true")
+        logger.info(
+            "[DB_ENGINE_SINGLETON_VERIFIED] engine_id=%s pool_size=%d max_overflow=%d — "
+            "single canonical engine initialized",
+            _engine_id,
+            _init_pool_size,
+            _init_max_overflow,
+        )
+        logger.info("[BOOTSTRAP_DB_INIT_COMPLETE] database module initialized bootstrap_complete=true")
 
 
 # ---------------------------------------------------------------------------

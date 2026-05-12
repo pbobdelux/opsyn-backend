@@ -19,7 +19,7 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import AsyncSessionLocal
+from database import get_async_session_local
 from models import BrandAPICredential, Order
 from services.leaflink_sync import safe_uuid_for_db, safe_uuid_mapped_product
 from utils.json_utils import make_json_safe
@@ -722,7 +722,8 @@ async def process_leaflink_webhook(
     errors: list[str] = []
 
     try:
-        async with AsyncSessionLocal() as upsert_db:
+        _AsyncSessionLocal = get_async_session_local()
+        async with _AsyncSessionLocal() as upsert_db:
             async with upsert_db.begin():
                 for order_data in orders_raw:
                     if not isinstance(order_data, dict):
