@@ -3092,14 +3092,16 @@ INSERT INTO orders (
     total_cents, amount, item_count, unit_count, line_items_json, raw_payload,
     source, review_status, sync_status, sync_health_status, sync_health_missing_fields,
     synced_at, last_synced_at,
-    created_at, updated_at
+    created_at, updated_at,
+    external_created_at, external_updated_at
 ) VALUES (
     CAST(:org_id AS uuid), CAST(:brand_id AS uuid), :external_order_id, :order_number,
     :customer_name, :status, :total_cents, :amount, :item_count, :unit_count,
     :line_items_json, :raw_payload, :source, :review_status, :sync_status,
     :sync_health_status, CAST(:sync_health_missing_fields AS jsonb),
     :synced_at, :last_synced_at,
-    :created_at, :updated_at
+    :created_at, :updated_at,
+    :external_created_at, :external_updated_at
 )
 ON CONFLICT (brand_id, external_order_id) DO UPDATE SET
     org_id = CAST(:org_id AS uuid),
@@ -3118,24 +3120,87 @@ ON CONFLICT (brand_id, external_order_id) DO UPDATE SET
     sync_health_missing_fields = EXCLUDED.sync_health_missing_fields,
     synced_at = EXCLUDED.synced_at,
     last_synced_at = EXCLUDED.last_synced_at,
-    updated_at = EXCLUDED.updated_at
+    updated_at = EXCLUDED.updated_at,
+    external_created_at = COALESCE(EXCLUDED.external_created_at, orders.external_created_at),
+    external_updated_at = COALESCE(EXCLUDED.external_updated_at, orders.external_updated_at)
 RETURNING (xmax = 0) AS was_inserted
 """
 
-                          # Normalize all datetime fields from LeafLink payload BEFORE
-                          # building SQL params — prevents naive/aware mixing in asyncpg.
-                          # normalize_datetime_value() never raises; returns None on failure.
-                          _norm_synced_at = normalize_datetime_value(now) or utc_now()
-                          _norm_created_at = normalize_datetime_value(now) or utc_now()
-                          _norm_updated_at = normalize_datetime_value(now) or utc_now()
-                          _norm_last_synced_at = normalize_datetime_value(now) or utc_now()
+                          # ---------------------------------------------------------------------------
+                          # Normalize ALL datetime fields using ensure_utc_datetime() — the canonical
+                          # UTC-aware normalizer.  Each field is logged individually so production
+                          # logs show exactly which values were normalized and from what source type.
+                          # This is the primary fix for:
+                          #   "can't subtract offset-naive and offset-aware datetimes" at $18 (synced_at)
+                          # ---------------------------------------------------------------------------
 
+                          # Server-side timestamps — always UTC-aware from utc_now(), but
+                          # normalize defensively to guarantee no naive datetime reaches asyncpg.
+                          _norm_synced_at = ensure_utc_datetime(now) or utc_now()
                           logger.debug(
-                              "[DATETIME_NORMALIZED] external_id=%s synced_at=%s created_at=%s updated_at=%s",
-                              external_id,
-                              _norm_synced_at.isoformat() if _norm_synced_at else None,
-                              _norm_created_at.isoformat() if _norm_created_at else None,
-                              _norm_updated_at.isoformat() if _norm_updated_at else None,
+                              "[DATETIME_NORMALIZED] field=synced_at source_type=%s tzinfo=UTC value=%s",
+                              type(now).__name__,
+                              _norm_synced_at.isoformat(),
+                          )
+
+                          _norm_last_synced_at = ensure_utc_datetime(now) or utc_now()
+                          logger.debug(
+                              "[DATETIME_NORMALIZED] field=last_synced_at source_type=%s tzinfo=UTC value=%s",
+                              type(now).__name__,
+                              _norm_last_synced_at.isoformat(),
+                          )
+
+                          _norm_created_at = ensure_utc_datetime(now) or utc_now()
+                          logger.debug(
+                              "[DATETIME_NORMALIZED] field=created_at source_type=%s tzinfo=UTC value=%s",
+                              type(now).__name__,
+                              _norm_created_at.isoformat(),
+                          )
+
+                          _norm_updated_at = ensure_utc_datetime(now) or utc_now()
+                          logger.debug(
+                              "[DATETIME_NORMALIZED] field=updated_at source_type=%s tzinfo=UTC value=%s",
+                              type(now).__name__,
+                              _norm_updated_at.isoformat(),
+                          )
+
+                          # LeafLink API response timestamps — may be ISO strings, naive datetimes,
+                          # or None.  ensure_utc_datetime() handles all cases and always returns
+                          # UTC-aware or None, preventing naive datetimes from reaching asyncpg.
+                          # Wrapped in try/except so an unexpected type from the API never kills
+                          # the upsert — we fall back to None (nullable column).
+                          _raw_ext_created = o.get("created_on") or o.get("created_at") or o.get("date_created")
+                          try:
+                              _norm_external_created_at = ensure_utc_datetime(_raw_ext_created)
+                          except (ValueError, TypeError):
+                              logger.warning(
+                                  "[DATETIME_NORMALIZED] field=external_created_at source_type=%s"
+                                  " value=%r — could not normalize, using None",
+                                  type(_raw_ext_created).__name__,
+                                  str(_raw_ext_created)[:50] if _raw_ext_created is not None else None,
+                              )
+                              _norm_external_created_at = None
+                          logger.debug(
+                              "[DATETIME_NORMALIZED] field=external_created_at source_type=%s tzinfo=UTC value=%s",
+                              type(_raw_ext_created).__name__,
+                              _norm_external_created_at.isoformat() if _norm_external_created_at else None,
+                          )
+
+                          _raw_ext_updated = o.get("updated_on") or o.get("updated_at") or o.get("date_updated")
+                          try:
+                              _norm_external_updated_at = ensure_utc_datetime(_raw_ext_updated)
+                          except (ValueError, TypeError):
+                              logger.warning(
+                                  "[DATETIME_NORMALIZED] field=external_updated_at source_type=%s"
+                                  " value=%r — could not normalize, using None",
+                                  type(_raw_ext_updated).__name__,
+                                  str(_raw_ext_updated)[:50] if _raw_ext_updated is not None else None,
+                              )
+                              _norm_external_updated_at = None
+                          logger.debug(
+                              "[DATETIME_NORMALIZED] field=external_updated_at source_type=%s tzinfo=UTC value=%s",
+                              type(_raw_ext_updated).__name__,
+                              _norm_external_updated_at.isoformat() if _norm_external_updated_at else None,
                           )
 
                           upsert_params = {
@@ -3160,6 +3225,8 @@ RETURNING (xmax = 0) AS was_inserted
                               "last_synced_at": _norm_last_synced_at,
                               "created_at": _norm_created_at,
                               "updated_at": _norm_updated_at,
+                              "external_created_at": _norm_external_created_at,
+                              "external_updated_at": _norm_external_updated_at,
                           }
 
                           # Apply all sanitizers
@@ -3169,12 +3236,30 @@ RETURNING (xmax = 0) AS was_inserted
                           upsert_params = apply_uuid_str_to_params(upsert_params)
 
                           # Final belt-and-suspenders: explicitly re-normalize all datetime
-                          # fields using normalize_datetime_value() immediately before execute()
+                          # fields using ensure_utc_datetime() immediately before execute()
                           # so no intermediate mutation can introduce a naive datetime.
-                          for _dt_field in ["synced_at", "last_synced_at", "created_at", "updated_at"]:
+                          for _dt_field in ["synced_at", "last_synced_at", "created_at", "updated_at",
+                                            "external_created_at", "external_updated_at"]:
                               _raw_dt = upsert_params.get(_dt_field)
-                              _safe_dt = normalize_datetime_value(_raw_dt) or utc_now()
-                              if _safe_dt != _raw_dt:
+                              if _raw_dt is None:
+                                  # None is valid for nullable fields (external_created_at, external_updated_at)
+                                  continue
+                              try:
+                                  _safe_dt = ensure_utc_datetime(_raw_dt) or utc_now()
+                              except (ValueError, TypeError):
+                                  # Unexpected type after sanitization — fall back to utc_now() for
+                                  # required fields, None for nullable external timestamp fields.
+                                  _is_nullable_field = _dt_field in ("external_created_at", "external_updated_at")
+                                  _safe_dt = None if _is_nullable_field else utc_now()
+                                  logger.warning(
+                                      "[DATETIME_NORMALIZED] field=%s external_id=%s"
+                                      " value=%r — unexpected type after sanitization, using %s",
+                                      _dt_field,
+                                      external_id,
+                                      str(_raw_dt)[:50],
+                                      "None" if _safe_dt is None else "utc_now()",
+                                  )
+                              if _safe_dt is not None and _safe_dt != _raw_dt:
                                   logger.debug(
                                       "[DATETIME_NORMALIZED] field=%s external_id=%s before=%r after=%s",
                                       _dt_field,
@@ -3187,16 +3272,19 @@ RETURNING (xmax = 0) AS was_inserted
 
                           # Final guard: scan ALL params for any remaining naive datetimes
                           # and fix them in-place (never raise — log and fix instead).
+                          # Log [DATETIME_VALIDATION_FAILED] for any field that still has a naive datetime
+                          # after all normalization passes — this should never happen in production.
                           for _field, _value in list(upsert_params.items()):
                               if isinstance(_value, datetime):
                                   if _value.tzinfo is None:
                                       datetime_normalization_failures += 1
                                       logger.error(
-                                          "[DATETIME_NORMALIZATION_FAILED] field=%s external_id=%s value=%s"
-                                          " — forcing UTC-aware",
+                                          "[DATETIME_VALIDATION_FAILED] field=%s external_id=%s value=%s"
+                                          " source_type=%s — forcing UTC-aware",
                                           _field,
                                           external_id,
                                           _value.isoformat(),
+                                          type(_value).__name__,
                                       )
                                       upsert_params[_field] = _value.replace(tzinfo=timezone.utc)
 
