@@ -211,6 +211,62 @@ def ensure_utc_datetime(value: Any) -> Optional[datetime]:
     raise ValueError(f"Cannot normalize datetime: {type(value).__name__}")
 
 
+def _trace_sql_params_for_datetimes(params: dict, context: str = "unknown") -> None:
+    """Enumerate every parameter in *params* and emit a [SQL_PARAM_TRACE] log line.
+
+    For each parameter logs:
+      - positional index (0-based, matching asyncpg's $N-1 binding order)
+      - parameter name
+      - Python type
+      - repr(value) truncated to 100 chars
+      - tzinfo (if datetime)
+      - whether the datetime is naive or aware
+
+    This is the primary diagnostic tool for identifying which field maps to a
+    specific asyncpg ``$N`` positional argument when the error message reports
+    "can't subtract offset-naive and offset-aware datetimes" at ``$N``.
+
+    Args:
+        params:  The final SQL parameters dict about to be passed to execute().
+        context: Short label for the calling site (e.g. "order_header_upsert").
+    """
+    if not isinstance(params, dict):
+        logger.warning(
+            "[SQL_PARAM_TRACE] context=%s params_type=%s — expected dict, skipping trace",
+            context,
+            type(params).__name__,
+        )
+        return
+
+    for idx, (name, value) in enumerate(params.items()):
+        value_repr = repr(value)
+        if len(value_repr) > 100:
+            value_repr = value_repr[:100] + "..."
+
+        if isinstance(value, datetime):
+            tzinfo_str = str(value.tzinfo) if value.tzinfo is not None else "None"
+            aware_str = "True" if value.tzinfo is not None else "False"
+            logger.info(
+                "[SQL_PARAM_TRACE] context=%s idx=%d field=%s type=%s tzinfo=%s aware=%s value=%s",
+                context,
+                idx,
+                name,
+                type(value).__name__,
+                tzinfo_str,
+                aware_str,
+                value_repr,
+            )
+        else:
+            logger.info(
+                "[SQL_PARAM_TRACE] context=%s idx=%d field=%s type=%s value=%s",
+                context,
+                idx,
+                name,
+                type(value).__name__,
+                value_repr,
+            )
+
+
 def _cursor_hash(cursor: Optional[str]) -> Optional[str]:
     """Return a short hash of a cursor for safe logging."""
     if not cursor:
@@ -3341,6 +3397,56 @@ RETURNING (xmax = 0) AS was_inserted
                           # Pre-bind validator: final scan of the EXACT object being passed to execute()
                           safe_params = _validate_and_fix_sql_params(safe_params)
 
+                          # ---------------------------------------------------------------
+                          # TARGETED FIX: explicitly re-normalize synced_at ($18) and all
+                          # other datetime fields using ensure_utc_datetime() AFTER all
+                          # sanitization passes.  This catches any naive datetime that was
+                          # introduced or reconstructed after the earlier normalization
+                          # pipeline (e.g. by _recursive_sanitize_sql_params converting an
+                          # ISO string back to a naive datetime, or a default value applied
+                          # without normalization).
+                          # ---------------------------------------------------------------
+                          _all_dt_fields = [
+                              "synced_at", "last_synced_at", "created_at", "updated_at",
+                              "external_created_at", "external_updated_at",
+                          ]
+                          for _fix_field in _all_dt_fields:
+                              _fix_val = safe_params.get(_fix_field)
+                              if _fix_val is None:
+                                  continue
+                              if isinstance(_fix_val, datetime):
+                                  if _fix_val.tzinfo is None:
+                                      _fixed = _fix_val.replace(tzinfo=timezone.utc)
+                                      logger.info(
+                                          "[DATETIME_FIELD_FIXED] context=order_header_upsert"
+                                          " field=%s original=%s tzinfo=None"
+                                          " fixed=%s action=replace_tzinfo_utc",
+                                          _fix_field,
+                                          _fix_val.isoformat(),
+                                          _fixed.isoformat(),
+                                      )
+                                      safe_params[_fix_field] = _fixed
+                                  else:
+                                      # Already aware — normalize to UTC
+                                      _fixed = _fix_val.astimezone(timezone.utc)
+                                      safe_params[_fix_field] = _fixed
+                              elif isinstance(_fix_val, str):
+                                  # String that slipped through — attempt to parse as UTC datetime
+                                  try:
+                                      _parsed = ensure_utc_datetime(_fix_val)
+                                      if _parsed is not None:
+                                          logger.info(
+                                              "[DATETIME_FIELD_FIXED] context=order_header_upsert"
+                                              " field=%s original_type=str value=%s"
+                                              " fixed=%s action=parsed_iso_string",
+                                              _fix_field,
+                                              _fix_val[:50],
+                                              _parsed.isoformat(),
+                                          )
+                                          safe_params[_fix_field] = _parsed
+                                  except (ValueError, TypeError):
+                                      pass
+
                           # [FINAL_EXECUTE_PARAMS] Deep recursive datetime audit
                           def _audit_params_for_naive_datetimes(params: Any, path: str = "params", depth: int = 0) -> None:
                               """Recursively audit params for naive datetimes and log findings."""
@@ -3409,6 +3515,37 @@ RETURNING (xmax = 0) AS was_inserted
 
                           # Final validation before execute
                           _audit_params_for_naive_datetimes(safe_params)
+
+                          # ---------------------------------------------------------------
+                          # COMPREHENSIVE PARAMETER TRACE — emit [SQL_PARAM_TRACE] for
+                          # every parameter so logs show the exact index/field/type/tzinfo
+                          # that maps to each asyncpg $N positional argument.
+                          # ---------------------------------------------------------------
+                          _trace_sql_params_for_datetimes(safe_params, "order_header_upsert")
+
+                          # ---------------------------------------------------------------
+                          # HARD-FAIL VALIDATION — raise RuntimeError before asyncpg runs
+                          # if ANY datetime param is still naive after all normalization.
+                          # This surfaces the exact field name instead of the cryptic
+                          # "can't subtract offset-naive and offset-aware datetimes at $N".
+                          # ---------------------------------------------------------------
+                          for _hf_idx, (_hf_field, _hf_value) in enumerate(safe_params.items()):
+                              if isinstance(_hf_value, datetime) and _hf_value.tzinfo is None:
+                                  logger.error(
+                                      "[FINAL_DATETIME_VALIDATION_FAILED] context=order_header_upsert"
+                                      " idx=%d field=%s value=%s tzinfo=None"
+                                      " — naive datetime reached execute(), raising RuntimeError",
+                                      _hf_idx,
+                                      _hf_field,
+                                      repr(_hf_value),
+                                  )
+                                  # Normalize in-place so the error is recoverable on retry,
+                                  # then raise so the caller sees the exact field name.
+                                  safe_params[_hf_field] = _hf_value.replace(tzinfo=timezone.utc)
+                                  raise RuntimeError(
+                                      f"[FINAL_DATETIME_VALIDATION_FAILED] field={_hf_field} idx={_hf_idx}"
+                                      f" value={_hf_value!r} tzinfo=None — naive datetime in order_header_upsert"
+                                  )
 
                           upsert_result = await db.execute(text(upsert_stmt), safe_params)
 
