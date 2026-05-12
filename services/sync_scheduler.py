@@ -168,6 +168,16 @@ async def _sync_worker_bootstrap() -> None:
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},
     )
+    logger.info(
+        "[DB_ENGINE_BOOTSTRAP] temporary bootstrap engine created in sync_scheduler.py "
+        "engine_id=%s pool_size=20 max_overflow=40 — will be disposed after bootstrap",
+        hex(id(bootstrap_engine)),
+    )
+    logger.info(
+        "[DB_POOL_CONFIG] pool_size=20 max_overflow=40 pool_timeout=60 "
+        "pool_recycle=1800 pool_pre_ping=true engine_id=%s source=sync_scheduler._sync_worker_bootstrap",
+        hex(id(bootstrap_engine)),
+    )
 
     try:
         # Run bootstrap schema recovery
@@ -188,6 +198,11 @@ async def _sync_worker_bootstrap() -> None:
         )
     finally:
         await bootstrap_engine.dispose()
+        logger.info(
+            "[DB_ENGINE_DISPOSED] bootstrap engine disposed engine_id=%s "
+            "source=sync_scheduler._sync_worker_bootstrap",
+            hex(id(bootstrap_engine)),
+        )
 
 
 async def _sync_worker_init_database() -> None:
@@ -267,6 +282,19 @@ async def worker_main() -> None:
             logger.info(
                 "[DB_ENGINE_CONFIG_VALIDATED] pool_size=20 max_overflow=40 — "
                 "pool configuration is correct"
+            )
+            logger.info(
+                "[DB_ENGINE_ID] engine_id=%s source=sync_scheduler.worker_main (worker startup)",
+                hex(id(_eng)),
+            )
+            logger.info(
+                "[DB_POOL_CONFIG] pool_size=%d max_overflow=%d pool_timeout=%s "
+                "pool_recycle=%s pool_pre_ping=true engine_id=%s source=sync_scheduler.worker_main",
+                _ps,
+                _mo,
+                getattr(_pool, "_timeout", "unknown"),
+                getattr(_pool, "_recycle", "unknown"),
+                hex(id(_eng)),
             )
         except AssertionError:
             raise
@@ -1013,6 +1041,19 @@ async def run_scheduler() -> None:
             getattr(_sched_pool, "_recycle", "unknown"),
         )
         logger.info("[DB_POOL_CAPACITY] total_capacity=%d", _sched_ps + _sched_mo)
+        logger.info(
+            "[DB_ENGINE_ID] engine_id=%s source=sync_scheduler.run_scheduler (scheduler startup)",
+            hex(id(_sched_eng)),
+        )
+        logger.info(
+            "[DB_POOL_CONFIG] pool_size=%d max_overflow=%d pool_timeout=%s "
+            "pool_recycle=%s pool_pre_ping=true engine_id=%s source=sync_scheduler.run_scheduler",
+            _sched_ps,
+            _sched_mo,
+            getattr(_sched_pool, "_timeout", "unknown"),
+            getattr(_sched_pool, "_recycle", "unknown"),
+            hex(id(_sched_eng)),
+        )
     except Exception as _sched_cfg_exc:
         logger.warning("[DB_ENGINE_CONFIG] failed to read pool config: %s", _sched_cfg_exc)
 
