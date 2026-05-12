@@ -505,3 +505,65 @@ async def inspect_schema_at_startup() -> None:
             exc,
             exc_info=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Pool health telemetry — importable background task
+# ---------------------------------------------------------------------------
+
+_POOL_SIZE_CONFIGURED = 20
+_POOL_MAX_OVERFLOW_CONFIGURED = 40
+_POOL_TOTAL_CAPACITY_CONFIGURED = _POOL_SIZE_CONFIGURED + _POOL_MAX_OVERFLOW_CONFIGURED
+
+
+async def log_pool_health() -> None:
+    """
+    Background task: log DB connection-pool health metrics every 60 seconds.
+
+    Emits [DB_POOL_HEALTH] with:
+      checked_out         — connections currently in use
+      overflow            — connections beyond pool_size
+      pool_size           — configured pool_size (20)
+      utilization_percent — checked_out / total_capacity * 100
+      available           — remaining capacity before pool is exhausted
+
+    Handles asyncio.CancelledError gracefully so it can be used as a
+    long-running asyncio.Task that is cancelled on shutdown.
+
+    Usage::
+
+        task = asyncio.create_task(log_pool_health())
+        # ... later ...
+        task.cancel()
+        await task
+    """
+    import asyncio as _asyncio
+
+    while True:
+        try:
+            await _asyncio.sleep(60)
+            if _engine is None:
+                continue
+            pool = _engine.pool
+            checked_out = pool.checkedout()
+            overflow = max(0, checked_out - _POOL_SIZE_CONFIGURED)
+            utilization_percent = round(
+                checked_out / _POOL_TOTAL_CAPACITY_CONFIGURED * 100, 1
+            )
+            available = max(0, _POOL_TOTAL_CAPACITY_CONFIGURED - checked_out)
+            logger.info(
+                "[DB_POOL_HEALTH] checked_out=%d overflow=%d pool_size=%d "
+                "utilization_percent=%.1f available=%d",
+                checked_out,
+                overflow,
+                _POOL_SIZE_CONFIGURED,
+                utilization_percent,
+                available,
+            )
+        except _asyncio.CancelledError:
+            logger.info("[DB_POOL_HEALTH] log_pool_health task cancelled, exiting")
+            return
+        except Exception as exc:
+            logger.warning(
+                "[DB_POOL_HEALTH] failed to read pool stats: %s", str(exc)[:200]
+            )
