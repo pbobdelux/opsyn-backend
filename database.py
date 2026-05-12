@@ -59,6 +59,10 @@ _engine = None
 _AsyncSessionLocal = None
 _bootstrap_complete = False
 
+# Track engine creation attempts for singleton enforcement
+_engine_creation_count = 0
+_engine_creation_sources: list[str] = []
+
 # DATABASE_URL is computed lazily so importing this module never raises.
 DATABASE_URL: str = ""
 
@@ -92,6 +96,47 @@ def get_async_session_local():
         )
     logger.info("[DB_SESSION_FACTORY_REQUESTED] returning AsyncSessionLocal")
     return _AsyncSessionLocal
+
+
+async def validate_single_engine() -> None:
+    """
+    Validate that exactly ONE canonical engine was created.
+
+    Raises RuntimeError if multiple engines were created, indicating a bug
+    in the bootstrap sequence or a code path that creates engines outside
+    the canonical initialize_database_after_bootstrap() function.
+
+    Called by main.py after _init_database() to enforce singleton constraint.
+    """
+    global _engine_creation_count
+
+    if _engine is None:
+        raise RuntimeError(
+            "[DB_SINGLETON_VALIDATION_FAILED] engine is None — "
+            "initialize_database_after_bootstrap() was never called"
+        )
+
+    if _engine_creation_count > 1:
+        logger.error(
+            "[DB_SINGLETON_VALIDATION_FAILED] multiple_engines_detected "
+            "count=%d sources=%s engine_id=%s",
+            _engine_creation_count,
+            _engine_creation_sources,
+            hex(id(_engine)),
+        )
+        raise RuntimeError(
+            f"[DB_SINGLETON_VALIDATION_FAILED] {_engine_creation_count} engines created — "
+            f"expected exactly 1. Sources: {_engine_creation_sources}. "
+            f"This indicates a bug in the bootstrap sequence or a code path creating "
+            f"engines outside initialize_database_after_bootstrap()."
+        )
+
+    logger.info(
+        "[DB_ENGINE_SINGLETON_VERIFIED] exactly_one_engine_created "
+        "engine_id=%s source=%s",
+        hex(id(_engine)),
+        _engine_creation_sources[0] if _engine_creation_sources else "unknown",
+    )
 
 
 def _build_database_url() -> str:
@@ -193,9 +238,21 @@ async def initialize_database_after_bootstrap() -> None:
     Populates the module-level _engine, _AsyncSessionLocal, DATABASE_URL, and
     _bootstrap_complete flag so all downstream code can use them.
     """
-    global _engine, _AsyncSessionLocal, DATABASE_URL, _bootstrap_complete
+    global _engine, _AsyncSessionLocal, DATABASE_URL, _bootstrap_complete, _engine_creation_count, _engine_creation_sources
 
     logger.info("[DB_INIT_START] initializing database module")
+
+    # Guard: fail if engine already created
+    if _engine is not None:
+        logger.error(
+            "[DB_INIT_GUARD_FAILED] engine already exists engine_id=%s — "
+            "initialize_database_after_bootstrap() called twice",
+            hex(id(_engine)),
+        )
+        raise RuntimeError(
+            "[DB_INIT_GUARD_FAILED] initialize_database_after_bootstrap() called twice — "
+            "engine already exists. This indicates a bug in the bootstrap sequence."
+        )
 
     logger.info("[BOOTSTRAP_DB_INIT] building DATABASE_URL")
     DATABASE_URL = _build_database_url()
@@ -223,6 +280,15 @@ async def initialize_database_after_bootstrap() -> None:
         pool_pre_ping=True,
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},
+    )
+
+    _engine_creation_count += 1
+    _engine_creation_sources.append("database.initialize_database_after_bootstrap")
+
+    logger.info(
+        "[DB_ENGINE_CREATION_TRACKED] engine_creation_count=%d engine_id=%s",
+        _engine_creation_count,
+        hex(id(_engine)),
     )
 
     logger.info("[DB_INIT_ENGINE_CREATED] async engine created")
@@ -288,10 +354,17 @@ async def refresh_connection_pool() -> None:
     Dispose of the current connection pool and create a new one.
     Use this after schema changes to ensure new connections see updated schema.
     """
-    global _engine, _AsyncSessionLocal, engine, AsyncSessionLocal
+    global _engine, _AsyncSessionLocal, engine, AsyncSessionLocal, _engine_creation_count, _engine_creation_sources
 
     if _engine is None:
         return
+
+    logger.info(
+        "[DB_POOL_REFRESH_START] refreshing connection pool engine_id=%s",
+        hex(id(_engine)),
+    )
+
+    old_engine_id = hex(id(_engine))
 
     logger.info("[Database] disposing_connection_pool")
     await _engine.dispose()
@@ -304,6 +377,16 @@ async def refresh_connection_pool() -> None:
         pool_pre_ping=True,
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},
+    )
+
+    _engine_creation_count += 1
+    _engine_creation_sources.append("database.refresh_connection_pool")
+
+    logger.info(
+        "[DB_ENGINE_RECREATED] old_engine_id=%s new_engine_id=%s creation_count=%d",
+        old_engine_id,
+        hex(id(_engine)),
+        _engine_creation_count,
     )
 
     _AsyncSessionLocal = async_sessionmaker(
@@ -356,10 +439,17 @@ async def dispose_and_recreate_engine() -> None:
     statement metadata from a previous deploy is discarded before the first
     sync operation runs.
     """
-    global _engine, _AsyncSessionLocal, engine, AsyncSessionLocal
+    global _engine, _AsyncSessionLocal, engine, AsyncSessionLocal, _engine_creation_count, _engine_creation_sources
 
     if _engine is None:
         return
+
+    logger.info(
+        "[DB_ENGINE_DISPOSE_RECREATE_START] disposing and recreating engine engine_id=%s",
+        hex(id(_engine)),
+    )
+
+    old_engine_id = hex(id(_engine))
 
     logger.info("[DB_STARTUP] disposing_engine_for_fresh_cache")
     await _engine.dispose()
@@ -370,6 +460,16 @@ async def dispose_and_recreate_engine() -> None:
         pool_pre_ping=True,
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},  # Disable statement cache to prevent UUID/VARCHAR type confusion
+    )
+
+    _engine_creation_count += 1
+    _engine_creation_sources.append("database.dispose_and_recreate_engine")
+
+    logger.info(
+        "[DB_ENGINE_RECREATED] old_engine_id=%s new_engine_id=%s creation_count=%d",
+        old_engine_id,
+        hex(id(_engine)),
+        _engine_creation_count,
     )
 
     _AsyncSessionLocal = async_sessionmaker(
