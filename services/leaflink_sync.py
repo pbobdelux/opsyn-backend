@@ -1274,6 +1274,42 @@ def assert_no_naive_datetimes(value: Any, path: str = "params") -> None:
             assert_no_naive_datetimes(item, f"{path}.{i}")
 
 
+def _assert_no_naive_datetimes(params: dict, context: str = "order_upsert") -> None:
+    """Final validation guard: raise AssertionError if any naive datetime is found in params.
+
+    Logs [DATETIME_VALIDATION_FAILED] with field name before raising so the
+    failure is always visible in production logs even if the AssertionError is
+    caught upstream.
+
+    Called immediately before every order header INSERT/UPSERT execute() as the
+    last line of defense against the asyncpg
+    'can't subtract offset-naive and offset-aware datetimes' error.
+
+    Args:
+        params:  SQL parameters dict to validate.
+        context: Short label for log context (e.g. 'order_upsert').
+
+    Raises:
+        AssertionError: If any datetime value has tzinfo=None.
+    """
+    if not isinstance(params, dict):
+        return
+    for field, value in params.items():
+        if isinstance(value, datetime):
+            if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+                logger.error(
+                    "[DATETIME_VALIDATION_FAILED] context=%s field=%s value=%s tzinfo=None"
+                    " — naive datetime would cause asyncpg offset-naive/offset-aware error",
+                    context,
+                    field,
+                    value.isoformat(),
+                )
+                raise AssertionError(
+                    f"[DATETIME_VALIDATION_FAILED] context={context} field={field} value={value!r}"
+                    f" — naive datetime must not reach asyncpg"
+                )
+
+
 def final_sanitize_order_lines_params(params: dict) -> dict:
     """Hard final sanitizer applied immediately before every order_lines execute().
 
@@ -3124,19 +3160,33 @@ RETURNING (xmax = 0) AS was_inserted
 
                           # Normalize all datetime fields from LeafLink payload BEFORE
                           # building SQL params — prevents naive/aware mixing in asyncpg.
-                          # normalize_datetime_value() never raises; returns None on failure.
-                          _norm_synced_at = normalize_datetime_value(now) or utc_now()
-                          _norm_created_at = normalize_datetime_value(now) or utc_now()
-                          _norm_updated_at = normalize_datetime_value(now) or utc_now()
-                          _norm_last_synced_at = normalize_datetime_value(now) or utc_now()
+                          # ensure_utc_datetime() is the canonical normalizer: handles
+                          # naive datetimes, aware datetimes, ISO strings, and date objects.
+                          # normalize_datetime_value() is used as a belt-and-suspenders fallback.
+                          _norm_synced_at = ensure_utc_datetime(now) or utc_now()
+                          _norm_created_at = ensure_utc_datetime(now) or utc_now()
+                          _norm_updated_at = ensure_utc_datetime(now) or utc_now()
+                          _norm_last_synced_at = ensure_utc_datetime(now) or utc_now()
 
-                          logger.debug(
-                              "[DATETIME_NORMALIZED] external_id=%s synced_at=%s created_at=%s updated_at=%s",
-                              external_id,
-                              _norm_synced_at.isoformat() if _norm_synced_at else None,
-                              _norm_created_at.isoformat() if _norm_created_at else None,
-                              _norm_updated_at.isoformat() if _norm_updated_at else None,
-                          )
+                          # [LEAFLINK_DATETIME_NORMALIZED] — log each datetime field
+                          # immediately after normalization from the LeafLink API response
+                          # so we can confirm UTC-aware values before they enter SQL params.
+                          for _ll_field, _ll_val in [
+                              ("synced_at", _norm_synced_at),
+                              ("last_synced_at", _norm_last_synced_at),
+                              ("created_at", _norm_created_at),
+                              ("updated_at", _norm_updated_at),
+                          ]:
+                              logger.debug(
+                                  "[LEAFLINK_DATETIME_NORMALIZED] external_id=%s field=%s"
+                                  " source_type=%s value=%s tzinfo=%s is_utc_aware=%s",
+                                  external_id,
+                                  _ll_field,
+                                  type(now).__name__,
+                                  _ll_val.isoformat() if _ll_val else None,
+                                  _ll_val.tzinfo if _ll_val else None,
+                                  bool(_ll_val and _ll_val.tzinfo is not None),
+                              )
 
                           upsert_params = {
                               "org_id": _sql_org_id,
@@ -3169,19 +3219,23 @@ RETURNING (xmax = 0) AS was_inserted
                           upsert_params = apply_uuid_str_to_params(upsert_params)
 
                           # Final belt-and-suspenders: explicitly re-normalize all datetime
-                          # fields using normalize_datetime_value() immediately before execute()
+                          # fields using ensure_utc_datetime() immediately before execute()
                           # so no intermediate mutation can introduce a naive datetime.
+                          # Log every field with [DATETIME_NORMALIZED] tag showing field name,
+                          # source type, and tzinfo=UTC for full observability.
                           for _dt_field in ["synced_at", "last_synced_at", "created_at", "updated_at"]:
                               _raw_dt = upsert_params.get(_dt_field)
-                              _safe_dt = normalize_datetime_value(_raw_dt) or utc_now()
-                              if _safe_dt != _raw_dt:
-                                  logger.debug(
-                                      "[DATETIME_NORMALIZED] field=%s external_id=%s before=%r after=%s",
-                                      _dt_field,
-                                      external_id,
-                                      _raw_dt,
-                                      _safe_dt.isoformat(),
-                                  )
+                              _safe_dt = ensure_utc_datetime(_raw_dt) or utc_now()
+                              logger.debug(
+                                  "[DATETIME_NORMALIZED] field=%s external_id=%s"
+                                  " source_type=%s before=%r after=%s tzinfo=%s",
+                                  _dt_field,
+                                  external_id,
+                                  type(_raw_dt).__name__,
+                                  _raw_dt,
+                                  _safe_dt.isoformat(),
+                                  _safe_dt.tzinfo,
+                              )
                               upsert_params[_dt_field] = _safe_dt
 
 
@@ -3285,6 +3339,38 @@ RETURNING (xmax = 0) AS was_inserted
 
                           # Final validation before execute
                           _audit_params_for_naive_datetimes(safe_params)
+
+                          # [DATETIME_NORMALIZED] — log every datetime param with field name,
+                          # source type, and tzinfo=UTC immediately before execute() so the
+                          # exact values bound to asyncpg are always visible in logs.
+                          for _pre_field, _pre_val in safe_params.items():
+                              if isinstance(_pre_val, datetime):
+                                  logger.debug(
+                                      "[DATETIME_NORMALIZED] pre_execute field=%s"
+                                      " source_type=%s value=%s tzinfo=%s is_utc_aware=%s",
+                                      _pre_field,
+                                      type(_pre_val).__name__,
+                                      _pre_val.isoformat(),
+                                      _pre_val.tzinfo,
+                                      bool(_pre_val.tzinfo is not None),
+                                  )
+
+                          # Final guard: _assert_no_naive_datetimes() raises AssertionError
+                          # and logs [DATETIME_VALIDATION_FAILED] if any naive datetime
+                          # remains in safe_params — this is the last line of defense before
+                          # asyncpg binding and prevents the
+                          # 'can't subtract offset-naive and offset-aware datetimes' error.
+                          try:
+                              _assert_no_naive_datetimes(safe_params, context="order_header_upsert")
+                          except AssertionError as _dt_assert_err:
+                              logger.error(
+                                  "[DATETIME_VALIDATION_FAILED] external_id=%s brand_id=%s"
+                                  " error=%s — aborting upsert to prevent asyncpg error",
+                                  external_id,
+                                  brand_id_value,
+                                  str(_dt_assert_err)[:300],
+                              )
+                              raise
 
                           upsert_result = await db.execute(text(upsert_stmt), safe_params)
 
