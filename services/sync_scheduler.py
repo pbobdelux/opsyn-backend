@@ -244,9 +244,18 @@ async def worker_main() -> None:
             recovered_count,
         )
 
-        # Phase 5: Start scheduler
-        logger.info("[SYNC_WORKER_SCHEDULER_START] starting scheduler")
-        await run_scheduler()
+        # Phase 5: Start scheduler and pool health telemetry as concurrent tasks
+        logger.info("[SYNC_WORKER_SCHEDULER_START] starting scheduler and pool health telemetry")
+        from database import log_pool_health
+        pool_health_task = asyncio.create_task(log_pool_health(), name="pool_health_telemetry")
+        try:
+            await run_scheduler()
+        finally:
+            pool_health_task.cancel()
+            try:
+                await pool_health_task
+            except asyncio.CancelledError:
+                pass
 
     except Exception as e:
         logger.error(
@@ -418,9 +427,9 @@ async def recover_stale_sync_jobs() -> int:
 # ---------------------------------------------------------------------------
 
 # Pool configuration constants (must match engine creation in database.py)
-_POOL_SIZE = 5
-_POOL_MAX_OVERFLOW = 10
-_POOL_TOTAL_CAPACITY = _POOL_SIZE + _POOL_MAX_OVERFLOW  # 15 total connections
+_POOL_SIZE = 20
+_POOL_MAX_OVERFLOW = 40
+_POOL_TOTAL_CAPACITY = _POOL_SIZE + _POOL_MAX_OVERFLOW  # 60 total connections
 _POOL_SATURATION_THRESHOLD = 0.80  # 80%
 
 
@@ -486,13 +495,31 @@ async def poll_and_execute() -> None:
     # ---------------------------------------------------------------------- #
     pool_saturation = _get_pool_saturation()
     if pool_saturation is not None and pool_saturation >= _POOL_SATURATION_THRESHOLD:
+        # Gather additional pool context for diagnostics
+        _checked_out: int = 0
+        _overflow: int = 0
+        _available: int = 0
+        _backoff_seconds: int = 30
+        try:
+            from database import get_engine as _get_engine
+            _pool = _get_engine().pool
+            _checked_out = _pool.checkedout()
+            _overflow = _pool.overflow()
+            _available = _POOL_SIZE - _checked_out
+        except Exception:
+            pass
         logger.warning(
             "[SCHEDULER_SKIPPED_POOL_SATURATED] pool_saturation=%.1f%% "
-            "threshold=%.0f%% skipping_poll_cycle sleeping_10s",
+            "threshold=%.0f%% checked_out=%d overflow=%d available=%d "
+            "estimated_recovery_time=%ds skipping_poll_cycle",
             pool_saturation * 100,
             _POOL_SATURATION_THRESHOLD * 100,
+            _checked_out,
+            _overflow,
+            _available,
+            _backoff_seconds,
         )
-        await asyncio.sleep(10)
+        await asyncio.sleep(_backoff_seconds)
         return
 
     # ---------------------------------------------------------------------- #
@@ -512,8 +539,12 @@ async def poll_and_execute() -> None:
         "priority_3=incremental_recent_orders priority_4=full_resync "
         "order_by=started_at_asc",
     )
+    import time as _time
+    _step1_session_opened_at = _time.monotonic()
+    _step1_session_id: str = ""
     try:
         async with AsyncSessionLocal() as db:
+            _step1_session_id = hex(id(db))
             result = await db.execute(
                 select(SyncRun)
                 .where(SyncRun.status.in_(["queued", "syncing"]))
@@ -523,6 +554,16 @@ async def poll_and_execute() -> None:
             sync_run = result.scalar_one_or_none()
 
             if not sync_run:
+                # No queued jobs — sleep longer before next poll to reduce
+                # unnecessary DB opens when the queue is empty.
+                _step1_duration = _time.monotonic() - _step1_session_opened_at
+                logger.info(
+                    "[DB_SESSION_CLOSED] session_id=%s duration_seconds=%.3f "
+                    "function_name=poll_and_execute reason=no_queued_jobs",
+                    _step1_session_id,
+                    _step1_duration,
+                )
+                await asyncio.sleep(15)
                 return
 
             sync_run_id = sync_run.id
@@ -556,6 +597,13 @@ async def poll_and_execute() -> None:
                     )
                     await mark_stalled(db, sync_run_id, stall_reason)
                     await db.commit()
+                    _step1_duration = _time.monotonic() - _step1_session_opened_at
+                    logger.info(
+                        "[DB_SESSION_CLOSED] session_id=%s duration_seconds=%.3f "
+                        "function_name=poll_and_execute reason=stall_detected",
+                        _step1_session_id,
+                        _step1_duration,
+                    )
                     return
 
             # ------------------------------------------------------------------ #
@@ -580,12 +628,29 @@ async def poll_and_execute() -> None:
         )
         sys.stdout.flush()
         raise
+    finally:
+        _step1_duration = _time.monotonic() - _step1_session_opened_at
+        logger.info(
+            "[DB_SESSION_CLOSED] session_id=%s duration_seconds=%.3f "
+            "function_name=poll_and_execute",
+            _step1_session_id,
+            _step1_duration,
+        )
+        if _step1_duration > 30:
+            logger.warning(
+                "[LONG_LIVED_DB_SESSION] duration_seconds=%.3f function_name=poll_and_execute "
+                "reason=sync_in_progress",
+                _step1_duration,
+            )
 
     # ---------------------------------------------------------------------- #
     # Step 3: Fetch credential                                                #
     # ---------------------------------------------------------------------- #
+    _step3_session_opened_at = _time.monotonic()
+    _step3_session_id: str = ""
     try:
         async with AsyncSessionLocal() as db:
+            _step3_session_id = hex(id(db))
             cred_result = await db.execute(
                 select(BrandAPICredential).where(
                     BrandAPICredential.brand_id == brand_id,
@@ -661,6 +726,21 @@ async def poll_and_execute() -> None:
         )
         sys.stdout.flush()
         raise
+    finally:
+        _step3_duration = _time.monotonic() - _step3_session_opened_at
+        logger.info(
+            "[DB_SESSION_CLOSED] session_id=%s duration_seconds=%.3f "
+            "function_name=poll_and_execute_step3_credentials",
+            _step3_session_id,
+            _step3_duration,
+        )
+        if _step3_duration > 30:
+            logger.warning(
+                "[LONG_LIVED_DB_SESSION] duration_seconds=%.3f "
+                "function_name=poll_and_execute_step3_credentials "
+                "reason=dead_letter_write",
+                _step3_duration,
+            )
 
     # ---------------------------------------------------------------------- #
     # Step 3.5: Overlapping full-sync guard                                   #
@@ -677,7 +757,8 @@ async def poll_and_execute() -> None:
         )
         logger.warning(
             "[QUEUE_SCHEDULER_SKIPPED_OVERLAPPING_SYNC] sync_run_id=%s brand_id=%s "
-            "already_running_brand=%s running_since=%s — skipping to prevent pool exhaustion",
+            "already_running_brand=%s running_since=%s — skipping to prevent pool exhaustion, "
+            "sleeping 30s",
             sync_run_id,
             brand_id,
             _running_brand,
@@ -685,6 +766,8 @@ async def poll_and_execute() -> None:
         )
         # Leave the job in "syncing" state — it will be retried on the next poll
         # once the active sync completes and releases the lock.
+        # Sleep 30s to avoid tight-looping while a full sync is in progress.
+        await asyncio.sleep(30)
         return
 
     # ---------------------------------------------------------------------- #
@@ -693,8 +776,11 @@ async def poll_and_execute() -> None:
 
     # Stamp last_progress_at immediately before the first API call so the
     # stall detector does not fire while we are waiting for the first page.
+    _step4_session_opened_at = _time.monotonic()
+    _step4_session_id: str = ""
     try:
         async with AsyncSessionLocal() as db:
+            _step4_session_id = hex(id(db))
             pre_run_result = await db.execute(
                 select(SyncRun).where(SyncRun.id == sync_run_id)
             )
@@ -710,6 +796,21 @@ async def poll_and_execute() -> None:
         )
         sys.stdout.flush()
         raise
+    finally:
+        _step4_duration = _time.monotonic() - _step4_session_opened_at
+        logger.info(
+            "[DB_SESSION_CLOSED] session_id=%s duration_seconds=%.3f "
+            "function_name=poll_and_execute_step4_progress_stamp",
+            _step4_session_id,
+            _step4_duration,
+        )
+        if _step4_duration > 30:
+            logger.warning(
+                "[LONG_LIVED_DB_SESSION] duration_seconds=%.3f "
+                "function_name=poll_and_execute_step4_progress_stamp "
+                "reason=stale_job_recovery",
+                _step4_duration,
+            )
 
     try:
         if last_next_url:

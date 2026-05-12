@@ -221,12 +221,19 @@ async def initialize_database_after_bootstrap() -> None:
         DATABASE_URL,
         echo=False,
         pool_pre_ping=True,
+        pool_size=20,
+        max_overflow=40,
+        pool_timeout=60,
+        pool_recycle=1800,
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},
     )
 
     logger.info("[DB_INIT_ENGINE_CREATED] async engine created")
-    logger.info("[BOOTSTRAP_DB_INIT] engine_created connect_args_ssl=require compiled_cache=disabled")
+    logger.info(
+        "[BOOTSTRAP_DB_INIT] engine_created connect_args_ssl=require compiled_cache=disabled "
+        "pool_size=20 max_overflow=40 pool_timeout=60 pool_recycle=1800 pool_pre_ping=true"
+    )
 
     _AsyncSessionLocal = async_sessionmaker(
         bind=_engine,
@@ -302,6 +309,10 @@ async def refresh_connection_pool() -> None:
         DATABASE_URL,
         echo=False,
         pool_pre_ping=True,
+        pool_size=20,
+        max_overflow=40,
+        pool_timeout=60,
+        pool_recycle=1800,
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},
     )
@@ -316,7 +327,10 @@ async def refresh_connection_pool() -> None:
     engine = _engine
     AsyncSessionLocal = _AsyncSessionLocal
 
-    logger.info("[Database] connection_pool_recreated with connect_args_ssl=require compiled_cache=disabled")
+    logger.info(
+        "[Database] connection_pool_recreated connect_args_ssl=require compiled_cache=disabled "
+        "pool_size=20 max_overflow=40 pool_timeout=60 pool_recycle=1800"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +382,10 @@ async def dispose_and_recreate_engine() -> None:
         DATABASE_URL,
         echo=False,
         pool_pre_ping=True,
+        pool_size=20,
+        max_overflow=40,
+        pool_timeout=60,
+        pool_recycle=1800,
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},  # Disable statement cache to prevent UUID/VARCHAR type confusion
     )
@@ -382,7 +400,10 @@ async def dispose_and_recreate_engine() -> None:
     engine = _engine
     AsyncSessionLocal = _AsyncSessionLocal
 
-    logger.info("[DB_STARTUP] engine_recreated_after_dispose compiled_cache=disabled")
+    logger.info(
+        "[DB_STARTUP] engine_recreated_after_dispose compiled_cache=disabled "
+        "pool_size=20 max_overflow=40 pool_timeout=60 pool_recycle=1800"
+    )
 
 
 async def confirm_database_identity() -> None:
@@ -493,3 +514,74 @@ async def inspect_schema_at_startup() -> None:
             exc,
             exc_info=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Pool health telemetry
+# ---------------------------------------------------------------------------
+
+# Pool capacity constants — kept in sync with create_async_engine() calls above.
+_TELEMETRY_POOL_SIZE = 20
+_TELEMETRY_MAX_OVERFLOW = 40
+_TELEMETRY_TOTAL_CAPACITY = _TELEMETRY_POOL_SIZE + _TELEMETRY_MAX_OVERFLOW  # 60 total
+
+
+async def log_pool_health() -> None:
+    """Emit [DB_POOL_HEALTH] telemetry every 60 seconds.
+
+    Logs the current connection pool utilisation so operators can detect
+    pool exhaustion before it causes QueuePool timeout warnings.
+
+    Metrics logged:
+      checked_out        — connections currently checked out (in use)
+      overflow           — overflow connections currently in use
+      pool_size          — base pool size (not counting overflow)
+      utilization_percent — checked_out / total_capacity * 100
+      available          — pool_size - checked_out (may be negative when overflow is active)
+
+    Designed to run as a long-lived background asyncio task alongside the
+    scheduler loop (see worker_main() in services/sync_scheduler.py).
+    """
+    import asyncio as _asyncio
+
+    logger.info(
+        "[DB_POOL_HEALTH_TASK_START] pool telemetry task started "
+        "pool_size=%d max_overflow=%d total_capacity=%d interval_seconds=60",
+        _TELEMETRY_POOL_SIZE,
+        _TELEMETRY_MAX_OVERFLOW,
+        _TELEMETRY_TOTAL_CAPACITY,
+    )
+
+    while True:
+        try:
+            await _asyncio.sleep(60)
+
+            if _engine is None:
+                logger.warning("[DB_POOL_HEALTH] engine not available — skipping telemetry")
+                continue
+
+            pool = _engine.pool
+            checked_out = pool.checkedout()
+            overflow = pool.overflow()
+            utilization_percent = (checked_out / _TELEMETRY_TOTAL_CAPACITY) * 100
+            available = _TELEMETRY_POOL_SIZE - checked_out
+
+            logger.info(
+                "[DB_POOL_HEALTH] checked_out=%d overflow=%d pool_size=%d "
+                "utilization_percent=%.1f available=%d total_capacity=%d",
+                checked_out,
+                overflow,
+                _TELEMETRY_POOL_SIZE,
+                utilization_percent,
+                available,
+                _TELEMETRY_TOTAL_CAPACITY,
+            )
+
+        except _asyncio.CancelledError:
+            logger.info("[DB_POOL_HEALTH_TASK_STOP] pool telemetry task cancelled")
+            return
+        except Exception as _exc:
+            logger.warning(
+                "[DB_POOL_HEALTH_ERROR] failed to read pool stats: %s",
+                str(_exc)[:200],
+            )
