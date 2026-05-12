@@ -232,6 +232,63 @@ async def initialize_database_after_bootstrap() -> None:
     logger.info("[DB_INIT_ENGINE_CREATED] async engine created")
     logger.info("[BOOTSTRAP_DB_INIT] engine_created connect_args_ssl=require compiled_cache=disabled pool_size=20 max_overflow=40 pool_timeout=60 pool_recycle=1800")
 
+    # ---------------------------------------------------------------------------
+    # [DB_ENGINE_CANONICAL] — log that this is the ONE canonical engine.
+    # [DB_ENGINE_ID]        — log hex(id(engine)) so all startup paths can verify
+    #                         they share the same engine object.
+    # [DB_POOL_CONFIG]      — log pool settings for production observability.
+    # ---------------------------------------------------------------------------
+    logger.info(
+        "[DB_ENGINE_CANONICAL] canonical async engine created in database.py "
+        "engine_id=%s pool_size=20 max_overflow=40 pool_timeout=60 "
+        "pool_recycle=1800 pool_pre_ping=true",
+        hex(id(_engine)),
+    )
+    logger.info(
+        "[DB_ENGINE_ID] engine_id=%s source=database.initialize_database_after_bootstrap",
+        hex(id(_engine)),
+    )
+    logger.info(
+        "[DB_POOL_CONFIG] pool_size=20 max_overflow=40 pool_timeout=60 "
+        "pool_recycle=1800 pool_pre_ping=true engine_id=%s",
+        hex(id(_engine)),
+    )
+
+    # ---------------------------------------------------------------------------
+    # Pool config assertions — fail startup immediately if the engine was somehow
+    # created with wrong settings (e.g. SQLAlchemy defaults: pool_size=5, max_overflow=10).
+    # ---------------------------------------------------------------------------
+    _init_pool = _engine.pool
+    _init_pool_size = _init_pool.size()
+    _init_max_overflow = _init_pool._max_overflow
+    if _init_pool_size != 20:
+        logger.error(
+            "[POOL_CONFIG_MISMATCH] pool_size=%d expected=20 engine_id=%s",
+            _init_pool_size,
+            hex(id(_engine)),
+        )
+        raise RuntimeError(
+            f"[POOL_CONFIG_MISMATCH] pool_size={_init_pool_size} expected=20 — "
+            "engine was created with wrong pool settings"
+        )
+    if _init_max_overflow != 40:
+        logger.error(
+            "[POOL_CONFIG_MISMATCH] max_overflow=%d expected=40 engine_id=%s",
+            _init_max_overflow,
+            hex(id(_engine)),
+        )
+        raise RuntimeError(
+            f"[POOL_CONFIG_MISMATCH] max_overflow={_init_max_overflow} expected=40 — "
+            "engine was created with wrong pool settings"
+        )
+    logger.info(
+        "[DB_POOL_CONFIG_VALIDATED] pool_size=%d max_overflow=%d engine_id=%s — "
+        "pool configuration matches expected values",
+        _init_pool_size,
+        _init_max_overflow,
+        hex(id(_engine)),
+    )
+
     _AsyncSessionLocal = async_sessionmaker(
         bind=_engine,
         class_=AsyncSession,
@@ -240,6 +297,11 @@ async def initialize_database_after_bootstrap() -> None:
 
     logger.info("[DB_INIT_SESSION_FACTORY_CREATED] session factory created")
     logger.info("[BOOTSTRAP_DB_INIT] session_factory_created")
+    logger.info(
+        "[DB_SESSION_FACTORY] AsyncSessionLocal created engine_id=%s "
+        "source=database.initialize_database_after_bootstrap",
+        hex(id(_engine)),
+    )
 
     # Verify connection works
     logger.info("[DB_INIT_CONNECTION_VERIFIED] testing database connection")
@@ -325,6 +387,15 @@ async def refresh_connection_pool() -> None:
     AsyncSessionLocal = _AsyncSessionLocal
 
     logger.info("[Database] connection_pool_recreated with connect_args_ssl=require compiled_cache=disabled pool_size=20 max_overflow=40 pool_timeout=60 pool_recycle=1800")
+    logger.info(
+        "[DB_ENGINE_ID] engine_id=%s source=database.refresh_connection_pool",
+        hex(id(_engine)),
+    )
+    logger.info(
+        "[DB_POOL_CONFIG] pool_size=20 max_overflow=40 pool_timeout=60 "
+        "pool_recycle=1800 pool_pre_ping=true engine_id=%s source=refresh_connection_pool",
+        hex(id(_engine)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +466,15 @@ async def dispose_and_recreate_engine() -> None:
     AsyncSessionLocal = _AsyncSessionLocal
 
     logger.info("[DB_STARTUP] engine_recreated_after_dispose compiled_cache=disabled")
+    logger.info(
+        "[DB_ENGINE_ID] engine_id=%s source=database.dispose_and_recreate_engine",
+        hex(id(_engine)),
+    )
+    logger.info(
+        "[DB_POOL_CONFIG] pool_size=20 max_overflow=40 pool_timeout=60 "
+        "pool_recycle=1800 pool_pre_ping=true engine_id=%s source=dispose_and_recreate_engine",
+        hex(id(_engine)),
+    )
 
 
 async def confirm_database_identity() -> None:

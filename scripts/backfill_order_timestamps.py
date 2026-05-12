@@ -78,6 +78,14 @@ async def backfill() -> None:
     # database module can validate DATABASE_URL before we proceed.
     from sqlalchemy import select, text
 
+    # Initialize the canonical database engine (pool_size=20, max_overflow=40)
+    # before using AsyncSessionLocal.  Scripts run outside the FastAPI lifespan
+    # so they must call initialize_database_after_bootstrap() explicitly.
+    from database import initialize_database_after_bootstrap, is_bootstrap_complete, get_async_session_local
+    if not is_bootstrap_complete():
+        logger.info("[Backfill] initializing database engine via initialize_database_after_bootstrap()")
+        await initialize_database_after_bootstrap()
+
     from database import AsyncSessionLocal
     from models import BrandAPICredential, Order
     from services.leaflink_client import LeafLinkClient

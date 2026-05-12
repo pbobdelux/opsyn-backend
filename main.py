@@ -70,6 +70,16 @@ async def _run_bootstrap() -> None:
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},
     )
+    logger.info(
+        "[DB_ENGINE_BOOTSTRAP] temporary bootstrap engine created in main.py "
+        "engine_id=%s pool_size=20 max_overflow=40 — will be disposed after bootstrap",
+        hex(id(bootstrap_engine)),
+    )
+    logger.info(
+        "[DB_POOL_CONFIG] pool_size=20 max_overflow=40 pool_timeout=60 "
+        "pool_recycle=1800 pool_pre_ping=true engine_id=%s source=main._run_bootstrap",
+        hex(id(bootstrap_engine)),
+    )
 
     try:
         from services.bootstrap_schema_recovery import bootstrap_schema_recovery
@@ -87,6 +97,10 @@ async def _run_bootstrap() -> None:
         )
     finally:
         await bootstrap_engine.dispose()
+        logger.info(
+            "[DB_ENGINE_DISPOSED] bootstrap engine disposed engine_id=%s source=main._run_bootstrap",
+            hex(id(bootstrap_engine)),
+        )
 
 
 async def _init_database() -> None:
@@ -135,6 +149,19 @@ async def _init_database() -> None:
         logger.info(
             "[DB_ENGINE_CONFIG_VALIDATED] pool_size=20 max_overflow=40 — "
             "pool configuration is correct"
+        )
+        logger.info(
+            "[DB_ENGINE_ID] engine_id=%s source=main._init_database (API startup)",
+            hex(id(_engine)),
+        )
+        logger.info(
+            "[DB_POOL_CONFIG] pool_size=%d max_overflow=%d pool_timeout=%s "
+            "pool_recycle=%s pool_pre_ping=true engine_id=%s source=main._init_database",
+            _actual_pool_size,
+            _actual_max_overflow,
+            getattr(_pool, "_timeout", "unknown"),
+            getattr(_pool, "_recycle", "unknown"),
+            hex(id(_engine)),
         )
 
     except Exception as e:

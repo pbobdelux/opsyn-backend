@@ -76,13 +76,22 @@ def _normalize_db_url(url: str) -> str:
 
 
 async def _create_engine(db_url: str):
-    """Create a minimal async engine for smoke testing."""
+    """Create a minimal async engine for smoke testing.
+
+    Uses the same pool settings as the canonical production engine in database.py
+    (pool_size=20, max_overflow=40) to avoid triggering pool exhaustion during
+    tests and to ensure the smoke test exercises the same configuration.
+    """
     from sqlalchemy.ext.asyncio import create_async_engine
 
     return create_async_engine(
         db_url,
         echo=False,
         pool_pre_ping=True,
+        pool_size=20,
+        max_overflow=40,
+        pool_timeout=60,
+        pool_recycle=1800,
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},
     )

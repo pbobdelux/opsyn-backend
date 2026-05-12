@@ -59,6 +59,14 @@ async def retry_line_items_for_orders(brand_id: str, limit: int = 100) -> dict:
     """
     from sqlalchemy import func, select
 
+    # Initialize the canonical database engine (pool_size=20, max_overflow=40)
+    # before using AsyncSessionLocal.  Scripts run outside the FastAPI lifespan
+    # so they must call initialize_database_after_bootstrap() explicitly.
+    from database import initialize_database_after_bootstrap, is_bootstrap_complete
+    if not is_bootstrap_complete():
+        logger.info("[RetryLineItems] initializing database engine via initialize_database_after_bootstrap()")
+        await initialize_database_after_bootstrap()
+
     from database import AsyncSessionLocal
     from models import Order, OrderLine
     from services.leaflink_sync import (
