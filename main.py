@@ -92,6 +92,8 @@ async def _init_database() -> None:
         from database import initialize_database_after_bootstrap
         await initialize_database_after_bootstrap()
         logger.info("[DB_INIT_COMPLETE] database engine initialized")
+        from database import validate_single_engine
+        await validate_single_engine()
     except Exception as e:
         logger.error("[BACKEND_DB_INIT_FAILED] error=%s", str(e)[:500])
         raise
