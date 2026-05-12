@@ -221,12 +221,16 @@ async def initialize_database_after_bootstrap() -> None:
         DATABASE_URL,
         echo=False,
         pool_pre_ping=True,
+        pool_size=20,
+        max_overflow=40,
+        pool_timeout=60,
+        pool_recycle=1800,
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},
     )
 
     logger.info("[DB_INIT_ENGINE_CREATED] async engine created")
-    logger.info("[BOOTSTRAP_DB_INIT] engine_created connect_args_ssl=require compiled_cache=disabled")
+    logger.info("[BOOTSTRAP_DB_INIT] engine_created connect_args_ssl=require compiled_cache=disabled pool_size=20 max_overflow=40 pool_timeout=60 pool_recycle=1800")
 
     _AsyncSessionLocal = async_sessionmaker(
         bind=_engine,
@@ -302,6 +306,10 @@ async def refresh_connection_pool() -> None:
         DATABASE_URL,
         echo=False,
         pool_pre_ping=True,
+        pool_size=20,
+        max_overflow=40,
+        pool_timeout=60,
+        pool_recycle=1800,
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},
     )
@@ -316,7 +324,7 @@ async def refresh_connection_pool() -> None:
     engine = _engine
     AsyncSessionLocal = _AsyncSessionLocal
 
-    logger.info("[Database] connection_pool_recreated with connect_args_ssl=require compiled_cache=disabled")
+    logger.info("[Database] connection_pool_recreated with connect_args_ssl=require compiled_cache=disabled pool_size=20 max_overflow=40 pool_timeout=60 pool_recycle=1800")
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +376,10 @@ async def dispose_and_recreate_engine() -> None:
         DATABASE_URL,
         echo=False,
         pool_pre_ping=True,
+        pool_size=20,
+        max_overflow=40,
+        pool_timeout=60,
+        pool_recycle=1800,
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},  # Disable statement cache to prevent UUID/VARCHAR type confusion
     )
