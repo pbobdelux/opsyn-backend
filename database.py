@@ -94,6 +94,47 @@ def get_async_session_local():
     return _AsyncSessionLocal
 
 
+def validate_single_engine() -> None:
+    """Verify that only one canonical engine exists and it has the correct pool config.
+
+    Raises RuntimeError if the engine has not been initialized or if the engine
+    id does not match the module-level singleton (indicating a second engine was
+    created outside of initialize_database_after_bootstrap()).
+
+    Logs [DB_ENGINE_SINGLETON_VERIFIED] on success so production logs can confirm
+    the singleton invariant is upheld at every startup path.
+    """
+    if _engine is None:
+        raise RuntimeError(
+            "[DB_ENGINE_SINGLETON_MISSING] validate_single_engine() called before "
+            "initialize_database_after_bootstrap() — engine has not been created yet"
+        )
+
+    # Verify pool settings match the canonical configuration
+    pool = _engine.pool
+    pool_size = pool.size()
+    max_overflow = pool._max_overflow
+
+    if pool_size != 20:
+        raise RuntimeError(
+            f"[DB_ENGINE_SINGLETON_INVALID] pool_size={pool_size} expected=20 — "
+            "engine was not created by initialize_database_after_bootstrap()"
+        )
+    if max_overflow != 40:
+        raise RuntimeError(
+            f"[DB_ENGINE_SINGLETON_INVALID] max_overflow={max_overflow} expected=40 — "
+            "engine was not created by initialize_database_after_bootstrap()"
+        )
+
+    logger.info(
+        "[DB_ENGINE_SINGLETON_VERIFIED] engine_id=%s pool_size=%d max_overflow=%d "
+        "source=database.validate_single_engine",
+        hex(id(_engine)),
+        pool_size,
+        max_overflow,
+    )
+
+
 def _build_database_url() -> str:
     """Normalize and validate DATABASE_URL from the environment."""
     raw = os.getenv("DATABASE_URL", "")

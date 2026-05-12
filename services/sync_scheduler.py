@@ -301,7 +301,21 @@ async def worker_main() -> None:
         except Exception as _cfg_exc:
             logger.warning("[DB_ENGINE_CONFIG] failed to read pool config: %s", _cfg_exc)
 
+        # Phase 2.6: Verify singleton engine invariant
+        # Raises RuntimeError immediately if a second engine was created with wrong
+        # pool settings, preventing "QueuePool limit of size 5 overflow 10" errors.
+        try:
+            from database import validate_single_engine
+            validate_single_engine()
+        except Exception as _singleton_exc:
+            logger.error(
+                "[DB_ENGINE_SINGLETON_FAILED] singleton validation failed error=%s",
+                str(_singleton_exc)[:500],
+            )
+            raise
+
         # Phase 3: Verify database connection
+
         logger.info("[SYNC_WORKER_DB_VERIFY_START] verifying database connection")
         await _verify_db_connection()
         logger.info("[SYNC_WORKER_DB_VERIFIED] database connection verified")

@@ -421,6 +421,14 @@ async def lifespan(app: FastAPI):
         await _init_database()
 
         # ---------------------------------------------------------------------------
+        # Phase 2.5: Verify singleton engine invariant
+        # Raises RuntimeError immediately if a second engine was created with wrong
+        # pool settings, preventing "QueuePool limit of size 5 overflow 10" errors.
+        # ---------------------------------------------------------------------------
+        from database import validate_single_engine
+        validate_single_engine()
+
+        # ---------------------------------------------------------------------------
         # Phase 3: Verify critical columns exist
         # ---------------------------------------------------------------------------
         await _verify_bootstrap_columns()
