@@ -301,6 +301,15 @@ async def worker_main() -> None:
         except Exception as _cfg_exc:
             logger.warning("[DB_ENGINE_CONFIG] failed to read pool config: %s", _cfg_exc)
 
+        # Phase 2.6: Validate singleton engine
+        try:
+            from database import validate_single_engine
+            await validate_single_engine()
+            logger.info("[DB_ENGINE_SINGLETON_VERIFIED] single canonical engine confirmed")
+        except RuntimeError as e:
+            logger.error("[DB_ENGINE_SINGLETON_VIOLATION] %s", str(e))
+            raise
+
         # Phase 3: Verify database connection
         logger.info("[SYNC_WORKER_DB_VERIFY_START] verifying database connection")
         await _verify_db_connection()

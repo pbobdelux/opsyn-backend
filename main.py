@@ -164,6 +164,10 @@ async def _init_database() -> None:
             hex(id(_engine)),
         )
 
+        # Validate singleton — raises RuntimeError if a second engine was created
+        from database import validate_single_engine
+        await validate_single_engine()
+
     except Exception as e:
         logger.error("[BACKEND_DB_INIT_FAILED] error=%s", str(e)[:500])
         raise
