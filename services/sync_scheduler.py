@@ -418,9 +418,9 @@ async def recover_stale_sync_jobs() -> int:
 # ---------------------------------------------------------------------------
 
 # Pool configuration constants (must match engine creation in database.py)
-_POOL_SIZE = 5
-_POOL_MAX_OVERFLOW = 10
-_POOL_TOTAL_CAPACITY = _POOL_SIZE + _POOL_MAX_OVERFLOW  # 15 total connections
+_POOL_SIZE = 20
+_POOL_MAX_OVERFLOW = 40
+_POOL_TOTAL_CAPACITY = _POOL_SIZE + _POOL_MAX_OVERFLOW  # 60 total connections
 _POOL_SATURATION_THRESHOLD = 0.80  # 80%
 
 
@@ -444,14 +444,66 @@ def _get_pool_saturation() -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Pool health telemetry
+# ---------------------------------------------------------------------------
+
+# Sentinel used by run_scheduler() to detect idle / sync-running conditions
+_POLL_DELAY_NO_JOBS = 15       # seconds to sleep when no queued jobs found
+_POLL_DELAY_SYNC_RUNNING = 30  # seconds to sleep when a full sync lock is held
+
+
+async def _pool_health_monitor() -> None:
+    """
+    Background task: log DB pool health metrics every 60 seconds.
+
+    Emits [DB_POOL_HEALTH] with:
+      checked_out       — connections currently in use
+      overflow          — connections beyond pool_size
+      pool_size         — configured pool_size (20)
+      utilization_pct   — checked_out / total_capacity * 100
+    """
+    while True:
+        try:
+            await asyncio.sleep(60)
+            from database import get_engine
+            eng = get_engine()
+            pool = eng.pool
+            checked_out = pool.checkedout()
+            overflow = max(0, checked_out - _POOL_SIZE)
+            utilization_pct = round(checked_out / _POOL_TOTAL_CAPACITY * 100, 1)
+            logger.info(
+                "[DB_POOL_HEALTH] checked_out=%d overflow=%d pool_size=%d "
+                "total_capacity=%d utilization_pct=%.1f",
+                checked_out,
+                overflow,
+                _POOL_SIZE,
+                _POOL_TOTAL_CAPACITY,
+                utilization_pct,
+            )
+        except asyncio.CancelledError:
+            logger.info("[DB_POOL_HEALTH] monitor task cancelled, exiting")
+            return
+        except Exception as exc:
+            logger.warning(
+                "[DB_POOL_HEALTH] failed to read pool stats: %s", str(exc)[:200]
+            )
+
+
+# ---------------------------------------------------------------------------
 # Core poll-and-execute function
 # ---------------------------------------------------------------------------
 
 
-async def poll_and_execute() -> None:
+async def poll_and_execute() -> int:
     """
-    Single poll iteration:
+    Single poll iteration.  Returns a suggested poll delay (seconds) for the
+    caller (run_scheduler) to use as the sleep duration before the next poll:
 
+      * _POLL_DELAY_NO_JOBS      (15 s) — no queued jobs found
+      * _POLL_DELAY_SYNC_RUNNING (30 s) — full-sync lock is held, skipping
+      * POLL_INTERVAL_SECONDS    ( 5 s) — normal execution path
+
+    Steps:
       1. Query SyncRun for the oldest queued or syncing job.
       2. Claim it (set worker_id, status=syncing, last_progress_at).
       3. Fetch the brand's LeafLink credential.
@@ -493,7 +545,7 @@ async def poll_and_execute() -> None:
             _POOL_SATURATION_THRESHOLD * 100,
         )
         await asyncio.sleep(10)
-        return
+        return POLL_INTERVAL_SECONDS
 
     # ---------------------------------------------------------------------- #
     # Stale job recovery: reset any jobs stuck in 'syncing' for > 5 minutes  #
@@ -512,6 +564,9 @@ async def poll_and_execute() -> None:
         "priority_3=incremental_recent_orders priority_4=full_resync "
         "order_by=started_at_asc",
     )
+    _session_open_at = datetime.now(timezone.utc)
+    _no_jobs_found = False
+    _job_stalled = False
     try:
         async with AsyncSessionLocal() as db:
             result = await db.execute(
@@ -523,55 +578,56 @@ async def poll_and_execute() -> None:
             sync_run = result.scalar_one_or_none()
 
             if not sync_run:
-                return
+                _no_jobs_found = True
+            else:
+                sync_run_id = sync_run.id
+                brand_id = sync_run.brand_id
+                start_page = sync_run.current_page or 1
+                # total_pages may be None for cursor-based pagination (LeafLink).
+                # Pass None through so sync_leaflink_background_continuous uses
+                # cursor termination rather than a page-count bound.
+                total_pages = sync_run.total_pages  # May be None
+                total_orders_available = sync_run.total_orders_available
+                # Resume cursor: if last_next_url is set, resume from that URL
+                # instead of starting from page 1 (worker restart recovery).
+                last_next_url = getattr(sync_run, "last_next_url", None)
 
-            sync_run_id = sync_run.id
-            brand_id = sync_run.brand_id
-            start_page = sync_run.current_page or 1
-            # total_pages may be None for cursor-based pagination (LeafLink).
-            # Pass None through so sync_leaflink_background_continuous uses
-            # cursor termination rather than a page-count bound.
-            total_pages = sync_run.total_pages  # May be None
-            total_orders_available = sync_run.total_orders_available
-            # Resume cursor: if last_next_url is set, resume from that URL
-            # instead of starting from page 1 (worker restart recovery).
-            last_next_url = getattr(sync_run, "last_next_url", None)
+                # ------------------------------------------------------------------ #
+                # Stall detection: only check jobs that have been claimed            #
+                # (worker_id is not null). Skip newly queued jobs.                   #
+                # ------------------------------------------------------------------ #
+                if sync_run.worker_id is not None:
+                    # Job was claimed by a worker but made no progress
+                    if detect_stalled(sync_run, stall_threshold_seconds=STALL_THRESHOLD_SECONDS):
+                        stall_reason = (
+                            f"no_progress_for_{STALL_THRESHOLD_SECONDS}s "
+                            f"last_progress_at={sync_run.last_progress_at}"
+                        )
+                        logger.warning(
+                            "[SyncWorker] job_stalled id=%s brand=%s reason=%s",
+                            sync_run_id,
+                            brand_id,
+                            stall_reason,
+                        )
+                        await mark_stalled(db, sync_run_id, stall_reason)
+                        await db.commit()
+                        _job_stalled = True
 
-            # ------------------------------------------------------------------ #
-            # Stall detection: only check jobs that have been claimed            #
-            # (worker_id is not null). Skip newly queued jobs.                   #
-            # ------------------------------------------------------------------ #
-            if sync_run.worker_id is not None:
-                # Job was claimed by a worker but made no progress
-                if detect_stalled(sync_run, stall_threshold_seconds=STALL_THRESHOLD_SECONDS):
-                    stall_reason = (
-                        f"no_progress_for_{STALL_THRESHOLD_SECONDS}s "
-                        f"last_progress_at={sync_run.last_progress_at}"
-                    )
-                    logger.warning(
-                        "[SyncWorker] job_stalled id=%s brand=%s reason=%s",
-                        sync_run_id,
-                        brand_id,
-                        stall_reason,
-                    )
-                    await mark_stalled(db, sync_run_id, stall_reason)
+                else:
+                    # ------------------------------------------------------------------ #
+                    # Step 2: Claim the job                                               #
+                    # ------------------------------------------------------------------ #
+                    sync_run.worker_id = WORKER_ID
+                    sync_run.status = "syncing"
+                    sync_run.last_progress_at = datetime.now(timezone.utc)
                     await db.commit()
-                    return
 
-            # ------------------------------------------------------------------ #
-            # Step 2: Claim the job                                               #
-            # ------------------------------------------------------------------ #
-            sync_run.worker_id = WORKER_ID
-            sync_run.status = "syncing"
-            sync_run.last_progress_at = datetime.now(timezone.utc)
-            await db.commit()
-
-            logger.info(
-                "[SyncWorker] job_claimed id=%s worker_id=%s brand=%s",
-                sync_run_id,
-                WORKER_ID,
-                brand_id,
-            )
+                    logger.info(
+                        "[SyncWorker] job_claimed id=%s worker_id=%s brand=%s",
+                        sync_run_id,
+                        WORKER_ID,
+                        brand_id,
+                    )
     except Exception as db_exc:
         logger.error(
             "[SyncWorker] database error in job query/claim: %s",
@@ -580,10 +636,34 @@ async def poll_and_execute() -> None:
         )
         sys.stdout.flush()
         raise
+    finally:
+        _session_duration = (datetime.now(timezone.utc) - _session_open_at).total_seconds()
+        logger.info(
+            "[DB_SESSION_CLOSED] function=poll_and_execute step=job_query duration_seconds=%.3f",
+            _session_duration,
+        )
+        if _session_duration > 30:
+            logger.warning(
+                "[LONG_LIVED_DB_SESSION] function=poll_and_execute step=job_query "
+                "duration_seconds=%.3f",
+                _session_duration,
+            )
+
+    if _no_jobs_found:
+        logger.info(
+            "[SCHEDULER_IDLE_SLEEP] reason=no_jobs_found suggested_delay_seconds=%d",
+            _POLL_DELAY_NO_JOBS,
+        )
+        return _POLL_DELAY_NO_JOBS
+
+    if _job_stalled:
+        return POLL_INTERVAL_SECONDS
 
     # ---------------------------------------------------------------------- #
     # Step 3: Fetch credential                                                #
     # ---------------------------------------------------------------------- #
+    _cred_session_open_at = datetime.now(timezone.utc)
+    _cred_early_return = False
     try:
         async with AsyncSessionLocal() as db:
             cred_result = await db.execute(
@@ -611,47 +691,47 @@ async def poll_and_execute() -> None:
                     fail_run.last_error = "LeafLink credential not found"
                     fail_run.completed_at = datetime.now(timezone.utc)
                     await db.commit()
-                return
-
-            api_key: str = cred.api_key or ""
-            company_id: str = cred.company_id or ""
-            auth_scheme: str = cred.auth_scheme or "Token"
-            base_url: str = cred.base_url or ""
-            org_id: str = getattr(cred, "org_id", None) or ""
-            logger.info(
-                "[SyncWorker] org_id_from_credential id=%s brand=%s org_id=%s",
-                sync_run_id,
-                brand_id,
-                org_id or "MISSING",
-            )
-
-            # Validate api_key
-            if not api_key or not api_key.strip():
-                logger.error("[SyncWorker] credential_invalid id=%s api_key_missing", sync_run_id)
-                fail_result = await db.execute(
-                    select(SyncRun).where(SyncRun.id == sync_run_id)
+                _cred_early_return = True
+            else:
+                api_key: str = cred.api_key or ""
+                company_id: str = cred.company_id or ""
+                auth_scheme: str = cred.auth_scheme or "Token"
+                base_url: str = cred.base_url or ""
+                org_id: str = getattr(cred, "org_id", None) or ""
+                logger.info(
+                    "[SyncWorker] org_id_from_credential id=%s brand=%s org_id=%s",
+                    sync_run_id,
+                    brand_id,
+                    org_id or "MISSING",
                 )
-                fail_run = fail_result.scalar_one_or_none()
-                if fail_run:
-                    fail_run.status = "failed"
-                    fail_run.last_error = "LeafLink api_key is empty"
-                    fail_run.completed_at = datetime.now(timezone.utc)
-                    await db.commit()
-                return
 
-            # Validate company_id
-            if not company_id or not company_id.strip():
-                logger.error("[SyncWorker] credential_invalid id=%s company_id_missing", sync_run_id)
-                fail_result = await db.execute(
-                    select(SyncRun).where(SyncRun.id == sync_run_id)
-                )
-                fail_run = fail_result.scalar_one_or_none()
-                if fail_run:
-                    fail_run.status = "failed"
-                    fail_run.last_error = "LeafLink company_id is empty"
-                    fail_run.completed_at = datetime.now(timezone.utc)
-                    await db.commit()
-                return
+                # Validate api_key
+                if not api_key or not api_key.strip():
+                    logger.error("[SyncWorker] credential_invalid id=%s api_key_missing", sync_run_id)
+                    fail_result = await db.execute(
+                        select(SyncRun).where(SyncRun.id == sync_run_id)
+                    )
+                    fail_run = fail_result.scalar_one_or_none()
+                    if fail_run:
+                        fail_run.status = "failed"
+                        fail_run.last_error = "LeafLink api_key is empty"
+                        fail_run.completed_at = datetime.now(timezone.utc)
+                        await db.commit()
+                    _cred_early_return = True
+
+                # Validate company_id
+                elif not company_id or not company_id.strip():
+                    logger.error("[SyncWorker] credential_invalid id=%s company_id_missing", sync_run_id)
+                    fail_result = await db.execute(
+                        select(SyncRun).where(SyncRun.id == sync_run_id)
+                    )
+                    fail_run = fail_result.scalar_one_or_none()
+                    if fail_run:
+                        fail_run.status = "failed"
+                        fail_run.last_error = "LeafLink company_id is empty"
+                        fail_run.completed_at = datetime.now(timezone.utc)
+                        await db.commit()
+                    _cred_early_return = True
 
     except Exception as db_exc:
         logger.error(
@@ -661,6 +741,24 @@ async def poll_and_execute() -> None:
         )
         sys.stdout.flush()
         raise
+    finally:
+        _cred_session_duration = (datetime.now(timezone.utc) - _cred_session_open_at).total_seconds()
+        logger.info(
+            "[DB_SESSION_CLOSED] function=poll_and_execute step=credential_fetch "
+            "sync_run_id=%s duration_seconds=%.3f",
+            sync_run_id,
+            _cred_session_duration,
+        )
+        if _cred_session_duration > 30:
+            logger.warning(
+                "[LONG_LIVED_DB_SESSION] function=poll_and_execute step=credential_fetch "
+                "sync_run_id=%s duration_seconds=%.3f",
+                sync_run_id,
+                _cred_session_duration,
+            )
+
+    if _cred_early_return:
+        return POLL_INTERVAL_SECONDS
 
     # ---------------------------------------------------------------------- #
     # Step 3.5: Overlapping full-sync guard                                   #
@@ -685,7 +783,11 @@ async def poll_and_execute() -> None:
         )
         # Leave the job in "syncing" state — it will be retried on the next poll
         # once the active sync completes and releases the lock.
-        return
+        logger.info(
+            "[SCHEDULER_IDLE_SLEEP] reason=sync_lock_held suggested_delay_seconds=%d",
+            _POLL_DELAY_SYNC_RUNNING,
+        )
+        return _POLL_DELAY_SYNC_RUNNING
 
     # ---------------------------------------------------------------------- #
     # Step 4: Execute sync                                                    #
@@ -693,6 +795,7 @@ async def poll_and_execute() -> None:
 
     # Stamp last_progress_at immediately before the first API call so the
     # stall detector does not fire while we are waiting for the first page.
+    _stamp_session_open_at = datetime.now(timezone.utc)
     try:
         async with AsyncSessionLocal() as db:
             pre_run_result = await db.execute(
@@ -710,6 +813,21 @@ async def poll_and_execute() -> None:
         )
         sys.stdout.flush()
         raise
+    finally:
+        _stamp_duration = (datetime.now(timezone.utc) - _stamp_session_open_at).total_seconds()
+        logger.info(
+            "[DB_SESSION_CLOSED] function=poll_and_execute step=progress_stamp "
+            "sync_run_id=%s duration_seconds=%.3f",
+            sync_run_id,
+            _stamp_duration,
+        )
+        if _stamp_duration > 30:
+            logger.warning(
+                "[LONG_LIVED_DB_SESSION] function=poll_and_execute step=progress_stamp "
+                "sync_run_id=%s duration_seconds=%.3f",
+                sync_run_id,
+                _stamp_duration,
+            )
 
     try:
         if last_next_url:
@@ -805,6 +923,8 @@ async def poll_and_execute() -> None:
                 sync_run_id,
                 str(mark_exc)[:200],
             )
+
+    return POLL_INTERVAL_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -948,52 +1068,80 @@ async def run_scheduler() -> None:
     _BACKOFF_MAX_SECONDS = 60
     _BACKOFF_MULTIPLIER = 2
 
+    # Spawn pool health monitor as a background task (runs every 60s)
+    _pool_monitor_task = asyncio.create_task(
+        _pool_health_monitor(), name="db_pool_health_monitor"
+    )
+    logger.info("[DB_POOL_HEALTH] pool health monitor started (60s interval)")
+
     # Main polling loop with exponential backoff on QueuePool TimeoutError
     poll_delay = POLL_INTERVAL_SECONDS
-    while True:
+    try:
+        while True:
+            try:
+                suggested_delay = await poll_and_execute()
+
+                # Use the delay suggested by poll_and_execute (idle / sync-running
+                # conditions return longer delays to reduce DB session churn).
+                if suggested_delay != POLL_INTERVAL_SECONDS:
+                    # Only log when the delay differs from the normal interval
+                    logger.info(
+                        "[SCHEDULER_IDLE_SLEEP] delay_seconds=%d "
+                        "(poll_and_execute suggested idle delay)",
+                        suggested_delay,
+                    )
+                    # Don't override an elevated backoff delay with a shorter idle delay
+                    effective_delay = max(suggested_delay, poll_delay)
+                else:
+                    # Normal execution — reset backoff if it was elevated
+                    if poll_delay != POLL_INTERVAL_SECONDS:
+                        logger.info(
+                            "[SCHEDULER_BACKOFF_RESET] poll_delay_reset_to=%ds "
+                            "previous_delay=%ds",
+                            POLL_INTERVAL_SECONDS,
+                            poll_delay,
+                        )
+                        poll_delay = POLL_INTERVAL_SECONDS
+                    effective_delay = poll_delay
+
+            except Exception as loop_exc:
+                exc_str = str(loop_exc)
+                # Detect QueuePool TimeoutError (pool exhaustion)
+                is_pool_timeout = (
+                    "QueuePool" in exc_str
+                    or "TimeoutError" in type(loop_exc).__name__
+                    or "pool timeout" in exc_str.lower()
+                    or "connection pool" in exc_str.lower()
+                )
+
+                if is_pool_timeout:
+                    new_delay = min(poll_delay * _BACKOFF_MULTIPLIER, _BACKOFF_MAX_SECONDS)
+                    logger.warning(
+                        "[SCHEDULER_BACKOFF] pool_timeout_detected "
+                        "increasing_poll_delay=%ds previous_delay=%ds "
+                        "error=%s",
+                        new_delay,
+                        poll_delay,
+                        exc_str[:200],
+                    )
+                    poll_delay = new_delay
+                else:
+                    logger.error(
+                        "[SyncWorker] FATAL ERROR in polling loop: %s",
+                        exc_str[:500],
+                        exc_info=True,
+                    )
+                sys.stdout.flush()
+                effective_delay = poll_delay
+
+            await asyncio.sleep(effective_delay)
+    finally:
+        _pool_monitor_task.cancel()
         try:
-            await poll_and_execute()
-
-            # Successful poll — reset backoff if it was elevated
-            if poll_delay != POLL_INTERVAL_SECONDS:
-                logger.info(
-                    "[SCHEDULER_BACKOFF_RESET] poll_delay_reset_to=%ds "
-                    "previous_delay=%ds",
-                    POLL_INTERVAL_SECONDS,
-                    poll_delay,
-                )
-                poll_delay = POLL_INTERVAL_SECONDS
-
-        except Exception as loop_exc:
-            exc_str = str(loop_exc)
-            # Detect QueuePool TimeoutError (pool exhaustion)
-            is_pool_timeout = (
-                "QueuePool" in exc_str
-                or "TimeoutError" in type(loop_exc).__name__
-                or "pool timeout" in exc_str.lower()
-                or "connection pool" in exc_str.lower()
-            )
-
-            if is_pool_timeout:
-                new_delay = min(poll_delay * _BACKOFF_MULTIPLIER, _BACKOFF_MAX_SECONDS)
-                logger.warning(
-                    "[SCHEDULER_BACKOFF] pool_timeout_detected "
-                    "increasing_poll_delay=%ds previous_delay=%ds "
-                    "error=%s",
-                    new_delay,
-                    poll_delay,
-                    exc_str[:200],
-                )
-                poll_delay = new_delay
-            else:
-                logger.error(
-                    "[SyncWorker] FATAL ERROR in polling loop: %s",
-                    exc_str[:500],
-                    exc_info=True,
-                )
-            sys.stdout.flush()
-
-        await asyncio.sleep(poll_delay)
+            await _pool_monitor_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("[DB_POOL_HEALTH] pool health monitor stopped")
 
 
 if __name__ == "__main__":
