@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from typing import AsyncGenerator
@@ -59,6 +60,31 @@ _engine = None
 _AsyncSessionLocal = None
 _bootstrap_complete = False
 
+# ---------------------------------------------------------------------------
+# Engine singleton enforcement
+# ---------------------------------------------------------------------------
+# _engine_id tracks the hex id() of the one canonical engine.  Any attempt to
+# create a second engine raises RuntimeError so we catch misconfigured code
+# paths before they silently produce a pool with default settings (5/10).
+_engine_id: str | None = None
+
+# Lock prevents concurrent calls to initialize_database_after_bootstrap() from
+# racing and creating two engines.  Acquired once; never released (singleton).
+_engine_creation_lock: asyncio.Lock | None = None
+
+
+def _get_engine_creation_lock() -> asyncio.Lock:
+    """Return the module-level engine-creation lock, creating it lazily.
+
+    The lock must be created inside a running event loop, so we defer
+    construction until the first call rather than at module import time.
+    """
+    global _engine_creation_lock
+    if _engine_creation_lock is None:
+        _engine_creation_lock = asyncio.Lock()
+    return _engine_creation_lock
+
+
 # DATABASE_URL is computed lazily so importing this module never raises.
 DATABASE_URL: str = ""
 
@@ -83,15 +109,25 @@ def get_engine():
 
 
 def get_async_session_local():
-    """Get AsyncSessionLocal, raising if database not initialized yet."""
+    """Get AsyncSessionLocal, raising if database not initialized yet.
+
+    Always call this function at *use time* (not import time) to guarantee
+    you receive the factory created by initialize_database_after_bootstrap().
+    Raises RuntimeError if the database has not been initialized yet.
+    """
     global _AsyncSessionLocal
     if _AsyncSessionLocal is None:
         raise RuntimeError(
             "[DB_NOT_INITIALIZED] AsyncSessionLocal not available — "
             "database must be initialized via initialize_database_after_bootstrap() first"
         )
-    logger.info("[DB_SESSION_FACTORY_REQUESTED] returning AsyncSessionLocal")
+    logger.debug("[DB_SESSION_FACTORY_REQUESTED] returning AsyncSessionLocal engine_id=%s", _engine_id)
     return _AsyncSessionLocal
+
+
+def get_engine_id() -> str | None:
+    """Return the hex engine_id of the canonical engine, or None if not yet initialized."""
+    return _engine_id
 
 
 def _build_database_url() -> str:
@@ -192,78 +228,163 @@ async def initialize_database_after_bootstrap() -> None:
 
     Populates the module-level _engine, _AsyncSessionLocal, DATABASE_URL, and
     _bootstrap_complete flag so all downstream code can use them.
+
+    Singleton-safe: if called a second time after the engine is already
+    initialized, raises RuntimeError to prevent silent pool misconfiguration.
     """
-    global _engine, _AsyncSessionLocal, DATABASE_URL, _bootstrap_complete
+    global _engine, _AsyncSessionLocal, DATABASE_URL, _bootstrap_complete, _engine_id
 
     logger.info("[DB_INIT_START] initializing database module")
 
-    logger.info("[BOOTSTRAP_DB_INIT] building DATABASE_URL")
-    DATABASE_URL = _build_database_url()
+    # ------------------------------------------------------------------
+    # Singleton guard — acquire the creation lock so concurrent callers
+    # (e.g. two workers racing at startup) cannot both create an engine.
+    # ------------------------------------------------------------------
+    _lock = _get_engine_creation_lock()
+    async with _lock:
+        if _engine is not None:
+            # Engine already exists — log and raise rather than silently
+            # creating a second engine with potentially wrong pool settings.
+            logger.error(
+                "[DB_ENGINE_SINGLETON_VIOLATION] initialize_database_after_bootstrap() called "
+                "a second time — engine already exists engine_id=%s. "
+                "Only ONE engine may be created per process.",
+                _engine_id,
+            )
+            raise RuntimeError(
+                "[DB_ENGINE_SINGLETON_VIOLATION] initialize_database_after_bootstrap() was "
+                "called more than once. Only one async engine may exist per process. "
+                f"Existing engine_id={_engine_id}"
+            )
 
-    logger.info(
-        "[BOOTSTRAP_DB_INIT] creating engine database_url=%s",
-        DATABASE_URL[:50] + "..." if DATABASE_URL else "NOT_SET",
-    )
+        logger.info("[BOOTSTRAP_DB_INIT] building DATABASE_URL")
+        DATABASE_URL = _build_database_url()
 
-    _parsed_url = urlparse(DATABASE_URL)
-    _drivername = _parsed_url.scheme
-    _host = _parsed_url.hostname or "unknown"
-    _has_ssl_in_url = "ssl" in _parsed_url.query.lower() or "sslmode" in _parsed_url.query.lower()
+        logger.info(
+            "[BOOTSTRAP_DB_INIT] creating engine database_url=%s",
+            DATABASE_URL[:50] + "..." if DATABASE_URL else "NOT_SET",
+        )
 
-    logger.info(
-        "[BOOTSTRAP_DB_INIT] drivername=%s host=%s ssl_in_url=%s",
-        _drivername,
-        _host,
-        _has_ssl_in_url,
-    )
+        _parsed_url = urlparse(DATABASE_URL)
+        _drivername = _parsed_url.scheme
+        _host = _parsed_url.hostname or "unknown"
+        _has_ssl_in_url = "ssl" in _parsed_url.query.lower() or "sslmode" in _parsed_url.query.lower()
 
-    _engine = create_async_engine(
-        DATABASE_URL,
-        echo=False,
-        pool_pre_ping=True,
-        pool_size=20,
-        max_overflow=40,
-        pool_timeout=60,
-        pool_recycle=1800,
-        connect_args={"ssl": "require"},
-        execution_options={"compiled_cache": None},
-    )
+        logger.info(
+            "[BOOTSTRAP_DB_INIT] drivername=%s host=%s ssl_in_url=%s",
+            _drivername,
+            _host,
+            _has_ssl_in_url,
+        )
 
-    logger.info("[DB_INIT_ENGINE_CREATED] async engine created")
-    logger.info("[BOOTSTRAP_DB_INIT] engine_created connect_args_ssl=require compiled_cache=disabled pool_size=20 max_overflow=40 pool_timeout=60 pool_recycle=1800")
+        # Log pool config before creation so it is visible even if creation fails
+        logger.info(
+            "[DB_POOL_CONFIG] pool_size=20 max_overflow=40 pool_timeout=60 "
+            "pool_recycle=1800 pool_pre_ping=true connect_args_ssl=require "
+            "compiled_cache=disabled"
+        )
 
-    _AsyncSessionLocal = async_sessionmaker(
-        bind=_engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-    )
+        _engine = create_async_engine(
+            DATABASE_URL,
+            echo=False,
+            pool_pre_ping=True,
+            pool_size=20,
+            max_overflow=40,
+            pool_timeout=60,
+            pool_recycle=1800,
+            connect_args={"ssl": "require"},
+            execution_options={"compiled_cache": None},
+        )
 
-    logger.info("[DB_INIT_SESSION_FACTORY_CREATED] session factory created")
-    logger.info("[BOOTSTRAP_DB_INIT] session_factory_created")
+        # Record the canonical engine id immediately after creation
+        _engine_id = hex(id(_engine))
 
-    # Verify connection works
-    logger.info("[DB_INIT_CONNECTION_VERIFIED] testing database connection")
-    async with _engine.connect() as conn:
-        await conn.execute(text("SELECT 1"))
+        logger.info(
+            "[DB_ENGINE_ID] engine_id=%s pool_size=20 max_overflow=40 "
+            "pool_timeout=60 pool_recycle=1800",
+            _engine_id,
+        )
+        logger.info("[DB_INIT_ENGINE_CREATED] async engine created engine_id=%s", _engine_id)
+        logger.info(
+            "[BOOTSTRAP_DB_INIT] engine_created connect_args_ssl=require "
+            "compiled_cache=disabled pool_size=20 max_overflow=40 "
+            "pool_timeout=60 pool_recycle=1800 engine_id=%s",
+            _engine_id,
+        )
 
-    _bootstrap_complete = True
-    logger.info("[DB_INIT_COMPLETE] database initialization complete")
+        # ------------------------------------------------------------------
+        # Pool assertion — fail immediately if the engine was somehow created
+        # with wrong pool settings (e.g. SQLAlchemy default 5/10).
+        # ------------------------------------------------------------------
+        _pool = _engine.pool
+        _actual_pool_size = _pool.size()
+        _actual_max_overflow = _pool._max_overflow
 
-    # Update module-level aliases so `from database import engine` and
-    # `from database import AsyncSessionLocal` work after bootstrap.
-    # Note: code that already did `from database import engine` before bootstrap
-    # will still have None — they must re-import or use `import database; database.engine`.
-    import sys as _sys
-    _mod = _sys.modules[__name__]
-    _mod.engine = _engine
-    _mod.AsyncSessionLocal = _AsyncSessionLocal
+        if _actual_pool_size != 20 or _actual_max_overflow != 40:
+            logger.error(
+                "[DB_ENGINE_CONFIG_MISMATCH] engine_id=%s pool_size=%d "
+                "(expected 20) max_overflow=%d (expected 40) — "
+                "engine created with wrong pool settings",
+                _engine_id,
+                _actual_pool_size,
+                _actual_max_overflow,
+            )
+            raise RuntimeError(
+                f"[DB_ENGINE_CONFIG_MISMATCH] engine_id={_engine_id} "
+                f"pool_size={_actual_pool_size} (expected 20) "
+                f"max_overflow={_actual_max_overflow} (expected 40). "
+                "Engine was created with wrong pool settings — "
+                "this would cause QueuePool exhaustion under load."
+            )
 
-    logger.info("[BOOTSTRAP_DB_INIT_COMPLETE] database module initialized bootstrap_complete=true")
+        logger.info(
+            "[DB_ENGINE_CONFIG_VALIDATED] engine_id=%s pool_size=%d "
+            "max_overflow=%d pool_timeout=%s pool_recycle=%s — "
+            "pool configuration is correct",
+            _engine_id,
+            _actual_pool_size,
+            _actual_max_overflow,
+            getattr(_pool, "_timeout", "unknown"),
+            getattr(_pool, "_recycle", "unknown"),
+        )
+
+        _AsyncSessionLocal = async_sessionmaker(
+            bind=_engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+
+        logger.info("[DB_INIT_SESSION_FACTORY_CREATED] session factory created engine_id=%s", _engine_id)
+        logger.info(
+            "[DB_SESSION_FACTORY] AsyncSessionLocal initialized engine_id=%s",
+            _engine_id,
+        )
+        logger.info("[BOOTSTRAP_DB_INIT] session_factory_created")
+
+        # Verify connection works
+        logger.info("[DB_INIT_CONNECTION_VERIFIED] testing database connection engine_id=%s", _engine_id)
+        async with _engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+
+        _bootstrap_complete = True
+        logger.info("[DB_INIT_COMPLETE] database initialization complete engine_id=%s", _engine_id)
+
+        # Update module-level aliases so `from database import engine` and
+        # `from database import AsyncSessionLocal` work after bootstrap.
+        # Note: code that already did `from database import engine` before bootstrap
+        # will still have None — they must re-import or use `import database; database.engine`.
+        import sys as _sys
+        _mod = _sys.modules[__name__]
+        _mod.engine = _engine
+        _mod.AsyncSessionLocal = _AsyncSessionLocal
+
+        logger.info(
+            "[BOOTSTRAP_DB_INIT_COMPLETE] database module initialized "
+            "bootstrap_complete=true engine_id=%s",
+            _engine_id,
+        )
 
 
-# ---------------------------------------------------------------------------
-# _initialize_engine: canonical alias used by the sync worker bootstrap.
-# Identical to initialize_database_after_bootstrap() — both names are valid.
 # ---------------------------------------------------------------------------
 _initialize_engine = initialize_database_after_bootstrap
 
@@ -283,8 +404,86 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             "DATABASE_URL is not configured — bootstrap must run first"
         )
 
+    # Verify the engine in use matches the canonical engine_id.
+    # A mismatch here means a second engine was created somewhere — which
+    # would explain pool exhaustion with the old default settings.
+    if _engine is not None and _engine_id is not None:
+        _current_id = hex(id(_engine))
+        if _current_id != _engine_id:
+            logger.error(
+                "[DB_ENGINE_ID_MISMATCH] get_db() engine_id=%s expected=%s — "
+                "engine was replaced without updating _engine_id",
+                _current_id,
+                _engine_id,
+            )
+
     async with _AsyncSessionLocal() as session:
         yield session
+
+
+async def validate_single_engine() -> None:
+    """Verify that only one engine exists and it matches the canonical engine_id.
+
+    Logs [DB_ENGINE_SINGLETON_VERIFIED] if the engine is the canonical one,
+    or [DB_ENGINE_SINGLETON_VIOLATION] if a mismatch is detected.
+
+    Call this from lifespan() and worker_main() after database initialization
+    to confirm no rogue engine was created by an early import.
+    """
+    if _engine is None:
+        logger.warning("[DB_ENGINE_SINGLETON] engine not initialized — skipping validation")
+        return
+
+    _current_id = hex(id(_engine))
+
+    if _engine_id is None:
+        logger.error(
+            "[DB_ENGINE_SINGLETON_VIOLATION] _engine_id is None but _engine exists "
+            "current_engine_id=%s — engine was created outside initialize_database_after_bootstrap()",
+            _current_id,
+        )
+        return
+
+    if _current_id != _engine_id:
+        logger.error(
+            "[DB_ENGINE_SINGLETON_VIOLATION] engine_id mismatch "
+            "current=%s canonical=%s — a second engine was created",
+            _current_id,
+            _engine_id,
+        )
+        raise RuntimeError(
+            f"[DB_ENGINE_SINGLETON_VIOLATION] engine_id mismatch: "
+            f"current={_current_id} canonical={_engine_id}. "
+            "A second engine was created outside initialize_database_after_bootstrap()."
+        )
+
+    # Verify pool settings on the live engine
+    _pool = _engine.pool
+    _ps = _pool.size()
+    _mo = _pool._max_overflow
+
+    if _ps != 20 or _mo != 40:
+        logger.error(
+            "[DB_ENGINE_SINGLETON_VIOLATION] engine_id=%s pool_size=%d "
+            "(expected 20) max_overflow=%d (expected 40) — "
+            "pool settings do not match expected production values",
+            _engine_id,
+            _ps,
+            _mo,
+        )
+        raise RuntimeError(
+            f"[DB_ENGINE_SINGLETON_VIOLATION] engine_id={_engine_id} "
+            f"pool_size={_ps} (expected 20) max_overflow={_mo} (expected 40). "
+            "Pool settings do not match expected production values."
+        )
+
+    logger.info(
+        "[DB_ENGINE_SINGLETON_VERIFIED] engine_id=%s pool_size=%d "
+        "max_overflow=%d — single canonical engine confirmed",
+        _engine_id,
+        _ps,
+        _mo,
+    )
 
 
 async def refresh_connection_pool() -> None:
@@ -292,12 +491,12 @@ async def refresh_connection_pool() -> None:
     Dispose of the current connection pool and create a new one.
     Use this after schema changes to ensure new connections see updated schema.
     """
-    global _engine, _AsyncSessionLocal, engine, AsyncSessionLocal
+    global _engine, _AsyncSessionLocal, engine, AsyncSessionLocal, _engine_id
 
     if _engine is None:
         return
 
-    logger.info("[Database] disposing_connection_pool")
+    logger.info("[Database] disposing_connection_pool engine_id=%s", _engine_id)
     await _engine.dispose()
     logger.info("[Database] connection_pool_disposed")
 
@@ -314,6 +513,9 @@ async def refresh_connection_pool() -> None:
         execution_options={"compiled_cache": None},
     )
 
+    # Update canonical engine_id to the new engine
+    _engine_id = hex(id(_engine))
+
     _AsyncSessionLocal = async_sessionmaker(
         bind=_engine,
         class_=AsyncSession,
@@ -324,7 +526,12 @@ async def refresh_connection_pool() -> None:
     engine = _engine
     AsyncSessionLocal = _AsyncSessionLocal
 
-    logger.info("[Database] connection_pool_recreated with connect_args_ssl=require compiled_cache=disabled pool_size=20 max_overflow=40 pool_timeout=60 pool_recycle=1800")
+    logger.info(
+        "[Database] connection_pool_recreated engine_id=%s "
+        "connect_args_ssl=require compiled_cache=disabled "
+        "pool_size=20 max_overflow=40 pool_timeout=60 pool_recycle=1800",
+        _engine_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -364,12 +571,12 @@ async def dispose_and_recreate_engine() -> None:
     statement metadata from a previous deploy is discarded before the first
     sync operation runs.
     """
-    global _engine, _AsyncSessionLocal, engine, AsyncSessionLocal
+    global _engine, _AsyncSessionLocal, engine, AsyncSessionLocal, _engine_id
 
     if _engine is None:
         return
 
-    logger.info("[DB_STARTUP] disposing_engine_for_fresh_cache")
+    logger.info("[DB_STARTUP] disposing_engine_for_fresh_cache engine_id=%s", _engine_id)
     await _engine.dispose()
 
     _engine = create_async_engine(
@@ -384,6 +591,9 @@ async def dispose_and_recreate_engine() -> None:
         execution_options={"compiled_cache": None},  # Disable statement cache to prevent UUID/VARCHAR type confusion
     )
 
+    # Update canonical engine_id to the new engine
+    _engine_id = hex(id(_engine))
+
     _AsyncSessionLocal = async_sessionmaker(
         bind=_engine,
         class_=AsyncSession,
@@ -394,7 +604,10 @@ async def dispose_and_recreate_engine() -> None:
     engine = _engine
     AsyncSessionLocal = _AsyncSessionLocal
 
-    logger.info("[DB_STARTUP] engine_recreated_after_dispose compiled_cache=disabled")
+    logger.info(
+        "[DB_STARTUP] engine_recreated_after_dispose engine_id=%s compiled_cache=disabled",
+        _engine_id,
+    )
 
 
 async def confirm_database_identity() -> None:

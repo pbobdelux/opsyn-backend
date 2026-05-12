@@ -93,7 +93,7 @@ async def _init_database() -> None:
     """Initialize the database engine after bootstrap completes."""
     logger.info("[BACKEND_DB_INIT_START] initializing database engine")
     try:
-        from database import initialize_database_after_bootstrap, get_engine
+        from database import initialize_database_after_bootstrap, get_engine, get_engine_id, validate_single_engine
         await initialize_database_after_bootstrap()
         logger.info("[DB_INIT_COMPLETE] database engine initialized")
 
@@ -106,7 +106,18 @@ async def _init_database() -> None:
         _pool = _engine.pool
         _actual_pool_size = _pool.size()
         _actual_max_overflow = _pool._max_overflow
+        _eid = get_engine_id()
 
+        logger.info(
+            "[DB_ENGINE_VALIDATION] engine_id=%s pool_size=%d max_overflow=%d "
+            "pool_timeout=%s pool_recycle=%s pool_pre_ping=true "
+            "database_url_source=DATABASE_URL",
+            _eid,
+            _actual_pool_size,
+            _actual_max_overflow,
+            getattr(_pool, "_timeout", "unknown"),
+            getattr(_pool, "_recycle", "unknown"),
+        )
         logger.info(
             "[DB_ENGINE_CONFIG] pool_size=%d max_overflow=%d pool_timeout=%s "
             "pool_recycle=%s pool_pre_ping=true database_url_source=DATABASE_URL",
@@ -133,9 +144,13 @@ async def _init_database() -> None:
             "Ensure initialize_database_after_bootstrap() is the only engine creation path."
         )
         logger.info(
-            "[DB_ENGINE_CONFIG_VALIDATED] pool_size=20 max_overflow=40 — "
-            "pool configuration is correct"
+            "[DB_ENGINE_CONFIG_VALIDATED] engine_id=%s pool_size=20 max_overflow=40 — "
+            "pool configuration is correct",
+            _eid,
         )
+
+        # Validate singleton — raises RuntimeError if a second engine was created
+        await validate_single_engine()
 
     except Exception as e:
         logger.error("[BACKEND_DB_INIT_FAILED] error=%s", str(e)[:500])
