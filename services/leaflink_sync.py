@@ -1802,16 +1802,17 @@ async def _insert_line_items_standalone(
             insert_columns.append(col)
 
 
+
     # UUID columns that require explicit CAST in the SQL VALUES clause so
     # PostgreSQL never infers the parameter type as character varying.
     _uuid_columns = {"mapped_product_id"}
-    # TIMESTAMP (without time zone) columns — bind UTC-naive datetimes
+    # TIMESTAMPTZ columns — bind UTC-aware datetimes (DateTime(timezone=True))
     _timestamp_columns = {"created_at", "updated_at"}
 
     columns_str = ", ".join(insert_columns)
     placeholders = ", ".join(
         f"CAST(:{col} AS UUID)" if col in _uuid_columns
-        else f"CAST(:{col} AS TIMESTAMP)" if col in _timestamp_columns
+        else f"CAST(:{col} AS TIMESTAMPTZ)" if col in _timestamp_columns
         else f":{col}"
         for col in insert_columns
     )
@@ -1819,6 +1820,7 @@ async def _insert_line_items_standalone(
         "[UUID_SQL_CAST_APPLIED] statement=_insert_line_items_standalone columns=%s",
         ",".join(col for col in insert_columns if col in _uuid_columns),
     )
+
 
     # Build the ON CONFLICT DO UPDATE clause — only include columns that exist
     _standalone_update_clauses = [
@@ -1990,21 +1992,25 @@ async def _insert_line_items_standalone(
             # Apply final hard sanitization
             insert_params = final_sanitize_order_lines_params(insert_params)
 
-            # Assert no naive datetimes remain anywhere
-            assert_no_naive_datetimes(insert_params, "params")
-
-            # Convert created_at and updated_at to UTC-naive for TIMESTAMP WITHOUT TIME ZONE columns
-            if "created_at" in insert_params:
-                insert_params["created_at"] = to_utc_naive(insert_params["created_at"])
-            if "updated_at" in insert_params:
-                insert_params["updated_at"] = to_utc_naive(insert_params["updated_at"])
-
             # Final barrier: ensure all UUID objects are strings before asyncpg execute()
             insert_params = apply_uuid_str_to_params(insert_params)
 
+            # [DATETIME_NORMALIZED] — log exact UTC-aware values being bound to TIMESTAMPTZ columns
+            for _dt_field in ("created_at", "updated_at"):
+                if _dt_field in insert_params:
+                    _dt_val = insert_params[_dt_field]
+                    logger.info(
+                        "[DATETIME_NORMALIZED] function=_insert_line_items_standalone field=%s"
+                        " source_type=%s tzinfo=%s value=%s",
+                        _dt_field,
+                        type(_dt_val).__name__,
+                        getattr(_dt_val, "tzinfo", None),
+                        _dt_val.isoformat() if isinstance(_dt_val, datetime) else _dt_val,
+                    )
+
             # Log the final bind values
             logger.debug(
-                "[ORDER_LINES_FINAL_DATETIME_BIND] created_at=%s type=%s tzinfo=%s updated_at=%s type=%s tzinfo=%s column_type=TIMESTAMP",
+                "[ORDER_LINES_FINAL_DATETIME_BIND] created_at=%s type=%s tzinfo=%s updated_at=%s type=%s tzinfo=%s column_type=TIMESTAMPTZ",
                 insert_params.get("created_at"),
                 type(insert_params.get("created_at")).__name__,
                 getattr(insert_params.get("created_at"), "tzinfo", None) if isinstance(insert_params.get("created_at"), datetime) else "N/A",
@@ -2020,13 +2026,28 @@ async def _insert_line_items_standalone(
                     logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
             # Pre-bind validator: final scan of the EXACT object being passed to execute()
             insert_params = _validate_and_fix_sql_params(insert_params)
+
+            # [DATETIME_VALIDATION_FAILED] guard — assert no naive datetimes reach asyncpg
+            for _vf, _vv in insert_params.items():
+                if isinstance(_vv, datetime) and (_vv.tzinfo is None or _vv.tzinfo.utcoffset(_vv) is None):
+                    logger.error(
+                        "[DATETIME_VALIDATION_FAILED] function=_insert_line_items_standalone field=%s value=%s",
+                        _vf, _vv,
+                    )
+                    raise AssertionError(
+                        f"[DATETIME_VALIDATION_FAILED] naive datetime in field={_vf} value={_vv!r}"
+                    )
+
             await db.execute(text(line_insert_stmt), insert_params)
 
             inserted += 1
 
             await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
 
+
         except Exception as line_error:
+
+
             try:
                 await db.execute(text(f"ROLLBACK TO SAVEPOINT {savepoint_name}"))
             except Exception:
@@ -2403,17 +2424,18 @@ async def sync_leaflink_orders(
 
                 # UUID columns that require explicit CAST in the SQL VALUES clause
                 _li_uuid_columns = {"mapped_product_id"}
-                # TIMESTAMP (without time zone) columns — bind UTC-naive datetimes
+                # TIMESTAMPTZ columns — bind UTC-aware datetimes (DateTime(timezone=True))
                 _li_timestamp_columns = {"created_at", "updated_at"}
 
                 _li_columns_str = ", ".join(_li_insert_columns)
                 _li_placeholders = ", ".join(
                     f"CAST(:{col} AS UUID)" if col in _li_uuid_columns
-                    else f"CAST(:{col} AS TIMESTAMP)" if col in _li_timestamp_columns
+                    else f"CAST(:{col} AS TIMESTAMPTZ)" if col in _li_timestamp_columns
                     else f":{col}"
                     for col in _li_insert_columns
                 )
                 logger.debug(
+
                     "[UUID_SQL_CAST_APPLIED] statement=sync_leaflink_orders columns=%s",
                     ",".join(col for col in _li_insert_columns if col in _li_uuid_columns),
                 )
@@ -2558,21 +2580,25 @@ async def sync_leaflink_orders(
                     # Apply final hard sanitization
                     _li_params = final_sanitize_order_lines_params(_li_params)
 
-                    # Assert no naive datetimes remain anywhere
-                    assert_no_naive_datetimes(_li_params, "params")
-
-                    # Convert created_at and updated_at to UTC-naive for TIMESTAMP WITHOUT TIME ZONE columns
-                    if "created_at" in _li_params:
-                        _li_params["created_at"] = to_utc_naive(_li_params["created_at"])
-                    if "updated_at" in _li_params:
-                        _li_params["updated_at"] = to_utc_naive(_li_params["updated_at"])
-
                     # Final barrier: ensure all UUID objects are strings before asyncpg execute()
                     _li_params = apply_uuid_str_to_params(_li_params)
 
+                    # [DATETIME_NORMALIZED] — log exact UTC-aware values being bound to TIMESTAMPTZ columns
+                    for _dt_field in ("created_at", "updated_at"):
+                        if _dt_field in _li_params:
+                            _dt_val = _li_params[_dt_field]
+                            logger.info(
+                                "[DATETIME_NORMALIZED] function=sync_leaflink_orders field=%s"
+                                " source_type=%s tzinfo=%s value=%s",
+                                _dt_field,
+                                type(_dt_val).__name__,
+                                getattr(_dt_val, "tzinfo", None),
+                                _dt_val.isoformat() if isinstance(_dt_val, datetime) else _dt_val,
+                            )
+
                     # Log the final bind values
                     logger.debug(
-                        "[ORDER_LINES_FINAL_DATETIME_BIND] created_at=%s type=%s tzinfo=%s updated_at=%s type=%s tzinfo=%s column_type=TIMESTAMP",
+                        "[ORDER_LINES_FINAL_DATETIME_BIND] created_at=%s type=%s tzinfo=%s updated_at=%s type=%s tzinfo=%s column_type=TIMESTAMPTZ",
                         _li_params.get("created_at"),
                         type(_li_params.get("created_at")).__name__,
                         getattr(_li_params.get("created_at"), "tzinfo", None) if isinstance(_li_params.get("created_at"), datetime) else "N/A",
@@ -2588,9 +2614,19 @@ async def sync_leaflink_orders(
                             logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
                     # Pre-bind validator: final scan of the EXACT object being passed to execute()
                     _li_params = _validate_and_fix_sql_params(_li_params)
+
+                    # [DATETIME_VALIDATION_FAILED] guard — assert no naive datetimes reach asyncpg
+                    for _vf, _vv in _li_params.items():
+                        if isinstance(_vv, datetime) and (_vv.tzinfo is None or _vv.tzinfo.utcoffset(_vv) is None):
+                            logger.error(
+                                "[DATETIME_VALIDATION_FAILED] function=sync_leaflink_orders field=%s value=%s",
+                                _vf, _vv,
+                            )
+                            raise AssertionError(
+                                f"[DATETIME_VALIDATION_FAILED] naive datetime in field={_vf} value={_vv!r}"
+                            )
+
                     await db.execute(text(_li_insert_stmt), _li_params)
-
-
 
                 total_lines_written += len(normalized_line_items)
 
@@ -4052,13 +4088,13 @@ async def sync_leaflink_line_items(
     # UUID columns that require explicit CAST in the SQL VALUES clause so
     # PostgreSQL never infers the parameter type as character varying.
     _uuid_columns = {"mapped_product_id"}
-    # TIMESTAMP (without time zone) columns — bind UTC-naive datetimes
+    # TIMESTAMPTZ columns — bind UTC-aware datetimes (DateTime(timezone=True))
     _timestamp_columns = {"created_at", "updated_at"}
 
     columns_str = ", ".join(insert_columns)
     placeholders = ", ".join(
         f"CAST(:{col} AS UUID)" if col in _uuid_columns
-        else f"CAST(:{col} AS TIMESTAMP)" if col in _timestamp_columns
+        else f"CAST(:{col} AS TIMESTAMPTZ)" if col in _timestamp_columns
         else f":{col}"
         for col in insert_columns
     )
@@ -4254,18 +4290,25 @@ async def sync_leaflink_line_items(
                 # Apply final hard sanitization
                 insert_params = final_sanitize_order_lines_params(insert_params)
 
-                # Convert created_at and updated_at to UTC-naive for TIMESTAMP WITHOUT TIME ZONE columns
-                if "created_at" in insert_params:
-                    insert_params["created_at"] = to_utc_naive(insert_params["created_at"])
-                if "updated_at" in insert_params:
-                    insert_params["updated_at"] = to_utc_naive(insert_params["updated_at"])
-
                 # Final barrier: ensure all UUID objects are strings before asyncpg execute()
                 insert_params = apply_uuid_str_to_params(insert_params)
 
+                # [DATETIME_NORMALIZED] — log exact UTC-aware values being bound to TIMESTAMPTZ columns
+                for _dt_field in ("created_at", "updated_at"):
+                    if _dt_field in insert_params:
+                        _dt_val = insert_params[_dt_field]
+                        logger.info(
+                            "[DATETIME_NORMALIZED] function=_upsert_line_items field=%s"
+                            " source_type=%s tzinfo=%s value=%s",
+                            _dt_field,
+                            type(_dt_val).__name__,
+                            getattr(_dt_val, "tzinfo", None),
+                            _dt_val.isoformat() if isinstance(_dt_val, datetime) else _dt_val,
+                        )
+
                 # Log the final bind values
                 logger.debug(
-                    "[ORDER_LINES_FINAL_DATETIME_BIND] created_at=%s type=%s tzinfo=%s updated_at=%s type=%s tzinfo=%s column_type=TIMESTAMP",
+                    "[ORDER_LINES_FINAL_DATETIME_BIND] created_at=%s type=%s tzinfo=%s updated_at=%s type=%s tzinfo=%s column_type=TIMESTAMPTZ",
                     insert_params.get("created_at"),
                     type(insert_params.get("created_at")).__name__,
                     getattr(insert_params.get("created_at"), "tzinfo", None) if isinstance(insert_params.get("created_at"), datetime) else "N/A",
@@ -4282,10 +4325,22 @@ async def sync_leaflink_line_items(
                 # Pre-bind validator: final scan of the EXACT object being passed to execute()
                 insert_params = _validate_and_fix_sql_params(insert_params)
 
+                # [DATETIME_VALIDATION_FAILED] guard — assert no naive datetimes reach asyncpg
+                for _vf, _vv in insert_params.items():
+                    if isinstance(_vv, datetime) and (_vv.tzinfo is None or _vv.tzinfo.utcoffset(_vv) is None):
+                        logger.error(
+                            "[DATETIME_VALIDATION_FAILED] function=_upsert_line_items field=%s value=%s",
+                            _vf, _vv,
+                        )
+                        raise AssertionError(
+                            f"[DATETIME_VALIDATION_FAILED] naive datetime in field={_vf} value={_vv!r}"
+                        )
+
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
                 await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
+
 
             except Exception as line_error:
                 try:
