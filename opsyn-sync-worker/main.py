@@ -62,11 +62,41 @@ async def process_sync_requests() -> None:
     """
     from sqlalchemy import select
 
-    from database import AsyncSessionLocal
     from models import BrandAPICredential, SyncRequest
     from services.leaflink_sync import sync_leaflink_background_continuous
 
     logger.info("[SyncWorker] started poll_interval_seconds=%s", POLL_INTERVAL_SECONDS)
+
+    # ---------------------------------------------------------------------------
+    # Ensure database is initialized before using AsyncSessionLocal.
+    # process_sync_requests() may be called directly (e.g. __main__ block) without
+    # going through worker_main(), so we initialize here unconditionally.
+    # initialize_database_after_bootstrap() is idempotent — safe to call twice.
+    # ---------------------------------------------------------------------------
+    from database import initialize_database_after_bootstrap, get_async_session_local, is_bootstrap_complete
+    if not is_bootstrap_complete():
+        logger.info("[SyncWorker] database not yet initialized — running initialize_database_after_bootstrap()")
+        await initialize_database_after_bootstrap()
+
+    # Resolve session factory at call time (never at module import time) to
+    # guarantee we always get the factory created by initialize_database_after_bootstrap().
+    AsyncSessionLocal = get_async_session_local()
+
+    # Log engine pool configuration for startup diagnostics
+    try:
+        from database import get_engine
+        _eng = get_engine()
+        _pool = _eng.pool
+        _ps = _pool.size()
+        _mo = _pool._max_overflow
+        logger.info(
+            "[DB_ENGINE_CONFIG] pool_size=%d max_overflow=%d total_capacity=%d "
+            "pool_pre_ping=true database_url_source=DATABASE_URL",
+            _ps, _mo, _ps + _mo,
+        )
+        logger.info("[DB_POOL_CAPACITY] total_capacity=%d", _ps + _mo)
+    except Exception as _cfg_exc:
+        logger.warning("[DB_ENGINE_CONFIG] failed to read pool config: %s", _cfg_exc)
 
     # Dispose and recreate the engine on startup to flush asyncpg prepared-statement
     # cache from any previous deploy, then inspect the live schema so sync code can
@@ -74,6 +104,8 @@ async def process_sync_requests() -> None:
     try:
         from database import confirm_database_identity, dispose_and_recreate_engine, inspect_schema_at_startup
         await dispose_and_recreate_engine()
+        # Re-resolve session factory after engine recreation
+        AsyncSessionLocal = get_async_session_local()
         await inspect_schema_at_startup()
         await confirm_database_identity()
     except Exception as _startup_exc:

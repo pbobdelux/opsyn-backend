@@ -63,6 +63,10 @@ async def _run_bootstrap() -> None:
         bootstrap_url,
         echo=False,
         pool_pre_ping=True,
+        pool_size=20,
+        max_overflow=40,
+        pool_timeout=60,
+        pool_recycle=1800,
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},
     )
@@ -89,9 +93,50 @@ async def _init_database() -> None:
     """Initialize the database engine after bootstrap completes."""
     logger.info("[BACKEND_DB_INIT_START] initializing database engine")
     try:
-        from database import initialize_database_after_bootstrap
+        from database import initialize_database_after_bootstrap, get_engine
         await initialize_database_after_bootstrap()
         logger.info("[DB_INIT_COMPLETE] database engine initialized")
+
+        # ---------------------------------------------------------------------------
+        # Engine configuration validation — fail startup if pool settings are wrong.
+        # This catches any code path that creates an engine with default pool settings
+        # (pool_size=5, max_overflow=10) instead of the tuned production values.
+        # ---------------------------------------------------------------------------
+        _engine = get_engine()
+        _pool = _engine.pool
+        _actual_pool_size = _pool.size()
+        _actual_max_overflow = _pool._max_overflow
+
+        logger.info(
+            "[DB_ENGINE_CONFIG] pool_size=%d max_overflow=%d pool_timeout=%s "
+            "pool_recycle=%s pool_pre_ping=true database_url_source=DATABASE_URL",
+            _actual_pool_size,
+            _actual_max_overflow,
+            getattr(_pool, "_timeout", "unknown"),
+            getattr(_pool, "_recycle", "unknown"),
+        )
+        logger.info(
+            "[DB_POOL_CAPACITY] total_capacity=%d (pool_size=%d + max_overflow=%d)",
+            _actual_pool_size + _actual_max_overflow,
+            _actual_pool_size,
+            _actual_max_overflow,
+        )
+
+        assert _actual_pool_size == 20, (
+            f"[DB_ENGINE_CONFIG_INVALID] pool_size={_actual_pool_size} expected=20 — "
+            "engine was created with wrong pool settings. "
+            "Ensure initialize_database_after_bootstrap() is the only engine creation path."
+        )
+        assert _actual_max_overflow == 40, (
+            f"[DB_ENGINE_CONFIG_INVALID] max_overflow={_actual_max_overflow} expected=40 — "
+            "engine was created with wrong pool settings. "
+            "Ensure initialize_database_after_bootstrap() is the only engine creation path."
+        )
+        logger.info(
+            "[DB_ENGINE_CONFIG_VALIDATED] pool_size=20 max_overflow=40 — "
+            "pool configuration is correct"
+        )
+
     except Exception as e:
         logger.error("[BACKEND_DB_INIT_FAILED] error=%s", str(e)[:500])
         raise
