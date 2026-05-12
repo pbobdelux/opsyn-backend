@@ -161,6 +161,10 @@ async def _sync_worker_bootstrap() -> None:
         bootstrap_url,
         echo=False,
         pool_pre_ping=True,
+        pool_size=20,
+        max_overflow=40,
+        pool_timeout=60,
+        pool_recycle=1800,
         connect_args={"ssl": "require"},
         execution_options={"compiled_cache": None},
     )
@@ -230,6 +234,44 @@ async def worker_main() -> None:
         logger.info("[SYNC_WORKER_DB_INIT_START] initializing database engine")
         await _sync_worker_init_database()
         logger.info("[SYNC_WORKER_DB_INIT_COMPLETE] database engine initialized")
+
+        # Phase 2.5: Validate and log engine pool configuration
+        try:
+            from database import get_engine
+            _eng = get_engine()
+            _pool = _eng.pool
+            _ps = _pool.size()
+            _mo = _pool._max_overflow
+            logger.info(
+                "[DB_ENGINE_CONFIG] pool_size=%d max_overflow=%d total_capacity=%d "
+                "pool_timeout=%s pool_recycle=%s pool_pre_ping=true "
+                "database_url_source=DATABASE_URL",
+                _ps,
+                _mo,
+                _ps + _mo,
+                getattr(_pool, "_timeout", "unknown"),
+                getattr(_pool, "_recycle", "unknown"),
+            )
+            logger.info("[DB_POOL_CAPACITY] total_capacity=%d", _ps + _mo)
+
+            assert _ps == 20, (
+                f"[DB_ENGINE_CONFIG_INVALID] pool_size={_ps} expected=20 — "
+                "engine was created with wrong pool settings. "
+                "Ensure initialize_database_after_bootstrap() is the only engine creation path."
+            )
+            assert _mo == 40, (
+                f"[DB_ENGINE_CONFIG_INVALID] max_overflow={_mo} expected=40 — "
+                "engine was created with wrong pool settings. "
+                "Ensure initialize_database_after_bootstrap() is the only engine creation path."
+            )
+            logger.info(
+                "[DB_ENGINE_CONFIG_VALIDATED] pool_size=20 max_overflow=40 — "
+                "pool configuration is correct"
+            )
+        except AssertionError:
+            raise
+        except Exception as _cfg_exc:
+            logger.warning("[DB_ENGINE_CONFIG] failed to read pool config: %s", _cfg_exc)
 
         # Phase 3: Verify database connection
         logger.info("[SYNC_WORKER_DB_VERIFY_START] verifying database connection")
@@ -950,6 +992,29 @@ async def run_scheduler() -> None:
         raise RuntimeError("Database not initialized — cannot start scheduler")
 
     logger.info("[SYNC_WORKER_READY] database initialized, scheduler starting")
+
+    # ---------------------------------------------------------------------- #
+    # Log engine pool configuration for startup diagnostics.                  #
+    # ---------------------------------------------------------------------- #
+    try:
+        from database import get_engine
+        _sched_eng = get_engine()
+        _sched_pool = _sched_eng.pool
+        _sched_ps = _sched_pool.size()
+        _sched_mo = _sched_pool._max_overflow
+        logger.info(
+            "[DB_ENGINE_CONFIG] pool_size=%d max_overflow=%d total_capacity=%d "
+            "pool_timeout=%s pool_recycle=%s pool_pre_ping=true "
+            "database_url_source=DATABASE_URL",
+            _sched_ps,
+            _sched_mo,
+            _sched_ps + _sched_mo,
+            getattr(_sched_pool, "_timeout", "unknown"),
+            getattr(_sched_pool, "_recycle", "unknown"),
+        )
+        logger.info("[DB_POOL_CAPACITY] total_capacity=%d", _sched_ps + _sched_mo)
+    except Exception as _sched_cfg_exc:
+        logger.warning("[DB_ENGINE_CONFIG] failed to read pool config: %s", _sched_cfg_exc)
 
     # ---------------------------------------------------------------------- #
     # Startup diagnostics: log env-var presence and parsed DATABASE_URL       #
