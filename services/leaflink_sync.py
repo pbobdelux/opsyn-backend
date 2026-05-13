@@ -267,6 +267,47 @@ def _trace_sql_params_for_datetimes(params: dict, context: str = "unknown") -> N
             )
 
 
+def _log_sanitized_datetime_params(params: dict, scope: str = "order_header") -> None:
+    """Log only datetime fields from *params* without exposing sensitive data.
+
+    Emits one ``[SQL_CAST_MAP]`` line per datetime field containing:
+      - scope  — caller-supplied label (e.g. "order_header")
+      - field  — parameter name
+      - type   — always "datetime"
+      - tzinfo — str(value.tzinfo), e.g. "UTC"
+      - aware  — True if tzinfo is set and utcoffset() is not None
+      - value  — ISO 8601 string (safe; contains no customer/order data)
+
+    Non-datetime fields (customer names, addresses, raw payloads, etc.) are
+    intentionally skipped so this function never leaks PII into logs.
+
+    Args:
+        params: The final SQL parameters dict about to be passed to execute().
+        scope:  Short label for the calling site (e.g. "order_header").
+    """
+    if not isinstance(params, dict):
+        logger.warning(
+            "[SQL_CAST_MAP] scope=%s params_type=%s — expected dict, skipping sanitized log",
+            scope,
+            type(params).__name__,
+        )
+        return
+
+    for field, value in params.items():
+        if not isinstance(value, datetime):
+            continue
+        tzinfo_str = str(value.tzinfo) if value.tzinfo is not None else "None"
+        aware = value.tzinfo is not None and value.utcoffset() is not None
+        logger.debug(
+            "[SQL_CAST_MAP] scope=%s field=%s type=datetime tzinfo=%s aware=%s value=%s",
+            scope,
+            field,
+            tzinfo_str,
+            aware,
+            value.isoformat(),
+        )
+
+
 def _cursor_hash(cursor: Optional[str]) -> Optional[str]:
     """Return a short hash of a cursor for safe logging."""
     if not cursor:
@@ -3534,30 +3575,23 @@ RETURNING (xmax = 0) AS was_inserted
 
 
                           # ---------------------------------------------------------------
-                          # HARD-FAIL VALIDATION — raise RuntimeError before asyncpg runs
+                          # HARD-FAIL VALIDATION — raise ValueError before asyncpg runs
                           # if ANY datetime param is still naive after all normalization.
-                          # This surfaces the exact field name instead of the cryptic
-                          # "can't subtract offset-naive and offset-aware datetimes at $N".
+                          # This is a hard-fail guard: do NOT normalize in-place here.
+                          # The caller must fix the source of the naive datetime upstream.
                           # ---------------------------------------------------------------
-                          for _hf_idx, (_hf_field, _hf_value) in enumerate(safe_params.items()):
-                              if isinstance(_hf_value, datetime) and _hf_value.tzinfo is None:
-                                  logger.error(
-                                      "[FINAL_DATETIME_VALIDATION_FAILED] context=order_header_upsert"
-                                      " idx=%d field=%s value=%s tzinfo=None"
-                                      " — naive datetime reached execute(), raising RuntimeError",
-                                      _hf_idx,
-                                      _hf_field,
-                                      repr(_hf_value),
-                                  )
-                                  # Normalize in-place so the error is recoverable on retry,
-                                  # then raise so the caller sees the exact field name.
-                                  safe_params[_hf_field] = _hf_value.replace(tzinfo=timezone.utc)
-                                  raise RuntimeError(
-                                      f"[FINAL_DATETIME_VALIDATION_FAILED] field={_hf_field} idx={_hf_idx}"
-                                      f" value={_hf_value!r} tzinfo=None — naive datetime in order_header_upsert"
-                                  )
+                          for _hf_field, _hf_value in safe_params.items():
+                              if isinstance(_hf_value, datetime):
+                                  if _hf_value.tzinfo is None or _hf_value.utcoffset() is None:
+                                      logger.error(
+                                          "[FINAL_DATETIME_VALIDATION_FAILED] scope=order_header field=%s",
+                                          _hf_field,
+                                      )
+                                      raise ValueError(
+                                          f"[FINAL_DATETIME_VALIDATION_FAILED] scope=order_header field={_hf_field}"
+                                      )
 
-                          logger.debug(f"[SQL_CAST_MAP] {safe_params}")
+                          _log_sanitized_datetime_params(safe_params, scope="order_header")
                           upsert_result = await db.execute(text(upsert_stmt), safe_params)
 
                           row = upsert_result.fetchone()
