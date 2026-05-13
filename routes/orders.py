@@ -15,7 +15,7 @@ from sqlalchemy import cast, func, literal_column, select
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import AsyncSessionLocal, get_db
+from database import get_db
 from models import BrandAPICredential, Order, SyncRequest, SyncRun
 from services.watchdog_client import emit_watchdog_event
 from utils.json_utils import make_json_safe

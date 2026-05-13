@@ -267,14 +267,16 @@ async def _resume_interrupted_syncs() -> None:
       - last_synced_page < total_pages_available
     """
     try:
-        from database import AsyncSessionLocal
+        from database import get_async_session_local
         from models import BrandAPICredential, SyncRequest
 
-        if AsyncSessionLocal is None:
-            logger.warning("startup: DATABASE_URL not set — skipping sync resume check")
+        try:
+            _session_factory = get_async_session_local()
+        except RuntimeError as _exc:
+            logger.warning("startup: DATABASE_URL not set — skipping sync resume check error=%s", _exc)
             return
 
-        async with AsyncSessionLocal() as session:
+        async with _session_factory() as session:
             result = await session.execute(
                 select(BrandAPICredential).where(
                     BrandAPICredential.integration_name == "leaflink",
@@ -308,7 +310,7 @@ async def _resume_interrupted_syncs() -> None:
                 cred.total_pages_available,
             )
             try:
-                async with AsyncSessionLocal() as enqueue_sess:
+                async with _session_factory() as enqueue_sess:
                     async with enqueue_sess.begin():
                         enqueue_sess.add(SyncRequest(
                             brand_id=cred.brand_id,
