@@ -3689,8 +3689,42 @@ async def api_orders_full_resync(
     """
     from services.credential_resolver import resolve_brand_credential
     from services.sync_run_manager import create_sync_run
+    import database as _database_module
 
     timestamp = datetime.now(timezone.utc).isoformat()
+
+    # ------------------------------------------------------------------ #
+    # Diagnostic: log entry point and resolve session factory at call     #
+    # time (not import time) to avoid the None-at-import-time bug.       #
+    # ------------------------------------------------------------------ #
+    logger.info("[FULL_RESYNC_ENTRY] brand_id=%s", brand_id)
+
+    _session_factory = None
+    try:
+        _session_factory = _database_module.get_async_session_local()
+    except Exception as _sf_exc:
+        logger.error(
+            "[FULL_RESYNC_FAILURE_POINT] variable=AsyncSessionLocal error=%s",
+            _sf_exc,
+        )
+        return make_json_safe({
+            "ok": False,
+            "error": f"Database session factory not available: {str(_sf_exc)[:200]}",
+            "brand_id": brand_id,
+            "timestamp": timestamp,
+        })
+
+    logger.info(
+        "[FULL_RESYNC_QUEUE_OBJECT] type=%s callable=%s",
+        type(_session_factory).__name__,
+        str(callable(_session_factory)).lower(),
+    )
+    logger.info(
+        "[FULL_RESYNC_ENQUEUE_TARGET] name=%s repr=%s",
+        getattr(_session_factory, "__name__", type(_session_factory).__name__),
+        repr(_session_factory)[:120],
+    )
+
     logger.info("[OrdersAPI] full_resync_enqueue brand_id=%s org=%s", brand_id, x_opsyn_org)
 
     # Resolve credential — validate it exists before enqueuing
@@ -3737,7 +3771,7 @@ async def api_orders_full_resync(
     # Create SyncRun record (own transaction, committed immediately)
     sync_run_id = None
     try:
-        async with AsyncSessionLocal() as _run_db:
+        async with _session_factory() as _run_db:
             async with _run_db.begin():
                 _run = await create_sync_run(_run_db, resolved_brand_id, mode="full")
                 sync_run_id = _run.id
@@ -3762,6 +3796,10 @@ async def api_orders_full_resync(
             "timestamp": timestamp,
         })
     except Exception as run_exc:
+        logger.warning(
+            "[FULL_RESYNC_FAILURE_POINT] variable=create_sync_run error=%s",
+            run_exc,
+        )
         logger.warning("[OrdersAPI] full_resync run_create_error error=%s", run_exc)
         # Non-fatal — proceed without a SyncRun record
 
@@ -3769,7 +3807,7 @@ async def api_orders_full_resync(
     # org_id is stored in the SyncRequest row so the worker can propagate it to
     # every order INSERT without needing to re-resolve the org from the header.
     try:
-        async with AsyncSessionLocal() as _enq_db:
+        async with _session_factory() as _enq_db:
             async with _enq_db.begin():
                 _enq_db.add(SyncRequest(
                     brand_id=resolved_brand_id,
@@ -3785,6 +3823,10 @@ async def api_orders_full_resync(
             sync_run_id,
         )
     except Exception as enq_exc:
+        logger.error(
+            "[FULL_RESYNC_FAILURE_POINT] variable=SyncRequest_enqueue error=%s",
+            enq_exc,
+        )
         logger.error(
             "[OrdersAPI] full_resync enqueue_error brand_id=%s error=%s",
             resolved_brand_id,
