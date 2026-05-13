@@ -3191,9 +3191,9 @@ INSERT INTO orders (
     :customer_name, :status, :total_cents, :amount, :item_count, :unit_count,
     :line_items_json, :raw_payload, :source, :review_status, :sync_status,
     :sync_health_status, CAST(:sync_health_missing_fields AS jsonb),
-    :synced_at, :last_synced_at,
-    :created_at, :updated_at,
-    :external_created_at, :external_updated_at
+    CAST(:synced_at AS TIMESTAMPTZ), CAST(:last_synced_at AS TIMESTAMPTZ),
+    CAST(:created_at AS TIMESTAMPTZ), CAST(:updated_at AS TIMESTAMPTZ),
+    CAST(:external_created_at AS TIMESTAMPTZ), CAST(:external_updated_at AS TIMESTAMPTZ)
 )
 ON CONFLICT (brand_id, external_order_id) DO UPDATE SET
     org_id = CAST(:org_id AS uuid),
@@ -3210,11 +3210,11 @@ ON CONFLICT (brand_id, external_order_id) DO UPDATE SET
     sync_status = EXCLUDED.sync_status,
     sync_health_status = EXCLUDED.sync_health_status,
     sync_health_missing_fields = EXCLUDED.sync_health_missing_fields,
-    synced_at = EXCLUDED.synced_at,
-    last_synced_at = EXCLUDED.last_synced_at,
-    updated_at = EXCLUDED.updated_at,
-    external_created_at = COALESCE(EXCLUDED.external_created_at, orders.external_created_at),
-    external_updated_at = COALESCE(EXCLUDED.external_updated_at, orders.external_updated_at)
+    synced_at = CAST(EXCLUDED.synced_at AS TIMESTAMPTZ),
+    last_synced_at = CAST(EXCLUDED.last_synced_at AS TIMESTAMPTZ),
+    updated_at = CAST(EXCLUDED.updated_at AS TIMESTAMPTZ),
+    external_created_at = COALESCE(CAST(EXCLUDED.external_created_at AS TIMESTAMPTZ), orders.external_created_at),
+    external_updated_at = COALESCE(CAST(EXCLUDED.external_updated_at AS TIMESTAMPTZ), orders.external_updated_at)
 RETURNING (xmax = 0) AS was_inserted
 """
 
@@ -3517,11 +3517,21 @@ RETURNING (xmax = 0) AS was_inserted
                           _audit_params_for_naive_datetimes(safe_params)
 
                           # ---------------------------------------------------------------
+                          # SQL CAST MAP — confirm all datetime fields use TIMESTAMPTZ
+                          # ---------------------------------------------------------------
+                          logger.info(
+                              "[SQL_CAST_MAP] synced_at=TIMESTAMPTZ last_synced_at=TIMESTAMPTZ"
+                              " created_at=TIMESTAMPTZ updated_at=TIMESTAMPTZ"
+                              " external_created_at=TIMESTAMPTZ external_updated_at=TIMESTAMPTZ"
+                          )
+
+                          # ---------------------------------------------------------------
                           # COMPREHENSIVE PARAMETER TRACE — emit [SQL_PARAM_TRACE] for
                           # every parameter so logs show the exact index/field/type/tzinfo
                           # that maps to each asyncpg $N positional argument.
                           # ---------------------------------------------------------------
                           _trace_sql_params_for_datetimes(safe_params, "order_header_upsert")
+
 
                           # ---------------------------------------------------------------
                           # HARD-FAIL VALIDATION — raise RuntimeError before asyncpg runs
