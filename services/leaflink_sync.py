@@ -3557,6 +3557,7 @@ RETURNING (xmax = 0) AS was_inserted
                                       f" value={_hf_value!r} tzinfo=None — naive datetime in order_header_upsert"
                                   )
 
+                          logger.debug(f"[SQL_CAST_MAP] {safe_params}")
                           upsert_result = await db.execute(text(upsert_stmt), safe_params)
 
                           row = upsert_result.fetchone()
