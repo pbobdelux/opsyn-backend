@@ -6004,16 +6004,47 @@ async def sync_leaflink_line_items(
         total_orders,
     )
 
-    # Update sync health after Phase 2 completes
-    if len(errors) == 0:
+    # Update sync health after Phase 2 completes.
+    # CRITICAL: Only mark last_successful_sync_at when line items actually
+    # succeeded. If total_failed > 0 and total_inserted == 0, this is a
+    # line item failure — do NOT mark as success.
+    _phase2_has_failures = total_failed > 0 or len(errors) > 0
+    _phase2_inserted_something = total_inserted > 0
+    if not _phase2_has_failures:
+        # Clean run — no failures at all
         await _update_sync_health_phase2(
             brand_id=brand_id_value,
             line_items_count=(total_inserted or 0),
         )
-    else:
+    elif _phase2_inserted_something and total_failed > 0:
+        # Partial success — some inserted, some failed
+        logger.warning(
+            "[SYNC_RECONCILIATION_FAILED] status=partial_line_item_failure "
+            "brand_id=%s line_items_inserted=%d line_items_failed=%d "
+            "reason=some_line_items_failed — NOT marking last_successful_sync_at",
+            brand_id_value, total_inserted, total_failed,
+        )
         await _record_sync_error(
             brand_id=brand_id_value,
-            error=Exception(f"Phase 2 completed with {len(errors)} errors"),
+            error=Exception(
+                f"Phase 2 partial: {total_inserted} inserted, {total_failed} failed, "
+                f"{len(errors)} batch errors"
+            ),
+        )
+    else:
+        # All line items failed or batch errors — definite failure
+        logger.warning(
+            "[SYNC_RECONCILIATION_FAILED] status=partial_line_item_failure "
+            "brand_id=%s line_items_inserted=%d line_items_failed=%d errors=%d "
+            "reason=all_line_items_failed — NOT marking last_successful_sync_at",
+            brand_id_value, total_inserted, total_failed, len(errors),
+        )
+        await _record_sync_error(
+            brand_id=brand_id_value,
+            error=Exception(
+                f"Phase 2 failed: {total_inserted} inserted, {total_failed} failed, "
+                f"{len(errors)} batch errors"
+            ),
         )
 
     return {
@@ -6450,7 +6481,21 @@ async def sync_leaflink_full_resync(
         total_local_orders,
     )
 
-    # Write final snapshot marking sync as complete
+    # Write final snapshot marking sync as complete.
+    # CRITICAL: Only set last_successful_sync_at when orders were actually
+    # inserted or updated. If total_inserted + total_updated == 0 and
+    # total_fetched > 0, this is a false success — do NOT mark as successful.
+    _resync_actually_succeeded = (
+        len(errors) == 0
+        and (total_inserted > 0 or total_updated > 0 or total_fetched == 0)
+    )
+    if not _resync_actually_succeeded and total_fetched > 0:
+        logger.warning(
+            "[SYNC_RECONCILIATION_FAILED] status=reconciliation_failed "
+            "brand_id=%s fetched=%d inserted=%d updated=%d failed=%d errors=%d "
+            "reason=db_count_did_not_grow — NOT marking last_successful_sync_at",
+            brand_id, total_fetched, total_inserted, total_updated, failed_count, len(errors),
+        )
     try:
         _final_rate = round(total_fetched / duration, 1) if duration > 0 and total_fetched > 0 else None
         _last_sync_at = datetime.now(timezone.utc)
@@ -6461,14 +6506,14 @@ async def sync_leaflink_full_resync(
                 pages_processed=pages_synced,
                 records_processed=total_fetched,
                 sync_rate=_final_rate,
-                last_successful_sync_at=_last_sync_at if len(errors) == 0 else None,
+                last_successful_sync_at=_last_sync_at if _resync_actually_succeeded else None,
             )
         )
     except Exception:
         pass  # snapshot is best-effort
 
     return {
-        "ok": len(errors) == 0,
+        "ok": _resync_actually_succeeded,
         "total_fetched": total_fetched,
         "total_inserted": total_inserted,
         "total_updated": total_updated,
@@ -7610,83 +7655,6 @@ async def _sync_leaflink_background_continuous_inner(
         if leaflink_total_count and leaflink_total_count > 0:
             completion_percent = (records_seen_from_leaflink / leaflink_total_count) * 100
 
-        # CRITICAL: Do NOT mark completed if next_cursor exists — pagination is incomplete.
-        # A non-None next_cursor means LeafLink has more pages; the loop exited early
-        # (e.g. timeout) rather than reaching the true end of the result set.
-        if next_cursor:
-            logger.warning(
-                "[LeafLinkSync] stopped_with_cursor id=%s brand=%s total_loaded=%s cursor_hash=%s",
-                sync_run_id,
-                brand_id,
-                total_orders_synced,
-                _cursor_hash(next_cursor),
-            )
-            if sync_run_id:
-                try:
-                    async with AsyncSessionLocal() as _stall_db:
-                        async with _stall_db.begin():
-                            await _srm_mark_stalled(
-                                _stall_db,
-                                sync_run_id,
-                                f"pagination_incomplete: next_cursor_present after {final_page} pages",
-                            )
-                except Exception as _stall_exc:
-                    logger.error(
-                        "[LeafLinkSync] mark_stalled_error id=%s error=%s",
-                        sync_run_id,
-                        _stall_exc,
-                    )
-        elif completion_percent >= 95:
-            # No next cursor and >= 95% complete — pagination complete
-            logger.info(
-                "[SYNC_COMPLETE] run_id=%s brand_id=%s org_id=%s "
-                "pages_processed=%s records_seen=%s leaflink_total=%s completion_percent=%.1f%%",
-                sync_run_id, brand_id, org_id,
-                pages_processed, records_seen_from_leaflink, leaflink_total_count,
-                completion_percent,
-            )
-            if sync_run_id:
-                try:
-                    async with AsyncSessionLocal() as _done_db:
-                        async with _done_db.begin():
-                            await _srm_mark_completed(_done_db, sync_run_id)
-                except Exception as _done_exc:
-                    logger.error(
-                        "[LeafLinkSync] mark_completed_error id=%s error=%s",
-                        sync_run_id,
-                        _done_exc,
-                    )
-        else:
-            # No next cursor but < 95% complete — mark as incomplete
-            _incomplete_reason = f"pagination_stopped_early: {completion_percent:.1f}% complete"
-            logger.warning(
-                "[SYNC_INCOMPLETE] run_id=%s brand_id=%s org_id=%s "
-                "pages_processed=%s records_seen=%s leaflink_total=%s completion_percent=%.1f%% "
-                "has_next=%s",
-                sync_run_id, brand_id, org_id,
-                pages_processed, records_seen_from_leaflink, leaflink_total_count,
-                completion_percent, next_cursor is not None,
-            )
-            if sync_run_id:
-                try:
-                    from models import SyncRun as _SyncRun
-                    async with AsyncSessionLocal() as _incomplete_db:
-                        async with _incomplete_db.begin():
-                            _inc_result = await _incomplete_db.execute(
-                                select(_SyncRun).where(_SyncRun.id == sync_run_id)
-                            )
-                            _inc_run = _inc_result.scalar_one_or_none()
-                            if _inc_run:
-                                _inc_run.status = "incomplete"
-                                _inc_run.last_error = _incomplete_reason
-                                _inc_run.completed_at = datetime.now(timezone.utc)
-                except Exception as _inc_exc:
-                    logger.error(
-                        "[LeafLinkSync] mark_incomplete_error id=%s error=%s",
-                        sync_run_id,
-                        _inc_exc,
-                    )
-
         # [SYNC_FINAL_COUNTS] Query actual DB counts — never use deferred/cached accounting.
         # This is the ground truth: what actually landed in the database this run.
         _sync_end_time = datetime.now(timezone.utc)
@@ -7731,28 +7699,79 @@ async def _sync_leaflink_background_continuous_inner(
                 _accounting_sum, records_seen_from_leaflink, brand_id,
             )
 
-        # Determine honest completion status
+        # DB-backed final reconciliation: query total order count before/after
+        # to verify the database actually grew. This is the ground-truth check
+        # that prevents false success when all orders are silently skipped.
+        _db_orders_before = 0
+        _db_orders_after = 0
+        _db_orders_delta = 0
+        try:
+            from sqlalchemy import func as _func_recon
+            async with AsyncSessionLocal() as _recon_db:
+                _before_res = await _recon_db.execute(
+                    select(_func_recon.count(Order.id)).where(
+                        Order.brand_id == brand_id,
+                        Order.created_at < _sync_start_time,
+                    )
+                )
+                _db_orders_before = _before_res.scalar() or 0
+
+                _after_res = await _recon_db.execute(
+                    select(_func_recon.count(Order.id)).where(
+                        Order.brand_id == brand_id,
+                    )
+                )
+                _db_orders_after = _after_res.scalar() or 0
+
+                _db_orders_delta = _db_orders_after - _db_orders_before
+        except Exception as _recon_exc:
+            logger.warning(
+                "[SYNC_RECONCILIATION_QUERY_FAILED] brand_id=%s error=%s — skipping reconciliation check",
+                brand_id, str(_recon_exc)[:200],
+            )
+            _db_orders_before = _db_inserted_count  # fallback
+            _db_orders_after = _db_inserted_count + _db_updated_count
+            _db_orders_delta = _db_inserted_count
+
+        # Determine honest completion status — NEVER report success without reconciliation
         if _db_inserted_count + _db_updated_count == 0 and _db_skipped_count == records_seen_from_leaflink and records_seen_from_leaflink > 0:
             _completion_status = "partial_duplicate_skip"
+            _termination_reason = "all_orders_matched_as_duplicates"
+        elif _db_orders_delta == 0 and records_seen_from_leaflink > 0 and _db_inserted_count == 0 and _db_updated_count == 0:
+            _completion_status = "reconciliation_failed"
+            _termination_reason = "db_count_did_not_grow"
         elif _total_errors > 0:
             _completion_status = "partial_line_item_failure"
+            _termination_reason = "line_item_errors"
         elif next_cursor:
             _completion_status = "partial_timeout"
+            _termination_reason = "pagination_incomplete"
         elif completion_percent < 95:
             _completion_status = "partial_timeout"
+            _termination_reason = "pagination_stopped_early"
         else:
-            _completion_status = "complete"
+            _completion_status = "success"
+            _termination_reason = "next_url_null" if not next_cursor else "pagination_incomplete"
 
-        _termination_reason = (
-            "next_url_null" if not next_cursor
-            else "pagination_incomplete"
-        )
+        # Log reconciliation warning for any non-success status
+        if _completion_status != "success":
+            logger.warning(
+                "[SYNC_RECONCILIATION_FAILED] status=%s reason=%s "
+                "fetched=%d inserted=%d updated=%d skipped=%d "
+                "db_before=%d db_after=%d db_delta=%d brand_id=%s sync_run_id=%s",
+                _completion_status, _termination_reason,
+                records_seen_from_leaflink, _db_inserted_count, _db_updated_count, _db_skipped_count,
+                _db_orders_before, _db_orders_after, _db_orders_delta,
+                brand_id, sync_run_id,
+            )
 
         # [SYNC_FINAL_ACCOUNTING] — ground-truth accounting from actual DB counts
         logger.info(
             "[SYNC_FINAL_ACCOUNTING] fetched=%d inserted=%d updated=%d skipped=%d "
+            "db_before=%d db_after=%d db_delta=%d "
             "line_items_inserted=deferred line_items_failed=deferred termination_reason=%s",
             records_seen_from_leaflink, _db_inserted_count, _db_updated_count, _db_skipped_count,
+            _db_orders_before, _db_orders_after, _db_orders_delta,
             _termination_reason,
         )
 
@@ -7760,10 +7779,12 @@ async def _sync_leaflink_background_continuous_inner(
         logger.info(
             "[SYNC_COMPLETION_STATUS] status=%s termination_reason=%s "
             "completion_scope=%.1f%% inserted=%d updated=%d skipped=%d "
+            "db_before=%d db_after=%d db_delta=%d "
             "line_items_inserted=deferred line_items_failed=deferred",
             _completion_status, _termination_reason,
             completion_percent,
             _db_inserted_count, _db_updated_count, _db_skipped_count,
+            _db_orders_before, _db_orders_after, _db_orders_delta,
         )
 
         logger.info(
@@ -7783,6 +7804,66 @@ async def _sync_leaflink_background_continuous_inner(
             completion_percent,
             _completion_status,
         )
+
+        # Update SyncRun status AFTER reconciliation — use honest _completion_status.
+        # NEVER mark as "completed" unless reconciliation passed (success).
+        # This prevents current_sync_state=success when DB didn't grow.
+        if sync_run_id:
+            try:
+                from models import SyncRun as _SyncRun
+                async with AsyncSessionLocal() as _status_db:
+                    async with _status_db.begin():
+                        _sr_result = await _status_db.execute(
+                            select(_SyncRun).where(_SyncRun.id == sync_run_id)
+                        )
+                        _sr_run = _sr_result.scalar_one_or_none()
+                        if _sr_run:
+                            _now_ts = datetime.now(timezone.utc)
+                            if _completion_status == "success":
+                                # Only mark completed when reconciliation passed
+                                _sr_run.status = "completed"
+                                _sr_run.completed_at = _now_ts
+                                _sr_run.last_error = None
+                                logger.info(
+                                    "[SYNC_RUN_MARKED_COMPLETED] run_id=%s brand_id=%s "
+                                    "db_delta=%d inserted=%d updated=%d",
+                                    sync_run_id, brand_id,
+                                    _db_orders_delta, _db_inserted_count, _db_updated_count,
+                                )
+                            elif next_cursor:
+                                # Pagination incomplete — mark stalled
+                                _sr_run.status = "stalled"
+                                _sr_run.stalled_reason = (
+                                    f"pagination_incomplete: next_cursor_present after {final_page} pages"
+                                )[:255]
+                                _sr_run.completed_at = _now_ts
+                                logger.warning(
+                                    "[SYNC_RUN_MARKED_STALLED] run_id=%s brand_id=%s "
+                                    "reason=pagination_incomplete",
+                                    sync_run_id, brand_id,
+                                )
+                            else:
+                                # Reconciliation failed or partial — mark incomplete with reason
+                                _sr_run.status = "incomplete"
+                                _sr_run.last_error = (
+                                    f"{_completion_status}: {_termination_reason} "
+                                    f"(fetched={records_seen_from_leaflink} "
+                                    f"inserted={_db_inserted_count} "
+                                    f"updated={_db_updated_count} "
+                                    f"db_delta={_db_orders_delta})"
+                                )
+                                _sr_run.completed_at = _now_ts
+                                logger.warning(
+                                    "[SYNC_RUN_MARKED_INCOMPLETE] run_id=%s brand_id=%s "
+                                    "status=%s reason=%s db_delta=%d",
+                                    sync_run_id, brand_id,
+                                    _completion_status, _termination_reason, _db_orders_delta,
+                                )
+            except Exception as _sr_update_exc:
+                logger.error(
+                    "[SYNC_RUN_STATUS_UPDATE_ERROR] run_id=%s brand_id=%s error=%s",
+                    sync_run_id, brand_id, str(_sr_update_exc)[:300],
+                )
 
         logger.info(
             "[OrdersSync] bg_sync_complete brand=%s final_page=%s total_pages=%s "
@@ -7809,7 +7890,7 @@ async def _sync_leaflink_background_continuous_inner(
         logger.info(
             "[LEAFLINK_SYNC_DEBUG] sync_complete brand_id=%s total_fetched=%s"
             " final_page=%s total_pages=%s duration=%ss total_local_orders=%s"
-            " completion_percent=%.1f%%",
+            " completion_percent=%.1f%% completion_status=%s db_delta=%d",
             brand_id,
             total_orders_synced,
             final_page,
@@ -7817,6 +7898,8 @@ async def _sync_leaflink_background_continuous_inner(
             total_duration,
             _final_total,
             completion_percent,
+            _completion_status,
+            _db_orders_delta,
         )
 
     except asyncio.CancelledError:

@@ -3905,7 +3905,15 @@ async def api_orders_sync_status(
     elif last_run and last_run.status == "failed":
         current_sync_state = "failed"
     elif last_completed:
+        # Only report "success" when the SyncRun was explicitly marked "completed"
+        # by the reconciliation-aware status update. "completed" status is only
+        # set when DB counts grew (reconciliation passed).
         current_sync_state = "success"
+    elif last_run and last_run.status == "incomplete":
+        # Reconciliation failed or partial — report the last_error for diagnosis
+        current_sync_state = "partial"
+    elif last_run and last_run.status == "stalled":
+        current_sync_state = "partial"
     elif last_run:
         current_sync_state = "partial"
     else:
