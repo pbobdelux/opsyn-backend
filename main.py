@@ -967,6 +967,33 @@ async def lifespan(app: FastAPI):
     print("✅ Sync scheduler task created")
 
     # ---------------------------------------------------------------------------
+    # Timezone audit — verify all datetime columns are TIMESTAMPTZ.
+    # Fails startup hard if any TIMESTAMP WITHOUT TIME ZONE columns remain,
+    # preventing asyncpg "offset-naive vs offset-aware" errors at runtime.
+    # ---------------------------------------------------------------------------
+    try:
+        from services.startup_timezone_audit import run_timezone_audit
+        _tz_audit_result = await run_timezone_audit()
+        logger.info(
+            "[DB_TIMEZONE_AUDIT_COMPLETE] ok=%s total_checked=%d ok_count=%d "
+            "mismatch=%d missing=%d",
+            _tz_audit_result.get("ok"),
+            _tz_audit_result.get("total_checked", 0),
+            _tz_audit_result.get("total_ok", 0),
+            _tz_audit_result.get("total_mismatch", 0),
+            _tz_audit_result.get("total_missing", 0),
+        )
+    except RuntimeError:
+        # RuntimeError from run_timezone_audit means TIMESTAMP WITHOUT TIME ZONE
+        # columns remain — re-raise to crash startup with a clear error message.
+        raise
+    except Exception as _tz_exc:
+        logger.warning(
+            "[DB_TIMEZONE_AUDIT_WARNING] audit_exception error=%s",
+            str(_tz_exc)[:300],
+        )
+
+    # ---------------------------------------------------------------------------
     # STARTUP_READY — emitted once all startup phases complete successfully.
     # Grep for this marker in Railway deploy logs to confirm a clean boot.
     # ---------------------------------------------------------------------------
