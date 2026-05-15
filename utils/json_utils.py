@@ -564,7 +564,7 @@ def sanitize_json_fields_only(params: dict) -> dict:
         is_json = _is_json_field(name)
         is_dt = _is_sql_datetime_field(name)
 
-        logger.info(
+        logger.debug(
             "[SQL_PARAM_TYPES] field=%s type=%s is_json_field=%s is_datetime_field=%s",
             name,
             type(value).__name__,
@@ -576,15 +576,16 @@ def sanitize_json_fields_only(params: dict) -> dict:
             before_count = _count_datetimes_in_value(value)
             sanitized_value = _recursive_json_field_sanitize(value)
             after_count = _count_datetimes_in_value(sanitized_value)
-            logger.info(
-                "[JSON_FIELD_SANITIZED] field=%s datetime_count_before=%d datetime_count_after=%d",
-                name,
-                before_count,
-                after_count,
-            )
+            if before_count > 0:
+                logger.debug(
+                    "[JSON_FIELD_SANITIZED] field=%s datetime_count_before=%d datetime_count_after=%d",
+                    name,
+                    before_count,
+                    after_count,
+                )
             result[name] = sanitized_value
         elif is_dt and value is not None:
-            logger.info(
+            logger.debug(
                 "[SQL_DATETIME_PRESERVED] field=%s type=%s tzinfo=%s",
                 name,
                 type(value).__name__,
@@ -630,7 +631,7 @@ def preserve_sql_datetime_fields(params: dict) -> dict:
             continue
         dt_count = _count_datetimes_in_value(value)
         status = "ok" if dt_count == 0 else "failed"
-        log_fn = logger.info if status == "ok" else logger.error
+        log_fn = logger.debug if status == "ok" else logger.error
         log_fn(
             "[JSON_FIELD_VALIDATION] field=%s datetime_count=%d status=%s",
             name,
@@ -656,7 +657,7 @@ def preserve_sql_datetime_fields(params: dict) -> dict:
         is_dt_obj = isinstance(value, datetime)
         has_tz = is_dt_obj and value.tzinfo is not None
         status = "ok" if (is_dt_obj and has_tz) else "failed"
-        log_fn = logger.info if status == "ok" else logger.error
+        log_fn = logger.debug if status == "ok" else logger.error
         log_fn(
             "[SQL_DATETIME_VALIDATION] field=%s is_datetime=%s has_tz=%s status=%s",
             name,
