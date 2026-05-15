@@ -4360,6 +4360,17 @@ async def sync_leaflink_line_items(
         order_row: Any,
         normalized_line_items: list[dict],
     ) -> tuple[int, int, list[tuple[dict, str]]]:
+        """
+        Upsert line items for an order.
+
+        Returns:
+            Tuple of (inserted_count, skipped_count, failed_items)
+            - inserted_count: Number of line items successfully inserted/updated
+            - skipped_count: Number of line items skipped (duplicate, malformed, etc.)
+            - failed_items: List of (item_dict, error_str) tuples for dead-lettering
+
+        ALWAYS returns a 3-tuple. Never returns None.
+        """
         order_id_val = order_row.id
         inserted = 0
         skipped = 0
@@ -4594,6 +4605,8 @@ async def sync_leaflink_line_items(
                 )
                 failed_items.append((item, str(line_error)[:500]))
 
+        return inserted, skipped, failed_items
+
     # ------------------------------------------------------------------
     # Aggregate counters across all orders
     # ------------------------------------------------------------------
@@ -4686,9 +4699,21 @@ async def sync_leaflink_line_items(
                         errors.append(f"_upsert_line_items not callable for order {order_id_val}")
                         continue
 
-                    inserted_count, skipped_count, failed_items = await _upsert_line_items(
+                    _upsert_result = await _upsert_line_items(
                         db, order_row, normalized_line_items
                     )
+                    if _upsert_result is None:
+                        logger.error(
+                            "[LINE_ITEM_UPSERT_RETURNED_NONE] order_id=%s external_id=%s — "
+                            "function returned None instead of 3-tuple, treating as failure",
+                            order_id_val,
+                            leaflink_order_id,
+                        )
+                        inserted_count, skipped_count, failed_items = 0, 0, [
+                            {"error": "line_item_upsert_returned_none"}
+                        ]
+                    else:
+                        inserted_count, skipped_count, failed_items = _upsert_result
 
                     logger.debug(
                         "[LINE_ITEM_UPSERT_COMMIT] brand_id=%s inserted=%s updated=0 duration=0s",
@@ -4827,9 +4852,21 @@ async def sync_leaflink_line_items(
                         sku_count,
                     )
 
-                    inserted_count, skipped_count, failed_items = await _upsert_line_items(
+                    _upsert_result = await _upsert_line_items(
                         db, order_row, normalized_line_items
                     )
+                    if _upsert_result is None:
+                        logger.error(
+                            "[LINE_ITEM_UPSERT_RETURNED_NONE] order_id=%s external_id=%s — "
+                            "function returned None instead of 3-tuple, treating as failure",
+                            order_id_val,
+                            leaflink_order_id,
+                        )
+                        inserted_count, skipped_count, failed_items = 0, 0, [
+                            {"error": "line_item_upsert_returned_none"}
+                        ]
+                    else:
+                        inserted_count, skipped_count, failed_items = _upsert_result
 
                     logger.debug(
                         "[LINE_ITEM_UPSERT_COMMIT] brand_id=%s inserted=%s updated=0 duration=0s",
