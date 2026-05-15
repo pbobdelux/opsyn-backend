@@ -418,17 +418,19 @@ async def get_orders(
         _brand_rows = _brand_rows_res.scalar() or 0
 
         # Rows by org_id
+        # orders.org_id is VARCHAR(120) — no CAST to UUID needed
         _org_rows_res = await db.execute(
-            _text_diag("SELECT COUNT(*) FROM orders WHERE org_id = CAST(:org_id AS uuid)"),
+            _text_diag("SELECT COUNT(*) FROM orders WHERE org_id = :org_id"),
             {"org_id": resolved_org_id},
         )
         _org_rows = _org_rows_res.scalar() or 0
 
         # Rows matching both brand_id AND org_id (what the main query will see)
+        # Both brand_id and org_id are VARCHAR(120) — no CAST needed
         _both_rows_res = await db.execute(
             _text_diag(
                 "SELECT COUNT(*) FROM orders "
-                "WHERE brand_id = :brand_id AND org_id = CAST(:org_id AS uuid)"
+                "WHERE brand_id = :brand_id AND org_id = :org_id"
             ),
             {"brand_id": brand_id, "org_id": resolved_org_id},
         )
@@ -3839,8 +3841,15 @@ async def api_orders_sync_status(
 
     # ------------------------------------------------------------------ #
     # Fast path: read from snapshot cache                                  #
+    # sync_metrics_snapshots.brand_id is VARCHAR — no CAST needed         #
     # ------------------------------------------------------------------ #
     snapshot = None
+    _snap_query_start = time.monotonic()
+    logger.info(
+        "[SYNC_STATUS_COUNT_QUERY] brand_id=%s source=sync_metrics_snapshots"
+        " cast_mode=none (brand_id is VARCHAR)",
+        brand_id,
+    )
     try:
         snap_result = await db.execute(
             _text_ss(
@@ -3855,11 +3864,22 @@ async def api_orders_sync_status(
             {"brand_id": brand_id},
         )
         snapshot = snap_result.fetchone()
-    except Exception as snap_exc:
+        _snap_duration_ms = round((time.monotonic() - _snap_query_start) * 1000, 1)
         logger.info(
-            "[OrdersAPI] sync_status snapshot_miss brand_id=%s reason=%s",
+            "[SYNC_STATUS_COUNT_RESULT] brand_id=%s snapshot_found=%s"
+            " total_local_orders=%s cast_mode_used=none query_duration_ms=%s",
+            brand_id,
+            snapshot is not None,
+            snapshot[0] if snapshot else None,
+            _snap_duration_ms,
+        )
+    except Exception as snap_exc:
+        _snap_duration_ms = round((time.monotonic() - _snap_query_start) * 1000, 1)
+        logger.info(
+            "[OrdersAPI] sync_status snapshot_miss brand_id=%s reason=%s duration_ms=%s",
             brand_id,
             str(snap_exc)[:100],
+            _snap_duration_ms,
         )
         try:
             await db.rollback()
@@ -4233,10 +4253,11 @@ async def api_orders_dead_letter_analysis(
     # Total dead-letter count                                              #
     # ------------------------------------------------------------------ #
     try:
+        # sync_dead_letters.brand_id is VARCHAR — no CAST needed
         total_res = await db.execute(
             _text(
                 "SELECT COUNT(*) FROM sync_dead_letters "
-                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL"
+                "WHERE brand_id = :brand_id AND resolved_at IS NULL"
             ),
             {"brand_id": brand_id},
         )
@@ -4253,7 +4274,7 @@ async def api_orders_dead_letter_analysis(
         stage_res = await db.execute(
             _text(
                 "SELECT error_stage, COUNT(*) as cnt FROM sync_dead_letters "
-                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL "
+                "WHERE brand_id = :brand_id AND resolved_at IS NULL "
                 "GROUP BY error_stage ORDER BY cnt DESC"
             ),
             {"brand_id": brand_id},
@@ -4274,7 +4295,7 @@ async def api_orders_dead_letter_analysis(
                 "SELECT id, external_id, order_number, error_stage, error_message, "
                 "       raw_payload, created_at "
                 "FROM sync_dead_letters "
-                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL "
+                "WHERE brand_id = :brand_id AND resolved_at IS NULL "
                 "ORDER BY created_at DESC "
                 "LIMIT :lim"
             ),
@@ -4526,7 +4547,7 @@ async def api_orders_sync_status_debug(
         dl_res = await db.execute(
             _text(
                 "SELECT COUNT(*) FROM sync_dead_letters "
-                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL"
+                "WHERE brand_id = :brand_id AND resolved_at IS NULL"
             ),
             {"brand_id": brand_id},
         )
@@ -4578,7 +4599,7 @@ async def api_orders_sync_status_debug(
         fc_res = await db.execute(
             _text(
                 "SELECT error_message FROM sync_dead_letters "
-                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL "
+                "WHERE brand_id = :brand_id AND resolved_at IS NULL "
                 "LIMIT 500"
             ),
             {"brand_id": brand_id},

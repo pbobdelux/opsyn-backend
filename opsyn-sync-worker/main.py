@@ -102,12 +102,14 @@ async def process_sync_requests() -> None:
     # cache from any previous deploy, then inspect the live schema so sync code can
     # check column existence without hitting the DB on every row.
     try:
-        from database import confirm_database_identity, dispose_and_recreate_engine, inspect_schema_at_startup
+        from database import audit_id_column_types, confirm_database_identity, dispose_and_recreate_engine, inspect_schema_at_startup
         await dispose_and_recreate_engine()
         # Re-resolve session factory after engine recreation
         AsyncSessionLocal = get_async_session_local()
         await inspect_schema_at_startup()
         await confirm_database_identity()
+        # Audit ID column types to catch VARCHAR vs UUID mismatches early
+        await audit_id_column_types()
     except Exception as _startup_exc:
         logger.error("[SyncWorker] startup_db_init_error error=%s", _startup_exc, exc_info=True)
 
