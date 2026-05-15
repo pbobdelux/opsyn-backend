@@ -278,6 +278,54 @@ def _validate_and_fix_recursive(value: Any, path: str = "params") -> Any:
     return value
 
 
+def _sanitize_params_for_sql_execution(params: Any, label: str = "unknown") -> Any:
+    """
+    FINAL SQL EXECUTION BOUNDARY: Deep-copy and recursively convert all datetime/date
+    values to ISO8601 strings immediately before db.execute().
+
+    This is the LAST chance to sanitize params before they reach asyncpg.
+
+    Args:
+        params: The params dict about to be passed to db.execute()
+        label: Statement label for logging (e.g., "line_item_upsert")
+
+    Returns:
+        A new params dict with all datetime/date values converted to ISO8601 strings.
+        The caller MUST use this returned dict for execution, not the original.
+    """
+    import copy
+
+    # Deep-copy to avoid mutating the original
+    sanitized = copy.deepcopy(params)
+
+    def _convert_datetimes(obj: Any) -> Any:
+        if isinstance(obj, datetime):
+            if obj.tzinfo is None:
+                obj = obj.replace(tzinfo=timezone.utc)
+            return obj.astimezone(timezone.utc).isoformat()
+        if isinstance(obj, date):
+            return obj.isoformat()
+        if isinstance(obj, dict):
+            return {k: _convert_datetimes(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_convert_datetimes(item) for item in obj]
+        if isinstance(obj, tuple):
+            return [_convert_datetimes(item) for item in obj]
+        return obj
+
+    sanitized = _convert_datetimes(sanitized)
+
+    # Log the type of created_at to prove it's now a string
+    if isinstance(sanitized, dict) and "created_at" in sanitized:
+        logger.info(
+            "[SAFE_EXECUTE_FINAL_PARAMS] label=%s created_at_type=%s",
+            label,
+            type(sanitized["created_at"]).__name__,
+        )
+
+    return sanitized
+
+
 def _sanitize_sql_params_recursive(value: Any, path: str = "params") -> Any:
     """Internal recursive worker for sanitize_sql_params."""
     # datetime must be checked before date (datetime is a subclass of date)

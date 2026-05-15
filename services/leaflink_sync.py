@@ -50,7 +50,7 @@ AsyncSessionLocal = _LazySessionLocal()
 
 from models import Order, OrderLine
 from models.sync_health import DeadLetterLineItem, SyncHealth
-from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value, sanitize_sql_params as _recursive_sanitize_sql_params, validate_and_fix_sql_params as _validate_and_fix_sql_params
+from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value, sanitize_sql_params as _recursive_sanitize_sql_params, validate_and_fix_sql_params as _validate_and_fix_sql_params, _sanitize_params_for_sql_execution as _sanitize_params_for_sql_execution
 
 if TYPE_CHECKING:
     from services.background_sync_manager import BackgroundSyncManager
@@ -759,6 +759,8 @@ async def _dead_letter_line_item(
             _dead_letter_params = _recursive_sanitize_sql_params(_dead_letter_params)
             # Pre-bind validator: final scan of the EXACT object being passed to execute()
             _dead_letter_params = _validate_and_fix_sql_params(_dead_letter_params)
+            # FINAL SQL EXECUTION BOUNDARY: deep-copy and convert all datetime/date to ISO strings
+            _dead_letter_params = _sanitize_params_for_sql_execution(_dead_letter_params, "dead_letter_write")
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -2171,6 +2173,8 @@ async def _insert_line_items_standalone(
                         f"[DATETIME_VALIDATION_FAILED] naive datetime in field={_vf} value={_vv!r}"
                     )
 
+            # FINAL SQL EXECUTION BOUNDARY: deep-copy and convert all datetime/date to ISO strings
+            insert_params = _sanitize_params_for_sql_execution(insert_params, "order_lines_insert")
             await db.execute(text(line_insert_stmt), insert_params)
 
             inserted += 1
@@ -2762,6 +2766,8 @@ async def sync_leaflink_orders(
                                 f"[DATETIME_VALIDATION_FAILED] naive datetime in field={_vf} value={_vv!r}"
                             )
 
+                    # FINAL SQL EXECUTION BOUNDARY: deep-copy and convert all datetime/date to ISO strings
+                    _li_params = _sanitize_params_for_sql_execution(_li_params, "line_item_upsert")
                     await db.execute(text(_li_insert_stmt), _li_params)
 
                 total_lines_written += len(normalized_line_items)
@@ -4666,6 +4672,8 @@ async def sync_leaflink_line_items(
                             f"[DATETIME_VALIDATION_FAILED] naive datetime in field={_vf} value={_vv!r}"
                         )
 
+                # FINAL SQL EXECUTION BOUNDARY: deep-copy and convert all datetime/date to ISO strings
+                insert_params = _sanitize_params_for_sql_execution(insert_params, "line_item_upsert")
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
