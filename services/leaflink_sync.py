@@ -3835,10 +3835,18 @@ RETURNING (xmax = 0) AS was_inserted
             if insert_success > 0 and insert_success % 25 == 0 and org_id_value is not None:
                 try:
                     async with AsyncSessionLocal() as _vis_db:
+                        # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
+                        # when asyncpg infers string params against native UUID columns.
+                        logger.info(
+                            "[UUID_SQL_CAST_APPLIED] statement=visibility_check columns=brand_id,org_id"
+                        )
                         _vis_result = await _vis_db.execute(
-                            select(func.count(Order.id))
-                            .where(Order.brand_id == brand_id_value)
-                            .where(Order.org_id == org_id_value)
+                            text(
+                                "SELECT COUNT(id) FROM orders"
+                                " WHERE brand_id = CAST(:brand_id AS UUID)"
+                                " AND org_id = CAST(:org_id AS UUID)"
+                            ),
+                            {"brand_id": brand_id_value, "org_id": org_id_value},
                         )
                         _visible_count = _vis_result.scalar() or 0
                         if _visible_count < insert_success:
@@ -3916,51 +3924,69 @@ RETURNING (xmax = 0) AS was_inserted
     )
 
     # [ORDER_COUNT_AFTER_SYNC] Query DB to verify orders are present and check for null fields
+    # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
+    # when asyncpg infers string params against native UUID columns.
     try:
-        from sqlalchemy import func as _func
         async with AsyncSessionLocal() as _count_db:
+            logger.info(
+                "[UUID_SQL_CAST_APPLIED] statement=order_count_after_sync columns=brand_id"
+            )
             _total_res = await _count_db.execute(
-                select(_func.count()).select_from(Order).where(Order.brand_id == brand_id_value)
+                text(
+                    "SELECT COUNT(*) FROM orders"
+                    " WHERE brand_id = CAST(:brand_id AS UUID)"
+                ),
+                {"brand_id": brand_id_value},
             )
             _total = _total_res.scalar() or 0
 
             _null_ext_id_res = await _count_db.execute(
-                select(_func.count()).select_from(Order).where(
-                    Order.brand_id == brand_id_value,
-                    Order.external_order_id.is_(None),
-                )
+                text(
+                    "SELECT COUNT(*) FROM orders"
+                    " WHERE brand_id = CAST(:brand_id AS UUID)"
+                    " AND external_order_id IS NULL"
+                ),
+                {"brand_id": brand_id_value},
             )
             _null_ext_id = _null_ext_id_res.scalar() or 0
 
             _null_org_id_res = await _count_db.execute(
-                select(_func.count()).select_from(Order).where(
-                    Order.brand_id == brand_id_value,
-                    Order.org_id.is_(None),
-                )
+                text(
+                    "SELECT COUNT(*) FROM orders"
+                    " WHERE brand_id = CAST(:brand_id AS UUID)"
+                    " AND org_id IS NULL"
+                ),
+                {"brand_id": brand_id_value},
             )
             _null_org_id = _null_org_id_res.scalar() or 0
 
             _null_brand_id_res = await _count_db.execute(
-                select(_func.count()).select_from(Order).where(
-                    Order.brand_id == brand_id_value,
-                    Order.brand_id.is_(None),
-                )
+                text(
+                    "SELECT COUNT(*) FROM orders"
+                    " WHERE brand_id = CAST(:brand_id AS UUID)"
+                    " AND brand_id IS NULL"
+                ),
+                {"brand_id": brand_id_value},
             )
             _null_brand_id = _null_brand_id_res.scalar() or 0
 
             _null_synced_at_res = await _count_db.execute(
-                select(_func.count()).select_from(Order).where(
-                    Order.brand_id == brand_id_value,
-                    Order.synced_at.is_(None),
-                )
+                text(
+                    "SELECT COUNT(*) FROM orders"
+                    " WHERE brand_id = CAST(:brand_id AS UUID)"
+                    " AND synced_at IS NULL"
+                ),
+                {"brand_id": brand_id_value},
             )
             _null_synced_at = _null_synced_at_res.scalar() or 0
 
             _null_ext_created_res = await _count_db.execute(
-                select(_func.count()).select_from(Order).where(
-                    Order.brand_id == brand_id_value,
-                    Order.external_created_at.is_(None),
-                )
+                text(
+                    "SELECT COUNT(*) FROM orders"
+                    " WHERE brand_id = CAST(:brand_id AS UUID)"
+                    " AND external_created_at IS NULL"
+                ),
+                {"brand_id": brand_id_value},
             )
             _null_ext_created = _null_ext_created_res.scalar() or 0
 
@@ -4021,10 +4047,18 @@ RETURNING (xmax = 0) AS was_inserted
     _final_visible_count = 0
     try:
         async with AsyncSessionLocal() as _final_db:
+            # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
+            # when asyncpg infers string params against native UUID columns.
+            logger.info(
+                "[UUID_SQL_CAST_APPLIED] statement=final_accounting_visible_count columns=brand_id,org_id"
+            )
             _final_vis_result = await _final_db.execute(
-                select(func.count(Order.id))
-                .where(Order.brand_id == brand_id_value)
-                .where(Order.org_id == org_id_value)
+                text(
+                    "SELECT COUNT(id) FROM orders"
+                    " WHERE brand_id = CAST(:brand_id AS UUID)"
+                    " AND org_id = CAST(:org_id AS UUID)"
+                ),
+                {"brand_id": brand_id_value, "org_id": org_id_value},
             )
             _final_visible_count = _final_vis_result.scalar() or 0
     except Exception as _fv_exc:
@@ -4233,11 +4267,18 @@ async def sync_leaflink_line_items(
 
     try:
         async with _AsyncSessionLocal() as check_db:
+            # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
+            # when asyncpg infers string params against native UUID columns.
+            logger.info(
+                "[UUID_SQL_CAST_APPLIED] statement=line_item_order_check columns=brand_id"
+            )
             result = await check_db.execute(
-                select(func.count()).select_from(Order).where(
-                    Order.brand_id == brand_id_value,
-                    Order.source == "leaflink"
-                )
+                text(
+                    "SELECT COUNT(*) FROM orders"
+                    " WHERE brand_id = CAST(:brand_id AS UUID)"
+                    " AND source = :source"
+                ),
+                {"brand_id": brand_id_value, "source": "leaflink"},
             )
             order_count = result.scalar_one()
     except Exception as e:
@@ -4647,13 +4688,28 @@ async def sync_leaflink_line_items(
 
             async with _AsyncSessionLocal() as db:
                 async with db.begin():
-                    result = await db.execute(
-                        select(Order).where(
-                            Order.brand_id == brand_id_value,
-                            Order.external_order_id == leaflink_order_id,
-                        )
+                    # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
+                    # when asyncpg infers string params against native UUID columns.
+                    logger.debug(
+                        "[UUID_SQL_CAST_APPLIED] statement=line_item_order_lookup columns=brand_id"
                     )
-                    order_row = result.scalar_one_or_none()
+                    result = await db.execute(
+                        text(
+                            "SELECT id, brand_id, external_order_id FROM orders"
+                            " WHERE brand_id = CAST(:brand_id AS UUID)"
+                            " AND external_order_id = :external_order_id"
+                            " LIMIT 1"
+                        ),
+                        {"brand_id": brand_id_value, "external_order_id": leaflink_order_id},
+                    )
+                    _row = result.fetchone()
+                    order_row = None
+                    if _row is not None:
+                        # Fetch the full ORM object by primary key to preserve existing behaviour
+                        _order_res = await db.execute(
+                            select(Order).where(Order.id == _row[0])
+                        )
+                        order_row = _order_res.scalar_one_or_none()
 
                     if order_row is None:
                         logger.warning(
@@ -4798,13 +4854,28 @@ async def sync_leaflink_line_items(
 
             async with _AsyncSessionLocal() as db:
                 async with db.begin():
-                    result = await db.execute(
-                        select(Order).where(
-                            Order.brand_id == brand_id_value,
-                            Order.external_order_id == leaflink_order_id,
-                        )
+                    # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
+                    # when asyncpg infers string params against native UUID columns.
+                    logger.debug(
+                        "[UUID_SQL_CAST_APPLIED] statement=line_item_retry_order_lookup columns=brand_id"
                     )
-                    order_row = result.scalar_one_or_none()
+                    result = await db.execute(
+                        text(
+                            "SELECT id, brand_id, external_order_id FROM orders"
+                            " WHERE brand_id = CAST(:brand_id AS UUID)"
+                            " AND external_order_id = :external_order_id"
+                            " LIMIT 1"
+                        ),
+                        {"brand_id": brand_id_value, "external_order_id": leaflink_order_id},
+                    )
+                    _retry_row = result.fetchone()
+                    order_row = None
+                    if _retry_row is not None:
+                        # Fetch the full ORM object by primary key to preserve existing behaviour
+                        _retry_order_res = await db.execute(
+                            select(Order).where(Order.id == _retry_row[0])
+                        )
+                        order_row = _retry_order_res.scalar_one_or_none()
 
                     if order_row is None:
                         logger.warning(
@@ -5010,17 +5081,25 @@ async def upsert_sync_metrics_snapshot(
     indexed columns.
     """
     try:
-        from sqlalchemy import func as _func_snap, text as _text_snap
-        from models import Order as _Order
+        from sqlalchemy import text as _text_snap
 
         now = datetime.now(timezone.utc)
         _run_id_str = str(sync_run_id) if sync_run_id is not None else None
 
         async with AsyncSessionLocal() as _snap_db:
-            # Gather counts in a single session (no transaction needed for reads)
+            # Gather counts in a single session (no transaction needed for reads).
+            # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
+            # when asyncpg infers string params against native UUID columns.
+            logger.info(
+                "[UUID_SQL_CAST_APPLIED] statement=sync_metrics_snapshot_counts columns=brand_id"
+            )
             try:
                 _total_res = await _snap_db.execute(
-                    select(_func_snap.count(_Order.id)).where(_Order.brand_id == brand_id)
+                    _text_snap(
+                        "SELECT COUNT(*) FROM orders"
+                        " WHERE brand_id = CAST(:brand_id AS UUID)"
+                    ),
+                    {"brand_id": brand_id},
                 )
                 total_local = _total_res.scalar() or 0
             except Exception:
@@ -5028,10 +5107,12 @@ async def upsert_sync_metrics_snapshot(
 
             try:
                 _ok_res = await _snap_db.execute(
-                    select(_func_snap.count(_Order.id)).where(
-                        _Order.brand_id == brand_id,
-                        _Order.sync_status == "ok",
-                    )
+                    _text_snap(
+                        "SELECT COUNT(*) FROM orders"
+                        " WHERE brand_id = CAST(:brand_id AS UUID)"
+                        " AND sync_status = :status"
+                    ),
+                    {"brand_id": brand_id, "status": "ok"},
                 )
                 total_ok = _ok_res.scalar() or 0
             except Exception:
@@ -5039,10 +5120,12 @@ async def upsert_sync_metrics_snapshot(
 
             try:
                 _partial_res = await _snap_db.execute(
-                    select(_func_snap.count(_Order.id)).where(
-                        _Order.brand_id == brand_id,
-                        _Order.sync_status == "partial",
-                    )
+                    _text_snap(
+                        "SELECT COUNT(*) FROM orders"
+                        " WHERE brand_id = CAST(:brand_id AS UUID)"
+                        " AND sync_status = :status"
+                    ),
+                    {"brand_id": brand_id, "status": "partial"},
                 )
                 total_partial = _partial_res.scalar() or 0
             except Exception:
@@ -5050,10 +5133,12 @@ async def upsert_sync_metrics_snapshot(
 
             try:
                 _failed_res = await _snap_db.execute(
-                    select(_func_snap.count(_Order.id)).where(
-                        _Order.brand_id == brand_id,
-                        _Order.sync_status == "failed",
-                    )
+                    _text_snap(
+                        "SELECT COUNT(*) FROM orders"
+                        " WHERE brand_id = CAST(:brand_id AS UUID)"
+                        " AND sync_status = :status"
+                    ),
+                    {"brand_id": brand_id, "status": "failed"},
                 )
                 total_failed = _failed_res.scalar() or 0
             except Exception:
@@ -5092,6 +5177,12 @@ async def upsert_sync_metrics_snapshot(
                     "last_successful_sync_at": last_successful_sync_at,
                     "updated_at": now,
                 })
+                # Use explicit CAST(:brand_id AS UUID) to avoid
+                # "operator does not exist: uuid = character varying" when
+                # asyncpg infers the parameter type as character varying.
+                logger.info(
+                    "[UUID_SQL_CAST_APPLIED] statement=sync_metrics_snapshot_upsert columns=brand_id"
+                )
                 await _snap_db.execute(
                     _text_snap("""
                         INSERT INTO sync_metrics_snapshots
@@ -5102,7 +5193,7 @@ async def upsert_sync_metrics_snapshot(
                              sync_rate, estimated_completion,
                              last_successful_sync_at, updated_at)
                         VALUES
-                            (:brand_id, :sync_run_id,
+                            (CAST(:brand_id AS UUID), :sync_run_id,
                              :total_local_orders, :total_ok, :total_partial, :total_failed,
                              :dead_letter_count, CAST(:count_by_failure_category AS jsonb),
                              :pages_processed, :records_processed,
@@ -5386,11 +5477,19 @@ async def sync_leaflink_full_resync(
     duration = round(time.monotonic() - resync_start, 2)
 
     # Get final local order count
+    # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
+    # when asyncpg infers string params against native UUID columns.
     try:
-        from sqlalchemy import func as _func_resync
         async with AsyncSessionLocal() as _count_db:
+            logger.info(
+                "[UUID_SQL_CAST_APPLIED] statement=resync_final_local_count columns=brand_id"
+            )
             _count_res = await _count_db.execute(
-                select(_func_resync.count()).select_from(Order).where(Order.brand_id == brand_id)
+                text(
+                    "SELECT COUNT(*) FROM orders"
+                    " WHERE brand_id = CAST(:brand_id AS UUID)"
+                ),
+                {"brand_id": brand_id},
             )
             total_local_orders = _count_res.scalar() or 0
     except Exception:
@@ -6560,11 +6659,19 @@ async def sync_leaflink_background_continuous(
         )
 
         # [LEAFLINK_SYNC_DEBUG] Final summary log
+        # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
+        # when asyncpg infers string params against native UUID columns.
         try:
-            from sqlalchemy import func as _func_final
             async with AsyncSessionLocal() as _final_count_db:
+                logger.info(
+                    "[UUID_SQL_CAST_APPLIED] statement=leaflink_sync_debug_final_count columns=brand_id"
+                )
                 _final_res = await _final_count_db.execute(
-                    select(_func_final.count()).select_from(Order).where(Order.brand_id == brand_id)
+                    text(
+                        "SELECT COUNT(*) FROM orders"
+                        " WHERE brand_id = CAST(:brand_id AS UUID)"
+                    ),
+                    {"brand_id": brand_id},
                 )
                 _final_total = _final_res.scalar() or 0
         except Exception:
