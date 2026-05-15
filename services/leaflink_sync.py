@@ -730,7 +730,7 @@ async def _dead_letter_line_item(
                 if raw_payload is not None
                 else None
             )
-            _dead_letter_params = sanitize_sql_params({
+            _dead_letter_params_raw = {
                 "brand_id": brand_id,
                 "external_order_id": external_order_id,
                 "order_id": order_id,
@@ -740,7 +740,10 @@ async def _dead_letter_line_item(
                 "reason": failure_reason[:500],
                 "count": failure_count,
                 "now": ensure_utc(utc_now(), "now"),
-            }, statement="_dead_letter_line_item")
+            }
+            # Pre-sanitize: convert all datetime/date objects to ISO8601 strings before validation
+            _dead_letter_params_raw = _sanitize_datetime_params(_dead_letter_params_raw, "dead_letter_write")
+            _dead_letter_params = sanitize_sql_params(_dead_letter_params_raw, statement="_dead_letter_line_item")
 
             _dead_letter_params = normalize_uuid_fields(_dead_letter_params)
             _dead_letter_params = normalize_datetime_fields(_dead_letter_params)
@@ -1407,6 +1410,63 @@ def final_sanitize_order_lines_params(params: dict) -> dict:
     return result
 
 
+def _sanitize_datetime_params(params: dict, label: str = "unknown") -> dict:
+    """Recursively convert all datetime/date objects in SQL params to ISO8601 strings.
+
+    This runs BEFORE validation, so the validator can confirm no datetime objects
+    remain in the params dict.  Handles:
+    - Top-level dict params
+    - Nested dicts
+    - Lists of dicts
+    - Dead-letter payloads
+    - raw_payload fields
+    - Line item payloads
+
+    Naive datetimes are assumed UTC and made aware before serialisation so the
+    resulting ISO string always carries a timezone offset (e.g. "+00:00").
+
+    Args:
+        params: Parameter dict to sanitize (not mutated — a new dict is returned).
+        label:  Statement label for logging (e.g. "line_item_upsert").
+
+    Returns:
+        Sanitized params dict with all datetime/date objects converted to ISO strings.
+    """
+    if not isinstance(params, dict):
+        return params
+
+    datetime_count = 0
+
+    def _convert(value: Any) -> Any:
+        nonlocal datetime_count
+        if isinstance(value, datetime):
+            datetime_count += 1
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc).isoformat()
+        if isinstance(value, date):
+            datetime_count += 1
+            return value.isoformat()
+        if isinstance(value, dict):
+            return {k: _convert(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_convert(item) for item in value]
+        if isinstance(value, tuple):
+            return [_convert(item) for item in value]
+        return value
+
+    result = {k: _convert(v) for k, v in params.items()}
+
+    if datetime_count > 0:
+        logger.debug(
+            "[DATETIME_PARAMS_SANITIZED] label=%s datetime_count=%d",
+            label,
+            datetime_count,
+        )
+
+    return result
+
+
 def safe_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -2024,6 +2084,8 @@ async def _insert_line_items_standalone(
                 isinstance(insert_params.get("mapped_product_id"), UUID),
             )
 
+            # Pre-sanitize: convert all datetime/date objects to ISO8601 strings before validation
+            insert_params = _sanitize_datetime_params(insert_params, "order_lines_insert")
             # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
             insert_params = sanitize_sql_params(insert_params, statement="_insert_line_items_standalone")
             insert_params = normalize_uuid_fields(insert_params)
@@ -2612,6 +2674,8 @@ async def sync_leaflink_orders(
                     if _li_enabled.get("total_price_cents", False):
                         _li_params["total_price_cents"] = item.get("total_price_cents")
 
+                    # Pre-sanitize: convert all datetime/date objects to ISO8601 strings before validation
+                    _li_params = _sanitize_datetime_params(_li_params, "line_item_upsert")
                     # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
                     _li_params = sanitize_sql_params(_li_params, statement="sync_leaflink_orders_line_items")
                     _li_params = normalize_uuid_fields(_li_params)
@@ -4514,6 +4578,8 @@ async def sync_leaflink_line_items(
                     isinstance(insert_params.get("mapped_product_id"), str),
                     isinstance(insert_params.get("mapped_product_id"), UUID),
                 )
+                # Pre-sanitize: convert all datetime/date objects to ISO8601 strings before validation
+                insert_params = _sanitize_datetime_params(insert_params, "line_item_upsert")
                 # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
                 insert_params = sanitize_sql_params(insert_params, statement="_upsert_line_items")
                 insert_params = normalize_uuid_fields(insert_params)
