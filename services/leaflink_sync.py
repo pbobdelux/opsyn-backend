@@ -11,6 +11,13 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID
 
+# Canonical datetime utilities — fixes BLOCKER #1 (offset-naive vs offset-aware)
+from utils.datetime_utils import (
+    get_utc_now as _get_utc_now_canonical,
+    normalize_datetime_utc as _normalize_datetime_utc_canonical,
+    assert_datetime_aware as _assert_datetime_aware_canonical,
+)
+
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -943,16 +950,22 @@ def utc_now() -> datetime:
 def to_utc_naive(dt: Any) -> datetime:
     """Convert datetime to UTC-naive for TIMESTAMP WITHOUT TIME ZONE columns.
 
+    NOTE: This function is retained for backward compatibility with any callers
+    that explicitly need a naive datetime for TIMESTAMP (not TIMESTAMPTZ) columns.
+    For all new code, use utc_now() or ensure_utc() which return UTC-aware datetimes.
+
     - If None: return current UTC time as naive
-    - If naive: return as-is
+    - If naive: return as-is (assumed UTC)
     - If aware: convert to UTC and strip tzinfo
     """
     if dt is None:
-        return datetime.now(timezone.utc).replace(tzinfo=None)
+        # Use canonical get_utc_now() then strip tzinfo for naive columns
+        return _get_utc_now_canonical().replace(tzinfo=None)
     if not isinstance(dt, datetime):
         return dt
     if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
         return dt
+    # Convert to UTC first, then strip tzinfo for TIMESTAMP (not TIMESTAMPTZ) columns
     return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 

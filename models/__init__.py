@@ -12,6 +12,9 @@ because this __init__.py re-exports everything that was previously in models.py.
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+# Canonical datetime utilities — fixes BLOCKER #1 (offset-naive vs offset-aware)
+from utils.datetime_utils import assert_datetime_aware as _assert_datetime_aware
+
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -156,8 +159,8 @@ class Order(Base):
     )
 
     id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), primary_key=True, index=True)
-    brand_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
-    org_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True, index=True)
+    brand_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), index=True, nullable=False)
+    org_id: Mapped[Optional[str]] = mapped_column(PG_UUID(as_uuid=False), nullable=True, index=True)
     external_order_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
 
     order_number: Mapped[str | None] = mapped_column(String(120), nullable=True)
@@ -441,22 +444,12 @@ class SyncRun(Base):
     def _ensure_utc(dt: datetime, field_name: str = "unknown") -> datetime:
         """Normalize a datetime to UTC-aware before arithmetic/comparison.
 
-        Handles naive datetimes (assumes UTC) and aware datetimes (converts to UTC).
+        Delegates to the canonical assert_datetime_aware() from utils.datetime_utils
+        which handles naive datetimes (assumes UTC) and aware datetimes (converts to UTC).
         This prevents 'can't subtract offset-naive and offset-aware datetimes' errors
         when DB columns return naive datetimes and we compare against UTC-aware now().
         """
-        import logging as _logging
-        _log = _logging.getLogger("sync_run_model")
-        if dt.tzinfo is None:
-            normalized = dt.replace(tzinfo=timezone.utc)
-            _log.info(
-                "[DATETIME_NORMALIZED] field=%s original=%s (naive) normalized=%s (UTC-aware)",
-                field_name,
-                dt.isoformat(),
-                normalized.isoformat(),
-            )
-            return normalized
-        return dt.astimezone(timezone.utc)
+        return _assert_datetime_aware(dt, context_name=f"SyncRun._ensure_utc.{field_name}")
 
     def is_stalled(self, stall_threshold_seconds: int = 90) -> bool:
         """Check if sync is stalled (no progress for threshold seconds)."""
@@ -469,6 +462,14 @@ class SyncRun(Base):
         try:
             a = datetime.now(timezone.utc)
             b = self._ensure_utc(self.last_progress_at, "last_progress_at")
+            _log.debug(
+                "[DATETIME_COMPARE_CHECK] context=is_stalled left_tz=%s right_tz=%s"
+                " left_type=%s right_type=%s",
+                getattr(a, "tzinfo", None),
+                getattr(b, "tzinfo", None),
+                type(a).__name__,
+                type(b).__name__,
+            )
             elapsed = (a - b).total_seconds()
         except TypeError as e:
             _log.error(
@@ -497,6 +498,14 @@ class SyncRun(Base):
         try:
             a = datetime.now(timezone.utc)
             b = self._ensure_utc(self.started_at, "started_at")
+            _log.debug(
+                "[DATETIME_COMPARE_CHECK] context=estimated_completion_minutes left_tz=%s right_tz=%s"
+                " left_type=%s right_type=%s",
+                getattr(a, "tzinfo", None),
+                getattr(b, "tzinfo", None),
+                type(a).__name__,
+                type(b).__name__,
+            )
             elapsed_seconds = (a - b).total_seconds()
         except TypeError as e:
             _log.error(
@@ -602,8 +611,8 @@ class SyncDeadLetter(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source: Mapped[str] = mapped_column(String(120), nullable=False, default="leaflink")
-    brand_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
-    org_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    brand_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False, index=True)
+    org_id: Mapped[Optional[str]] = mapped_column(PG_UUID(as_uuid=False), nullable=True)
 
     # Order identification
     external_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
@@ -696,7 +705,7 @@ class SyncMetricsSnapshot(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    brand_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    brand_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False, index=True)
     sync_run_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
 
     # Cached order counts
