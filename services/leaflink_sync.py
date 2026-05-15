@@ -1714,7 +1714,7 @@ async def _update_sync_health_phase1(
                 db,
                 """
                     INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, orders_fetched_last_run, updated_at)
-                    VALUES (CAST(:brand_id AS UUID), :now, :count, 0, 0, :count, :now)
+                    VALUES (:brand_id, :now, :count, 0, 0, :count, :now)
                     ON CONFLICT (brand_id) DO UPDATE SET
                         last_attempted_sync_at = :now,
                         total_orders_synced = sync_health.total_orders_synced + :count,
@@ -1756,7 +1756,7 @@ async def _update_sync_health_phase2(
                         orders_written_last_run = :count,
                         last_error = NULL,
                         updated_at = :now
-                    WHERE brand_id = CAST(:brand_id AS UUID)
+                    WHERE brand_id = :brand_id
                 """,
                 params,
                 label="sync_health_phase2_update"
@@ -1785,7 +1785,7 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
                 db,
                 """
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, last_error_at, updated_at)
-                    VALUES (CAST(:brand_id AS UUID), :error, 1, :now, :now)
+                    VALUES (:brand_id, :error, 1, :now, :now)
                     ON CONFLICT (brand_id) DO UPDATE SET
                         last_error = :error,
                         consecutive_failures = sync_health.consecutive_failures + 1,
@@ -1818,7 +1818,7 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
                 db,
                 """
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
-                    VALUES (CAST(:brand_id AS UUID), :error, 0, :now)
+                    VALUES (:brand_id, :error, 0, :now)
                     ON CONFLICT (brand_id) DO UPDATE SET
                         last_error = :error,
                         updated_at = :now
@@ -1951,7 +1951,7 @@ async def _dead_letter_line_item(
                                 (brand_id, external_order_id, order_id, sku, product_name,
                                  raw_payload, failure_reason, failure_count, last_failed_at, created_at)
                             VALUES
-                                (CAST(:brand_id AS UUID), :external_order_id, :order_id, :sku, :product_name,
+                                (:brand_id, :external_order_id, :order_id, :sku, :product_name,
                                  CAST(:raw_payload AS jsonb), :reason, :count, :now, :now)
                             ON CONFLICT (brand_id, external_order_id, sku) DO UPDATE SET
                                 failure_count = dead_letter_line_items.failure_count + 1,
@@ -2069,7 +2069,7 @@ async def _write_dead_letter_batch(
                                     (brand_id, external_order_id, order_id, sku, product_name,
                                      raw_payload, failure_reason, failure_count, last_failed_at, created_at)
                                 VALUES
-                                    (CAST(:brand_id AS UUID), :external_order_id, :order_id, :sku, :product_name,
+                                    (:brand_id, :external_order_id, :order_id, :sku, :product_name,
                                      CAST(:raw_payload AS jsonb), :reason, :count, :now, :now)
                                 ON CONFLICT (brand_id, external_order_id, sku) DO UPDATE SET
                                     failure_count = dead_letter_line_items.failure_count + 1,
@@ -4168,6 +4168,9 @@ async def sync_leaflink_orders_headers_only(
     transaction_abort = 0
     datetime_normalization_failures = 0
 
+    # Global order counter for [ORDER_MATCH_DECISION] sampling (once per 100 orders)
+    _global_order_counter = 0
+
     # Exception fingerprinting — track dominant failures (capped at 100)
     exception_fingerprints: dict[str, dict] = {}
     MAX_FINGERPRINTS = 100
@@ -4497,6 +4500,12 @@ async def sync_leaflink_orders_headers_only(
 
                           # True upsert: ON CONFLICT (brand_id, external_order_id) DO UPDATE
                           # Uses xmax to detect insert vs update for accurate counters.
+                          #
+                          # IMPORTANT: brand_id and org_id are VARCHAR(120) columns in the
+                          # actual DB schema (not UUID columns). Do NOT use CAST(:x AS uuid)
+                          # here — that causes "operator does not exist: character varying = uuid"
+                          # errors which prevent the ON CONFLICT clause from matching existing
+                          # rows, turning every upsert into a failed insert instead of an update.
                           upsert_stmt = """
 INSERT INTO orders (
     org_id, brand_id, external_order_id, order_number, customer_name, status,
@@ -4505,15 +4514,15 @@ INSERT INTO orders (
     synced_at, last_synced_at,
     created_at, updated_at
 ) VALUES (
-    CAST(:org_id AS uuid), CAST(:brand_id AS uuid), :external_order_id, :order_number,
+    :org_id, :brand_id, :external_order_id, :order_number,
     :customer_name, :status, :total_cents, :amount, :item_count, :unit_count,
-    :line_items_json, :raw_payload, :source, :review_status, :sync_status,
+    CAST(:line_items_json AS jsonb), CAST(:raw_payload AS jsonb), :source, :review_status, :sync_status,
     :sync_health_status, CAST(:sync_health_missing_fields AS jsonb),
     :synced_at, :last_synced_at,
     :created_at, :updated_at
 )
 ON CONFLICT (brand_id, external_order_id) DO UPDATE SET
-    org_id = CAST(:org_id AS uuid),
+    org_id = EXCLUDED.org_id,
     customer_name = EXCLUDED.customer_name,
     status = EXCLUDED.status,
     order_number = EXCLUDED.order_number,
@@ -4751,6 +4760,30 @@ RETURNING (xmax = 0) AS was_inserted
 
                           row = upsert_result.fetchone()
                           was_inserted = row[0] if row else True
+
+                          # Increment global order counter for [ORDER_MATCH_DECISION] sampling
+                          _global_order_counter += 1
+
+                          # [ORDER_MATCH_DECISION] — sampled once per 100 orders so operators
+                          # can audit the conflict key used and insert/update ratio without
+                          # flooding logs on large syncs.
+                          if _global_order_counter % 100 == 1:
+                              _ext_id_present = bool(external_id and external_id not in ("unknown", ""))
+                              _order_num_present = bool(_order_number_for_log and _order_number_for_log not in ("unknown", ""))
+                              _conflict_key = "external_id" if _ext_id_present else (
+                                  "order_number" if _order_num_present else "fallback_uuid"
+                              )
+                              logger.info(
+                                  "[ORDER_MATCH_DECISION] sample_index=%d "
+                                  "external_order_id_present=%s order_number_present=%s "
+                                  "conflict_key_used=%s action=%s brand_id=%s",
+                                  _global_order_counter,
+                                  _ext_id_present,
+                                  _order_num_present,
+                                  _conflict_key,
+                                  "insert" if was_inserted else "update",
+                                  brand_id_value,
+                              )
 
                           # [ORDER_MATCH_CHECK] — log every upsert outcome so we can trace
                           # why orders are inserted vs updated vs skipped.
@@ -5187,6 +5220,92 @@ RETURNING (xmax = 0) AS was_inserted
             "[ORDER_COUNT_AFTER_SYNC] brand_id=%s error=%s",
             brand_id_value,
             str(_count_exc)[:200],
+        )
+
+    # [ORDER_IDENTITY_AUDIT] — emit identity health metrics after each sync run so
+    # operators can detect null/unknown external_order_id and duplicate key collisions
+    # that would cause the upsert to silently update the wrong row.
+    try:
+        from sqlalchemy import func as _func_audit
+        async with AsyncSessionLocal() as _audit_db:
+            # Count orders with external_order_id IS NULL
+            _audit_null_ext_res = await _audit_db.execute(
+                select(_func_audit.count()).select_from(Order).where(
+                    Order.brand_id == brand_id_value,
+                    Order.external_order_id.is_(None),
+                )
+            )
+            _audit_null_ext = _audit_null_ext_res.scalar() or 0
+
+            # Count orders with external_order_id = 'unknown'
+            _audit_unknown_ext_res = await _audit_db.execute(
+                select(_func_audit.count()).select_from(Order).where(
+                    Order.brand_id == brand_id_value,
+                    Order.external_order_id == "unknown",
+                )
+            )
+            _audit_unknown_ext = _audit_unknown_ext_res.scalar() or 0
+
+            # Count duplicate order_number per brand (order_number appears more than once)
+            _audit_dup_order_num_res = await _audit_db.execute(
+                text(
+                    "SELECT COUNT(*) FROM ("
+                    "  SELECT order_number FROM orders"
+                    "  WHERE brand_id = :brand_id AND order_number IS NOT NULL"
+                    "  GROUP BY order_number HAVING COUNT(*) > 1"
+                    ") AS dups"
+                ),
+                {"brand_id": brand_id_value},
+            )
+            _audit_dup_order_num = _audit_dup_order_num_res.scalar() or 0
+
+            # Count duplicate external_order_id per brand (should be 0 due to unique constraint)
+            _audit_dup_ext_id_res = await _audit_db.execute(
+                text(
+                    "SELECT COUNT(*) FROM ("
+                    "  SELECT external_order_id FROM orders"
+                    "  WHERE brand_id = :brand_id AND external_order_id IS NOT NULL"
+                    "  GROUP BY external_order_id HAVING COUNT(*) > 1"
+                    ") AS dups"
+                ),
+                {"brand_id": brand_id_value},
+            )
+            _audit_dup_ext_id = _audit_dup_ext_id_res.scalar() or 0
+
+        logger.info(
+            "[ORDER_IDENTITY_AUDIT] brand_id=%s "
+            "null_external_order_id=%d unknown_external_order_id=%d "
+            "duplicate_order_number=%d duplicate_external_order_id=%d "
+            "inserted_this_run=%d updated_this_run=%d",
+            brand_id_value,
+            _audit_null_ext,
+            _audit_unknown_ext,
+            _audit_dup_order_num,
+            _audit_dup_ext_id,
+            total_created,
+            total_updated,
+        )
+        if _audit_null_ext > 0 or _audit_unknown_ext > 0:
+            logger.warning(
+                "[ORDER_IDENTITY_AUDIT_WARN] brand_id=%s "
+                "null_or_unknown_external_order_id=%d — these orders cannot be "
+                "correctly matched on re-sync and may cause silent update collisions",
+                brand_id_value,
+                _audit_null_ext + _audit_unknown_ext,
+            )
+        if _audit_dup_ext_id > 0:
+            logger.error(
+                "[ORDER_IDENTITY_AUDIT_CRITICAL] brand_id=%s "
+                "duplicate_external_order_id=%d — unique constraint violation risk; "
+                "upsert conflict detection is broken for these rows",
+                brand_id_value,
+                _audit_dup_ext_id,
+            )
+    except Exception as _audit_exc:
+        logger.warning(
+            "[ORDER_IDENTITY_AUDIT] brand_id=%s error=%s — skipping identity audit",
+            brand_id_value,
+            str(_audit_exc)[:200],
         )
 
     # Update sync health after Phase 1 commits
@@ -7323,7 +7442,7 @@ async def _sync_leaflink_background_continuous_inner(
                                             SET sync_status = 'auth_failed',
                                                 last_error = :error,
                                                 updated_at = NOW()
-                                            WHERE brand_id = CAST(:brand_id AS uuid)
+                                            WHERE brand_id = :brand_id
                                               AND integration_name = 'leaflink'
                                               AND is_active = true
                                         """,
@@ -7965,6 +8084,33 @@ async def _sync_leaflink_background_continuous_inner(
             _db_orders_after = _db_inserted_count + _db_updated_count
             _db_orders_delta = _db_inserted_count
 
+        # [PAGINATION_INCOMPLETE] — log when pagination stopped before the API estimate.
+        # This fires whenever next_cursor is still set (more pages exist) OR when
+        # fetched_total is materially below the LeafLink estimate.
+        _leaflink_estimate = leaflink_total_count or 0
+        _pagination_gap = max(0, _leaflink_estimate - records_seen_from_leaflink)
+        _pagination_gap_pct = (_pagination_gap / _leaflink_estimate * 100) if _leaflink_estimate > 0 else 0.0
+        if next_cursor or (_leaflink_estimate > 0 and _pagination_gap_pct > 2.0):
+            logger.warning(
+                "[PAGINATION_INCOMPLETE] brand_id=%s "
+                "pages_processed=%d leaflink_estimate=%d fetched_total=%d "
+                "gap=%d gap_pct=%.1f%% next_url_present=%s sync_run_id=%s",
+                brand_id,
+                pages_processed,
+                _leaflink_estimate,
+                records_seen_from_leaflink,
+                _pagination_gap,
+                _pagination_gap_pct,
+                bool(next_cursor),
+                sync_run_id,
+            )
+
+        # Reconciliation gap check: if total_local_orders_after < leaflink_estimate by > 2%,
+        # force status to "partial_reconciliation_gap" so the caller knows data is incomplete.
+        _recon_gap_pct = 0.0
+        if _leaflink_estimate > 0 and _db_orders_after < _leaflink_estimate:
+            _recon_gap_pct = (_leaflink_estimate - _db_orders_after) / _leaflink_estimate * 100
+
         # Determine honest completion status — NEVER report success without reconciliation
         if _db_inserted_count + _db_updated_count == 0 and _db_skipped_count == records_seen_from_leaflink and records_seen_from_leaflink > 0:
             _completion_status = "partial_duplicate_skip"
@@ -7975,12 +8121,35 @@ async def _sync_leaflink_background_continuous_inner(
         elif _total_errors > 0:
             _completion_status = "partial_line_item_failure"
             _termination_reason = "line_item_errors"
+        elif next_cursor and _pagination_gap_pct > 2.0:
+            # Pagination stopped early AND gap is material — distinguish from timeout
+            _completion_status = "partial_page_limit"
+            _termination_reason = "pagination_incomplete_with_gap"
         elif next_cursor:
             _completion_status = "partial_timeout"
             _termination_reason = "pagination_incomplete"
         elif completion_percent < 95:
             _completion_status = "partial_timeout"
             _termination_reason = "pagination_stopped_early"
+        elif _recon_gap_pct > 2.0:
+            # Pagination reached end but DB count is still below estimate by > 2%
+            _completion_status = "partial_reconciliation_gap"
+            _termination_reason = (
+                f"total_local_orders={_db_orders_after} < "
+                f"leaflink_estimate={_leaflink_estimate} "
+                f"gap={_recon_gap_pct:.1f}%"
+            )
+            logger.warning(
+                "[SYNC_RECONCILIATION_GAP] brand_id=%s "
+                "total_local_orders=%d leaflink_estimate=%d gap_pct=%.1f%% "
+                "inserted=%d updated=%d — sync may need another run to close gap",
+                brand_id,
+                _db_orders_after,
+                _leaflink_estimate,
+                _recon_gap_pct,
+                _db_inserted_count,
+                _db_updated_count,
+            )
         else:
             _completion_status = "success"
             _termination_reason = "next_url_null" if not next_cursor else "pagination_incomplete"
