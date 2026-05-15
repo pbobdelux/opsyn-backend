@@ -9,7 +9,7 @@ Tables:
 from datetime import datetime, timezone
 
 from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
@@ -36,7 +36,7 @@ class SyncHealth(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    brand_id: Mapped[str] = mapped_column(String(120), nullable=False, unique=True, index=True)
+    brand_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False, unique=True, index=True)
 
     last_successful_sync_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -90,7 +90,7 @@ class DeadLetterLineItem(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    brand_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    brand_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False, index=True)
     external_order_id: Mapped[str] = mapped_column(String(120), nullable=False)
 
     # Resolved DB order PK (may be None if the parent order was never found)

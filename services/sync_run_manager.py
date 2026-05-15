@@ -12,6 +12,9 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+# Canonical datetime utilities — fixes BLOCKER #1 (offset-naive vs offset-aware)
+from utils.datetime_utils import assert_datetime_aware as _assert_datetime_aware
+
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -332,11 +335,10 @@ async def recover_orphaned_runs() -> int:
                     if last_activity is None:
                         continue
 
-                    # Normalize to UTC-aware for comparison
-                    if last_activity.tzinfo is None:
-                        last_activity = last_activity.replace(tzinfo=timezone.utc)
-                    else:
-                        last_activity = last_activity.astimezone(timezone.utc)
+                    # Normalize to UTC-aware for comparison using canonical utility
+                    last_activity = _assert_datetime_aware(
+                        last_activity, context_name="recover_orphaned_runs.last_activity"
+                    )
 
                     if last_activity < cutoff:
                         elapsed = (_utc_now() - last_activity).total_seconds()
@@ -520,19 +522,11 @@ async def reset_run(
 def _ensure_utc_for_compare(dt: datetime, field_name: str = "unknown") -> datetime:
     """Normalize a datetime to UTC-aware before arithmetic/comparison.
 
-    Handles naive datetimes (assumes UTC) and aware datetimes (converts to UTC).
-    Logs [DATETIME_NORMALIZED] when a conversion is applied.
+    Delegates to the canonical assert_datetime_aware() from utils.datetime_utils
+    which handles naive datetimes (assumes UTC) and aware datetimes (converts to UTC).
+    Logs [DATETIME_COMPARE_CHECK] and [DATETIME_NAIVE_FIXED] when a conversion is applied.
     """
-    if dt.tzinfo is None:
-        normalized = dt.replace(tzinfo=timezone.utc)
-        logger.info(
-            "[DATETIME_NORMALIZED] field=%s original=%s (naive) normalized=%s (UTC-aware)",
-            field_name,
-            dt.isoformat(),
-            normalized.isoformat(),
-        )
-        return normalized
-    return dt.astimezone(timezone.utc)
+    return _assert_datetime_aware(dt, context_name=f"sync_run_manager.{field_name}")
 
 
 def detect_stalled(sync_run: SyncRun, stall_threshold_seconds: int = STALL_THRESHOLD_SECONDS) -> bool:
@@ -550,6 +544,14 @@ def detect_stalled(sync_run: SyncRun, stall_threshold_seconds: int = STALL_THRES
         try:
             a = _utc_now()
             b = _ensure_utc_for_compare(sync_run.started_at, "started_at")
+            logger.debug(
+                "[DATETIME_COMPARE_CHECK] context=detect_stalled.started_at"
+                " left_tz=%s right_tz=%s left_type=%s right_type=%s",
+                getattr(a, "tzinfo", None),
+                getattr(b, "tzinfo", None),
+                type(a).__name__,
+                type(b).__name__,
+            )
             elapsed = (a - b).total_seconds()
         except TypeError as e:
             logger.error(
@@ -565,6 +567,14 @@ def detect_stalled(sync_run: SyncRun, stall_threshold_seconds: int = STALL_THRES
     try:
         a = _utc_now()
         b = _ensure_utc_for_compare(sync_run.last_progress_at, "last_progress_at")
+        logger.debug(
+            "[DATETIME_COMPARE_CHECK] context=detect_stalled.last_progress_at"
+            " left_tz=%s right_tz=%s left_type=%s right_type=%s",
+            getattr(a, "tzinfo", None),
+            getattr(b, "tzinfo", None),
+            type(a).__name__,
+            type(b).__name__,
+        )
         elapsed = (a - b).total_seconds()
     except TypeError as e:
         logger.error(
