@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID
 
@@ -1339,6 +1340,130 @@ def _schedule_dead_letter_task(coro) -> None:
     tasks are queued.
     """
     asyncio.create_task(coro)
+
+
+# ---------------------------------------------------------------------------
+# Per-order outcome tracking — every order must emit exactly ONE outcome log
+# ---------------------------------------------------------------------------
+
+class OrderOutcome(str, Enum):
+    """Canonical outcome for a single order processed during a sync batch.
+
+    Every order that enters the upsert pipeline must emit exactly one
+    [ORDER_RESULT] log line using one of these values so that batch
+    reconciliation can verify: fetched == inserted + updated + skipped
+    + dead_lettered + failed.
+    """
+    inserted             = "inserted"
+    updated              = "updated"
+    skipped_duplicate    = "skipped_duplicate"
+    skipped_unchanged    = "skipped_unchanged"
+    validation_failed    = "validation_failed"
+    constraint_failed    = "constraint_failed"
+    normalization_failed = "normalization_failed"
+    dead_lettered        = "dead_lettered"
+
+
+def _record_order_outcome(external_order_id: Optional[str], action: OrderOutcome) -> None:
+    """Emit exactly one [ORDER_RESULT] log line for a processed order.
+
+    Called once per order, immediately after the final disposition is known
+    (insert, update, skip, or failure).  The structured key=value format
+    makes these lines grep-able and parseable by log aggregators.
+
+    Args:
+        external_order_id: LeafLink order PK (or "unknown" if extraction failed).
+        action:            The canonical outcome for this order.
+    """
+    logger.info(
+        "[ORDER_RESULT] external_order_id=%s action=%s",
+        external_order_id or "unknown",
+        action.value,
+    )
+
+
+async def _record_batch_reconciliation(
+    brand_id: str,
+    fetched: int,
+    processed: int,
+    inserted: int,
+    updated: int,
+    skipped: int,
+    dead_lettered: int,
+    failed: int,
+    db_before: int,
+    db_after: int,
+) -> None:
+    """Emit [BATCH_RECONCILIATION] and [POST_COMMIT_ROW_COUNT] log lines.
+
+    Called once at the end of every batch/page after the DB commit.
+    Asserts the accounting equation:
+        fetched == inserted + updated + skipped + dead_lettered + failed
+
+    If the equation does not balance, a [BATCH_RECONCILIATION_MISMATCH]
+    warning is emitted with the exact delta so the discrepancy can be
+    traced to a specific batch.
+
+    Args:
+        brand_id:     Brand UUID string (for log correlation).
+        fetched:      Orders received from LeafLink for this batch.
+        processed:    Orders that entered the upsert loop (≤ fetched).
+        inserted:     Orders successfully inserted (xmax == 0).
+        updated:      Orders successfully updated (xmax != 0).
+        skipped:      Orders skipped (duplicate, unchanged, validation).
+        dead_lettered: Orders written to the dead-letter table.
+        failed:       Orders that raised an unhandled exception.
+        db_before:    Row count in orders table BEFORE this batch commit.
+        db_after:     Row count in orders table AFTER this batch commit.
+    """
+    net_db_growth = db_after - db_before
+    accounting_sum = inserted + updated + skipped + dead_lettered + failed
+
+    logger.info(
+        "[BATCH_RECONCILIATION] brand_id=%s fetched=%d processed=%d "
+        "inserted=%d updated=%d skipped=%d dead_lettered=%d failed=%d "
+        "net_db_growth=%d",
+        brand_id,
+        fetched,
+        processed,
+        inserted,
+        updated,
+        skipped,
+        dead_lettered,
+        failed,
+        net_db_growth,
+    )
+
+    logger.info(
+        "[POST_COMMIT_ROW_COUNT] brand_id=%s before=%d after=%d delta=%d",
+        brand_id,
+        db_before,
+        db_after,
+        net_db_growth,
+    )
+
+    # Assert accounting equation — log mismatch but never raise so sync continues
+    if accounting_sum != fetched:
+        logger.warning(
+            "[BATCH_RECONCILIATION_MISMATCH] brand_id=%s "
+            "fetched=%d != (inserted=%d + updated=%d + skipped=%d "
+            "+ dead_lettered=%d + failed=%d) = %d  delta=%d",
+            brand_id,
+            fetched,
+            inserted,
+            updated,
+            skipped,
+            dead_lettered,
+            failed,
+            accounting_sum,
+            fetched - accounting_sum,
+        )
+    else:
+        logger.info(
+            "[BATCH_RECONCILIATION_OK] brand_id=%s fetched=%d accounting_balanced=true",
+            brand_id,
+            fetched,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4125,6 +4250,22 @@ async def sync_leaflink_orders_headers_only(
         batch_updated = 0
         batch_skipped = 0
         batch_dead_letter = 0
+        batch_failed = 0  # orders that raised an unhandled exception (not dead-lettered)
+
+        # Pre-commit row count — query BEFORE opening the batch transaction so
+        # [POST_COMMIT_ROW_COUNT] can show the exact delta this batch produced.
+        _batch_db_before = 0
+        try:
+            async with AsyncSessionLocal() as _pre_db:
+                _pre_res = await _pre_db.execute(
+                    select(func.count(Order.id)).where(Order.brand_id == brand_id_value)
+                )
+                _batch_db_before = _pre_res.scalar() or 0
+        except Exception as _pre_exc:
+            logger.warning(
+                "[PRE_COMMIT_ROW_COUNT_ERROR] brand_id=%s batch=%s error=%s",
+                brand_id_value, batch_num, str(_pre_exc)[:200],
+            )
 
         try:
             async with AsyncSessionLocal() as db:
@@ -4146,15 +4287,35 @@ async def sync_leaflink_orders_headers_only(
                                 "[ORDER_SKIPPED] brand_id=%s external_order_id=unknown reason=invalid_payload details=not_a_dict",
                                 brand_id_value,
                             )
+                            _record_order_outcome("unknown", OrderOutcome.validation_failed)
                             batch_skipped += 1
                             continue
 
                           # Map external_order_id: use order["id"] as primary source
                           # (LeafLink raw payloads carry the order PK in "id").
-                          external_id = safe_str(o.get("id") or o.get("external_id") or o.get("external_order_id"))
+                          # Audit all candidate fields so "unknown" IDs can be diagnosed.
+                          _raw_id          = o.get("id")
+                          _raw_external_id = o.get("external_id")
+                          _raw_ext_order   = o.get("external_order_id")
+                          _raw_order_num   = o.get("order_number")
+                          external_id = safe_str(_raw_id or _raw_external_id or _raw_ext_order)
                           _order_ext_id_for_log = external_id or "missing"
-                          _order_number_for_log = safe_str(o.get("order_number"))
+                          _order_number_for_log = safe_str(_raw_order_num)
                           _raw_payload_ref = o
+
+                          # [EXTERNAL_ID_AUDIT] — log extraction result for every order so
+                          # "unknown" IDs can be traced to a specific payload field gap.
+                          logger.debug(
+                              "[EXTERNAL_ID_AUDIT] brand_id=%s id=%s external_id=%s "
+                              "external_order_id=%s order_number=%s resolved=%s",
+                              brand_id_value,
+                              _raw_id,
+                              _raw_external_id,
+                              _raw_ext_order,
+                              _raw_order_num,
+                              external_id or "MISSING",
+                          )
+
                           if not external_id:
                             logger.error(
                                 "[OrdersSync] skip_no_external_id batch=%s order_number=%s",
@@ -4165,8 +4326,10 @@ async def sync_leaflink_orders_headers_only(
                                 "[ORDER_SKIPPED] brand_id=%s external_order_id=unknown reason=missing_external_order_id",
                                 brand_id_value,
                             )
+                            _record_order_outcome("unknown", OrderOutcome.validation_failed)
                             batch_skipped += 1
                             continue
+
 
                           logger.debug(
                               "[ORG_CONTEXT] stage=order_processing org_id=%s brand_id=%s"
@@ -4612,6 +4775,7 @@ RETURNING (xmax = 0) AS was_inserted
                                   _order_number_for_log,
                                   brand_id_value,
                               )
+                              _record_order_outcome(external_id, OrderOutcome.inserted)
                           else:
                               batch_updated += 1
                               update_success += 1
@@ -4626,6 +4790,7 @@ RETURNING (xmax = 0) AS was_inserted
                                   _order_number_for_log,
                                   brand_id_value,
                               )
+                              _record_order_outcome(external_id, OrderOutcome.updated)
                           # Release savepoint on success — order is committed with the batch
                           await db.execute(text(f"RELEASE SAVEPOINT {_sp_name}"))
 
@@ -4653,12 +4818,14 @@ RETURNING (xmax = 0) AS was_inserted
                                     _order_ext_id_for_log,
                                     brand_id_value,
                                 )
+                                _record_order_outcome(_order_ext_id_for_log, OrderOutcome.skipped_duplicate)
                             else:
                                 logger.error(
                                     "[ORDER_INSERT_ROLLBACK] external_id=%s error=%s",
                                     _order_ext_id_for_log,
                                     _err_reason[:200],
                                 )
+                                _record_order_outcome(_order_ext_id_for_log, OrderOutcome.constraint_failed)
                             batch_dead_letter += 1
                             batch_skipped += 1
                             dead_letter_written += 1
@@ -4690,12 +4857,14 @@ RETURNING (xmax = 0) AS was_inserted
                                     f"integrity_error external_id={_order_ext_id_for_log}: {_err_reason[:200]}"
                                 )
                             continue
+
                         except Exception as _order_exc:
                             # Roll back to savepoint so the batch transaction remains usable
                             try:
                                 await db.execute(text(f"ROLLBACK TO SAVEPOINT {_sp_name}"))
                             except Exception:
                                 pass
+
                             # Per-order failure — log, write dead-letter, continue
                             _err_reason = str(_order_exc)[:300]
                             _batch_payload_size = len(str(_raw_payload_ref)) if _raw_payload_ref else 0
@@ -4781,12 +4950,13 @@ RETURNING (xmax = 0) AS was_inserted
                             batch_dead_letter += 1
                             dead_letter_written += 1
                             batch_skipped += 1
+                            _record_order_outcome(_order_ext_id_for_log, OrderOutcome.dead_lettered)
                             if len(errors) < 10:
                                 errors.append(
                                     f"header_insert external_id={_order_ext_id_for_log}: {_err_reason[:200]}"
                                 )
                             continue
-                # Explicit commit guarantee
+
                 await db.commit()
 
             # Batch committed successfully (async with db.begin() exited cleanly)
@@ -4807,7 +4977,40 @@ RETURNING (xmax = 0) AS was_inserted
             total_skipped += batch_skipped
             total_dead_letter += batch_dead_letter
 
-            # Visibility verification every 25 successful inserts
+            # Post-commit row count — query AFTER commit so the delta reflects
+            # exactly what this batch wrote to the database.
+            _batch_db_after = 0
+            try:
+                async with AsyncSessionLocal() as _post_db:
+                    _post_res = await _post_db.execute(
+                        select(func.count(Order.id)).where(Order.brand_id == brand_id_value)
+                    )
+                    _batch_db_after = _post_res.scalar() or 0
+            except Exception as _post_exc:
+                logger.warning(
+                    "[POST_COMMIT_ROW_COUNT_ERROR] brand_id=%s batch=%s error=%s",
+                    brand_id_value, batch_num, str(_post_exc)[:200],
+                )
+                _batch_db_after = _batch_db_before + batch_created  # fallback estimate
+
+            # Emit [BATCH_RECONCILIATION] + [POST_COMMIT_ROW_COUNT] + assert equation
+            # Note: batch_skipped already includes batch_dead_letter (both increment batch_skipped).
+            # Accounting: fetched == inserted + updated + pure_skipped + dead_lettered + failed
+            #   where pure_skipped = batch_skipped - batch_dead_letter
+            await _record_batch_reconciliation(
+                brand_id=brand_id_value,
+                fetched=current_batch_size,
+                processed=batch_created + batch_updated + batch_skipped + batch_failed,
+                inserted=batch_created,
+                updated=batch_updated,
+                skipped=batch_skipped - batch_dead_letter,  # pure skips (not dead-lettered)
+                dead_lettered=batch_dead_letter,
+                failed=batch_failed,
+                db_before=_batch_db_before,
+                db_after=_batch_db_after,
+            )
+
+
             if insert_success > 0 and insert_success % 25 == 0 and org_id_value is not None:
                 try:
                     async with AsyncSessionLocal() as _vis_db:
@@ -4873,8 +5076,24 @@ RETURNING (xmax = 0) AS was_inserted
                     len(batches),
                     err_msg[:200],
                 )
+                _record_order_outcome(_skipped_ext_id, OrderOutcome.constraint_failed)
             errors.append(err_msg)
             total_skipped += current_batch_size
+
+            # Emit batch reconciliation even for failed batches so every batch
+            # has exactly one [BATCH_RECONCILIATION] log line.
+            await _record_batch_reconciliation(
+                brand_id=brand_id_value,
+                fetched=current_batch_size,
+                processed=current_batch_size,
+                inserted=0,
+                updated=0,
+                skipped=0,
+                dead_lettered=0,
+                failed=current_batch_size,
+                db_before=_batch_db_before,
+                db_after=_batch_db_before,  # no growth — transaction rolled back
+            )
             continue
 
     sync_duration = round(time.monotonic() - sync_start, 2)
