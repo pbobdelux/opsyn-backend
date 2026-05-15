@@ -23,6 +23,7 @@ from services.leaflink_sync import (
     _sanitize_json_value,
     assert_no_naive_datetimes,
     final_sanitize_order_lines_params,
+    _sanitize_datetime_params,
 )
 
 
@@ -463,3 +464,157 @@ class TestFinalSanitizeOrderLinesParams:
         result = final_sanitize_order_lines_params(params)
         # After final sanitization, assert_no_naive_datetimes must pass
         assert_no_naive_datetimes(result, "params")
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_datetime_params — datetime-to-ISO8601 converter
+# ---------------------------------------------------------------------------
+
+class TestSanitizeDatetimeParams:
+    """Regression tests for _sanitize_datetime_params().
+
+    Verifies that all datetime/date objects are converted to ISO8601 strings
+    before SQL parameter validation, covering all structural variants that
+    appear in line-item and dead-letter code paths.
+    """
+
+    # 1. Simple dict with a top-level datetime
+    def test_simple_dict_naive_datetime_to_iso(self):
+        params = {"created_at": datetime(2024, 6, 1, 12, 0, 0)}
+        result = _sanitize_datetime_params(params, "test")
+        assert isinstance(result["created_at"], str)
+        assert "2024-06-01" in result["created_at"]
+        assert "+00:00" in result["created_at"]
+
+    def test_simple_dict_aware_datetime_to_iso(self):
+        dt = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        params = {"created_at": dt}
+        result = _sanitize_datetime_params(params, "test")
+        assert isinstance(result["created_at"], str)
+        assert result["created_at"] == "2024-06-01T12:00:00+00:00"
+
+    def test_simple_dict_no_datetime_objects_remain(self):
+        params = {"created_at": datetime.now(timezone.utc), "sku": "ABC"}
+        result = _sanitize_datetime_params(params, "test")
+        for v in result.values():
+            assert not isinstance(v, datetime), f"datetime object found: {v!r}"
+
+    # 2. Nested dict
+    def test_nested_dict_datetime_to_iso(self):
+        params = {"payload": {"created_at": datetime(2024, 3, 15, tzinfo=timezone.utc)}}
+        result = _sanitize_datetime_params(params, "test")
+        assert isinstance(result["payload"]["created_at"], str)
+        assert "2024-03-15" in result["payload"]["created_at"]
+
+    def test_nested_dict_no_datetime_objects_remain(self):
+        params = {
+            "outer": {
+                "inner": {"created_at": datetime.now(timezone.utc)},
+                "updated_at": datetime.now(timezone.utc),
+            }
+        }
+        result = _sanitize_datetime_params(params, "test")
+
+        def _check_no_dt(obj):
+            if isinstance(obj, datetime):
+                raise AssertionError(f"datetime found: {obj!r}")
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    _check_no_dt(v)
+            if isinstance(obj, list):
+                for item in obj:
+                    _check_no_dt(item)
+
+        _check_no_dt(result)
+
+    # 3. List of dicts
+    def test_list_of_dicts_datetime_to_iso(self):
+        params = {
+            "items": [
+                {"created_at": datetime(2024, 1, 1, tzinfo=timezone.utc)},
+                {"created_at": datetime(2024, 2, 1, tzinfo=timezone.utc)},
+            ]
+        }
+        result = _sanitize_datetime_params(params, "test")
+        for item in result["items"]:
+            assert isinstance(item["created_at"], str)
+            assert not isinstance(item["created_at"], datetime)
+
+    # 4. Line item payload
+    def test_line_item_payload_datetime_to_iso(self):
+        params = {
+            "order_id": 42,
+            "sku": "SKU-001",
+            "created_at": datetime(2024, 5, 10, 8, 0, 0, tzinfo=timezone.utc),
+            "updated_at": datetime(2024, 5, 10, 8, 0, 0, tzinfo=timezone.utc),
+            "line_items": [
+                {"created_at": datetime(2024, 5, 10, tzinfo=timezone.utc), "qty": 3}
+            ],
+        }
+        result = _sanitize_datetime_params(params, "line_item_upsert")
+        assert isinstance(result["created_at"], str)
+        assert isinstance(result["updated_at"], str)
+        assert isinstance(result["line_items"][0]["created_at"], str)
+        assert result["line_items"][0]["qty"] == 3
+
+    # 5. Dead-letter payload
+    def test_dead_letter_payload_datetime_to_iso(self):
+        params = {
+            "brand_id": "some-brand",
+            "now": datetime(2024, 6, 1, tzinfo=timezone.utc),
+            "raw_payload": {"created_at": datetime(2024, 6, 1, tzinfo=timezone.utc)},
+        }
+        result = _sanitize_datetime_params(params, "dead_letter_write")
+        assert isinstance(result["now"], str)
+        assert isinstance(result["raw_payload"]["created_at"], str)
+
+    # 6. Naive datetime gets UTC offset in ISO string
+    def test_naive_datetime_gets_utc_offset(self):
+        params = {"created_at": datetime(2024, 1, 15, 10, 30, 0)}  # naive
+        result = _sanitize_datetime_params(params, "test")
+        assert "+00:00" in result["created_at"]
+
+    # 7. date object (not datetime) becomes ISO date string
+    def test_date_object_to_iso_string(self):
+        params = {"ship_date": date(2024, 7, 4)}
+        result = _sanitize_datetime_params(params, "test")
+        assert isinstance(result["ship_date"], str)
+        assert result["ship_date"] == "2024-07-04"
+
+    # 8. Non-datetime values pass through unchanged
+    def test_non_datetime_values_pass_through(self):
+        params = {
+            "sku": "ABC-123",
+            "quantity": 5,
+            "unit_price": Decimal("9.99"),
+            "mapped_product_id": None,
+            "active": True,
+        }
+        result = _sanitize_datetime_params(params, "test")
+        assert result["sku"] == "ABC-123"
+        assert result["quantity"] == 5
+        assert result["unit_price"] == Decimal("9.99")
+        assert result["mapped_product_id"] is None
+        assert result["active"] is True
+
+    # 9. All keys preserved
+    def test_all_keys_preserved(self):
+        params = {
+            "order_id": 1,
+            "sku": "X",
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        }
+        result = _sanitize_datetime_params(params, "test")
+        assert set(result.keys()) == set(params.keys())
+
+    # 10. Empty dict returns empty dict
+    def test_empty_dict_returns_empty_dict(self):
+        result = _sanitize_datetime_params({}, "test")
+        assert result == {}
+
+    # 11. Non-dict input returned unchanged
+    def test_non_dict_input_returned_unchanged(self):
+        assert _sanitize_datetime_params(None, "test") is None
+        assert _sanitize_datetime_params("string", "test") == "string"
+        assert _sanitize_datetime_params(42, "test") == 42
