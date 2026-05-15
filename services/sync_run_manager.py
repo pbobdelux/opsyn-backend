@@ -9,7 +9,7 @@ stall detection, cursor-loop detection) are enforced in one place.
 
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import select
@@ -22,6 +22,10 @@ logger = logging.getLogger("sync_run_manager")
 
 # How long without progress before a run is considered stalled (seconds)
 STALL_THRESHOLD_SECONDS = 90
+
+# How long a running sync can go without a heartbeat before it is considered
+# orphaned and forcibly transitioned to 'failed' (30 minutes)
+ORPHAN_TIMEOUT_SECONDS = 1800
 
 # Minimum pages completed before ETA is meaningful
 ETA_MIN_PAGES = 3
@@ -74,6 +78,12 @@ async def create_sync_run(
     db.add(run)
     await db.flush()  # populate run.id without committing
 
+    logger.info(
+        "[SYNC_RUN_STATE_TRANSITION] run_id=%s brand=%s from=none to=queued mode=%s",
+        run.id,
+        brand_id,
+        mode,
+    )
     logger.info(
         "[SyncRunManager] created run_id=%s brand=%s mode=%s",
         run.id,
@@ -152,6 +162,14 @@ async def update_progress(
 
     if run.status == "queued":
         run.status = "syncing"
+        logger.info(
+            "[SYNC_RUN_STATE_TRANSITION] run_id=%s brand=%s from=queued to=syncing"
+            " pages=%s orders=%s",
+            sync_run_id,
+            run.brand_id,
+            pages_synced,
+            orders_loaded,
+        )
 
     if total_pages is not None:
         run.total_pages = total_pages
@@ -179,12 +197,22 @@ async def mark_completed(db: AsyncSession, sync_run_id: int) -> None:
         logger.error("[SyncRunManager] mark_completed run_not_found run_id=%s", sync_run_id)
         return
 
+    prior_status = run.status
     now = _utc_now()
     run.status = "completed"
     run.completed_at = now
     run.updated_at = now
     run.last_error = None
 
+    logger.info(
+        "[SYNC_RUN_STATE_TRANSITION] run_id=%s brand=%s from=%s to=completed"
+        " pages=%s orders=%s",
+        sync_run_id,
+        run.brand_id,
+        prior_status,
+        run.pages_synced,
+        run.orders_loaded_this_run,
+    )
     logger.info(
         "[SyncRunManager] completed run_id=%s brand=%s pages=%s orders=%s",
         sync_run_id,
@@ -208,12 +236,21 @@ async def mark_stalled(
         logger.error("[SyncRunManager] mark_stalled run_not_found run_id=%s", sync_run_id)
         return
 
+    prior_status = run.status
     now = _utc_now()
     run.status = "stalled"
     run.stalled_reason = reason
     run.completed_at = now
     run.updated_at = now
 
+    logger.warning(
+        "[SYNC_RUN_STATE_TRANSITION] run_id=%s brand=%s from=%s to=stalled reason=%s pages=%s",
+        sync_run_id,
+        run.brand_id,
+        prior_status,
+        reason,
+        run.pages_synced,
+    )
     logger.warning(
         "[SyncRunManager] stalled run_id=%s brand=%s reason=%s pages=%s",
         sync_run_id,
@@ -237,6 +274,7 @@ async def mark_failed(
         logger.error("[SyncRunManager] mark_failed run_not_found run_id=%s", sync_run_id)
         return
 
+    prior_status = run.status
     now = _utc_now()
     run.status = "failed"
     run.last_error = error
@@ -245,12 +283,165 @@ async def mark_failed(
     run.updated_at = now
 
     logger.error(
+        "[SYNC_RUN_STATE_TRANSITION] run_id=%s brand=%s from=%s to=failed"
+        " error=%s pages=%s",
+        sync_run_id,
+        run.brand_id,
+        prior_status,
+        error[:200],
+        run.pages_synced,
+    )
+    logger.error(
         "[SyncRunManager] failed run_id=%s brand=%s error=%s pages=%s",
         sync_run_id,
         run.brand_id,
         error,
         run.pages_synced,
     )
+
+
+# ---------------------------------------------------------------------------
+# Stuck-running protection — orphaned run recovery
+# ---------------------------------------------------------------------------
+
+async def recover_orphaned_runs() -> int:
+    """Scan for sync_runs stuck in 'running'/'queued'/'syncing' state for
+    longer than ORPHAN_TIMEOUT_SECONDS and transition them to 'failed'.
+
+    Called at worker startup and periodically to prevent runs from being
+    permanently stuck when a worker crashes without cleaning up.
+
+    Returns the number of runs that were recovered (transitioned to failed).
+    """
+    recovered = 0
+    cutoff = _utc_now() - timedelta(seconds=ORPHAN_TIMEOUT_SECONDS)
+
+    try:
+        async with AsyncSessionLocal() as db:
+            async with db.begin():
+                result = await db.execute(
+                    select(SyncRun).where(
+                        SyncRun.status.in_(["queued", "syncing"]),
+                    )
+                )
+                candidates = result.scalars().all()
+
+                for run in candidates:
+                    # Determine the last activity timestamp
+                    last_activity = run.last_progress_at or run.started_at
+                    if last_activity is None:
+                        continue
+
+                    # Normalize to UTC-aware for comparison
+                    if last_activity.tzinfo is None:
+                        last_activity = last_activity.replace(tzinfo=timezone.utc)
+                    else:
+                        last_activity = last_activity.astimezone(timezone.utc)
+
+                    if last_activity < cutoff:
+                        elapsed = (_utc_now() - last_activity).total_seconds()
+                        prior_status = run.status
+                        now = _utc_now()
+                        run.status = "failed"
+                        run.last_error = (
+                            f"orphaned_run: no progress for {int(elapsed)}s "
+                            f"(threshold={ORPHAN_TIMEOUT_SECONDS}s)"
+                        )
+                        run.error_count = (run.error_count or 0) + 1
+                        run.completed_at = now
+                        run.updated_at = now
+
+                        logger.error(
+                            "[SYNC_RUN_STATE_TRANSITION] run_id=%s brand=%s from=%s to=failed"
+                            " reason=orphaned_run elapsed_seconds=%s threshold=%s",
+                            run.id,
+                            run.brand_id,
+                            prior_status,
+                            int(elapsed),
+                            ORPHAN_TIMEOUT_SECONDS,
+                        )
+                        logger.error(
+                            "[SyncRunManager] orphaned_run_recovered run_id=%s brand=%s"
+                            " prior_status=%s elapsed_seconds=%s",
+                            run.id,
+                            run.brand_id,
+                            prior_status,
+                            int(elapsed),
+                        )
+                        recovered += 1
+
+        if recovered > 0:
+            logger.warning(
+                "[SyncRunManager] orphan_recovery_complete recovered=%s",
+                recovered,
+            )
+        else:
+            logger.info("[SyncRunManager] orphan_recovery_complete recovered=0 (no orphans found)")
+
+    except Exception as exc:
+        logger.error(
+            "[SyncRunManager] orphan_recovery_error error=%s",
+            str(exc)[:300],
+        )
+
+    return recovered
+
+
+async def mark_failed_if_running(
+    sync_run_id: int,
+    error: str,
+) -> None:
+    """Transition a sync run to 'failed' only if it is currently in an active
+    state (queued, syncing).  Safe to call from error handlers and finally
+    blocks — never raises, never double-fails a run that is already terminal.
+
+    Opens its own DB session so it can be called from any context.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            async with db.begin():
+                result = await db.execute(
+                    select(SyncRun).where(SyncRun.id == sync_run_id)
+                )
+                run = result.scalar_one_or_none()
+                if run is None:
+                    logger.warning(
+                        "[SyncRunManager] mark_failed_if_running run_not_found run_id=%s",
+                        sync_run_id,
+                    )
+                    return
+
+                if run.status not in ("queued", "syncing"):
+                    logger.info(
+                        "[SyncRunManager] mark_failed_if_running skipped run_id=%s"
+                        " current_status=%s (already terminal)",
+                        sync_run_id,
+                        run.status,
+                    )
+                    return
+
+                prior_status = run.status
+                now = _utc_now()
+                run.status = "failed"
+                run.last_error = error[:500]
+                run.error_count = (run.error_count or 0) + 1
+                run.completed_at = now
+                run.updated_at = now
+
+                logger.error(
+                    "[SYNC_RUN_STATE_TRANSITION] run_id=%s brand=%s from=%s to=failed"
+                    " reason=mark_failed_if_running error=%s",
+                    sync_run_id,
+                    run.brand_id,
+                    prior_status,
+                    error[:200],
+                )
+    except Exception as exc:
+        logger.error(
+            "[SyncRunManager] mark_failed_if_running_error run_id=%s error=%s",
+            sync_run_id,
+            str(exc)[:200],
+        )
 
 
 # ---------------------------------------------------------------------------

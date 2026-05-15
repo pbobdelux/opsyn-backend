@@ -3876,6 +3876,9 @@ async def api_orders_sync_status(
     from services.sync_run_manager import detect_stalled
     from sqlalchemy import text as _text_ss
 
+    # Stall threshold for /sync-status: 30 minutes without progress = stalled
+    _SYNC_STATUS_STALL_SECONDS = 1800
+
     timestamp = datetime.now(timezone.utc).isoformat()
     logger.info("[OrdersAPI] sync_status brand_id=%s", brand_id)
 
@@ -3936,14 +3939,38 @@ async def api_orders_sync_status(
         last_run = None
 
     # ------------------------------------------------------------------ #
-    # Determine sync state                                                 #
+    # Determine sync state — with 30-minute stall detection               #
     # ------------------------------------------------------------------ #
     is_stalled = detect_stalled(active_run) if active_run else False
 
+    # Additional 30-minute stall check: if active run hasn't updated in
+    # >30 minutes, report as 'stalled' regardless of the 90s stall threshold
+    _stall_warning: Optional[str] = None
+    if active_run and not is_stalled:
+        _last_updated = active_run.last_progress_at or active_run.started_at
+        if _last_updated is not None:
+            if _last_updated.tzinfo is None:
+                _last_updated = _last_updated.replace(tzinfo=timezone.utc)
+            _elapsed = (datetime.now(timezone.utc) - _last_updated).total_seconds()
+            if _elapsed > _SYNC_STATUS_STALL_SECONDS:
+                is_stalled = True
+                _stall_warning = (
+                    f"sync_run {active_run.id} has not progressed in "
+                    f"{int(_elapsed)}s (threshold={_SYNC_STATUS_STALL_SECONDS}s)"
+                )
+                logger.warning(
+                    "[SYNC_STATUS_QUERY] stall_detected run_id=%s brand_id=%s"
+                    " elapsed_seconds=%s threshold=%s",
+                    active_run.id,
+                    brand_id,
+                    int(_elapsed),
+                    _SYNC_STATUS_STALL_SECONDS,
+                )
+
     if active_run and not is_stalled:
         current_sync_state = "running"
-    elif is_stalled:
-        current_sync_state = "partial"
+    elif active_run and is_stalled:
+        current_sync_state = "stalled"
     elif last_run and last_run.status == "failed":
         current_sync_state = "failed"
     elif last_completed:
@@ -3987,6 +4014,29 @@ async def api_orders_sync_status(
 
     total_leaflink_estimate = last_run.total_orders_available if last_run else None
 
+    _pages_synced = last_run.pages_synced if last_run else 0
+    _orders_loaded = last_run.orders_loaded_this_run if last_run else 0
+    _active_run_id = active_run.id if active_run else None
+    _last_updated_at = None
+    if active_run:
+        _lu = active_run.last_progress_at or active_run.updated_at
+        if _lu:
+            _last_updated_at = _lu.isoformat() if hasattr(_lu, "isoformat") else str(_lu)
+
+    logger.info(
+        "[SYNC_STATUS_QUERY] brand_id=%s active_sync_run_id=%s"
+        " current_sync_state=%s pages_synced=%s orders_loaded=%s"
+        " last_updated_at=%s is_stalled=%s data_source=%s",
+        brand_id,
+        _active_run_id,
+        current_sync_state,
+        _pages_synced,
+        _orders_loaded,
+        _last_updated_at,
+        is_stalled,
+        data_source,
+    )
+
     return make_json_safe({
         "ok": True,
         "brand_id": brand_id,
@@ -3998,9 +4048,12 @@ async def api_orders_sync_status(
         "partial_sync_count": partial_sync_count,
         "failed_order_count": failed_order_count,
         "last_error": last_error,
-        "active_sync_run_id": active_run.id if active_run else None,
-        "pages_synced": last_run.pages_synced if last_run else 0,
-        "orders_loaded_this_run": last_run.orders_loaded_this_run if last_run else 0,
+        "active_sync_run_id": _active_run_id,
+        "pages_synced": _pages_synced,
+        "orders_loaded_this_run": _orders_loaded,
+        "is_stalled": is_stalled,
+        "stall_warning": _stall_warning,
+        "last_updated_at": _last_updated_at,
         "data_source": data_source,
         "timestamp": timestamp,
     })

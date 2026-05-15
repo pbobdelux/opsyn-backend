@@ -79,6 +79,15 @@ async def process_sync_requests() -> None:
     except Exception as _startup_exc:
         logger.error("[SyncWorker] startup_db_init_error error=%s", _startup_exc, exc_info=True)
 
+    # Recover orphaned sync runs — transition any runs stuck in queued/syncing
+    # for longer than 30 minutes to 'failed' so they don't block new syncs.
+    try:
+        from services.sync_run_manager import recover_orphaned_runs
+        _recovered = await recover_orphaned_runs()
+        logger.info("[SyncWorker] startup_orphan_recovery recovered=%s", _recovered)
+    except Exception as _orphan_exc:
+        logger.error("[SyncWorker] startup_orphan_recovery_error error=%s", _orphan_exc, exc_info=True)
+
     while True:
         try:
             async with AsyncSessionLocal() as db:

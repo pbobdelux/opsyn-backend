@@ -211,7 +211,7 @@ def ensure_utc_datetime(value: Any) -> Optional[datetime]:
     raise ValueError(f"Cannot normalize datetime: {type(value).__name__}")
 
 
-def _trace_sql_params_for_datetimes(params: dict, context: str = "unknown") -> None:
+def _trace_sql_params_for_datetimes(params: dict, context: str = "unknown", force: bool = False) -> None:
     """Enumerate every parameter in *params* and emit a [SQL_PARAM_TRACE] log line.
 
     For each parameter logs:
@@ -226,9 +226,14 @@ def _trace_sql_params_for_datetimes(params: dict, context: str = "unknown") -> N
     specific asyncpg ``$N`` positional argument when the error message reports
     "can't subtract offset-naive and offset-aware datetimes" at ``$N``.
 
+    Log volume reduction: only logs when force=True (error path) or when a
+    naive datetime is detected.  Per-field logging for every order is suppressed
+    to reduce log volume by ~95% during large syncs.
+
     Args:
         params:  The final SQL parameters dict about to be passed to execute().
         context: Short label for the calling site (e.g. "order_header_upsert").
+        force:   If True, log all fields regardless (use on error paths only).
     """
     if not isinstance(params, dict):
         logger.warning(
@@ -236,6 +241,16 @@ def _trace_sql_params_for_datetimes(params: dict, context: str = "unknown") -> N
             context,
             type(params).__name__,
         )
+        return
+
+    # Scan for naive datetimes — always log those regardless of force flag
+    has_naive = any(
+        isinstance(v, datetime) and (v.tzinfo is None or v.tzinfo.utcoffset(v) is None)
+        for v in params.values()
+    )
+
+    # Only emit per-field trace on error paths or when a naive datetime is found
+    if not force and not has_naive:
         return
 
     for idx, (name, value) in enumerate(params.items()):
@@ -2055,7 +2070,7 @@ async def _insert_line_items_standalone(
             for _dt_field in ("created_at", "updated_at"):
                 if _dt_field in insert_params:
                     _dt_val = insert_params[_dt_field]
-                    logger.info(
+                    logger.debug(
                         "[DATETIME_NORMALIZED] function=_insert_line_items_standalone field=%s"
                         " source_type=%s tzinfo=%s value=%s",
                         _dt_field,
@@ -2640,10 +2655,11 @@ async def sync_leaflink_orders(
                     _li_params = apply_uuid_str_to_params(_li_params)
 
                     # [DATETIME_NORMALIZED] — log exact UTC-aware values being bound to TIMESTAMPTZ columns
+                    # Reduced to DEBUG to avoid per-line-item log volume during large syncs
                     for _dt_field in ("created_at", "updated_at"):
                         if _dt_field in _li_params:
                             _dt_val = _li_params[_dt_field]
-                            logger.info(
+                            logger.debug(
                                 "[DATETIME_NORMALIZED] function=sync_leaflink_orders field=%s"
                                 " source_type=%s tzinfo=%s value=%s",
                                 _dt_field,
@@ -3248,11 +3264,23 @@ RETURNING (xmax = 0) AS was_inserted
                               type(now).__name__,
                               _norm_created_at.isoformat(),
                           )
+                          logger.debug(
+                              "[DATETIME_FIELD_NORMALIZED] field=created_at tzinfo=%s aware=%s value=%s",
+                              _norm_created_at.tzinfo,
+                              _norm_created_at.tzinfo is not None,
+                              _norm_created_at.isoformat(),
+                          )
 
                           _norm_updated_at = ensure_utc_datetime(now) or utc_now()
                           logger.debug(
                               "[DATETIME_NORMALIZED] field=updated_at source_type=%s tzinfo=UTC value=%s",
                               type(now).__name__,
+                              _norm_updated_at.isoformat(),
+                          )
+                          logger.debug(
+                              "[DATETIME_FIELD_NORMALIZED] field=updated_at tzinfo=%s aware=%s value=%s",
+                              _norm_updated_at.tzinfo,
+                              _norm_updated_at.tzinfo is not None,
                               _norm_updated_at.isoformat(),
                           )
 
@@ -3277,6 +3305,15 @@ RETURNING (xmax = 0) AS was_inserted
                               type(_raw_ext_created).__name__,
                               _norm_external_created_at.isoformat() if _norm_external_created_at else None,
                           )
+                          if _raw_ext_created is not None:
+                              logger.info(
+                                  "[DATETIME_FIELD_NORMALIZED] field=external_created_at"
+                                  " source_type=%s raw=%r normalized=%s aware=%s",
+                                  type(_raw_ext_created).__name__,
+                                  str(_raw_ext_created)[:50],
+                                  _norm_external_created_at.isoformat() if _norm_external_created_at else "None",
+                                  _norm_external_created_at is not None and _norm_external_created_at.tzinfo is not None,
+                              )
 
                           _raw_ext_updated = o.get("updated_on") or o.get("updated_at") or o.get("date_updated")
                           try:
@@ -3294,6 +3331,15 @@ RETURNING (xmax = 0) AS was_inserted
                               type(_raw_ext_updated).__name__,
                               _norm_external_updated_at.isoformat() if _norm_external_updated_at else None,
                           )
+                          if _raw_ext_updated is not None:
+                              logger.info(
+                                  "[DATETIME_FIELD_NORMALIZED] field=external_updated_at"
+                                  " source_type=%s raw=%r normalized=%s aware=%s",
+                                  type(_raw_ext_updated).__name__,
+                                  str(_raw_ext_updated)[:50],
+                                  _norm_external_updated_at.isoformat() if _norm_external_updated_at else "None",
+                                  _norm_external_updated_at is not None and _norm_external_updated_at.tzinfo is not None,
+                              )
 
                           upsert_params = {
                               "org_id": _sql_org_id,
@@ -3448,6 +3494,8 @@ RETURNING (xmax = 0) AS was_inserted
                                       pass
 
                           # [FINAL_EXECUTE_PARAMS] Deep recursive datetime audit
+                          # Only logs errors (naive datetimes) — [DATETIME_OK] reduced to DEBUG
+                          # to avoid per-field/per-order log volume during large syncs.
                           def _audit_params_for_naive_datetimes(params: Any, path: str = "params", depth: int = 0) -> None:
                               """Recursively audit params for naive datetimes and log findings."""
                               if depth > 20:
@@ -3468,7 +3516,8 @@ RETURNING (xmax = 0) AS was_inserted
                                           repr(params)
                                       )
                                   else:
-                                      logger.info(
+                                      # Reduced to DEBUG — fires for every datetime field in every order
+                                      logger.debug(
                                           "[DATETIME_OK] path=%s type=%s tzinfo=%s",
                                           path,
                                           type(params).__name__,
@@ -3478,8 +3527,8 @@ RETURNING (xmax = 0) AS was_inserted
                           # Call audit before execute
                           _audit_params_for_naive_datetimes(safe_params)
 
-                          # Log the exact params object
-                          logger.info(
+                          # Log the exact params object (DEBUG — fires for every order)
+                          logger.debug(
                               "[FINAL_EXECUTE_PARAMS] order_header_upsert params_keys=%s params_count=%d",
                               list(safe_params.keys()) if isinstance(safe_params, dict) else "not_dict",
                               len(safe_params) if isinstance(safe_params, dict) else 0
@@ -3518,8 +3567,9 @@ RETURNING (xmax = 0) AS was_inserted
 
                           # ---------------------------------------------------------------
                           # SQL CAST MAP — confirm all datetime fields use TIMESTAMPTZ
+                          # Reduced to DEBUG — fires for every order; keep for diagnostics
                           # ---------------------------------------------------------------
-                          logger.info(
+                          logger.debug(
                               "[SQL_CAST_MAP] synced_at=TIMESTAMPTZ last_synced_at=TIMESTAMPTZ"
                               " created_at=TIMESTAMPTZ updated_at=TIMESTAMPTZ"
                               " external_created_at=TIMESTAMPTZ external_updated_at=TIMESTAMPTZ"
@@ -3565,12 +3615,12 @@ RETURNING (xmax = 0) AS was_inserted
                           if was_inserted:
                               batch_created += 1
                               insert_success += 1
-                              logger.info(
+                              logger.debug(
                                   "[ORDER_INSERTED] external_id=%s order_id=pending status=inserted brand_id=%s",
                                   external_id,
                                   brand_id_value,
                               )
-                              logger.info(
+                              logger.debug(
                                   "[ORDER_UPSERT_SUCCESS] external_id=%s order_number=%s action=insert brand_id=%s",
                                   external_id,
                                   _order_number_for_log,
@@ -3579,12 +3629,12 @@ RETURNING (xmax = 0) AS was_inserted
                           else:
                               batch_updated += 1
                               update_success += 1
-                              logger.info(
+                              logger.debug(
                                   "[ORDER_UPSERTED] external_id=%s order_id=pending status=updated brand_id=%s",
                                   external_id,
                                   brand_id_value,
                               )
-                              logger.info(
+                              logger.debug(
                                   "[ORDER_UPSERT_SUCCESS] external_id=%s order_number=%s action=update brand_id=%s",
                                   external_id,
                                   _order_number_for_log,
@@ -3592,6 +3642,20 @@ RETURNING (xmax = 0) AS was_inserted
                               )
                           # Release savepoint on success — order is committed with the batch
                           await db.execute(text(f"RELEASE SAVEPOINT {_sp_name}"))
+
+                          # [SYNC_PAGE_PROGRESS] — log every 50 orders to track progress
+                          # without flooding logs with per-order lines
+                          _orders_done = insert_success + update_success
+                          if _orders_done > 0 and _orders_done % 50 == 0:
+                              logger.info(
+                                  "[SYNC_PAGE_PROGRESS] page=%s orders_loaded=%s"
+                                  " partial_count=%s failed_count=%s brand_id=%s",
+                                  pages_fetched,
+                                  _orders_done,
+                                  skipped_duplicate + skipped_validation + skipped_org_missing,
+                                  dead_letter_written,
+                                  brand_id_value,
+                              )
 
                         except IntegrityError as _order_exc:
                             # Roll back to savepoint so the batch transaction remains usable
@@ -4441,10 +4505,11 @@ async def sync_leaflink_line_items(
                 insert_params = apply_uuid_str_to_params(insert_params)
 
                 # [DATETIME_NORMALIZED] — log exact UTC-aware values being bound to TIMESTAMPTZ columns
+                # Reduced to DEBUG to avoid per-line-item log volume during large syncs
                 for _dt_field in ("created_at", "updated_at"):
                     if _dt_field in insert_params:
                         _dt_val = insert_params[_dt_field]
-                        logger.info(
+                        logger.debug(
                             "[DATETIME_NORMALIZED] function=_upsert_line_items field=%s"
                             " source_type=%s tzinfo=%s value=%s",
                             _dt_field,
