@@ -5680,6 +5680,8 @@ async def sync_leaflink_background_continuous(
     # Initialize fingerprint dicts here so the finally block can always reference them
     exception_fingerprints: dict[str, dict] = {}
     _last_fingerprint_log_time: dict[str, float] = {}
+    # Initialize termination reason here so exception handlers can always reference it
+    _termination_reason = "unknown"
 
     # ---------------------------------------------------------------------------
     # Watchdog heartbeat — logs every 30s to confirm event loop is alive
@@ -5897,6 +5899,17 @@ async def sync_leaflink_background_continuous(
                     pages_done,
                     pages_total,
                 )
+                _termination_reason = "timeout_reached"
+                # [FULL_RESYNC_PAGE_LIMIT_HIT] Hard timeout guard fired
+                logger.warning(
+                    "[FULL_RESYNC_PAGE_LIMIT_HIT] max_pages_configured=%s pages_synced=%s"
+                    " reason=timeout_guard elapsed_seconds=%.1f brand_id=%s sync_run_id=%s",
+                    total_pages if total_pages is not None else "none",
+                    pages_processed,
+                    elapsed_total,
+                    brand_id,
+                    sync_run_id,
+                )
                 break
 
             batch_start = time.monotonic()
@@ -5925,6 +5938,16 @@ async def sync_leaflink_background_continuous(
                     )
                 except asyncio.TimeoutError:
                     logger.error("[FETCH_TIMEOUT] page=%s", pages_processed)
+                    _termination_reason = "timeout_reached"
+                    # [FULL_RESYNC_PAGE_LIMIT_HIT] Per-page fetch timed out (60s guard)
+                    logger.error(
+                        "[FULL_RESYNC_PAGE_LIMIT_HIT] max_pages_configured=%s pages_synced=%s"
+                        " reason=fetch_timeout_60s brand_id=%s sync_run_id=%s",
+                        total_pages if total_pages is not None else "none",
+                        pages_processed,
+                        brand_id,
+                        sync_run_id,
+                    )
                     break
                 fetch_duration = time.monotonic() - fetch_start
                 if fetch_duration > 5:
@@ -6068,6 +6091,23 @@ async def sync_leaflink_background_continuous(
             # Update pagination tracking state
             if _total_count_from_api is not None:
                 leaflink_total_count = _total_count_from_api
+
+            # [LEAFLINK_NEXT_URL_STATE] Per-page diagnostic: log next_url state on every fetch
+            # This is the primary signal for diagnosing why pagination stopped early.
+            logger.info(
+                "[LEAFLINK_NEXT_URL_STATE] current_page=%s orders_fetched_this_page=%s"
+                " next_url_hash=%s next_url_present=%s pages_synced_so_far=%s"
+                " orders_loaded_so_far=%s total_leaflink_estimate=%s brand_id=%s sync_run_id=%s",
+                current_page,
+                len(batch_orders),
+                _cursor_hash(next_cursor),
+                next_cursor is not None,
+                pages_processed,
+                total_orders_synced,
+                leaflink_total_count if leaflink_total_count is not None else "unknown",
+                brand_id,
+                sync_run_id,
+            )
 
             # [PAGINATION_EXTRACT] Log extracted pagination fields after every page (debug only)
             logger.debug(
@@ -6528,6 +6568,7 @@ async def sync_leaflink_background_continuous(
                     current_page += pages_fetched_this_batch
             else:
                 # next_cursor is None — all pages fetched
+                _termination_reason = "next_url_null"
                 break
 
         # ---------------------------------------------------------------------- #
@@ -6536,6 +6577,34 @@ async def sync_leaflink_background_continuous(
         total_duration = round(time.monotonic() - bg_start, 1)
         # When total_pages is None (cursor-based), final_page is simply the last page visited
         final_page = pages_processed
+
+        # Detect page-limit termination when total_pages is set and we hit the bound
+        if _termination_reason == "unknown" and total_pages is not None and current_page > total_pages:
+            _termination_reason = "page_limit_hit"
+
+        # [FULL_RESYNC_TERMINATION_REASON] Structured log explaining why the pagination loop exited.
+        # This is the primary diagnostic for run 85 stopping at page 52.
+        _orders_per_page_avg = (
+            round(records_seen_from_leaflink / pages_processed, 1)
+            if pages_processed > 0
+            else 0
+        )
+        logger.info(
+            "[FULL_RESYNC_TERMINATION_REASON] pages_synced=%s orders_loaded_this_run=%s"
+            " total_leaflink_estimate=%s next_url_present=%s next_url_hash=%s"
+            " termination_reason=%s elapsed_seconds=%.1f orders_per_page_average=%s"
+            " brand_id=%s sync_run_id=%s",
+            pages_processed,
+            records_seen_from_leaflink,
+            leaflink_total_count if leaflink_total_count is not None else "unknown",
+            next_cursor is not None,
+            _cursor_hash(next_cursor),
+            _termination_reason,
+            total_duration,
+            _orders_per_page_avg,
+            brand_id,
+            sync_run_id,
+        )
 
         # [LEAFLINK_BACKFILL_COMPLETE] Final summary for the entire backfill run
         logger.info(
@@ -6592,6 +6661,24 @@ async def sync_leaflink_background_continuous(
                 completion_percent,
             )
             if sync_run_id:
+                # [FULL_RESYNC_COMPLETENESS_CHECK] Pre-completion diagnostic snapshot.
+                # Logged immediately before mark_completed() so we can verify the sync
+                # actually reached the end of the result set before being marked success.
+                logger.info(
+                    "[FULL_RESYNC_COMPLETENESS_CHECK] sync_run_id=%s brand_id=%s"
+                    " pages_synced=%s orders_loaded_this_run=%s total_leaflink_estimate=%s"
+                    " completeness_percentage=%.1f is_complete=%s next_url_present=%s"
+                    " termination_reason=%s",
+                    sync_run_id,
+                    brand_id,
+                    pages_processed,
+                    records_seen_from_leaflink,
+                    leaflink_total_count if leaflink_total_count is not None else "unknown",
+                    completion_percent,
+                    not next_cursor,  # True only when next_url is null (real end)
+                    next_cursor is not None,
+                    _termination_reason,
+                )
                 try:
                     async with AsyncSessionLocal() as _done_db:
                         async with _done_db.begin():
@@ -6602,6 +6689,7 @@ async def sync_leaflink_background_continuous(
                         sync_run_id,
                         _done_exc,
                     )
+
         else:
             # No next cursor but < 95% complete — mark as incomplete
             _incomplete_reason = f"pagination_stopped_early: {completion_percent:.1f}% complete"
@@ -6712,9 +6800,10 @@ async def sync_leaflink_background_continuous(
             pass
         raise
     except Exception as e:
+        _termination_reason = "exception_caught"
         logger.error(
             "[FATAL_SYNC_EXCEPTION] run_id=%s brand_id=%s exception_type=%s message=%s "
-            "current_page=%s records_seen=%s next_url_present=%s",
+            "current_page=%s records_seen=%s next_url_present=%s termination_reason=%s",
             sync_run_id,
             brand_id,
             type(e).__name__,
@@ -6722,8 +6811,10 @@ async def sync_leaflink_background_continuous(
             pages_processed,
             records_seen_from_leaflink,
             next_cursor is not None,
+            _termination_reason,
             exc_info=True,
         )
+
         # Persist final state
         try:
             async with AsyncSessionLocal() as _exc_db:
