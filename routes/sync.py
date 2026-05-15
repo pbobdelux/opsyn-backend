@@ -53,10 +53,24 @@ async def get_sync_status(
     Returns the last successful sync time, consecutive failure count, and
     running totals for orders and line items synced.
     """
-    result = await db.execute(
-        select(SyncHealth).where(SyncHealth.brand_id == brand_id)
+    # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
+    # when asyncpg infers string params against native UUID columns.
+    logger.info("[UUID_SQL_CAST_APPLIED] statement=get_sync_status columns=brand_id")
+    _health_row = await db.execute(
+        text(
+            "SELECT id FROM sync_health"
+            " WHERE brand_id = CAST(:brand_id AS UUID)"
+            " LIMIT 1"
+        ),
+        {"brand_id": brand_id},
     )
-    health = result.scalar_one_or_none()
+    _health_id_row = _health_row.fetchone()
+    health = None
+    if _health_id_row is not None:
+        _health_res = await db.execute(
+            select(SyncHealth).where(SyncHealth.id == _health_id_row[0])
+        )
+        health = _health_res.scalar_one_or_none()
 
     if health is None:
         return {
@@ -96,13 +110,28 @@ async def get_dead_letter_items(
     Returns line items that failed insertion after max retries, ordered by
     most recently failed first.
     """
-    result = await db.execute(
-        select(DeadLetterLineItem)
-        .where(DeadLetterLineItem.brand_id == brand_id)
-        .order_by(DeadLetterLineItem.last_failed_at.desc())
-        .limit(limit)
+    # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
+    # when asyncpg infers string params against native UUID columns.
+    logger.info("[UUID_SQL_CAST_APPLIED] statement=get_dead_letter_items columns=brand_id")
+    _dl_ids_res = await db.execute(
+        text(
+            "SELECT id FROM dead_letter_line_items"
+            " WHERE brand_id = CAST(:brand_id AS UUID)"
+            " ORDER BY last_failed_at DESC"
+            " LIMIT :limit"
+        ),
+        {"brand_id": brand_id, "limit": limit},
     )
-    items = result.scalars().all()
+    _dl_ids = [row[0] for row in _dl_ids_res.fetchall()]
+    if _dl_ids:
+        _items_res = await db.execute(
+            select(DeadLetterLineItem)
+            .where(DeadLetterLineItem.id.in_(_dl_ids))
+            .order_by(DeadLetterLineItem.last_failed_at.desc())
+        )
+        items = _items_res.scalars().all()
+    else:
+        items = []
 
     return {
         "ok": True,
@@ -410,13 +439,25 @@ async def recover_sync(
     enqueues a new pending SyncRequest so the worker will retry on next poll.
     Returns immediately — the sync runs in the background.
     """
-    result = await db.execute(
-        select(SyncHealth).where(
-            SyncHealth.brand_id == brand_id,
-            SyncHealth.consecutive_failures > 0,
-        )
+    # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
+    # when asyncpg infers string params against native UUID columns.
+    logger.info("[UUID_SQL_CAST_APPLIED] statement=recover_sync_health_check columns=brand_id")
+    _recover_row = await db.execute(
+        text(
+            "SELECT id FROM sync_health"
+            " WHERE brand_id = CAST(:brand_id AS UUID)"
+            " AND consecutive_failures > 0"
+            " LIMIT 1"
+        ),
+        {"brand_id": brand_id},
     )
-    health = result.scalar_one_or_none()
+    _recover_id_row = _recover_row.fetchone()
+    health = None
+    if _recover_id_row is not None:
+        _recover_res = await db.execute(
+            select(SyncHealth).where(SyncHealth.id == _recover_id_row[0])
+        )
+        health = _recover_res.scalar_one_or_none()
 
     if not health:
         return {"ok": True, "message": "No retryable syncs found", "brand_id": brand_id}

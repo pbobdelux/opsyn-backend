@@ -12,7 +12,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal
@@ -471,17 +471,25 @@ async def reset_run(
             hard,
         )
 
-    # Count orders before potential deletion
-    from sqlalchemy import func
+    # Count orders before potential deletion.
+    # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
+    # when asyncpg infers string params against native UUID columns.
+    logger.info(
+        "[UUID_SQL_CAST_APPLIED] statement=reset_run_order_count columns=brand_id"
+    )
     count_result = await db.execute(
-        select(func.count(Order.id)).where(Order.brand_id == brand_id)
+        text("SELECT COUNT(*) FROM orders WHERE brand_id = CAST(:brand_id AS UUID)"),
+        {"brand_id": brand_id},
     )
     order_count = count_result.scalar_one() or 0
 
     if hard:
-        from sqlalchemy import delete
+        logger.info(
+            "[UUID_SQL_CAST_APPLIED] statement=reset_run_hard_delete columns=brand_id"
+        )
         await db.execute(
-            delete(Order).where(Order.brand_id == brand_id)
+            text("DELETE FROM orders WHERE brand_id = CAST(:brand_id AS UUID)"),
+            {"brand_id": brand_id},
         )
         logger.warning(
             "[SyncRunManager] hard_reset brand=%s deleted_orders=%s",
