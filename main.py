@@ -127,6 +127,7 @@ logger.info("[BACKEND_IMPORT] importing ORM models and routers")
 
 from fastapi import Depends, FastAPI, HTTPException, Header, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from middleware.latency_tracking import LatencyTrackingMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
@@ -478,6 +479,25 @@ async def lifespan(app: FastAPI):
         len(_failed_noncritical),
     )
     logger.info("[Startup] migrations_complete count=%s", len(applied))
+
+    # ---------------------------------------------------------------------------
+    # Update migration health state for /health/migrations endpoint
+    # ---------------------------------------------------------------------------
+    try:
+        from services.health_service import update_migration_health as _update_mig_health
+        _current_mig_version = applied[-1] if applied else (_skipped_legacy[-1] if _skipped_legacy else None)
+        _mig_status = "failed" if _migration_critical_failure else ("completed" if not _failed_noncritical else "completed_with_warnings")
+        _update_mig_health(
+            last_run_at=datetime.now(timezone.utc).isoformat(),
+            current_version=_current_mig_version,
+            status=_mig_status,
+            failed_migrations=_failed_noncritical,
+            skipped_migrations=_skipped_legacy,
+            validation_warnings=[],
+        )
+        logger.info("[MIGRATION_HEALTH_UPDATED] version=%s status=%s", _current_mig_version, _mig_status)
+    except Exception as _mh_exc:
+        logger.warning("[MIGRATION_HEALTH_UPDATE_FAILED] error=%s", str(_mh_exc)[:200])
 
     # ---------------------------------------------------------------------------
     # Emergency self-healing: apply any missing webhook schema columns/tables
@@ -989,6 +1009,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Latency tracking middleware — records p50/p95/p99 for all requests
+app.add_middleware(LatencyTrackingMiddleware)
 
 # ---------------------------------------------------------------------------
 # API ROUTERS

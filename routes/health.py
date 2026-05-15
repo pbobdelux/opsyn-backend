@@ -24,6 +24,215 @@ logger = logging.getLogger("health")
 router = APIRouter(prefix="/health", tags=["health"])
 
 # ---------------------------------------------------------------------------
+# Structured health sub-endpoints (new observability layer)
+# ---------------------------------------------------------------------------
+
+@router.get("/sync/detailed")
+async def health_sync_detailed(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """
+    Detailed sync health with active/stalled/orphaned run breakdown,
+    24h success/failure counts, and dead letter metrics.
+    """
+    from services.health_service import get_sync_health, check_for_alerts
+    timestamp = datetime.now(timezone.utc).isoformat()
+    try:
+        metrics = await get_sync_health(db)
+        alerts = await check_for_alerts(db)
+        return make_json_safe({
+            "ok": True,
+            "timestamp": timestamp,
+            "active_runs": metrics.active_runs,
+            "active_run_details": metrics.active_run_details,
+            "stalled_runs": metrics.stalled_runs,
+            "stalled_run_details": metrics.stalled_run_details,
+            "orphaned_runs": metrics.orphaned_runs,
+            "orphaned_run_details": metrics.orphaned_run_details,
+            "successful_24h": metrics.successful_24h,
+            "failed_24h": metrics.failed_24h,
+            "avg_duration_seconds": metrics.avg_duration_seconds,
+            "orders_processed_24h": metrics.orders_processed_24h,
+            "line_items_processed_24h": metrics.line_items_processed_24h,
+            "dead_letters_created_24h": metrics.dead_letters_created_24h,
+            "retry_queue_size": metrics.retry_queue_size,
+            "last_successful_sync_at": metrics.last_successful_sync_at,
+            "failed_run_details": metrics.failed_run_details,
+            "alerts": alerts,
+        })
+    except Exception as exc:
+        logger.error("[HEALTH_SYNC_DETAILED] error=%s", str(exc)[:300], exc_info=True)
+        return {"ok": False, "timestamp": timestamp, "error": str(exc)[:300]}
+
+
+@router.get("/database")
+async def health_database(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """
+    Database connectivity, query latency (p50/p95/p99), and migration state.
+    """
+    from services.health_service import get_database_health
+    from middleware.latency_tracking import get_latency_percentiles
+    timestamp = datetime.now(timezone.utc).isoformat()
+    try:
+        metrics = await get_database_health(db)
+        api_latency = get_latency_percentiles()
+        return make_json_safe({
+            "ok": metrics.connected,
+            "timestamp": timestamp,
+            "connectivity": "connected" if metrics.connected else "disconnected",
+            "query_latency": {
+                "p50_ms": metrics.query_latency_p50_ms,
+                "p95_ms": metrics.query_latency_p95_ms,
+                "p99_ms": metrics.query_latency_p99_ms,
+            },
+            "api_latency": api_latency,
+            "error_count_24h": metrics.error_count_24h,
+            "last_successful_query_at": metrics.last_successful_query_at,
+            "connection_pool_status": metrics.connection_pool_status,
+            "migration_state": {
+                "current_version": metrics.current_migration_version,
+                "pending_migrations": metrics.pending_migrations,
+            },
+        })
+    except Exception as exc:
+        logger.error("[HEALTH_DATABASE] error=%s", str(exc)[:300], exc_info=True)
+        return {"ok": False, "timestamp": timestamp, "connectivity": "error", "error": str(exc)[:300]}
+
+
+@router.get("/migrations")
+async def health_migrations() -> dict[str, Any]:
+    """
+    Migration runner health: last run, current version, failed/skipped counts,
+    and validation warnings.
+    """
+    from services.health_service import get_migration_health
+    timestamp = datetime.now(timezone.utc).isoformat()
+    try:
+        metrics = await get_migration_health()
+        return make_json_safe({
+            "ok": metrics.failed_count == 0,
+            "timestamp": timestamp,
+            "last_run_at": metrics.last_run_at,
+            "current_version": metrics.current_version,
+            "status": metrics.status,
+            "failed_migrations": {
+                "count": metrics.failed_count,
+                "list": metrics.failed_migrations,
+            },
+            "skipped_migrations": {
+                "count": metrics.skipped_count,
+                "list": metrics.skipped_migrations,
+            },
+            "validation_warnings": {
+                "count": metrics.warning_count,
+                "list": metrics.validation_warnings,
+            },
+        })
+    except Exception as exc:
+        logger.error("[HEALTH_MIGRATIONS] error=%s", str(exc)[:300], exc_info=True)
+        return {"ok": False, "timestamp": timestamp, "status": "error", "error": str(exc)[:300]}
+
+
+@router.get("/run/{sync_run_id}")
+async def health_sync_run(sync_run_id: int, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """
+    Detailed metrics for a specific sync run by ID.
+    """
+    from services.health_service import get_sync_run_metrics
+    timestamp = datetime.now(timezone.utc).isoformat()
+    try:
+        metrics = await get_sync_run_metrics(db, sync_run_id)
+        if metrics is None:
+            return {"ok": False, "timestamp": timestamp, "error": f"sync run {sync_run_id} not found"}
+        return make_json_safe({
+            "ok": True,
+            "timestamp": timestamp,
+            **metrics.model_dump(),
+        })
+    except Exception as exc:
+        logger.error("[HEALTH_SYNC_RUN] run_id=%s error=%s", sync_run_id, str(exc)[:300], exc_info=True)
+        return {"ok": False, "timestamp": timestamp, "error": str(exc)[:300]}
+
+
+@router.get("/overview")
+async def health_overview(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """
+    Overall system health: status (healthy/degraded/critical), sync summary,
+    database summary, migration summary, warnings, and failures.
+    """
+    from services.health_service import get_sync_health, get_database_health, get_migration_health, check_for_alerts
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    warnings: list[str] = []
+    failures: list[str] = []
+    overall_status = "healthy"
+
+    try:
+        sync_metrics = await get_sync_health(db)
+        db_metrics = await get_database_health(db)
+        mig_metrics = await get_migration_health()
+        alerts = await check_for_alerts(db)
+
+        # Determine overall status
+        if not db_metrics.connected:
+            overall_status = "critical"
+            failures.append("Database connectivity failure")
+        if mig_metrics.failed_count > 0:
+            overall_status = "critical"
+            failures.append(f"{mig_metrics.failed_count} migration(s) failed")
+        if sync_metrics.stalled_runs > 0:
+            if overall_status == "healthy":
+                overall_status = "degraded"
+            warnings.append(f"{sync_metrics.stalled_runs} sync run(s) stalled")
+        if sync_metrics.failed_24h > 0:
+            if overall_status == "healthy":
+                overall_status = "degraded"
+            warnings.append(f"{sync_metrics.failed_24h} sync failure(s) in last 24h")
+        if mig_metrics.warning_count > 0:
+            warnings.append(f"{mig_metrics.warning_count} migration validation warning(s)")
+
+        for alert in alerts:
+            if alert.get("severity") == "CRITICAL" and overall_status != "critical":
+                overall_status = "critical"
+
+        return make_json_safe({
+            "ok": overall_status != "critical",
+            "status": overall_status,
+            "timestamp": timestamp,
+            "sync_health": {
+                "active_runs": sync_metrics.active_runs,
+                "stalled_runs": sync_metrics.stalled_runs,
+                "successful_24h": sync_metrics.successful_24h,
+                "failed_24h": sync_metrics.failed_24h,
+                "last_successful_sync_at": sync_metrics.last_successful_sync_at,
+                "retry_queue_size": sync_metrics.retry_queue_size,
+            },
+            "database_health": {
+                "connected": db_metrics.connected,
+                "connection_pool_status": db_metrics.connection_pool_status,
+                "current_migration_version": db_metrics.current_migration_version,
+            },
+            "migration_health": {
+                "status": mig_metrics.status,
+                "failed_count": mig_metrics.failed_count,
+                "warning_count": mig_metrics.warning_count,
+            },
+            "last_sync_at": sync_metrics.last_successful_sync_at,
+            "active_sync_count": sync_metrics.active_runs,
+            "warnings": warnings,
+            "failures": failures,
+            "alerts": alerts,
+        })
+    except Exception as exc:
+        logger.error("[HEALTH_OVERVIEW] error=%s", str(exc)[:300], exc_info=True)
+        return {
+            "ok": False,
+            "status": "critical",
+            "timestamp": timestamp,
+            "error": str(exc)[:300],
+            "warnings": warnings,
+            "failures": failures,
+        }
+
+# ---------------------------------------------------------------------------
 # Feature flags
 # ---------------------------------------------------------------------------
 _LEAFLINK_SYNC_STALE_MINUTES = int(os.getenv("LEAFLINK_SYNC_STALE_MINUTES", "60"))
