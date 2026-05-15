@@ -71,6 +71,17 @@ from services.sql_param_sanitizer import (
     assert_no_datetime_in_json as _assert_no_datetime_in_json,
 )
 
+# Order identity audit and upsert key resolution
+from services.order_identity_audit import (
+    audit_order_identity as _audit_order_identity,
+    get_order_match_key as _get_order_match_key,
+)
+
+# Reconciliation validator — prevents false-success when pagination stops early
+from services.reconciliation_validator import (
+    validate_sync_reconciliation as _validate_sync_reconciliation,
+)
+
 if TYPE_CHECKING:
     from services.background_sync_manager import BackgroundSyncManager
 
@@ -3089,9 +3100,117 @@ async def sync_leaflink_orders_headers_only(
                                   brand_id_value, external_id,
                               )
 
+                          # ------------------------------------------------------------------
+                          # Determine correct conflict target based on order identity.
+                          # Uses get_order_match_key() to select the right unique key:
+                          #   external_id   → ON CONFLICT (brand_id, external_order_id)
+                          #   order_number  → ON CONFLICT (brand_id, order_number) [fallback]
+                          #   generated_uuid → plain INSERT, no ON CONFLICT [safe fallback]
+                          # This fixes the 12,300 plateau: orders with missing/unknown
+                          # external_order_id were silently colliding on the unique
+                          # constraint, causing updates instead of inserts.
+                          # ------------------------------------------------------------------
+                          _match_key_type, _match_key_value = _get_order_match_key(
+                              external_order_id=external_id,
+                              order_number=order_number,
+                              brand_id=brand_id_value,
+                          )
+
+                          # Log match decision once per 100 orders (throttled)
+                          _orders_processed_total = insert_success + update_success + batch_skipped
+                          if _orders_processed_total % 100 == 0:
+                              logger.info(
+                                  "[ORDER_MATCH_DECISION] external_order_id_present=%s"
+                                  " order_number_present=%s match_key_type=%s brand_id=%s",
+                                  external_id is not None and external_id != "unknown",
+                                  order_number is not None,
+                                  _match_key_type,
+                                  brand_id_value,
+                              )
+
                           # True upsert: ON CONFLICT (brand_id, external_order_id) DO UPDATE
                           # Uses xmax to detect insert vs update for accurate counters.
-                          upsert_stmt = """
+                          # For order_number fallback: ON CONFLICT (brand_id, order_number)
+                          # For generated_uuid: plain INSERT (no conflict clause)
+                          if _match_key_type == "order_number":
+                              # Fallback: use (brand_id, order_number) as conflict target.
+                              # This handles orders where external_order_id is missing/unknown
+                              # but order_number is present and unique within the brand.
+                              upsert_stmt = """
+INSERT INTO orders (
+    org_id, brand_id, external_order_id, order_number, customer_name, status,
+    total_cents, amount, item_count, unit_count, line_items_json, raw_payload,
+    source, review_status, sync_status, sync_health_status, sync_health_missing_fields,
+    synced_at, last_synced_at,
+    created_at, updated_at,
+    external_created_at, external_updated_at
+) VALUES (
+    CAST(:org_id AS uuid), CAST(:brand_id AS uuid), :external_order_id, :order_number,
+    :customer_name, :status, :total_cents, :amount, :item_count, :unit_count,
+    :line_items_json, :raw_payload, :source, :review_status, :sync_status,
+    :sync_health_status, CAST(:sync_health_missing_fields AS jsonb),
+    CAST(:synced_at AS TIMESTAMPTZ), CAST(:last_synced_at AS TIMESTAMPTZ),
+    CAST(:created_at AS TIMESTAMPTZ), CAST(:updated_at AS TIMESTAMPTZ),
+    CAST(:external_created_at AS TIMESTAMPTZ), CAST(:external_updated_at AS TIMESTAMPTZ)
+)
+ON CONFLICT (brand_id, order_number) DO UPDATE SET
+    org_id = CAST(:org_id AS uuid),
+    external_order_id = COALESCE(EXCLUDED.external_order_id, orders.external_order_id),
+    customer_name = EXCLUDED.customer_name,
+    status = EXCLUDED.status,
+    total_cents = EXCLUDED.total_cents,
+    amount = EXCLUDED.amount,
+    item_count = EXCLUDED.item_count,
+    unit_count = EXCLUDED.unit_count,
+    line_items_json = EXCLUDED.line_items_json,
+    raw_payload = EXCLUDED.raw_payload,
+    review_status = EXCLUDED.review_status,
+    sync_status = EXCLUDED.sync_status,
+    sync_health_status = EXCLUDED.sync_health_status,
+    sync_health_missing_fields = EXCLUDED.sync_health_missing_fields,
+    synced_at = CAST(EXCLUDED.synced_at AS TIMESTAMPTZ),
+    last_synced_at = CAST(EXCLUDED.last_synced_at AS TIMESTAMPTZ),
+    updated_at = CAST(EXCLUDED.updated_at AS TIMESTAMPTZ),
+    external_created_at = COALESCE(CAST(EXCLUDED.external_created_at AS TIMESTAMPTZ), orders.external_created_at),
+    external_updated_at = COALESCE(CAST(EXCLUDED.external_updated_at AS TIMESTAMPTZ), orders.external_updated_at)
+RETURNING (xmax = 0) AS was_inserted
+"""
+                          elif _match_key_type == "generated_uuid":
+                              # Safe fallback: use a generated UUID as external_order_id.
+                              # No ON CONFLICT clause — always inserts a new row.
+                              # This prevents collisions when both external_order_id and
+                              # order_number are missing.
+                              external_id = _match_key_value  # override with safe UUID
+                              upsert_stmt = """
+INSERT INTO orders (
+    org_id, brand_id, external_order_id, order_number, customer_name, status,
+    total_cents, amount, item_count, unit_count, line_items_json, raw_payload,
+    source, review_status, sync_status, sync_health_status, sync_health_missing_fields,
+    synced_at, last_synced_at,
+    created_at, updated_at,
+    external_created_at, external_updated_at
+) VALUES (
+    CAST(:org_id AS uuid), CAST(:brand_id AS uuid), :external_order_id, :order_number,
+    :customer_name, :status, :total_cents, :amount, :item_count, :unit_count,
+    :line_items_json, :raw_payload, :source, :review_status, :sync_status,
+    :sync_health_status, CAST(:sync_health_missing_fields AS jsonb),
+    CAST(:synced_at AS TIMESTAMPTZ), CAST(:last_synced_at AS TIMESTAMPTZ),
+    CAST(:created_at AS TIMESTAMPTZ), CAST(:updated_at AS TIMESTAMPTZ),
+    CAST(:external_created_at AS TIMESTAMPTZ), CAST(:external_updated_at AS TIMESTAMPTZ)
+)
+RETURNING (xmax = 0) AS was_inserted
+"""
+                              logger.debug(
+                                  "[ORDER_SAFE_FALLBACK_INSERT] brand=%s generated_external_id=%s"
+                                  " order_number=%s",
+                                  brand_id_value,
+                                  external_id,
+                                  order_number,
+                              )
+                          else:
+                              # Default: ON CONFLICT (brand_id, external_order_id) DO UPDATE
+                              # Uses xmax to detect insert vs update for accurate counters.
+                              upsert_stmt = """
 INSERT INTO orders (
     org_id, brand_id, external_order_id, order_number, customer_name, status,
     total_cents, amount, item_count, unit_count, line_items_json, raw_payload,
@@ -5339,6 +5458,32 @@ async def sync_leaflink_background_continuous(
         brand_id,
         id(asyncio.current_task()),
     )
+
+    # ------------------------------------------------------------------
+    # Identity audit on sync startup — log null/unknown/duplicate counts
+    # so we can diagnose upsert identity issues before the sync begins.
+    # Fire-and-forget: never let audit errors block the sync.
+    # ------------------------------------------------------------------
+    try:
+        async with AsyncSessionLocal() as _audit_db:
+            _identity_audit = await _audit_order_identity(_audit_db, brand_id)
+            logger.info(
+                "[ORDER_IDENTITY_AUDIT] brand=%s null_external_id=%d"
+                " unknown_external_id=%d duplicate_order_number=%d"
+                " null_order_number=%d",
+                brand_id,
+                _identity_audit["null_external_order_id_count"],
+                _identity_audit["unknown_external_order_id_count"],
+                _identity_audit["duplicate_order_number_count"],
+                _identity_audit["null_order_number_count"],
+            )
+    except Exception as _audit_exc:
+        logger.warning(
+            "[ORDER_IDENTITY_AUDIT] startup_audit_error brand=%s error=%s",
+            brand_id,
+            str(_audit_exc)[:200],
+        )
+
     # Initialize tracking variables before try block so exception handlers can reference them
     pages_processed = 0
     records_seen_from_leaflink = 0
@@ -6290,6 +6435,52 @@ async def sync_leaflink_background_continuous(
         completion_percent = 0.0
         if leaflink_total_count and leaflink_total_count > 0:
             completion_percent = (records_seen_from_leaflink / leaflink_total_count) * 100
+
+        # ------------------------------------------------------------------
+        # Reconciliation validation — validate sync completion and explain
+        # any gap between local and LeafLink counts before marking success.
+        # Prevents false-success when pagination stops before the estimate.
+        # ------------------------------------------------------------------
+        if sync_run_id:
+            try:
+                async with AsyncSessionLocal() as _recon_db:
+                    _reconciliation = await _validate_sync_reconciliation(
+                        sync_run_id=sync_run_id,
+                        db=_recon_db,
+                    )
+                    logger.info(
+                        "[SYNC_RECONCILIATION] status=%s leaflink_estimate=%d fetched=%d"
+                        " inserted=%d updated=%d total_local=%d visible_local=%d"
+                        " gap_pct=%.1f%% dead_letters=%d brand=%s sync_run_id=%s",
+                        _reconciliation["status"],
+                        _reconciliation["leaflink_total_estimate"],
+                        _reconciliation["fetched_total_this_run"],
+                        _reconciliation["inserted_headers"],
+                        _reconciliation["updated_headers"],
+                        _reconciliation["total_local_orders_after"],
+                        _reconciliation["visible_local_orders_after"],
+                        _reconciliation["gap_percentage"],
+                        _reconciliation["dead_letter_count"],
+                        brand_id,
+                        sync_run_id,
+                    )
+                    # Warn if reconciliation shows a gap but don't block completion —
+                    # the status is already set by the pagination check below.
+                    if _reconciliation["status"] not in ("success", "unknown"):
+                        logger.warning(
+                            "[SYNC_STATUS_PARTIAL] reason=%s gap_pct=%.1f%% brand=%s"
+                            " — reconciliation gap detected",
+                            _reconciliation["status"],
+                            _reconciliation["gap_percentage"],
+                            brand_id,
+                        )
+            except Exception as _recon_exc:
+                logger.warning(
+                    "[SYNC_RECONCILIATION] validation_error brand=%s sync_run_id=%s error=%s",
+                    brand_id,
+                    sync_run_id,
+                    str(_recon_exc)[:200],
+                )
 
         # CRITICAL: Do NOT mark completed if next_cursor exists — pagination is incomplete.
         # A non-None next_cursor means LeafLink has more pages; the loop exited early
