@@ -50,7 +50,16 @@ AsyncSessionLocal = _LazySessionLocal()
 
 from models import Order, OrderLine
 from models.sync_health import DeadLetterLineItem, SyncHealth
-from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value, sanitize_sql_params as _recursive_sanitize_sql_params, validate_and_fix_sql_params as _validate_and_fix_sql_params, _sanitize_params_for_sql_execution as _sanitize_params_for_sql_execution
+from utils.json_utils import (
+    make_json_safe,
+    normalize_datetime as normalize_datetime_value,
+    sanitize_sql_params as _recursive_sanitize_sql_params,
+    validate_and_fix_sql_params as _validate_and_fix_sql_params,
+    _sanitize_params_for_sql_execution as _sanitize_params_for_sql_execution,
+    deep_convert_all_datetimes as _deep_convert_all_datetimes,
+    assert_no_datetime_anywhere as _assert_no_datetime_anywhere,
+    _count_datetimes as _count_datetimes_in_params,
+)
 
 if TYPE_CHECKING:
     from services.background_sync_manager import BackgroundSyncManager
@@ -547,8 +556,8 @@ async def _update_sync_health_phase1(
                 if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
                     logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
                     _phase1_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _phase1_params = _validate_and_fix_sql_params(_phase1_params)
+            # ABSOLUTE FINAL BOUNDARY: deep-convert all datetimes to ISO strings + assert
+            _phase1_params = _final_sql_sanitize(_phase1_params, "sync_health_phase1")
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, orders_fetched_last_run, updated_at)
@@ -598,8 +607,8 @@ async def _update_sync_health_phase2(
                 if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
                     logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
                     _phase2_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _phase2_params = _validate_and_fix_sql_params(_phase2_params)
+            # ABSOLUTE FINAL BOUNDARY: deep-convert all datetimes to ISO strings + assert
+            _phase2_params = _final_sql_sanitize(_phase2_params, "sync_health_phase2")
             await db.execute(
                 text("""
                     UPDATE sync_health SET
@@ -647,8 +656,8 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
                 if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
                     logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
                     _sync_error_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _sync_error_params = _validate_and_fix_sql_params(_sync_error_params)
+            # ABSOLUTE FINAL BOUNDARY: deep-convert all datetimes to ISO strings + assert
+            _sync_error_params = _final_sql_sanitize(_sync_error_params, "sync_health_record_error")
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, last_error_at, updated_at)
@@ -691,8 +700,8 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
                 if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
                     logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
                     _retryable_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _retryable_params = _validate_and_fix_sql_params(_retryable_params)
+            # ABSOLUTE FINAL BOUNDARY: deep-convert all datetimes to ISO strings + assert
+            _retryable_params = _final_sql_sanitize(_retryable_params, "sync_health_retryable_error")
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
@@ -759,8 +768,8 @@ async def _dead_letter_line_item(
             _dead_letter_params = _recursive_sanitize_sql_params(_dead_letter_params)
             # Pre-bind validator: final scan of the EXACT object being passed to execute()
             _dead_letter_params = _validate_and_fix_sql_params(_dead_letter_params)
-            # FINAL SQL EXECUTION BOUNDARY: deep-copy and convert all datetime/date to ISO strings
-            _dead_letter_params = _sanitize_params_for_sql_execution(_dead_letter_params, "dead_letter_write")
+            # ABSOLUTE FINAL BOUNDARY: deep-convert all datetimes to ISO strings + assert
+            _dead_letter_params = _final_sql_sanitize(_dead_letter_params, "dead_letter_line_item")
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -910,10 +919,8 @@ async def _write_sync_dead_letter(
                         params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
                     else:
                         params[_param_key] = _param_val.astimezone(timezone.utc)
-            # Try to write with new detail columns; fall back to legacy schema if columns don't exist yet
-            params = _recursive_sanitize_sql_params(params)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            params = _validate_and_fix_sql_params(params)
+            # ABSOLUTE FINAL BOUNDARY: deep-convert all datetimes to ISO strings + assert
+            params = _final_sql_sanitize(params, "sync_dead_letter_write")
             try:
                 await db.execute(
                     text("""
@@ -988,6 +995,58 @@ def utc_now() -> datetime:
     (dt - UTC_EPOCH).total_seconds() where UTC_EPOCH is timezone-aware.
     """
     return datetime.now(timezone.utc)
+
+
+def _final_sql_sanitize(params: Any, label: str) -> Any:
+    """Absolute final SQL sanitization boundary.
+
+    This is the ONE canonical sanitizer that MUST be called immediately before
+    every ``db.execute(text(...), params)`` call.  No exceptions.  No caller
+    trust.
+
+    Steps:
+    1. Count datetimes before sanitization (for logging).
+    2. Call ``deep_convert_all_datetimes()`` — recursively converts ALL
+       datetime/date objects to ISO 8601 strings.  Returns a new dict.
+    3. Log [FINAL_SQL_SANITIZED] with before/after counts and top-level keys.
+    4. Call ``assert_no_datetime_anywhere()`` — raises AssertionError if any
+       datetime survived (aborts SQL execution).
+    5. Log [FINAL_SQL_ASSERTION_PASSED].
+    6. Return the sanitized params.
+
+    Args:
+        params: The params dict about to be passed to db.execute().
+        label:  Short name of the calling operation for log context.
+
+    Returns:
+        Sanitized params dict with all datetime/date values as ISO strings.
+    """
+    if params is None:
+        return params
+
+    dt_before = _count_datetimes_in_params(params)
+    sanitized = _deep_convert_all_datetimes(params)
+    dt_after = _count_datetimes_in_params(sanitized)
+
+    top_keys = list(sanitized.keys()) if isinstance(sanitized, dict) else "not_dict"
+    logger.info(
+        "[FINAL_SQL_SANITIZED] label=%s datetime_count_before=%d"
+        " datetime_count_after=%d top_level_keys=%s",
+        label,
+        dt_before,
+        dt_after,
+        top_keys,
+    )
+
+    _assert_no_datetime_anywhere(sanitized, label=label)
+
+    logger.info(
+        "[FINAL_SQL_ASSERTION_PASSED] label=%s params_keys=%s",
+        label,
+        top_keys,
+    )
+
+    return sanitized
 
 
 def to_utc_naive(dt: Any) -> datetime:
@@ -2173,8 +2232,8 @@ async def _insert_line_items_standalone(
                         f"[DATETIME_VALIDATION_FAILED] naive datetime in field={_vf} value={_vv!r}"
                     )
 
-            # FINAL SQL EXECUTION BOUNDARY: deep-copy and convert all datetime/date to ISO strings
-            insert_params = _sanitize_params_for_sql_execution(insert_params, "order_lines_insert")
+            # ABSOLUTE FINAL BOUNDARY: deep-convert all datetimes to ISO strings + assert
+            insert_params = _final_sql_sanitize(insert_params, "order_lines_insert")
             await db.execute(text(line_insert_stmt), insert_params)
 
             inserted += 1
@@ -2766,8 +2825,8 @@ async def sync_leaflink_orders(
                                 f"[DATETIME_VALIDATION_FAILED] naive datetime in field={_vf} value={_vv!r}"
                             )
 
-                    # FINAL SQL EXECUTION BOUNDARY: deep-copy and convert all datetime/date to ISO strings
-                    _li_params = _sanitize_params_for_sql_execution(_li_params, "line_item_upsert")
+                    # ABSOLUTE FINAL BOUNDARY: deep-convert all datetimes to ISO strings + assert
+                    _li_params = _final_sql_sanitize(_li_params, "line_item_upsert_batch")
                     await db.execute(text(_li_insert_stmt), _li_params)
 
                 total_lines_written += len(normalized_line_items)
@@ -3547,21 +3606,10 @@ RETURNING (xmax = 0) AS was_inserted
                                       _fixed = _fix_val.astimezone(timezone.utc)
                                       safe_params[_fix_field] = _fixed
                               elif isinstance(_fix_val, str):
-                                  # String that slipped through — attempt to parse as UTC datetime
-                                  try:
-                                      _parsed = ensure_utc_datetime(_fix_val)
-                                      if _parsed is not None:
-                                          logger.info(
-                                              "[DATETIME_FIELD_FIXED] context=order_header_upsert"
-                                              " field=%s original_type=str value=%s"
-                                              " fixed=%s action=parsed_iso_string",
-                                              _fix_field,
-                                              _fix_val[:50],
-                                              _parsed.isoformat(),
-                                          )
-                                          safe_params[_fix_field] = _parsed
-                                  except (ValueError, TypeError):
-                                      pass
+                                  # ISO string — leave as-is.  _final_sql_sanitize (called below)
+                                  # is the canonical boundary; re-parsing strings back to datetime
+                                  # objects here was the root cause of datetimes surviving to execute().
+                                  pass
 
                           # [FINAL_EXECUTE_PARAMS] Deep recursive datetime audit
                           # Only logs errors (naive datetimes) — [DATETIME_OK] reduced to DEBUG
@@ -3659,23 +3707,8 @@ RETURNING (xmax = 0) AS was_inserted
                           # This surfaces the exact field name instead of the cryptic
                           # "can't subtract offset-naive and offset-aware datetimes at $N".
                           # ---------------------------------------------------------------
-                          for _hf_idx, (_hf_field, _hf_value) in enumerate(safe_params.items()):
-                              if isinstance(_hf_value, datetime) and _hf_value.tzinfo is None:
-                                  logger.error(
-                                      "[FINAL_DATETIME_VALIDATION_FAILED] context=order_header_upsert"
-                                      " idx=%d field=%s value=%s tzinfo=None"
-                                      " — naive datetime reached execute(), raising RuntimeError",
-                                      _hf_idx,
-                                      _hf_field,
-                                      repr(_hf_value),
-                                  )
-                                  # Normalize in-place so the error is recoverable on retry,
-                                  # then raise so the caller sees the exact field name.
-                                  safe_params[_hf_field] = _hf_value.replace(tzinfo=timezone.utc)
-                                  raise RuntimeError(
-                                      f"[FINAL_DATETIME_VALIDATION_FAILED] field={_hf_field} idx={_hf_idx}"
-                                      f" value={_hf_value!r} tzinfo=None — naive datetime in order_header_upsert"
-                                  )
+                          # ABSOLUTE FINAL BOUNDARY: deep-convert all datetimes to ISO strings + assert
+                          safe_params = _final_sql_sanitize(safe_params, "order_header_upsert")
 
                           upsert_result = await db.execute(text(upsert_stmt), safe_params)
 
@@ -4672,8 +4705,8 @@ async def sync_leaflink_line_items(
                             f"[DATETIME_VALIDATION_FAILED] naive datetime in field={_vf} value={_vv!r}"
                         )
 
-                # FINAL SQL EXECUTION BOUNDARY: deep-copy and convert all datetime/date to ISO strings
-                insert_params = _sanitize_params_for_sql_execution(insert_params, "line_item_upsert")
+                # ABSOLUTE FINAL BOUNDARY: deep-convert all datetimes to ISO strings + assert
+                insert_params = _final_sql_sanitize(insert_params, "line_item_upsert")
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
@@ -5235,7 +5268,7 @@ async def upsert_sync_metrics_snapshot(
                 import json as _json_snap
                 _cat_json = None  # category breakdown not computed here (expensive)
 
-                _snap_params = _validate_and_fix_sql_params({
+                _snap_params = _final_sql_sanitize({
                     "brand_id": brand_id,
                     "sync_run_id": _run_id_str,
                     "total_local_orders": total_local,
@@ -5250,7 +5283,7 @@ async def upsert_sync_metrics_snapshot(
                     "estimated_completion": estimated_completion,
                     "last_successful_sync_at": last_successful_sync_at,
                     "updated_at": now,
-                })
+                }, "sync_metrics_snapshot")
                 # Use explicit CAST(:brand_id AS UUID) to avoid
                 # "operator does not exist: uuid = character varying" when
                 # asyncpg infers the parameter type as character varying.
@@ -6376,13 +6409,13 @@ async def sync_leaflink_background_continuous(
                                         last_progress_at = :now
                                     WHERE id = :run_id
                                 """),
-                                {
+                                _final_sql_sanitize({
                                     "next_url": next_cursor,
                                     "total_count": leaflink_total_count,
                                     "page": pages_processed,
                                     "now": datetime.now(timezone.utc),
                                     "run_id": sync_run_id,
-                                },
+                                }, "sync_runs_pagination_state"),
                             )
                         await _state_db.commit()
                     logger.info(
@@ -6926,7 +6959,7 @@ async def sync_leaflink_background_continuous(
                 async with AsyncSessionLocal() as _final_db:
                     await _final_db.execute(
                         text("UPDATE sync_runs SET last_progress_at = :now WHERE id = :id"),
-                        {"now": datetime.now(timezone.utc), "id": sync_run_id},
+                        _final_sql_sanitize({"now": datetime.now(timezone.utc), "id": sync_run_id}, "sync_runs_final_progress"),
                     )
                     await _final_db.commit()
             except Exception:
