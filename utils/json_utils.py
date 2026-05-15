@@ -199,21 +199,24 @@ def validate_and_fix_sql_params(params: Any) -> Any:
     - Walks every value in *params* (dict, list, or tuple).
     - For any ``datetime`` with ``tzinfo is None``:
         * Logs ``[SQL_PARAM_PREBIND_NAIVE_DATETIME]`` at ERROR level.
-        * Replaces the value with ``value.replace(tzinfo=timezone.utc)``.
+        * Converts to ISO 8601 string with ``+00:00`` offset.
+    - For any ``datetime`` that is already UTC-aware:
+        * Converts to UTC and returns ISO 8601 string.
     - For any plain ``date`` (not datetime):
         * Logs ``[SQL_PARAM_PREBIND_DATE_COERCED]`` at WARNING level.
-        * Converts to UTC midnight datetime.
-    - For any ``datetime`` that is already UTC-aware, normalises to UTC via
-      ``astimezone(timezone.utc)`` (no-op if already UTC).
+        * Converts to ISO date string (``YYYY-MM-DD``).
     - Never raises exceptions — all errors are caught and logged.
-    - Returns the (possibly modified) params object.
+    - Returns the (possibly modified) params object with all datetime/date
+      values replaced by ISO 8601 strings so asyncpg never receives a raw
+      Python datetime object.
 
     Args:
         params: The SQL parameters dict (or list/tuple) about to be passed to
                 ``db.execute()``.  Modified in-place when *params* is a dict.
 
     Returns:
-        The sanitized params object (same type as input).
+        The sanitized params object (same type as input, with datetime/date
+        values converted to ISO 8601 strings).
     """
     try:
         return _validate_and_fix_recursive(params, path="params")
@@ -230,24 +233,27 @@ def _validate_and_fix_recursive(value: Any, path: str = "params") -> Any:
     # datetime must be checked before date (datetime is a subclass of date)
     if isinstance(value, datetime):
         if value.tzinfo is None:
+            # Naive datetime → assume UTC and convert to ISO string
             fixed = value.replace(tzinfo=timezone.utc)
             logger.error(
-                "[SQL_PARAM_PREBIND_NAIVE_DATETIME] path=%s value=%s — forcing UTC-aware",
+                "[SQL_PARAM_PREBIND_NAIVE_DATETIME] path=%s value=%s — converting to ISO8601 string",
                 path,
                 value.isoformat(),
             )
-            return fixed
-        return value.astimezone(timezone.utc)
+            return fixed.isoformat()  # Return ISO string, not datetime object
+        # Aware datetime → convert to UTC and return ISO string
+        utc_dt = value.astimezone(timezone.utc)
+        return utc_dt.isoformat()  # Return ISO string, not datetime object
 
-    # Plain date (not datetime) → UTC midnight datetime
+    # Plain date (not datetime) → ISO date string
     if isinstance(value, date):
-        fixed = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+        iso_str = value.isoformat()
         logger.warning(
-            "[SQL_PARAM_PREBIND_DATE_COERCED] path=%s value=%s — converted to UTC midnight datetime",
+            "[SQL_PARAM_PREBIND_DATE_COERCED] path=%s value=%s — converted to ISO date string",
             path,
             value.isoformat(),
         )
-        return fixed
+        return iso_str  # Return ISO string, not datetime object
 
     # dict → recurse over values, modify in-place and return
     if isinstance(value, dict):
