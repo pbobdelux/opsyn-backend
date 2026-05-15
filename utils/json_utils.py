@@ -17,6 +17,8 @@ __all__ = [
     "sanitize_sql_params",
     "validate_and_fix_sql_params",
     "_sanitize_params_for_sql_execution",
+    "sanitize_json_fields_only",
+    "preserve_sql_datetime_fields",
     "deep_convert_all_datetimes",
     "assert_no_datetime_anywhere",
     "log_sanitization",
@@ -401,3 +403,285 @@ def _sanitize_sql_params_recursive(value: Any, path: str = "params") -> Any:
 
     # All other types (str, int, float, bool, None, Decimal, UUID, etc.) pass through
     return value
+
+
+# ---------------------------------------------------------------------------
+# Type-aware sanitizer — JSON fields only, SQL datetime params preserved
+# ---------------------------------------------------------------------------
+
+# Field names whose values are JSON blobs and MUST have all datetime objects
+# converted to ISO strings before being passed to asyncpg as JSONB/text params.
+_JSON_FIELD_NAMES: frozenset[str] = frozenset({
+    "raw_payload",
+    "line_items_json",
+    "sync_health_missing_fields",
+    "exception_details",
+    "failure_context",
+    "metadata",
+    "count_by_failure_category",
+    "payload_keys",
+})
+
+# Suffixes that identify JSON/payload fields regardless of exact name.
+_JSON_FIELD_SUFFIXES: tuple[str, ...] = ("_json", "_payload")
+
+# Field names that are SQL TIMESTAMP bind parameters and MUST remain as native
+# Python datetime objects (asyncpg expects datetime, not ISO strings).
+_SQL_DATETIME_FIELD_NAMES: frozenset[str] = frozenset({
+    "created_at",
+    "updated_at",
+    "synced_at",
+    "last_synced_at",
+    "external_created_at",
+    "external_updated_at",
+    "now",
+    "last_attempted_sync_at",
+    "last_error_at",
+    "last_progress_at",
+    "last_successful_sync_at",
+    "estimated_completion",
+})
+
+# Suffix that identifies SQL datetime columns regardless of exact name.
+_SQL_DATETIME_SUFFIX: str = "_at"
+
+
+def _is_json_field(name: str) -> bool:
+    """Return True if *name* identifies a JSON/JSONB payload field."""
+    if name in _JSON_FIELD_NAMES:
+        return True
+    return any(name.endswith(sfx) for sfx in _JSON_FIELD_SUFFIXES)
+
+
+def _is_sql_datetime_field(name: str) -> bool:
+    """Return True if *name* identifies a SQL TIMESTAMP bind parameter.
+
+    JSON fields that happen to end with ``_at`` are NOT datetime fields —
+    ``_is_json_field`` takes precedence.
+    """
+    if _is_json_field(name):
+        return False
+    if name in _SQL_DATETIME_FIELD_NAMES:
+        return True
+    return name.endswith(_SQL_DATETIME_SUFFIX)
+
+
+def _recursive_json_field_sanitize(obj: Any, _depth: int = 0) -> Any:
+    """Recursively convert datetime/date objects inside a JSON field value to ISO strings.
+
+    This is intentionally identical to ``make_json_safe`` but kept separate so
+    the intent is explicit: this function is ONLY called on JSON field values,
+    never on SQL bind parameters.
+    """
+    MAX_DEPTH = 20
+    if _depth > MAX_DEPTH:
+        return "[max_depth_exceeded]"
+
+    if obj is None:
+        return None
+
+    # datetime before date (datetime is a subclass of date)
+    if isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            obj = obj.replace(tzinfo=timezone.utc)
+        return obj.astimezone(timezone.utc).isoformat()
+
+    if isinstance(obj, date):
+        return obj.isoformat()
+
+    if isinstance(obj, Decimal):
+        return float(obj)
+
+    if isinstance(obj, UUID):
+        return str(obj)
+
+    if isinstance(obj, dict):
+        return {k: _recursive_json_field_sanitize(v, _depth + 1) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple)):
+        return [_recursive_json_field_sanitize(item, _depth + 1) for item in obj]
+
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    return str(obj)[:500]
+
+
+def _count_datetimes_in_value(obj: Any, _depth: int = 0) -> int:
+    """Count datetime/date objects recursively in *obj*."""
+    if _depth > 20:
+        return 0
+    if isinstance(obj, (datetime, date)):
+        return 1
+    if isinstance(obj, dict):
+        return sum(_count_datetimes_in_value(v, _depth + 1) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(_count_datetimes_in_value(item, _depth + 1) for item in obj)
+    return 0
+
+
+def sanitize_json_fields_only(params: dict) -> dict:
+    """Type-aware sanitizer: convert datetimes inside JSON fields, preserve SQL datetime params.
+
+    Iterates over every top-level key in *params*:
+
+    - **JSON fields** (``raw_payload``, ``line_items_json``, ``*_json``, ``*_payload``,
+      ``sync_health_missing_fields``, etc.): recursively convert any
+      ``datetime``/``date`` objects to ISO 8601 strings so the value is safe
+      to pass as a JSONB/text bind parameter.
+
+    - **SQL datetime columns** (``created_at``, ``updated_at``, ``synced_at``,
+      ``*_at``, ``now``, etc.): left completely untouched — asyncpg requires
+      native ``datetime`` objects for TIMESTAMP columns.
+
+    - **All other fields**: passed through unchanged.
+
+    Logs ``[SQL_PARAM_TYPES]`` for every field and
+    ``[JSON_FIELD_SANITIZED]`` for every JSON field that is processed.
+
+    Args:
+        params: SQL parameter dict about to be passed to ``db.execute()``.
+
+    Returns:
+        New dict with JSON fields sanitized and SQL datetime params preserved.
+    """
+    if not isinstance(params, dict):
+        logger.warning(
+            "[SQL_PARAM_TYPES] params_type=%s — expected dict, returning unchanged",
+            type(params).__name__,
+        )
+        return params  # type: ignore[return-value]
+
+    result: dict = {}
+
+    for name, value in params.items():
+        is_json = _is_json_field(name)
+        is_dt = _is_sql_datetime_field(name)
+
+        logger.info(
+            "[SQL_PARAM_TYPES] field=%s type=%s is_json_field=%s is_datetime_field=%s",
+            name,
+            type(value).__name__,
+            is_json,
+            is_dt,
+        )
+
+        if is_json and value is not None:
+            before_count = _count_datetimes_in_value(value)
+            sanitized_value = _recursive_json_field_sanitize(value)
+            after_count = _count_datetimes_in_value(sanitized_value)
+            logger.info(
+                "[JSON_FIELD_SANITIZED] field=%s datetime_count_before=%d datetime_count_after=%d",
+                name,
+                before_count,
+                after_count,
+            )
+            result[name] = sanitized_value
+        elif is_dt and value is not None:
+            logger.info(
+                "[SQL_DATETIME_PRESERVED] field=%s type=%s tzinfo=%s",
+                name,
+                type(value).__name__,
+                str(value.tzinfo) if isinstance(value, datetime) else "n/a",
+            )
+            result[name] = value
+        else:
+            result[name] = value
+
+    return result
+
+
+def preserve_sql_datetime_fields(params: dict) -> dict:
+    """Sanitize JSON fields and validate type fidelity for SQL datetime columns.
+
+    Calls ``sanitize_json_fields_only()`` then validates:
+
+    - Every JSON field contains **no** ``datetime``/``date`` objects after
+      sanitization (raises ``AssertionError`` if any remain).
+    - Every SQL datetime column that is present and non-None **is** a native
+      ``datetime`` object with timezone info (raises ``AssertionError`` if it
+      is a string or naive datetime).
+
+    Logs ``[JSON_FIELD_VALIDATION]`` and ``[SQL_DATETIME_VALIDATION]`` for
+    every relevant field.
+
+    Args:
+        params: SQL parameter dict about to be passed to ``db.execute()``.
+
+    Returns:
+        Sanitized params dict with JSON fields clean and SQL datetimes intact.
+
+    Raises:
+        AssertionError: If a JSON field still contains a datetime after
+            sanitization, or if a SQL datetime column is a string / naive
+            datetime.
+    """
+    sanitized = sanitize_json_fields_only(params)
+
+    # --- Validate JSON fields ---
+    for name, value in sanitized.items():
+        if not _is_json_field(name) or value is None:
+            continue
+        dt_count = _count_datetimes_in_value(value)
+        status = "ok" if dt_count == 0 else "failed"
+        log_fn = logger.info if status == "ok" else logger.error
+        log_fn(
+            "[JSON_FIELD_VALIDATION] field=%s datetime_count=%d status=%s",
+            name,
+            dt_count,
+            status,
+        )
+        if dt_count > 0:
+            logger.error(
+                "[JSON_FIELD_VALIDATION_FAILED] field=%s datetime_count=%d"
+                " — datetime objects must not remain in JSON fields after sanitization",
+                name,
+                dt_count,
+            )
+            raise AssertionError(
+                f"JSON field '{name}' still contains {dt_count} datetime object(s) "
+                f"after sanitization — all datetimes in JSON fields must be ISO strings"
+            )
+
+    # --- Validate SQL datetime columns ---
+    for name, value in sanitized.items():
+        if not _is_sql_datetime_field(name) or value is None:
+            continue
+        is_dt_obj = isinstance(value, datetime)
+        has_tz = is_dt_obj and value.tzinfo is not None
+        status = "ok" if (is_dt_obj and has_tz) else "failed"
+        log_fn = logger.info if status == "ok" else logger.error
+        log_fn(
+            "[SQL_DATETIME_VALIDATION] field=%s is_datetime=%s has_tz=%s status=%s",
+            name,
+            is_dt_obj,
+            has_tz,
+            status,
+        )
+        if not is_dt_obj:
+            logger.error(
+                "[SQL_DATETIME_VALIDATION_FAILED] field=%s type=%s value=%r"
+                " — SQL datetime column must be a native datetime object, not %s",
+                name,
+                type(value).__name__,
+                str(value)[:100],
+                type(value).__name__,
+            )
+            raise AssertionError(
+                f"SQL datetime column '{name}' is type {type(value).__name__!r} "
+                f"(value={str(value)[:100]!r}), expected a native datetime object. "
+                f"asyncpg requires datetime objects for TIMESTAMP columns."
+            )
+        if not has_tz:
+            logger.error(
+                "[SQL_DATETIME_VALIDATION_FAILED] field=%s value=%s"
+                " — SQL datetime column is naive (no tzinfo), must be UTC-aware",
+                name,
+                value.isoformat(),
+            )
+            raise AssertionError(
+                f"SQL datetime column '{name}' is naive (tzinfo=None, value={value.isoformat()!r}). "
+                f"All SQL datetime params must be UTC-aware datetime objects."
+            )
+
+    return sanitized

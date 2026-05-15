@@ -50,7 +50,7 @@ AsyncSessionLocal = _LazySessionLocal()
 
 from models import Order, OrderLine
 from models.sync_health import DeadLetterLineItem, SyncHealth
-from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value, sanitize_sql_params as _recursive_sanitize_sql_params, validate_and_fix_sql_params as _validate_and_fix_sql_params, _sanitize_params_for_sql_execution as _sanitize_params_for_sql_execution
+from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value, sanitize_sql_params as _recursive_sanitize_sql_params, validate_and_fix_sql_params as _validate_and_fix_sql_params, _sanitize_params_for_sql_execution as _sanitize_params_for_sql_execution, preserve_sql_datetime_fields as preserve_sql_datetime_fields
 from utils.sanitizers import deep_convert_all_datetimes, assert_no_datetime_anywhere, log_sanitization
 
 if TYPE_CHECKING:
@@ -540,8 +540,8 @@ async def _update_sync_health_phase1(
                 "count": (orders_count or 0),
             }
             _phase1_params = apply_uuid_str_to_params(_phase1_params)
-            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
-            _phase1_params = _sanitize_params_for_sql_execution(_phase1_params, "_update_sync_health_phase1")
+            # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
+            _phase1_params = preserve_sql_datetime_fields(_phase1_params)
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, orders_fetched_last_run, updated_at)
@@ -582,8 +582,8 @@ async def _update_sync_health_phase2(
                 "count": line_items_count,
             }
             _phase2_params = apply_uuid_str_to_params(_phase2_params)
-            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
-            _phase2_params = _sanitize_params_for_sql_execution(_phase2_params, "_update_sync_health_phase2")
+            # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
+            _phase2_params = preserve_sql_datetime_fields(_phase2_params)
             await db.execute(
                 text("""
                     UPDATE sync_health SET
@@ -623,8 +623,8 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
                 "now": ensure_utc(utc_now(), "now"),
             }
             _sync_error_params = apply_uuid_str_to_params(_sync_error_params)
-            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
-            _sync_error_params = _sanitize_params_for_sql_execution(_sync_error_params, "_record_sync_error")
+            # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
+            _sync_error_params = preserve_sql_datetime_fields(_sync_error_params)
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, last_error_at, updated_at)
@@ -658,8 +658,8 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
                 "now": ensure_utc(utc_now(), "now"),
             }
             _retryable_params = apply_uuid_str_to_params(_retryable_params)
-            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
-            _retryable_params = _sanitize_params_for_sql_execution(_retryable_params, "_record_retryable_error")
+            # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
+            _retryable_params = preserve_sql_datetime_fields(_retryable_params)
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
@@ -709,8 +709,8 @@ async def _dead_letter_line_item(
                 "now": ensure_utc(utc_now(), "now"),
             }
             _dead_letter_params = apply_uuid_str_to_params(_dead_letter_params)
-            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
-            _dead_letter_params = _sanitize_params_for_sql_execution(_dead_letter_params, "dead_letter_write")
+            # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
+            _dead_letter_params = preserve_sql_datetime_fields(_dead_letter_params)
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -838,8 +838,8 @@ async def _write_sync_dead_letter(
                 "now": now,
             }
             params = apply_uuid_str_to_params(params)
-            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
-            params = _sanitize_params_for_sql_execution(params, "_write_sync_dead_letter")
+            # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
+            params = preserve_sql_datetime_fields(params)
             try:
                 await db.execute(
                     text("""
@@ -2015,8 +2015,8 @@ async def _insert_line_items_standalone(
             # Final barrier: ensure all UUID objects are strings before asyncpg execute()
             insert_params = apply_uuid_str_to_params(insert_params)
 
-            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
-            insert_params = _sanitize_params_for_sql_execution(insert_params, "order_lines_insert")
+            # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
+            insert_params = preserve_sql_datetime_fields(insert_params)
             await db.execute(text(line_insert_stmt), insert_params)
 
             inserted += 1
@@ -2523,8 +2523,8 @@ async def sync_leaflink_orders(
                     # Final barrier: ensure all UUID objects are strings before asyncpg execute()
                     _li_params = apply_uuid_str_to_params(_li_params)
 
-                    # Absolute final SQL boundary — convert ALL datetimes to ISO strings
-                    _li_params = _sanitize_params_for_sql_execution(_li_params, "line_item_upsert")
+                    # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
+                    _li_params = preserve_sql_datetime_fields(_li_params)
                     await db.execute(text(_li_insert_stmt), _li_params)
 
                 total_lines_written += len(normalized_line_items)
@@ -3253,9 +3253,9 @@ RETURNING (xmax = 0) AS was_inserted
                                       )
                                       upsert_params[_field] = _value.replace(tzinfo=timezone.utc)
 
-                          # Absolute final SQL boundary — convert ALL datetimes to ISO strings,
-                          # assert none remain, then execute. This is the single canonical path.
-                          safe_params = _sanitize_params_for_sql_execution(upsert_params, "order_header_upsert")
+                          # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved.
+                          # This is the single canonical path for order header upserts.
+                          safe_params = preserve_sql_datetime_fields(upsert_params)
 
                           upsert_result = await db.execute(text(upsert_stmt), safe_params)
 
@@ -4167,8 +4167,8 @@ async def sync_leaflink_line_items(
                 # Final barrier: ensure all UUID objects are strings before asyncpg execute()
                 insert_params = apply_uuid_str_to_params(insert_params)
 
-                # Absolute final SQL boundary — convert ALL datetimes to ISO strings
-                insert_params = _sanitize_params_for_sql_execution(insert_params, "line_item_upsert")
+                # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
+                insert_params = preserve_sql_datetime_fields(insert_params)
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
 
@@ -4730,7 +4730,7 @@ async def upsert_sync_metrics_snapshot(
                 import json as _json_snap
                 _cat_json = None  # category breakdown not computed here (expensive)
 
-                _snap_params = _validate_and_fix_sql_params({
+                _snap_params = preserve_sql_datetime_fields({
                     "brand_id": brand_id,
                     "sync_run_id": _run_id_str,
                     "total_local_orders": total_local,
@@ -6419,9 +6419,8 @@ async def sync_leaflink_background_continuous(
         if sync_run_id:
             try:
                 async with AsyncSessionLocal() as _final_db:
-                    _progress_params = _sanitize_params_for_sql_execution(
+                    _progress_params = preserve_sql_datetime_fields(
                         {"now": datetime.now(timezone.utc), "id": sync_run_id},
-                        "sync_run_progress_update",
                     )
                     await _final_db.execute(
                         text("UPDATE sync_runs SET last_progress_at = :now WHERE id = :id"),
