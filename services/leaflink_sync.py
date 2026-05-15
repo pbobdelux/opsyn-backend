@@ -51,7 +51,7 @@ AsyncSessionLocal = _LazySessionLocal()
 
 from models import Order, OrderLine
 from models.sync_health import DeadLetterLineItem, SyncHealth
-from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value, sanitize_sql_params as _recursive_sanitize_sql_params, validate_and_fix_sql_params as _validate_and_fix_sql_params
+from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value, sanitize_sql_params as _recursive_sanitize_sql_params, validate_and_fix_sql_params as _validate_and_fix_sql_params, validate_final_sql_params
 
 if TYPE_CHECKING:
     from services.background_sync_manager import BackgroundSyncManager
@@ -910,14 +910,24 @@ async def safe_execute(
     # Log SQL bind mapping ($N → param key) for debugging asyncpg binding errors
     _log_sql_bind_mapping(sql_text, safe_params, label)
 
-    # Hard assertion: no datetime/date objects anywhere in params (including nested in JSONB)
-    assert_no_datetime_anywhere(safe_params, label)
+    # Field-aware final validation: allow native datetime objects in SQL TIMESTAMP columns,
+    # reject datetimes only inside JSON/JSONB fields.
+    # This replaces the legacy assert_no_datetime_anywhere() blanket rejector which was
+    # incorrectly blocking valid datetime objects bound to TIMESTAMP columns.
+    safe_params = validate_final_sql_params(safe_params)
 
     # Log final check before execute
     logger.info(
         "[SAFE_EXECUTE_FINAL_CHECK] label=%s param_keys=%s all_json_safe=true",
         label,
         list(safe_params.keys())
+    )
+
+    # Log execution boundary before every db.execute() call
+    logger.info(
+        "[FINAL_EXECUTION_BOUNDARY] label=%s param_count=%d",
+        label,
+        len(safe_params) if isinstance(safe_params, dict) else 0,
     )
 
     # CRITICAL: ALWAYS execute using safe_params, NEVER reference original params again
@@ -4452,8 +4462,11 @@ RETURNING (xmax = 0) AS was_inserted
                                       _sf,
                                       _sv.isoformat(),
                                   )
-                          # Pre-bind validator: final scan of the EXACT object being passed to execute()
-                          safe_params = _validate_and_fix_sql_params(safe_params)
+                          # Pre-bind validator: field-aware final scan of the EXACT object being passed to execute()
+                          # Uses validate_final_sql_params() which ALLOWS native datetime objects in
+                          # SQL TIMESTAMP columns (created_at, updated_at, etc.) and only rejects
+                          # datetimes inside JSON/JSONB fields.
+                          safe_params = validate_final_sql_params(safe_params)
 
                           # [FINAL_EXECUTE_PARAMS] Deep recursive datetime audit
                           def _audit_params_for_naive_datetimes(params: Any, path: str = "params", depth: int = 0) -> None:

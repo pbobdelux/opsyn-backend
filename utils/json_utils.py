@@ -186,43 +186,214 @@ def sanitize_sql_params(params: Any) -> Any:
     return _sanitize_sql_params_recursive(params, path="params")
 
 
-def validate_and_fix_sql_params(params: Any) -> Any:
-    """Final pre-bind validator — scans the EXACT params object passed to execute() and fixes
-    any remaining naive datetimes in-place.
 
-    This is the LAST line of defense before asyncpg binding.  It is called
-    immediately before every ``db.execute(text(...), params)`` call so that
-    no mutation between the earlier sanitization passes and the actual bind
-    can slip a naive datetime through.
+# ---------------------------------------------------------------------------
+# Field-aware sets for validate_final_sql_params()
+# ---------------------------------------------------------------------------
 
-    Behaviour:
-    - Walks every value in *params* (dict, list, or tuple).
-    - For any ``datetime`` with ``tzinfo is None``:
-        * Logs ``[SQL_PARAM_PREBIND_NAIVE_DATETIME]`` at ERROR level.
-        * Replaces the value with ``value.replace(tzinfo=timezone.utc)``.
-    - For any plain ``date`` (not datetime):
-        * Logs ``[SQL_PARAM_PREBIND_DATE_COERCED]`` at WARNING level.
-        * Converts to UTC midnight datetime.
-    - For any ``datetime`` that is already UTC-aware, normalises to UTC via
-      ``astimezone(timezone.utc)`` (no-op if already UTC).
-    - Never raises exceptions — all errors are caught and logged.
-    - Returns the (possibly modified) params object.
+# SQL TIMESTAMP columns — native datetime objects are REQUIRED here.
+# asyncpg binds these directly to PostgreSQL TIMESTAMP/TIMESTAMPTZ columns.
+ALLOWED_DATETIME_SQL_FIELDS: frozenset = frozenset({
+    "created_at",
+    "updated_at",
+    "external_created_at",
+    "external_updated_at",
+    "synced_at",
+    "last_synced_at",
+    "last_attempted_sync_at",
+    "last_successful_sync_at",
+    "last_error_at",
+    "now",
+    "estimated_completion",
+})
+
+# JSON/JSONB columns — datetimes MUST be ISO strings here, never native objects.
+JSON_FIELD_PATTERNS: frozenset = frozenset({
+    "raw_payload",
+    "line_items_json",
+    "metadata",
+    "payload",
+    "response_json",
+    "review_status",
+    "sync_health_missing_fields",
+    "sync_health_status",
+    "payload_keys",
+    "category_breakdown",
+})
+
+
+def validate_final_sql_params(params: Any) -> Any:
+    """Field-aware final pre-bind validator for SQL parameters.
+
+    Replaces the legacy ``validate_and_fix_sql_params()`` blanket rejector.
+    Runs on the EXACT params dict passed to ``db.execute()`` and applies
+    field-aware rules:
+
+    - **TIMESTAMP columns** (``ALLOWED_DATETIME_SQL_FIELDS``): native
+      ``datetime`` objects are *required* — they are left as UTC-aware
+      datetimes and logged with ``[FINAL_SQL_PARAM_OK]``.
+    - **JSON/JSONB columns** (``JSON_FIELD_PATTERNS`` or ``*_json`` /
+      ``*_payload`` suffixes): any ``datetime`` found inside these fields is
+      converted to an ISO UTC string and logged with
+      ``[FINAL_JSON_PAYLOAD_OK]``.
+    - **All other fields**: naive datetimes are forced to UTC-aware and logged
+      with ``[SQL_PARAM_PREBIND_NAIVE_DATETIME]`` at ERROR level; aware
+      datetimes are normalised to UTC silently.
+
+    Never raises exceptions — all errors are caught and logged.
 
     Args:
         params: The SQL parameters dict (or list/tuple) about to be passed to
-                ``db.execute()``.  Modified in-place when *params* is a dict.
+                ``db.execute()``.
 
     Returns:
         The sanitized params object (same type as input).
     """
+    if not isinstance(params, dict):
+        # For non-dict params fall back to the legacy recursive fixer
+        try:
+            return _validate_and_fix_recursive(params, path="params")
+        except Exception as exc:  # pragma: no cover
+            logger.error(
+                "[SQL_PARAM_PREBIND_ERROR] unexpected error during pre-bind validation: %s",
+                str(exc)[:300],
+            )
+            return params
+
     try:
-        return _validate_and_fix_recursive(params, path="params")
+        for field, value in list(params.items()):
+            if value is None:
+                continue
+
+            # ----------------------------------------------------------------
+            # TIMESTAMP columns: datetime objects are REQUIRED — allow them.
+            # ----------------------------------------------------------------
+            if field in ALLOWED_DATETIME_SQL_FIELDS:
+                if isinstance(value, datetime):
+                    # Ensure UTC-aware (fix naive silently)
+                    if value.tzinfo is None:
+                        params[field] = value.replace(tzinfo=timezone.utc)
+                    else:
+                        params[field] = value.astimezone(timezone.utc)
+                    logger.info(
+                        "[FINAL_SQL_PARAM_OK] field=%s type=%s tzinfo=%s",
+                        field,
+                        type(params[field]).__name__,
+                        params[field].tzinfo,
+                    )
+                elif isinstance(value, date):
+                    # Plain date -> UTC midnight datetime
+                    params[field] = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+                    logger.info(
+                        "[FINAL_SQL_PARAM_OK] field=%s type=date->datetime tzinfo=UTC",
+                        field,
+                    )
+                continue
+
+            # ----------------------------------------------------------------
+            # JSON/JSONB columns: datetimes MUST be ISO strings — sanitize.
+            # ----------------------------------------------------------------
+            is_json_field = (
+                field in JSON_FIELD_PATTERNS
+                or field.endswith("_json")
+                or field.endswith("_payload")
+                or field.endswith("_status")
+                or field.endswith("_fields")
+            )
+            if is_json_field:
+                if isinstance(value, (dict, list, tuple, datetime, date)):
+                    params[field] = _make_json_safe_for_bind(value)
+                    logger.info(
+                        "[FINAL_JSON_PAYLOAD_OK] field=%s datetime_count=0",
+                        field,
+                    )
+                continue
+
+            # ----------------------------------------------------------------
+            # All other fields: fix any stray datetimes.
+            # ----------------------------------------------------------------
+            if isinstance(value, datetime):
+                if value.tzinfo is None:
+                    fixed = value.replace(tzinfo=timezone.utc)
+                    logger.error(
+                        "[SQL_PARAM_PREBIND_NAIVE_DATETIME] path=params.%s value=%s — forcing UTC-aware",
+                        field,
+                        value.isoformat(),
+                    )
+                    params[field] = fixed
+                else:
+                    params[field] = value.astimezone(timezone.utc)
+            elif isinstance(value, date):
+                fixed = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+                logger.warning(
+                    "[SQL_PARAM_PREBIND_DATE_COERCED] path=params.%s value=%s — converted to UTC midnight datetime",
+                    field,
+                    value.isoformat(),
+                )
+                params[field] = fixed
+
+        return params
+
     except Exception as exc:  # pragma: no cover
         logger.error(
             "[SQL_PARAM_PREBIND_ERROR] unexpected error during pre-bind validation: %s",
             str(exc)[:300],
         )
         return params
+
+
+def _make_json_safe_for_bind(value: Any, _depth: int = 0) -> Any:
+    """Recursively convert datetime/date objects to ISO strings for JSON/JSONB binding.
+
+    Lightweight version of make_json_safe() used only inside validate_final_sql_params()
+    to sanitize JSON field values without touching TIMESTAMP column values.
+    """
+    MAX_DEPTH = 20
+    if _depth > MAX_DEPTH:
+        return "[max_depth_exceeded]"
+
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+
+    if isinstance(value, date):
+        return value.isoformat()
+
+    if isinstance(value, Decimal):
+        return float(value)
+
+    if isinstance(value, UUID):
+        return str(value)
+
+    if isinstance(value, dict):
+        return {k: _make_json_safe_for_bind(v, _depth + 1) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple)):
+        return [_make_json_safe_for_bind(item, _depth + 1) for item in value]
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    return str(value)[:500]
+
+
+def validate_and_fix_sql_params(params: Any) -> Any:
+    """Deprecated alias for validate_final_sql_params().
+
+    .. deprecated::
+        Use ``validate_final_sql_params()`` instead.  This alias is kept for
+        backward compatibility only and will be removed in a future release.
+        The new function is field-aware and does NOT reject native datetime
+        objects in SQL TIMESTAMP columns.
+    """
+    logger.debug(
+        "[VALIDATE_AND_FIX_SQL_PARAMS_DEPRECATED] use validate_final_sql_params() instead"
+    )
+    return validate_final_sql_params(params)
 
 
 def _validate_and_fix_recursive(value: Any, path: str = "params") -> Any:
