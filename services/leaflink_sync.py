@@ -51,6 +51,7 @@ AsyncSessionLocal = _LazySessionLocal()
 from models import Order, OrderLine
 from models.sync_health import DeadLetterLineItem, SyncHealth
 from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value, sanitize_sql_params as _recursive_sanitize_sql_params, validate_and_fix_sql_params as _validate_and_fix_sql_params, _sanitize_params_for_sql_execution as _sanitize_params_for_sql_execution
+from utils.sanitizers import deep_convert_all_datetimes, assert_no_datetime_anywhere, log_sanitization
 
 if TYPE_CHECKING:
     from services.background_sync_manager import BackgroundSyncManager
@@ -533,22 +534,14 @@ async def _update_sync_health_phase1(
     """Record that Phase 1 started/completed for this brand."""
     try:
         async with AsyncSessionLocal() as db:
-            _phase1_params = sanitize_sql_params(
-                {"brand_id": brand_id, "now": ensure_utc(utc_now(), "now"), "count": (orders_count or 0)},
-                statement="_update_sync_health_phase1",
-            )
-            _phase1_params = normalize_uuid_fields(_phase1_params)
-            _phase1_params = normalize_datetime_fields(_phase1_params)
+            _phase1_params = {
+                "brand_id": brand_id,
+                "now": ensure_utc(utc_now(), "now"),
+                "count": (orders_count or 0),
+            }
             _phase1_params = apply_uuid_str_to_params(_phase1_params)
-            # Final recursive sanitization — belt-and-suspenders guard
-            _phase1_params = _recursive_sanitize_sql_params(_phase1_params)
-            # Final guard: scan params for raw naive datetimes before execute
-            for _param_key, _param_val in _phase1_params.items():
-                if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
-                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
-                    _phase1_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _phase1_params = _validate_and_fix_sql_params(_phase1_params)
+            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
+            _phase1_params = _sanitize_params_for_sql_execution(_phase1_params, "_update_sync_health_phase1")
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_attempted_sync_at, total_orders_synced, consecutive_failures, total_line_items_synced, orders_fetched_last_run, updated_at)
@@ -583,23 +576,14 @@ async def _update_sync_health_phase2(
     """Record that Phase 2 completed successfully for this brand."""
     try:
         async with AsyncSessionLocal() as db:
-            _phase2_params = sanitize_sql_params(
-                {"brand_id": brand_id, "now": ensure_utc(utc_now(), "now"), "count": line_items_count},
-                statement="_update_sync_health_phase2",
-            )
-            _phase2_params = normalize_uuid_fields(_phase2_params)
-            _phase2_params = normalize_datetime_fields(_phase2_params)
-
+            _phase2_params = {
+                "brand_id": brand_id,
+                "now": ensure_utc(utc_now(), "now"),
+                "count": line_items_count,
+            }
             _phase2_params = apply_uuid_str_to_params(_phase2_params)
-            # Final recursive sanitization — belt-and-suspenders guard
-            _phase2_params = _recursive_sanitize_sql_params(_phase2_params)
-            # Final guard: scan params for raw naive datetimes before execute
-            for _param_key, _param_val in _phase2_params.items():
-                if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
-                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
-                    _phase2_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _phase2_params = _validate_and_fix_sql_params(_phase2_params)
+            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
+            _phase2_params = _sanitize_params_for_sql_execution(_phase2_params, "_update_sync_health_phase2")
             await db.execute(
                 text("""
                     UPDATE sync_health SET
@@ -633,22 +617,14 @@ async def _record_sync_error(brand_id: str, error: Exception) -> None:
     """Increment consecutive_failures and record the last error message."""
     try:
         async with AsyncSessionLocal() as db:
-            _sync_error_params = sanitize_sql_params(
-                {"brand_id": brand_id, "error": str(error)[:500], "now": ensure_utc(utc_now(), "now")},
-                statement="_record_sync_error",
-            )
-            _sync_error_params = normalize_uuid_fields(_sync_error_params)
-            _sync_error_params = normalize_datetime_fields(_sync_error_params)
+            _sync_error_params = {
+                "brand_id": brand_id,
+                "error": str(error)[:500],
+                "now": ensure_utc(utc_now(), "now"),
+            }
             _sync_error_params = apply_uuid_str_to_params(_sync_error_params)
-            # Final recursive sanitization — belt-and-suspenders guard
-            _sync_error_params = _recursive_sanitize_sql_params(_sync_error_params)
-            # Final guard: scan params for raw naive datetimes before execute
-            for _param_key, _param_val in _sync_error_params.items():
-                if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
-                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
-                    _sync_error_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _sync_error_params = _validate_and_fix_sql_params(_sync_error_params)
+            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
+            _sync_error_params = _sanitize_params_for_sql_execution(_sync_error_params, "_record_sync_error")
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, last_error_at, updated_at)
@@ -676,23 +652,14 @@ async def _record_retryable_error(brand_id: str, error_msg: str) -> None:
     """Record a retryable (transient) sync error in sync_health without incrementing consecutive_failures."""
     try:
         async with AsyncSessionLocal() as db:
-            _retryable_params = sanitize_sql_params(
-                {"brand_id": brand_id, "error": error_msg[:500], "now": ensure_utc(utc_now(), "now")},
-                statement="_record_retryable_error",
-            )
-            _retryable_params = normalize_uuid_fields(_retryable_params)
-            _retryable_params = normalize_datetime_fields(_retryable_params)
+            _retryable_params = {
+                "brand_id": brand_id,
+                "error": error_msg[:500],
+                "now": ensure_utc(utc_now(), "now"),
+            }
             _retryable_params = apply_uuid_str_to_params(_retryable_params)
-
-            # Final recursive sanitization — belt-and-suspenders guard
-            _retryable_params = _recursive_sanitize_sql_params(_retryable_params)
-            # Final guard: scan params for raw naive datetimes before execute
-            for _param_key, _param_val in _retryable_params.items():
-                if isinstance(_param_val, datetime) and _param_val.tzinfo is None:
-                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
-                    _retryable_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _retryable_params = _validate_and_fix_sql_params(_retryable_params)
+            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
+            _retryable_params = _sanitize_params_for_sql_execution(_retryable_params, "_record_retryable_error")
             await db.execute(
                 text("""
                     INSERT INTO sync_health (brand_id, last_error, consecutive_failures, updated_at)
@@ -730,7 +697,7 @@ async def _dead_letter_line_item(
                 if raw_payload is not None
                 else None
             )
-            _dead_letter_params_raw = {
+            _dead_letter_params = {
                 "brand_id": brand_id,
                 "external_order_id": external_order_id,
                 "order_id": order_id,
@@ -741,25 +708,8 @@ async def _dead_letter_line_item(
                 "count": failure_count,
                 "now": ensure_utc(utc_now(), "now"),
             }
-            # Pre-sanitize: convert all datetime/date objects to ISO8601 strings before validation
-            _dead_letter_params_raw = _sanitize_datetime_params(_dead_letter_params_raw, "dead_letter_write")
-            _dead_letter_params = sanitize_sql_params(_dead_letter_params_raw, statement="_dead_letter_line_item")
-
-            _dead_letter_params = normalize_uuid_fields(_dead_letter_params)
-            _dead_letter_params = normalize_datetime_fields(_dead_letter_params)
             _dead_letter_params = apply_uuid_str_to_params(_dead_letter_params)
-            # Final guard: scan params for raw naive datetimes before execute
-            for _param_key, _param_val in list(_dead_letter_params.items()):
-                if isinstance(_param_val, datetime):
-                    if _param_val.tzinfo is None:
-                        logger.error("[RAW_DATETIME_DETECTED] field=%s value=%s", _param_key, _param_val.isoformat())
-                        _dead_letter_params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-                    else:
-                        _dead_letter_params[_param_key] = _param_val.astimezone(timezone.utc)
-            _dead_letter_params = _recursive_sanitize_sql_params(_dead_letter_params)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            _dead_letter_params = _validate_and_fix_sql_params(_dead_letter_params)
-            # FINAL SQL EXECUTION BOUNDARY: deep-copy and convert all datetime/date to ISO strings
+            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
             _dead_letter_params = _sanitize_params_for_sql_execution(_dead_letter_params, "dead_letter_write")
             await db.execute(
                 text("""
@@ -867,7 +817,7 @@ async def _write_sync_dead_letter(
             )
             now = ensure_utc(utc_now(), "now")
             # Build params dict and sanitize — centralized sanitizer handles all type coercions
-            params = sanitize_sql_params({
+            params = {
                 "source": source,
                 "brand_id": safe_uuid_for_db(brand_id, "brand_id") or brand_id,
                 "org_id": safe_uuid_for_db(org_id, "org_id"),
@@ -886,34 +836,10 @@ async def _write_sync_dead_letter(
                 "problematic_field": problematic_field,
                 "problematic_value_preview": (problematic_value_preview or "")[:100] if problematic_value_preview else None,
                 "now": now,
-            }, statement="_write_sync_dead_letter")
-            # FINAL coercion — apply safe_uuid_for_db() directly into the params
-            # dict immediately before execute() so no mutation after coercion can
-            # slip through.
-            params["org_id"] = safe_uuid_for_db(params.get("org_id"), "org_id")
-            params["brand_id"] = safe_uuid_for_db(params.get("brand_id"), "brand_id") or params.get("brand_id")
-            logger.debug(
-                "[DEAD_LETTER_FINAL_TYPES] org_id=%s org_type=%s brand_id=%s brand_type=%s",
-                params.get("org_id"),
-                type(params.get("org_id")),
-                params.get("brand_id"),
-                type(params.get("brand_id")),
-            )
-            params = normalize_uuid_fields(params)
-            params = normalize_datetime_fields(params)
+            }
             params = apply_uuid_str_to_params(params)
-            # Final guard: scan params for raw naive datetimes before execute
-            for _param_key, _param_val in list(params.items()):
-                if isinstance(_param_val, datetime):
-                    if _param_val.tzinfo is None:
-                        logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _param_key, _param_val.isoformat())
-                        params[_param_key] = _param_val.replace(tzinfo=timezone.utc)
-                    else:
-                        params[_param_key] = _param_val.astimezone(timezone.utc)
-            # Try to write with new detail columns; fall back to legacy schema if columns don't exist yet
-            params = _recursive_sanitize_sql_params(params)
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            params = _validate_and_fix_sql_params(params)
+            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
+            params = _sanitize_params_for_sql_execution(params, "_write_sync_dead_letter")
             try:
                 await db.execute(
                     text("""
@@ -2086,94 +2012,10 @@ async def _insert_line_items_standalone(
                 isinstance(insert_params.get("mapped_product_id"), UUID),
             )
 
-            # Pre-sanitize: convert all datetime/date objects to ISO8601 strings before validation
-            insert_params = _sanitize_datetime_params(insert_params, "order_lines_insert")
-            # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
-            insert_params = sanitize_sql_params(insert_params, statement="_insert_line_items_standalone")
-            insert_params = normalize_uuid_fields(insert_params)
-            insert_params = normalize_datetime_fields(insert_params)
-            # Belt-and-suspenders: explicitly ensure created_at/updated_at are UTC-aware
-            # immediately before execute() so no intermediate mutation can introduce a naive datetime.
-            if "created_at" in insert_params:
-                insert_params["created_at"] = ensure_utc(insert_params["created_at"], "created_at") or utc_now()
-            if "updated_at" in insert_params:
-                insert_params["updated_at"] = ensure_utc(insert_params["updated_at"], "updated_at") or utc_now()
-
-            # Fail-fast assertions before execute
-            if "created_at" in insert_params:
-                _ca = insert_params["created_at"]
-                assert isinstance(_ca, datetime) and _ca.tzinfo is not None and _ca.tzinfo.utcoffset(_ca) is not None, (
-                    f"[FAIL_FAST] created_at is naive or not a datetime: {_ca!r}"
-                )
-            if "updated_at" in insert_params:
-                _ua = insert_params["updated_at"]
-                assert isinstance(_ua, datetime) and _ua.tzinfo is not None and _ua.tzinfo.utcoffset(_ua) is not None, (
-                    f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
-                )
-
-            # Log every parameter in final order with position (DEBUG only — high volume)
-            for idx, (k, v) in enumerate(insert_params.items(), start=1):
-                logger.debug(
-                    "[ORDER_LINES_PARAM_POSITION] idx=%s key=%s type=%s value=%r tzinfo=%s aware=%s",
-                    idx,
-                    k,
-                    type(v).__name__,
-                    v if not isinstance(v, (dict, list)) else f"<{type(v).__name__} len={len(v)}>",
-                    getattr(v, "tzinfo", None) if isinstance(v, datetime) else "N/A",
-                    bool(getattr(v, "tzinfo", None) and getattr(v, "tzinfo", None).utcoffset(v))
-                    if isinstance(v, datetime) else None,
-                )
-
-            # Apply final hard sanitization
-            insert_params = final_sanitize_order_lines_params(insert_params)
-
             # Final barrier: ensure all UUID objects are strings before asyncpg execute()
             insert_params = apply_uuid_str_to_params(insert_params)
 
-            # [DATETIME_NORMALIZED] — log exact UTC-aware values being bound to TIMESTAMPTZ columns
-            for _dt_field in ("created_at", "updated_at"):
-                if _dt_field in insert_params:
-                    _dt_val = insert_params[_dt_field]
-                    logger.debug(
-                        "[DATETIME_NORMALIZED] function=_insert_line_items_standalone field=%s"
-                        " source_type=%s tzinfo=%s value=%s",
-                        _dt_field,
-                        type(_dt_val).__name__,
-                        getattr(_dt_val, "tzinfo", None),
-                        _dt_val.isoformat() if isinstance(_dt_val, datetime) else _dt_val,
-                    )
-
-            # Log the final bind values
-            logger.debug(
-                "[ORDER_LINES_FINAL_DATETIME_BIND] created_at=%s type=%s tzinfo=%s updated_at=%s type=%s tzinfo=%s column_type=TIMESTAMPTZ",
-                insert_params.get("created_at"),
-                type(insert_params.get("created_at")).__name__,
-                getattr(insert_params.get("created_at"), "tzinfo", None) if isinstance(insert_params.get("created_at"), datetime) else "N/A",
-                insert_params.get("updated_at"),
-                type(insert_params.get("updated_at")).__name__,
-                getattr(insert_params.get("updated_at"), "tzinfo", None) if isinstance(insert_params.get("updated_at"), datetime) else "N/A",
-            )
-            # FINAL recursive sanitization — catches any datetime objects in nested structures
-            insert_params = _recursive_sanitize_sql_params(insert_params)
-            # Final defensive scan: log any remaining naive datetimes
-            for _sf, _sv in insert_params.items():
-                if isinstance(_sv, datetime) and _sv.tzinfo is None:
-                    logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
-            # Pre-bind validator: final scan of the EXACT object being passed to execute()
-            insert_params = _validate_and_fix_sql_params(insert_params)
-
-            # [DATETIME_VALIDATION_FAILED] guard — assert no naive datetimes reach asyncpg
-            for _vf, _vv in insert_params.items():
-                if isinstance(_vv, datetime) and (_vv.tzinfo is None or _vv.tzinfo.utcoffset(_vv) is None):
-                    logger.error(
-                        "[DATETIME_VALIDATION_FAILED] function=_insert_line_items_standalone field=%s value=%s",
-                        _vf, _vv,
-                    )
-                    raise AssertionError(
-                        f"[DATETIME_VALIDATION_FAILED] naive datetime in field={_vf} value={_vv!r}"
-                    )
-
-            # FINAL SQL EXECUTION BOUNDARY: deep-copy and convert all datetime/date to ISO strings
+            # Absolute final SQL boundary — convert ALL datetimes to ISO strings
             insert_params = _sanitize_params_for_sql_execution(insert_params, "order_lines_insert")
             await db.execute(text(line_insert_stmt), insert_params)
 
@@ -2678,95 +2520,10 @@ async def sync_leaflink_orders(
                     if _li_enabled.get("total_price_cents", False):
                         _li_params["total_price_cents"] = item.get("total_price_cents")
 
-                    # Pre-sanitize: convert all datetime/date objects to ISO8601 strings before validation
-                    _li_params = _sanitize_datetime_params(_li_params, "line_item_upsert")
-                    # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
-                    _li_params = sanitize_sql_params(_li_params, statement="sync_leaflink_orders_line_items")
-                    _li_params = normalize_uuid_fields(_li_params)
-                    _li_params = normalize_datetime_fields(_li_params)
-                    # Belt-and-suspenders: explicitly ensure created_at/updated_at are UTC-aware
-                    # immediately before execute() so no intermediate mutation can introduce a naive datetime.
-                    if "created_at" in _li_params:
-                        _li_params["created_at"] = ensure_utc(_li_params["created_at"], "created_at") or utc_now()
-                    if "updated_at" in _li_params:
-                        _li_params["updated_at"] = ensure_utc(_li_params["updated_at"], "updated_at") or utc_now()
-
-                    # Fail-fast assertions before execute
-                    if "created_at" in _li_params:
-                        _ca = _li_params["created_at"]
-                        assert isinstance(_ca, datetime) and _ca.tzinfo is not None and _ca.tzinfo.utcoffset(_ca) is not None, (
-                            f"[FAIL_FAST] created_at is naive or not a datetime: {_ca!r}"
-                        )
-                    if "updated_at" in _li_params:
-                        _ua = _li_params["updated_at"]
-                        assert isinstance(_ua, datetime) and _ua.tzinfo is not None and _ua.tzinfo.utcoffset(_ua) is not None, (
-                            f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
-                        )
-
-                    # Log every parameter in final order with position (DEBUG only — high volume)
-                    for idx, (k, v) in enumerate(_li_params.items(), start=1):
-                        logger.debug(
-                            "[ORDER_LINES_PARAM_POSITION] idx=%s key=%s type=%s value=%r tzinfo=%s aware=%s",
-                            idx,
-                            k,
-                            type(v).__name__,
-                            v if not isinstance(v, (dict, list)) else f"<{type(v).__name__} len={len(v)}>",
-                            getattr(v, "tzinfo", None) if isinstance(v, datetime) else "N/A",
-                            bool(getattr(v, "tzinfo", None) and getattr(v, "tzinfo", None).utcoffset(v))
-                            if isinstance(v, datetime) else None,
-                        )
-
-                    # Apply final hard sanitization
-                    _li_params = final_sanitize_order_lines_params(_li_params)
-
                     # Final barrier: ensure all UUID objects are strings before asyncpg execute()
                     _li_params = apply_uuid_str_to_params(_li_params)
 
-                    # [DATETIME_NORMALIZED] — log exact UTC-aware values being bound to TIMESTAMPTZ columns
-                    # Reduced to DEBUG to avoid per-line-item log volume during large syncs
-                    for _dt_field in ("created_at", "updated_at"):
-                        if _dt_field in _li_params:
-                            _dt_val = _li_params[_dt_field]
-                            logger.debug(
-                                "[DATETIME_NORMALIZED] function=sync_leaflink_orders field=%s"
-                                " source_type=%s tzinfo=%s value=%s",
-                                _dt_field,
-                                type(_dt_val).__name__,
-                                getattr(_dt_val, "tzinfo", None),
-                                _dt_val.isoformat() if isinstance(_dt_val, datetime) else _dt_val,
-                            )
-
-                    # Log the final bind values
-                    logger.debug(
-                        "[ORDER_LINES_FINAL_DATETIME_BIND] created_at=%s type=%s tzinfo=%s updated_at=%s type=%s tzinfo=%s column_type=TIMESTAMPTZ",
-                        _li_params.get("created_at"),
-                        type(_li_params.get("created_at")).__name__,
-                        getattr(_li_params.get("created_at"), "tzinfo", None) if isinstance(_li_params.get("created_at"), datetime) else "N/A",
-                        _li_params.get("updated_at"),
-                        type(_li_params.get("updated_at")).__name__,
-                        getattr(_li_params.get("updated_at"), "tzinfo", None) if isinstance(_li_params.get("updated_at"), datetime) else "N/A",
-                    )
-                    # FINAL recursive sanitization — catches any datetime objects in nested structures
-                    _li_params = _recursive_sanitize_sql_params(_li_params)
-                    # Final defensive scan: log any remaining naive datetimes
-                    for _sf, _sv in _li_params.items():
-                        if isinstance(_sv, datetime) and _sv.tzinfo is None:
-                            logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
-                    # Pre-bind validator: final scan of the EXACT object being passed to execute()
-                    _li_params = _validate_and_fix_sql_params(_li_params)
-
-                    # [DATETIME_VALIDATION_FAILED] guard — assert no naive datetimes reach asyncpg
-                    for _vf, _vv in _li_params.items():
-                        if isinstance(_vv, datetime) and (_vv.tzinfo is None or _vv.tzinfo.utcoffset(_vv) is None):
-                            logger.error(
-                                "[DATETIME_VALIDATION_FAILED] function=sync_leaflink_orders field=%s value=%s",
-                                _vf, _vv,
-                            )
-                            raise AssertionError(
-                                f"[DATETIME_VALIDATION_FAILED] naive datetime in field={_vf} value={_vv!r}"
-                            )
-
-                    # FINAL SQL EXECUTION BOUNDARY: deep-copy and convert all datetime/date to ISO strings
+                    # Absolute final SQL boundary — convert ALL datetimes to ISO strings
                     _li_params = _sanitize_params_for_sql_execution(_li_params, "line_item_upsert")
                     await db.execute(text(_li_insert_stmt), _li_params)
 
@@ -3496,186 +3253,9 @@ RETURNING (xmax = 0) AS was_inserted
                                       )
                                       upsert_params[_field] = _value.replace(tzinfo=timezone.utc)
 
-                          # FINAL recursive sanitization — belt-and-suspenders guard that
-                          # recursively walks all nested structures (dicts, lists, tuples)
-                          # and converts every datetime/date to UTC-aware.  This catches
-                          # any datetime objects that slipped through earlier normalization
-                          # stages or were created/modified after them.
-                          safe_params = _recursive_sanitize_sql_params(upsert_params)
-                          # Final defensive scan: log any remaining naive datetimes
-                          for _sf, _sv in safe_params.items():
-                              if isinstance(_sv, datetime) and _sv.tzinfo is None:
-                                  logger.error(
-                                      "[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s",
-                                      _sf,
-                                      _sv.isoformat(),
-                                  )
-                          # Pre-bind validator: final scan of the EXACT object being passed to execute()
-                          safe_params = _validate_and_fix_sql_params(safe_params)
-
-                          # ---------------------------------------------------------------
-                          # TARGETED FIX: explicitly re-normalize synced_at ($18) and all
-                          # other datetime fields using ensure_utc_datetime() AFTER all
-                          # sanitization passes.  This catches any naive datetime that was
-                          # introduced or reconstructed after the earlier normalization
-                          # pipeline (e.g. by _recursive_sanitize_sql_params converting an
-                          # ISO string back to a naive datetime, or a default value applied
-                          # without normalization).
-                          # ---------------------------------------------------------------
-                          _all_dt_fields = [
-                              "synced_at", "last_synced_at", "created_at", "updated_at",
-                              "external_created_at", "external_updated_at",
-                          ]
-                          for _fix_field in _all_dt_fields:
-                              _fix_val = safe_params.get(_fix_field)
-                              if _fix_val is None:
-                                  continue
-                              if isinstance(_fix_val, datetime):
-                                  if _fix_val.tzinfo is None:
-                                      _fixed = _fix_val.replace(tzinfo=timezone.utc)
-                                      logger.info(
-                                          "[DATETIME_FIELD_FIXED] context=order_header_upsert"
-                                          " field=%s original=%s tzinfo=None"
-                                          " fixed=%s action=replace_tzinfo_utc",
-                                          _fix_field,
-                                          _fix_val.isoformat(),
-                                          _fixed.isoformat(),
-                                      )
-                                      safe_params[_fix_field] = _fixed
-                                  else:
-                                      # Already aware — normalize to UTC
-                                      _fixed = _fix_val.astimezone(timezone.utc)
-                                      safe_params[_fix_field] = _fixed
-                              elif isinstance(_fix_val, str):
-                                  # String that slipped through — attempt to parse as UTC datetime
-                                  try:
-                                      _parsed = ensure_utc_datetime(_fix_val)
-                                      if _parsed is not None:
-                                          logger.info(
-                                              "[DATETIME_FIELD_FIXED] context=order_header_upsert"
-                                              " field=%s original_type=str value=%s"
-                                              " fixed=%s action=parsed_iso_string",
-                                              _fix_field,
-                                              _fix_val[:50],
-                                              _parsed.isoformat(),
-                                          )
-                                          safe_params[_fix_field] = _parsed
-                                  except (ValueError, TypeError):
-                                      pass
-
-                          # [FINAL_EXECUTE_PARAMS] Deep recursive datetime audit
-                          # Only logs errors (naive datetimes) — [DATETIME_OK] reduced to DEBUG
-                          # to avoid per-field/per-order log volume during large syncs.
-                          def _audit_params_for_naive_datetimes(params: Any, path: str = "params", depth: int = 0) -> None:
-                              """Recursively audit params for naive datetimes and log findings."""
-                              if depth > 20:
-                                  return
-
-                              if isinstance(params, dict):
-                                  for k, v in params.items():
-                                      _audit_params_for_naive_datetimes(v, path=f"{path}.{k}", depth=depth+1)
-                              elif isinstance(params, (list, tuple)):
-                                  for i, item in enumerate(params):
-                                      _audit_params_for_naive_datetimes(item, path=f"{path}[{i}]", depth=depth+1)
-                              elif isinstance(params, datetime):
-                                  if params.tzinfo is None:
-                                      logger.error(
-                                          "[NAIVE_DATETIME_FOUND] path=%s type=%s repr=%s tzinfo=None",
-                                          path,
-                                          type(params).__name__,
-                                          repr(params)
-                                      )
-                                  else:
-                                      # Reduced to DEBUG — fires for every datetime field in every order
-                                      logger.debug(
-                                          "[DATETIME_OK] path=%s type=%s tzinfo=%s",
-                                          path,
-                                          type(params).__name__,
-                                          params.tzinfo
-                                      )
-
-                          # Call audit before execute
-                          _audit_params_for_naive_datetimes(safe_params)
-
-                          # Log the exact params object (DEBUG — fires for every order)
-                          logger.debug(
-                              "[FINAL_EXECUTE_PARAMS] order_header_upsert params_keys=%s params_count=%d",
-                              list(safe_params.keys()) if isinstance(safe_params, dict) else "not_dict",
-                              len(safe_params) if isinstance(safe_params, dict) else 0
-                          )
-
-                          # Hard-force conversion: if ANY datetime has tzinfo is None, fix it
-                          def _force_utc_all_datetimes(params: Any) -> Any:
-                              """Final hard-force conversion: ensure NO naive datetimes reach execute()."""
-                              if isinstance(params, dict):
-                                  for k, v in params.items():
-                                      if isinstance(v, datetime) and v.tzinfo is None:
-                                          logger.error(
-                                              "[NAIVE_DATETIME_FIXED] key=%s value=%s action=force_utc",
-                                              k,
-                                              v.isoformat()
-                                          )
-                                          params[k] = v.replace(tzinfo=timezone.utc)
-                                      elif isinstance(v, (dict, list, tuple)):
-                                          _force_utc_all_datetimes(v)
-                              elif isinstance(params, (list, tuple)):
-                                  for i, item in enumerate(params):
-                                      if isinstance(item, datetime) and item.tzinfo is None:
-                                          logger.error(
-                                              "[NAIVE_DATETIME_FIXED] index=%d value=%s action=force_utc",
-                                              i,
-                                              item.isoformat()
-                                          )
-                                          params[i] = item.replace(tzinfo=timezone.utc)
-                                      elif isinstance(item, (dict, list, tuple)):
-                                          _force_utc_all_datetimes(item)
-
-                          _force_utc_all_datetimes(safe_params)
-
-                          # Final validation before execute
-                          _audit_params_for_naive_datetimes(safe_params)
-
-                          # ---------------------------------------------------------------
-                          # SQL CAST MAP — confirm all datetime fields use TIMESTAMPTZ
-                          # Reduced to DEBUG — fires for every order; keep for diagnostics
-                          # ---------------------------------------------------------------
-                          logger.debug(
-                              "[SQL_CAST_MAP] synced_at=TIMESTAMPTZ last_synced_at=TIMESTAMPTZ"
-                              " created_at=TIMESTAMPTZ updated_at=TIMESTAMPTZ"
-                              " external_created_at=TIMESTAMPTZ external_updated_at=TIMESTAMPTZ"
-                          )
-
-                          # ---------------------------------------------------------------
-                          # COMPREHENSIVE PARAMETER TRACE — emit [SQL_PARAM_TRACE] for
-                          # every parameter so logs show the exact index/field/type/tzinfo
-                          # that maps to each asyncpg $N positional argument.
-                          # ---------------------------------------------------------------
-                          _trace_sql_params_for_datetimes(safe_params, "order_header_upsert")
-
-
-                          # ---------------------------------------------------------------
-                          # HARD-FAIL VALIDATION — raise RuntimeError before asyncpg runs
-                          # if ANY datetime param is still naive after all normalization.
-                          # This surfaces the exact field name instead of the cryptic
-                          # "can't subtract offset-naive and offset-aware datetimes at $N".
-                          # ---------------------------------------------------------------
-                          for _hf_idx, (_hf_field, _hf_value) in enumerate(safe_params.items()):
-                              if isinstance(_hf_value, datetime) and _hf_value.tzinfo is None:
-                                  logger.error(
-                                      "[FINAL_DATETIME_VALIDATION_FAILED] context=order_header_upsert"
-                                      " idx=%d field=%s value=%s tzinfo=None"
-                                      " — naive datetime reached execute(), raising RuntimeError",
-                                      _hf_idx,
-                                      _hf_field,
-                                      repr(_hf_value),
-                                  )
-                                  # Normalize in-place so the error is recoverable on retry,
-                                  # then raise so the caller sees the exact field name.
-                                  safe_params[_hf_field] = _hf_value.replace(tzinfo=timezone.utc)
-                                  raise RuntimeError(
-                                      f"[FINAL_DATETIME_VALIDATION_FAILED] field={_hf_field} idx={_hf_idx}"
-                                      f" value={_hf_value!r} tzinfo=None — naive datetime in order_header_upsert"
-                                  )
+                          # Absolute final SQL boundary — convert ALL datetimes to ISO strings,
+                          # assert none remain, then execute. This is the single canonical path.
+                          safe_params = _sanitize_params_for_sql_execution(upsert_params, "order_header_upsert")
 
                           upsert_result = await db.execute(text(upsert_stmt), safe_params)
 
@@ -4584,95 +4164,10 @@ async def sync_leaflink_line_items(
                     isinstance(insert_params.get("mapped_product_id"), str),
                     isinstance(insert_params.get("mapped_product_id"), UUID),
                 )
-                # Pre-sanitize: convert all datetime/date objects to ISO8601 strings before validation
-                insert_params = _sanitize_datetime_params(insert_params, "line_item_upsert")
-                # Centralized sanitizer: fix naive datetimes, date objects, UUID types, JSON payloads
-                insert_params = sanitize_sql_params(insert_params, statement="_upsert_line_items")
-                insert_params = normalize_uuid_fields(insert_params)
-                insert_params = normalize_datetime_fields(insert_params)
-                # Belt-and-suspenders: explicitly ensure created_at/updated_at are UTC-aware
-                # immediately before execute() so no intermediate mutation can introduce a naive datetime.
-                if "created_at" in insert_params:
-                    insert_params["created_at"] = ensure_utc(insert_params["created_at"], "created_at") or utc_now()
-                if "updated_at" in insert_params:
-                    insert_params["updated_at"] = ensure_utc(insert_params["updated_at"], "updated_at") or utc_now()
-
-                # Fail-fast assertions before execute
-                if "created_at" in insert_params:
-                    _ca = insert_params["created_at"]
-                    assert isinstance(_ca, datetime) and _ca.tzinfo is not None and _ca.tzinfo.utcoffset(_ca) is not None, (
-                        f"[FAIL_FAST] created_at is naive or not a datetime: {_ca!r}"
-                    )
-                if "updated_at" in insert_params:
-                    _ua = insert_params["updated_at"]
-                    assert isinstance(_ua, datetime) and _ua.tzinfo is not None and _ua.tzinfo.utcoffset(_ua) is not None, (
-                        f"[FAIL_FAST] updated_at is naive or not a datetime: {_ua!r}"
-                    )
-
-                # Log every parameter in final order with position (DEBUG only — high volume)
-                for idx, (k, v) in enumerate(insert_params.items(), start=1):
-                    logger.debug(
-                        "[ORDER_LINES_PARAM_POSITION] idx=%s key=%s type=%s value=%r tzinfo=%s aware=%s",
-                        idx,
-                        k,
-                        type(v).__name__,
-                        v if not isinstance(v, (dict, list)) else f"<{type(v).__name__} len={len(v)}>",
-                        getattr(v, "tzinfo", None) if isinstance(v, datetime) else "N/A",
-                        bool(getattr(v, "tzinfo", None) and getattr(v, "tzinfo", None).utcoffset(v))
-                        if isinstance(v, datetime) else None,
-                    )
-
-                # Apply final hard sanitization
-                insert_params = final_sanitize_order_lines_params(insert_params)
-
                 # Final barrier: ensure all UUID objects are strings before asyncpg execute()
                 insert_params = apply_uuid_str_to_params(insert_params)
 
-                # [DATETIME_NORMALIZED] — log exact UTC-aware values being bound to TIMESTAMPTZ columns
-                # Reduced to DEBUG to avoid per-line-item log volume during large syncs
-                for _dt_field in ("created_at", "updated_at"):
-                    if _dt_field in insert_params:
-                        _dt_val = insert_params[_dt_field]
-                        logger.debug(
-                            "[DATETIME_NORMALIZED] function=_upsert_line_items field=%s"
-                            " source_type=%s tzinfo=%s value=%s",
-                            _dt_field,
-                            type(_dt_val).__name__,
-                            getattr(_dt_val, "tzinfo", None),
-                            _dt_val.isoformat() if isinstance(_dt_val, datetime) else _dt_val,
-                        )
-
-                # Log the final bind values
-                logger.debug(
-                    "[ORDER_LINES_FINAL_DATETIME_BIND] created_at=%s type=%s tzinfo=%s updated_at=%s type=%s tzinfo=%s column_type=TIMESTAMPTZ",
-                    insert_params.get("created_at"),
-                    type(insert_params.get("created_at")).__name__,
-                    getattr(insert_params.get("created_at"), "tzinfo", None) if isinstance(insert_params.get("created_at"), datetime) else "N/A",
-                    insert_params.get("updated_at"),
-                    type(insert_params.get("updated_at")).__name__,
-                    getattr(insert_params.get("updated_at"), "tzinfo", None) if isinstance(insert_params.get("updated_at"), datetime) else "N/A",
-                )
-                # FINAL recursive sanitization — catches any datetime objects in nested structures
-                insert_params = _recursive_sanitize_sql_params(insert_params)
-                # Final defensive scan: log any remaining naive datetimes
-                for _sf, _sv in insert_params.items():
-                    if isinstance(_sv, datetime) and _sv.tzinfo is None:
-                        logger.error("[SQL_PARAM_DATETIME_REMAINING] field=%s value=%s", _sf, _sv.isoformat())
-                # Pre-bind validator: final scan of the EXACT object being passed to execute()
-                insert_params = _validate_and_fix_sql_params(insert_params)
-
-                # [DATETIME_VALIDATION_FAILED] guard — assert no naive datetimes reach asyncpg
-                for _vf, _vv in insert_params.items():
-                    if isinstance(_vv, datetime) and (_vv.tzinfo is None or _vv.tzinfo.utcoffset(_vv) is None):
-                        logger.error(
-                            "[DATETIME_VALIDATION_FAILED] function=_upsert_line_items field=%s value=%s",
-                            _vf, _vv,
-                        )
-                        raise AssertionError(
-                            f"[DATETIME_VALIDATION_FAILED] naive datetime in field={_vf} value={_vv!r}"
-                        )
-
-                # FINAL SQL EXECUTION BOUNDARY: deep-copy and convert all datetime/date to ISO strings
+                # Absolute final SQL boundary — convert ALL datetimes to ISO strings
                 insert_params = _sanitize_params_for_sql_execution(insert_params, "line_item_upsert")
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
@@ -6924,9 +6419,13 @@ async def sync_leaflink_background_continuous(
         if sync_run_id:
             try:
                 async with AsyncSessionLocal() as _final_db:
+                    _progress_params = _sanitize_params_for_sql_execution(
+                        {"now": datetime.now(timezone.utc), "id": sync_run_id},
+                        "sync_run_progress_update",
+                    )
                     await _final_db.execute(
                         text("UPDATE sync_runs SET last_progress_at = :now WHERE id = :id"),
-                        {"now": datetime.now(timezone.utc), "id": sync_run_id},
+                        _progress_params,
                     )
                     await _final_db.commit()
             except Exception:

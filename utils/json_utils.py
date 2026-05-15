@@ -4,6 +4,24 @@ from datetime import date, datetime, timezone
 from uuid import UUID
 from typing import Any, Optional
 
+from utils.sanitizers import (
+    deep_convert_all_datetimes,
+    assert_no_datetime_anywhere,
+    log_sanitization,
+)
+
+# Re-export so callers can import from either module
+__all__ = [
+    "make_json_safe",
+    "normalize_datetime",
+    "sanitize_sql_params",
+    "validate_and_fix_sql_params",
+    "_sanitize_params_for_sql_execution",
+    "deep_convert_all_datetimes",
+    "assert_no_datetime_anywhere",
+    "log_sanitization",
+]
+
 logger = logging.getLogger(__name__)
 
 
@@ -280,49 +298,27 @@ def _validate_and_fix_recursive(value: Any, path: str = "params") -> Any:
 
 def _sanitize_params_for_sql_execution(params: Any, label: str = "unknown") -> Any:
     """
-    FINAL SQL EXECUTION BOUNDARY: Deep-copy and recursively convert all datetime/date
-    values to ISO8601 strings immediately before db.execute().
+    FINAL SQL EXECUTION BOUNDARY: Recursively convert all datetime/date values
+    to ISO 8601 strings immediately before db.execute().
 
-    This is the LAST chance to sanitize params before they reach asyncpg.
+    Delegates to deep_convert_all_datetimes() — the single canonical converter —
+    then asserts no datetime objects remain and logs the sanitization event.
 
     Args:
         params: The params dict about to be passed to db.execute()
         label: Statement label for logging (e.g., "line_item_upsert")
 
     Returns:
-        A new params dict with all datetime/date values converted to ISO8601 strings.
+        A new params dict with all datetime/date values converted to ISO 8601 strings.
         The caller MUST use this returned dict for execution, not the original.
     """
-    import copy
-
-    # Deep-copy to avoid mutating the original
-    sanitized = copy.deepcopy(params)
-
-    def _convert_datetimes(obj: Any) -> Any:
-        if isinstance(obj, datetime):
-            if obj.tzinfo is None:
-                obj = obj.replace(tzinfo=timezone.utc)
-            return obj.astimezone(timezone.utc).isoformat()
-        if isinstance(obj, date):
-            return obj.isoformat()
-        if isinstance(obj, dict):
-            return {k: _convert_datetimes(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_convert_datetimes(item) for item in obj]
-        if isinstance(obj, tuple):
-            return [_convert_datetimes(item) for item in obj]
-        return obj
-
-    sanitized = _convert_datetimes(sanitized)
-
-    # Log the type of created_at to prove it's now a string
-    if isinstance(sanitized, dict) and "created_at" in sanitized:
-        logger.info(
-            "[SAFE_EXECUTE_FINAL_PARAMS] label=%s created_at_type=%s",
-            label,
-            type(sanitized["created_at"]).__name__,
-        )
-
+    sanitized = deep_convert_all_datetimes(params)
+    log_sanitization(label, params, sanitized)
+    assert_no_datetime_anywhere(sanitized)
+    logger.info(
+        "[FINAL_SQL_ASSERTION_PASSED] label=%s path_checked=root",
+        label,
+    )
     return sanitized
 
 
