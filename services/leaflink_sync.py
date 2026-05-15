@@ -7,7 +7,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID
@@ -4576,6 +4576,15 @@ RETURNING (xmax = 0) AS was_inserted
                           row = upsert_result.fetchone()
                           was_inserted = row[0] if row else True
 
+                          # [ORDER_MATCH_CHECK] — log every upsert outcome so we can trace
+                          # why orders are inserted vs updated vs skipped.
+                          _match_reason = "insert_new" if was_inserted else "update_existing"
+                          logger.info(
+                              "[ORDER_MATCH_CHECK] external_order_id=%s brand_id=%s "
+                              "matched_order_id=pending match_reason=%s",
+                              external_id, brand_id_value, _match_reason,
+                          )
+
                           if was_inserted:
                               batch_created += 1
                               insert_success += 1
@@ -4618,6 +4627,14 @@ RETURNING (xmax = 0) AS was_inserted
                             insert_rollback += 1
                             if "duplicate" in _err_reason.lower() or "uq_" in _err_reason.lower():
                                 skipped_duplicate += 1
+                                logger.warning(
+                                    "[ORDER_SKIPPED_REASON] reason=duplicate_match "
+                                    "external_order_id=%s brand_id=%s existing_order_id=unknown "
+                                    "constraint=%s",
+                                    _order_ext_id_for_log,
+                                    brand_id_value,
+                                    _err_reason[:200],
+                                )
                                 logger.debug(
                                     "[ORDER_SKIPPED_DUPLICATE] external_id=%s brand_id=%s",
                                     _order_ext_id_for_log,
@@ -4830,6 +4847,19 @@ RETURNING (xmax = 0) AS was_inserted
                 err_msg[:200],
                 exc_info=True,
             )
+            # Log every order in the failed batch as skipped so we can trace the cause
+            for _skipped_order in batch:
+                _skipped_ext_id = safe_str(_skipped_order.get("id") or _skipped_order.get("external_id") or _skipped_order.get("external_order_id")) if isinstance(_skipped_order, dict) else "unknown"
+                logger.warning(
+                    "[ORDER_SKIPPED_REASON] reason=batch_transaction_failed "
+                    "external_order_id=%s brand_id=%s existing_order_id=none "
+                    "batch=%s/%s error=%s",
+                    _skipped_ext_id,
+                    brand_id_value,
+                    batch_num,
+                    len(batches),
+                    err_msg[:200],
+                )
             errors.append(err_msg)
             total_skipped += current_batch_size
             continue
@@ -5498,6 +5528,22 @@ async def sync_leaflink_line_items(
                 except Exception:
                     pass
 
+                # [LINE_ITEM_DB_EXCEPTION] — structured exception log with constraint/sqlstate
+                # so we can distinguish FK failures from unique constraint failures from NULL violations.
+                _li_constraint = getattr(line_error, 'constraint_name', None) or getattr(line_error, 'constraint', None)
+                _li_sqlstate = getattr(line_error, 'sqlstate', None) or getattr(line_error, 'pgcode', None)
+                _li_orig = getattr(line_error, 'orig', None)
+                if _li_orig is not None:
+                    _li_constraint = _li_constraint or getattr(_li_orig, 'diag', None) and getattr(_li_orig.diag, 'constraint_name', None)
+                    _li_sqlstate = _li_sqlstate or getattr(_li_orig, 'pgcode', None)
+                logger.error(
+                    "[LINE_ITEM_DB_EXCEPTION] order_id=%s line_number=%s "
+                    "constraint=%s sqlstate=%s error=%s",
+                    order_id_val, line_number,
+                    _li_constraint or "unknown",
+                    _li_sqlstate or "unknown",
+                    str(line_error)[:500],
+                )
                 logger.error(
                     "[ORDER_LINES_UPSERT_FAIL] order_id=%s sku=%s error=%s",
                     order_id_val,
@@ -5899,6 +5945,33 @@ async def sync_leaflink_line_items(
         brand_id_value,
         bg_duration,
     )
+
+    # [SYNC_FINAL_ACCOUNTING] for Phase 2 — actual line item counts (not deferred)
+    _li_completion_status: str
+    if total_failed > 0 and total_inserted == 0:
+        _li_completion_status = "partial_line_item_failure"
+    elif total_failed > 0:
+        _li_completion_status = "partial_line_item_failure"
+    elif len(errors) > 0:
+        _li_completion_status = "partial_line_item_failure"
+    else:
+        _li_completion_status = "complete"
+
+    logger.info(
+        "[SYNC_FINAL_ACCOUNTING] phase=line_items brand_id=%s "
+        "orders_processed=%s line_items_inserted=%s line_items_skipped=%s "
+        "line_items_failed=%s retried=%s errors=%s completion_status=%s duration=%ss",
+        brand_id_value,
+        total_orders,
+        total_inserted,
+        total_skipped,
+        total_failed,
+        total_retried,
+        len(errors),
+        _li_completion_status,
+        bg_duration,
+    )
+
     logger.info(
         "[SYNC_PHASE_2_COMPLETE] brand_id=%s orders_processed=%s line_items_total=%s inserted=%s skipped=%s failed=%s retried=%s duration=%ss",
         brand_id_value,
@@ -7614,18 +7687,101 @@ async def _sync_leaflink_background_continuous_inner(
                         _inc_exc,
                     )
 
-        # [SYNC_FINAL_COUNTS] Log final summary for the entire sync run
+        # [SYNC_FINAL_COUNTS] Query actual DB counts — never use deferred/cached accounting.
+        # This is the ground truth: what actually landed in the database this run.
+        _sync_end_time = datetime.now(timezone.utc)
+        _sync_start_time = _sync_end_time - timedelta(seconds=total_duration)
+        _db_inserted_count = 0
+        _db_updated_count = 0
+        try:
+            from sqlalchemy import func as _func_counts
+            async with AsyncSessionLocal() as _counts_db:
+                _ins_res = await _counts_db.execute(
+                    select(_func_counts.count(Order.id)).where(
+                        Order.brand_id == brand_id,
+                        Order.created_at >= _sync_start_time,
+                    )
+                )
+                _db_inserted_count = _ins_res.scalar() or 0
+
+                _upd_res = await _counts_db.execute(
+                    select(_func_counts.count(Order.id)).where(
+                        Order.brand_id == brand_id,
+                        Order.updated_at >= _sync_start_time,
+                        Order.created_at < _sync_start_time,
+                    )
+                )
+                _db_updated_count = _upd_res.scalar() or 0
+        except Exception as _counts_exc:
+            logger.warning(
+                "[SYNC_FINAL_COUNTS] db_count_query_failed brand_id=%s error=%s — falling back to accumulated counters",
+                brand_id, str(_counts_exc)[:200],
+            )
+            _db_inserted_count = _total_inserted
+            _db_updated_count = _total_updated
+
+        _db_skipped_count = max(0, records_seen_from_leaflink - _db_inserted_count - _db_updated_count)
+
+        # Verify accounting equation: inserted + updated + skipped == fetched
+        _accounting_sum = _db_inserted_count + _db_updated_count + _db_skipped_count
+        if _accounting_sum != records_seen_from_leaflink:
+            logger.warning(
+                "[SYNC_ACCOUNTING_MISMATCH] inserted=%d + updated=%d + skipped=%d = %d != fetched=%d brand_id=%s",
+                _db_inserted_count, _db_updated_count, _db_skipped_count,
+                _accounting_sum, records_seen_from_leaflink, brand_id,
+            )
+
+        # Determine honest completion status
+        if _db_inserted_count + _db_updated_count == 0 and _db_skipped_count == records_seen_from_leaflink and records_seen_from_leaflink > 0:
+            _completion_status = "partial_duplicate_skip"
+        elif _total_errors > 0:
+            _completion_status = "partial_line_item_failure"
+        elif next_cursor:
+            _completion_status = "partial_timeout"
+        elif completion_percent < 95:
+            _completion_status = "partial_timeout"
+        else:
+            _completion_status = "complete"
+
+        _termination_reason = (
+            "next_url_null" if not next_cursor
+            else "pagination_incomplete"
+        )
+
+        # [SYNC_FINAL_ACCOUNTING] — ground-truth accounting from actual DB counts
         logger.info(
-            "[SYNC_FINAL_COUNTS] fetched=%s created=deferred updated=deferred skipped=deferred errors=0"
+            "[SYNC_FINAL_ACCOUNTING] fetched=%d inserted=%d updated=%d skipped=%d "
+            "line_items_inserted=deferred line_items_failed=deferred termination_reason=%s",
+            records_seen_from_leaflink, _db_inserted_count, _db_updated_count, _db_skipped_count,
+            _termination_reason,
+        )
+
+        # [SYNC_COMPLETION_STATUS] — honest completion status (not just "worker didn't crash")
+        logger.info(
+            "[SYNC_COMPLETION_STATUS] status=%s termination_reason=%s "
+            "completion_scope=%.1f%% inserted=%d updated=%d skipped=%d "
+            "line_items_inserted=deferred line_items_failed=deferred",
+            _completion_status, _termination_reason,
+            completion_percent,
+            _db_inserted_count, _db_updated_count, _db_skipped_count,
+        )
+
+        logger.info(
+            "[SYNC_FINAL_COUNTS] fetched=%s inserted=%s updated=%s skipped=%s errors=%s"
             " final_page=%s total_pages=%s duration=%ss brand_id=%s sync_run_id=%s"
-            " completion_percent=%.1f%%",
-            total_orders_synced,
+            " completion_percent=%.1f%% completion_status=%s",
+            records_seen_from_leaflink,
+            _db_inserted_count,
+            _db_updated_count,
+            _db_skipped_count,
+            _total_errors,
             final_page,
             total_pages,
             total_duration,
             brand_id,
             sync_run_id,
             completion_percent,
+            _completion_status,
         )
 
         logger.info(
