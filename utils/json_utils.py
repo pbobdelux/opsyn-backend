@@ -1,3 +1,4 @@
+import copy
 import logging
 from decimal import Decimal
 from datetime import date, datetime, timezone
@@ -5,6 +6,117 @@ from uuid import UUID
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Canonical deep datetime converter — THE single source of truth for
+# converting all datetime objects to ISO strings before SQL execution.
+# ---------------------------------------------------------------------------
+
+def deep_convert_all_datetimes(params: Any) -> Any:
+    """Recursively convert ALL datetime/date objects to ISO 8601 strings.
+
+    This is the CANONICAL final-boundary sanitizer.  It must be called
+    immediately before every ``db.execute(text(...), params)`` call so that
+    no datetime object — regardless of how it was created or mutated — ever
+    reaches asyncpg.
+
+    Rules:
+    - ``datetime`` (naive)  → assume UTC, attach tzinfo, return ``.isoformat()``
+    - ``datetime`` (aware)  → convert to UTC, return ``.isoformat()``
+    - ``date`` (not datetime) → return ``.isoformat()`` (YYYY-MM-DD string)
+    - ``dict``               → recurse over values, return new dict
+    - ``list`` / ``tuple``   → recurse over items, return new list
+    - All other types        → pass through unchanged (str, int, float,
+                               Decimal, bool, None, UUID, …)
+
+    Returns a fully sanitized *copy* — the original is never mutated.
+    """
+    return _deep_convert_recursive(params, path="root")
+
+
+def _deep_convert_recursive(value: Any, path: str) -> Any:
+    """Internal recursive worker for deep_convert_all_datetimes."""
+    # datetime must be checked before date (datetime is a subclass of date)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        iso = value.astimezone(timezone.utc).isoformat()
+        logger.debug(
+            "[DEEP_CONVERT_DATETIME] path=%s converted_to=%s",
+            path,
+            iso,
+        )
+        return iso
+
+    if isinstance(value, date):
+        iso = value.isoformat()
+        logger.debug(
+            "[DEEP_CONVERT_DATE] path=%s converted_to=%s",
+            path,
+            iso,
+        )
+        return iso
+
+    if isinstance(value, dict):
+        return {k: _deep_convert_recursive(v, f"{path}.{k}") for k, v in value.items()}
+
+    if isinstance(value, (list, tuple)):
+        return [_deep_convert_recursive(item, f"{path}[{i}]") for i, item in enumerate(value)]
+
+    # All other types (str, int, float, bool, None, Decimal, UUID, …) pass through
+    return value
+
+
+def assert_no_datetime_anywhere(params: Any, label: str = "unknown") -> None:
+    """Assert that *params* contains zero datetime/date objects at any depth.
+
+    Must be called immediately after ``deep_convert_all_datetimes()`` and
+    before ``db.execute()``.  If any datetime is found the full dotted path
+    is logged at ERROR level and an ``AssertionError`` is raised — SQL
+    execution is aborted.
+
+    Args:
+        params: The sanitized params object about to be passed to execute().
+        label:  Caller label for log context (e.g. ``"order_header_upsert"``).
+    """
+    _assert_no_datetime_recursive(params, path="root", label=label)
+
+
+def _assert_no_datetime_recursive(value: Any, path: str, label: str) -> None:
+    """Internal recursive worker for assert_no_datetime_anywhere."""
+    if isinstance(value, (datetime, date)):
+        logger.error(
+            "[DATETIME_FOUND_IN_PARAMS] label=%s path=%s type=%s value=%r"
+            " — aborting SQL execution",
+            label,
+            path,
+            type(value).__name__,
+            str(value)[:100],
+        )
+        raise AssertionError(
+            f"[DATETIME_FOUND_IN_PARAMS] label={label} path={path} "
+            f"type={type(value).__name__} value={value!r}"
+        )
+
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _assert_no_datetime_recursive(v, f"{path}.{k}", label)
+
+    elif isinstance(value, (list, tuple)):
+        for i, item in enumerate(value):
+            _assert_no_datetime_recursive(item, f"{path}[{i}]", label)
+
+
+def _count_datetimes(value: Any) -> int:
+    """Count the number of datetime/date objects at any depth in *value*."""
+    if isinstance(value, (datetime, date)):
+        return 1
+    if isinstance(value, dict):
+        return sum(_count_datetimes(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_count_datetimes(item) for item in value)
+    return 0
 
 
 def make_json_safe(value: Any, _depth: int = 0, _seen: set = None) -> Any:
@@ -382,26 +494,9 @@ def _sanitize_sql_params_recursive(value: Any, path: str = "params") -> Any:
         ]
 
     # str → attempt ISO datetime parse only for strings that look like timestamps
-    if isinstance(value, str) and value and len(value) >= 10:
-        # Only attempt parse if the string starts with a 4-digit year (YYYY-)
-        # to avoid expensive parse attempts on arbitrary strings.
-        if len(value) >= 19 and value[4] == "-" and value[7] == "-":
-            try:
-                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                else:
-                    parsed = parsed.astimezone(timezone.utc)
-                logger.info(
-                    "[SQL_PARAM_DATETIME_FIXED] path=%s action=iso_string_to_utc original=%s fixed=%s",
-                    path,
-                    value,
-                    parsed.isoformat(),
-                )
-                return parsed
-            except (ValueError, TypeError):
-                # Not a datetime string — pass through unchanged
-                pass
-
     # All other types (str, int, float, bool, None, Decimal, UUID, etc.) pass through
+    # NOTE: ISO datetime strings are intentionally NOT re-parsed back to datetime objects.
+    # Converting ISO strings back to datetime objects was the root cause of datetimes
+    # surviving to SQL execution after _validate_and_fix_sql_params had already
+    # converted them to strings.  Strings are safe for asyncpg — leave them alone.
     return value
