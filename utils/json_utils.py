@@ -300,28 +300,34 @@ def _validate_and_fix_recursive(value: Any, path: str = "params") -> Any:
 
 def _sanitize_params_for_sql_execution(params: Any, label: str = "unknown") -> Any:
     """
-    FINAL SQL EXECUTION BOUNDARY: Recursively convert all datetime/date values
-    to ISO 8601 strings immediately before db.execute().
+    DEPRECATED — superseded by preserve_sql_datetime_fields() (PR #467).
 
-    Delegates to deep_convert_all_datetimes() — the single canonical converter —
-    then asserts no datetime objects remain and logs the sanitization event.
+    This legacy blanket validator converted ALL datetime objects to ISO strings,
+    including valid SQL TIMESTAMP bind params (created_at, updated_at, etc.) that
+    asyncpg requires as native datetime objects for TIMESTAMPTZ columns.
+
+    Callers should use preserve_sql_datetime_fields() instead, which correctly
+    distinguishes between JSON payload fields (must be ISO strings) and SQL
+    TIMESTAMP columns (must be native datetime objects).
+
+    This function is retained for backward compatibility but is a no-op pass-through
+    to avoid breaking any callers that still reference it.  It does NOT call
+    assert_no_datetime_anywhere() or deep_convert_all_datetimes() — those blanket
+    validators are incompatible with type-aware SQL parameter handling.
 
     Args:
         params: The params dict about to be passed to db.execute()
         label: Statement label for logging (e.g., "line_item_upsert")
 
     Returns:
-        A new params dict with all datetime/date values converted to ISO 8601 strings.
-        The caller MUST use this returned dict for execution, not the original.
+        params unchanged — use preserve_sql_datetime_fields() for actual sanitization.
     """
-    sanitized = deep_convert_all_datetimes(params)
-    log_sanitization(label, params, sanitized)
-    assert_no_datetime_anywhere(sanitized)
-    logger.info(
-        "[FINAL_SQL_ASSERTION_PASSED] label=%s path_checked=root",
+    logger.debug(
+        "[LEGACY_SANITIZER_BYPASSED] label=%s — _sanitize_params_for_sql_execution is deprecated,"
+        " use preserve_sql_datetime_fields() instead",
         label,
     )
-    return sanitized
+    return params
 
 
 def _sanitize_sql_params_recursive(value: Any, path: str = "params") -> Any:

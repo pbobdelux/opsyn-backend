@@ -50,8 +50,12 @@ AsyncSessionLocal = _LazySessionLocal()
 
 from models import Order, OrderLine
 from models.sync_health import DeadLetterLineItem, SyncHealth
-from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value, sanitize_sql_params as _recursive_sanitize_sql_params, validate_and_fix_sql_params as _validate_and_fix_sql_params, _sanitize_params_for_sql_execution as _sanitize_params_for_sql_execution, preserve_sql_datetime_fields as preserve_sql_datetime_fields
-from utils.sanitizers import deep_convert_all_datetimes, assert_no_datetime_anywhere, log_sanitization
+from utils.json_utils import make_json_safe, normalize_datetime as normalize_datetime_value, sanitize_sql_params as _recursive_sanitize_sql_params, validate_and_fix_sql_params as _validate_and_fix_sql_params, preserve_sql_datetime_fields as preserve_sql_datetime_fields
+# NOTE: _sanitize_params_for_sql_execution, assert_no_datetime_anywhere, deep_convert_all_datetimes
+# are intentionally NOT imported here. Those are legacy blanket validators (PR #466) that reject
+# ALL datetime objects including valid SQL TIMESTAMP bind params. They are superseded by the
+# type-aware preserve_sql_datetime_fields() from PR #467, which correctly distinguishes between
+# JSON payload fields (must be ISO strings) and SQL TIMESTAMP columns (must be native datetime).
 
 if TYPE_CHECKING:
     from services.background_sync_manager import BackgroundSyncManager
@@ -697,6 +701,19 @@ async def _dead_letter_line_item(
                 if raw_payload is not None
                 else None
             )
+            _now_dl = ensure_utc(utc_now(), "now")
+            # [LINE_ITEM_ALLOWED_DATETIME] — created_at/updated_at are valid SQL TIMESTAMP
+            # bind params and must NOT be converted to ISO strings by any blanket validator.
+            logger.info(
+                "[LINE_ITEM_ALLOWED_DATETIME] field=created_at type=%s tzinfo=%s",
+                type(_now_dl).__name__,
+                str(_now_dl.tzinfo) if _now_dl is not None else "None",
+            )
+            logger.info(
+                "[LINE_ITEM_ALLOWED_DATETIME] field=updated_at type=%s tzinfo=%s",
+                type(_now_dl).__name__,
+                str(_now_dl.tzinfo) if _now_dl is not None else "None",
+            )
             _dead_letter_params = {
                 "brand_id": brand_id,
                 "external_order_id": external_order_id,
@@ -706,7 +723,7 @@ async def _dead_letter_line_item(
                 "raw_payload": raw_payload_str,
                 "reason": failure_reason[:500],
                 "count": failure_count,
-                "now": ensure_utc(utc_now(), "now"),
+                "now": _now_dl,
             }
             _dead_letter_params = apply_uuid_str_to_params(_dead_letter_params)
             # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
@@ -816,6 +833,13 @@ async def _write_sync_dead_letter(
                 else json.dumps({})
             )
             now = ensure_utc(utc_now(), "now")
+            # [LINE_ITEM_ALLOWED_DATETIME] — created_at (now) is a valid SQL TIMESTAMP bind param
+            # and must NOT be converted to ISO strings by any blanket validator.
+            logger.info(
+                "[LINE_ITEM_ALLOWED_DATETIME] field=created_at type=%s tzinfo=%s",
+                type(now).__name__,
+                str(now.tzinfo) if now is not None else "None",
+            )
             # Build params dict and sanitize — centralized sanitizer handles all type coercions
             params = {
                 "source": source,
@@ -4097,6 +4121,21 @@ async def sync_leaflink_line_items(
                 total_price = item.get("total_price") or 0
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
                 now_val = ensure_utc(utc_now(), "created_at")
+
+                # [LINE_ITEM_ALLOWED_DATETIME] — prove field-aware validation is working.
+                # created_at and updated_at are valid SQL TIMESTAMP bind params and MUST
+                # remain as native datetime objects (asyncpg requires datetime for TIMESTAMPTZ).
+                # They are NOT JSON payload fields and must NOT be converted to ISO strings.
+                logger.info(
+                    "[LINE_ITEM_ALLOWED_DATETIME] field=created_at type=%s tzinfo=%s",
+                    type(now_val).__name__,
+                    str(now_val.tzinfo) if now_val is not None else "None",
+                )
+                logger.info(
+                    "[LINE_ITEM_ALLOWED_DATETIME] field=updated_at type=%s tzinfo=%s",
+                    type(now_val).__name__,
+                    str(now_val.tzinfo) if now_val is not None else "None",
+                )
 
                 insert_params: dict[str, Any] = {
                     "order_id": order_id_val,
