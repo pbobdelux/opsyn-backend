@@ -44,12 +44,21 @@ async def _get_brand_order_count(
     db: AsyncSession,
     brand_id: str,
 ) -> int:
-    """Get total order count for a brand. Used by all endpoints."""
+    """Get total order count for a brand. Used by all endpoints.
+
+    Uses brand_id::text cast to avoid 'character varying = uuid' type errors
+    when asyncpg infers the parameter type from the column definition.
+    """
+    from sqlalchemy import text as _text
     try:
         result = await db.execute(
-            select(func.count(Order.id)).where(Order.brand_id == brand_id)
+            _text(
+                "SELECT COUNT(*) FROM orders"
+                " WHERE brand_id::text = :brand_id"
+            ),
+            {"brand_id": brand_id},
         )
-        return result.scalar_one() or 0
+        return result.scalar() or 0
     except Exception as exc:
         logger.error("[OrdersAPI] order_count_error brand=%s error=%s", brand_id, exc)
         await db.rollback()
