@@ -3,7 +3,7 @@ import io
 import logging
 import os
 from datetime import datetime, date, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -32,6 +32,187 @@ router.include_router(_raw_schema_check_router)
 
 # Admin seed token from environment
 ADMIN_SEED_TOKEN = os.getenv("ADMIN_SEED_TOKEN", "opsyn-seed-2026")
+
+# Admin diagnostics token — separate from seed token for least-privilege access
+ADMIN_DIAGNOSTICS_TOKEN = os.getenv("ADMIN_DIAGNOSTICS_TOKEN", os.getenv("ADMIN_SEED_TOKEN", "opsyn-seed-2026"))
+
+
+# =============================================================================
+# Endpoint: GET /admin/diagnostics
+# Requires X-OPSYN-ADMIN header. Returns full system diagnostic snapshot.
+# =============================================================================
+
+@router.get("/diagnostics")
+async def get_diagnostics(
+    x_opsyn_admin: Optional[str] = Header(default=None, alias="x-opsyn-admin"),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Full system diagnostic snapshot for on-call engineers.
+
+    Requires X-OPSYN-ADMIN header matching ADMIN_DIAGNOSTICS_TOKEN env var.
+
+    Returns:
+      - backend_status (healthy/degraded/critical)
+      - sync_health (active, stalled, orphaned, 24h success/failure)
+      - last_sync (timestamp, duration, status, orders/items/dead letters)
+      - active_runs (list with timestamps and progress)
+      - dead_letters (count, sample failures)
+      - failed_runs (count, sample failures, error types)
+      - migration_warnings (count, list)
+      - api_latency (p50, p95, p99)
+      - db_latency (p50, p95, p99)
+      - timestamp (when diagnostics were generated)
+    """
+    # Auth check
+    if not x_opsyn_admin or x_opsyn_admin != ADMIN_DIAGNOSTICS_TOKEN:
+        raise HTTPException(
+            status_code=403,
+            detail="X-OPSYN-ADMIN header is required and must match the configured admin token",
+        )
+
+    from services.health_service import (
+        get_sync_health,
+        get_database_health,
+        get_migration_health,
+        check_for_alerts,
+    )
+    from middleware.latency_tracking import get_latency_percentiles, get_db_latency_percentiles
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    try:
+        sync_metrics = await get_sync_health(db)
+        db_metrics = await get_database_health(db)
+        mig_metrics = await get_migration_health()
+        alerts = await check_for_alerts(db)
+        api_latency = get_latency_percentiles()
+        db_latency = get_db_latency_percentiles()
+
+        # Determine backend status
+        backend_status = "healthy"
+        if not db_metrics.connected or mig_metrics.failed_count > 0:
+            backend_status = "critical"
+        elif sync_metrics.stalled_runs > 0 or sync_metrics.failed_24h > 0:
+            backend_status = "degraded"
+        for alert in alerts:
+            if alert.get("severity") == "CRITICAL":
+                backend_status = "critical"
+                break
+
+        # Dead letters sample
+        dead_letter_count = 0
+        dead_letter_samples: list[dict] = []
+        try:
+            dl_result = await db.execute(
+                text("""
+                    SELECT id, brand_id, external_id, error_message, failure_category, created_at
+                    FROM sync_dead_letters
+                    WHERE resolved_at IS NULL
+                    ORDER BY created_at DESC
+                    LIMIT 5
+                """)
+            )
+            dl_rows = dl_result.fetchall()
+            dead_letter_samples = [
+                {
+                    "id": r[0],
+                    "brand_id": r[1],
+                    "external_id": r[2],
+                    "error_message": (r[3] or "")[:200],
+                    "failure_category": r[4],
+                    "created_at": r[5].isoformat() if r[5] else None,
+                }
+                for r in dl_rows
+            ]
+            count_result = await db.execute(
+                text("SELECT COUNT(*) FROM sync_dead_letters WHERE resolved_at IS NULL")
+            )
+            dead_letter_count = int(count_result.scalar() or 0)
+        except Exception as dl_exc:
+            logger.warning("[ADMIN_DIAGNOSTICS] dead_letter_query_failed error=%s", str(dl_exc)[:200])
+
+        # Last sync details
+        last_sync: dict = {}
+        try:
+            last_sync_result = await db.execute(
+                text("""
+                    SELECT id, brand_id, status, started_at, completed_at,
+                           orders_loaded_this_run, last_error
+                    FROM sync_runs
+                    WHERE status = 'completed'
+                    ORDER BY completed_at DESC
+                    LIMIT 1
+                """)
+            )
+            last_sync_row = last_sync_result.fetchone()
+            if last_sync_row:
+                run_id, brand_id, status, started_at, completed_at, orders_loaded, last_error = last_sync_row
+                if started_at and started_at.tzinfo is None:
+                    started_at = started_at.replace(tzinfo=timezone.utc)
+                if completed_at and completed_at.tzinfo is None:
+                    completed_at = completed_at.replace(tzinfo=timezone.utc)
+                duration = (completed_at - started_at).total_seconds() if started_at and completed_at else None
+                last_sync = {
+                    "run_id": run_id,
+                    "brand_id": brand_id,
+                    "status": status,
+                    "started_at": started_at.isoformat() if started_at else None,
+                    "completed_at": completed_at.isoformat() if completed_at else None,
+                    "duration_seconds": duration,
+                    "orders_loaded": orders_loaded or 0,
+                    "last_error": last_error,
+                }
+        except Exception as ls_exc:
+            logger.warning("[ADMIN_DIAGNOSTICS] last_sync_query_failed error=%s", str(ls_exc)[:200])
+
+        return make_json_safe({
+            "ok": backend_status != "critical",
+            "backend_status": backend_status,
+            "timestamp": timestamp,
+            "sync_health": {
+                "active_runs": sync_metrics.active_runs,
+                "stalled_runs": sync_metrics.stalled_runs,
+                "orphaned_runs": sync_metrics.orphaned_runs,
+                "successful_24h": sync_metrics.successful_24h,
+                "failed_24h": sync_metrics.failed_24h,
+                "orders_processed_24h": sync_metrics.orders_processed_24h,
+                "dead_letters_24h": sync_metrics.dead_letters_created_24h,
+                "retry_queue_size": sync_metrics.retry_queue_size,
+                "last_successful_sync_at": sync_metrics.last_successful_sync_at,
+            },
+            "last_sync": last_sync,
+            "active_runs": sync_metrics.active_run_details,
+            "dead_letters": {
+                "count": dead_letter_count,
+                "samples": dead_letter_samples,
+            },
+            "failed_runs": {
+                "count": sync_metrics.failed_24h,
+                "samples": sync_metrics.failed_run_details,
+            },
+            "migration_warnings": {
+                "count": mig_metrics.warning_count,
+                "list": mig_metrics.validation_warnings,
+                "failed_migrations": mig_metrics.failed_migrations,
+            },
+            "api_latency": api_latency,
+            "db_latency": db_latency,
+            "database": {
+                "connected": db_metrics.connected,
+                "current_migration_version": db_metrics.current_migration_version,
+            },
+            "alerts": alerts,
+        })
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[ADMIN_DIAGNOSTICS] error=%s", str(exc)[:300], exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Diagnostics failed: {str(exc)[:300]}",
+        )
 
 
 # =============================================================================

@@ -2379,6 +2379,14 @@ async def sync_leaflink_orders(
                     payload_size=_payload_size,
                     customer_name=customer_name,
                 )
+                # Classify into error taxonomy and emit structured log
+                try:
+                    from services.health_service import classify_exception, record_sync_error
+                    from models.health_metrics import ErrorTaxonomy
+                    _hdr_error_type = classify_exception(header_exc)
+                    record_sync_error(None, _hdr_error_type, header_err_msg, {"external_id": external_id, "stage": "header_insert"})
+                except Exception:
+                    pass
                 logger.error(
                     "[SYNC_HEADER_INSERT_FAILED] external_id=%s order_number=%s brand_id=%s error=%s",
                     external_id,

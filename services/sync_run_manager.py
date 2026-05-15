@@ -190,8 +190,81 @@ async def update_progress(
     )
 
 
-async def mark_completed(db: AsyncSession, sync_run_id: int) -> None:
-    """Mark a SyncRun as completed."""
+async def update_run_metrics(
+    db: AsyncSession,
+    sync_run_id: int,
+    *,
+    orders_fetched: Optional[int] = None,
+    orders_inserted: Optional[int] = None,
+    orders_updated: Optional[int] = None,
+    line_items_inserted: Optional[int] = None,
+    line_items_updated: Optional[int] = None,
+    dead_letters_created: Optional[int] = None,
+    error_type: Optional[str] = None,
+    error_context: Optional[dict] = None,
+    failure_reason: Optional[str] = None,
+) -> None:
+    """
+    Update detailed metrics on a SyncRun record.
+
+    Increments counters (orders_fetched, orders_inserted, etc.) by the
+    provided delta values.  Pass None to leave a field unchanged.
+
+    This is called by sync code after each batch to accumulate per-run totals.
+    """
+    result = await db.execute(
+        select(SyncRun).where(SyncRun.id == sync_run_id)
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        logger.warning("[SyncRunManager] update_run_metrics run_not_found run_id=%s", sync_run_id)
+        return
+
+    if orders_fetched is not None:
+        run.orders_fetched = (run.orders_fetched or 0) + orders_fetched
+    if orders_inserted is not None:
+        run.orders_inserted = (run.orders_inserted or 0) + orders_inserted
+    if orders_updated is not None:
+        run.orders_updated = (run.orders_updated or 0) + orders_updated
+    if line_items_inserted is not None:
+        run.line_items_inserted = (run.line_items_inserted or 0) + line_items_inserted
+    if line_items_updated is not None:
+        run.line_items_updated = (run.line_items_updated or 0) + line_items_updated
+    if dead_letters_created is not None:
+        run.dead_letters_created = (run.dead_letters_created or 0) + dead_letters_created
+    if error_type is not None:
+        run.error_type = error_type
+    if error_context is not None:
+        run.error_context = error_context
+    if failure_reason is not None:
+        run.failure_reason = failure_reason
+
+    run.updated_at = _utc_now()
+
+    logger.debug(
+        "[SyncRunManager] metrics_updated run_id=%s orders_fetched=%s inserted=%s updated=%s"
+        " line_items_inserted=%s dead_letters=%s",
+        sync_run_id,
+        run.orders_fetched,
+        run.orders_inserted,
+        run.orders_updated,
+        run.line_items_inserted,
+        run.dead_letters_created,
+    )
+
+
+async def mark_completed(
+    db: AsyncSession,
+    sync_run_id: int,
+    *,
+    orders_fetched: Optional[int] = None,
+    orders_inserted: Optional[int] = None,
+    orders_updated: Optional[int] = None,
+    line_items_inserted: Optional[int] = None,
+    line_items_updated: Optional[int] = None,
+    dead_letters_created: Optional[int] = None,
+) -> None:
+    """Mark a SyncRun as completed, optionally recording final metrics."""
     result = await db.execute(
         select(SyncRun).where(SyncRun.id == sync_run_id)
     )
@@ -207,14 +280,31 @@ async def mark_completed(db: AsyncSession, sync_run_id: int) -> None:
     run.updated_at = now
     run.last_error = None
 
+    # Record final metrics if provided
+    if orders_fetched is not None:
+        run.orders_fetched = orders_fetched
+    if orders_inserted is not None:
+        run.orders_inserted = orders_inserted
+    if orders_updated is not None:
+        run.orders_updated = orders_updated
+    if line_items_inserted is not None:
+        run.line_items_inserted = line_items_inserted
+    if line_items_updated is not None:
+        run.line_items_updated = line_items_updated
+    if dead_letters_created is not None:
+        run.dead_letters_created = dead_letters_created
+
     logger.info(
         "[SYNC_RUN_STATE_TRANSITION] run_id=%s brand=%s from=%s to=completed"
-        " pages=%s orders=%s",
+        " pages=%s orders=%s orders_inserted=%s orders_updated=%s dead_letters=%s",
         sync_run_id,
         run.brand_id,
         prior_status,
         run.pages_synced,
         run.orders_loaded_this_run,
+        run.orders_inserted,
+        run.orders_updated,
+        run.dead_letters_created,
     )
     logger.info(
         "[SyncRunManager] completed run_id=%s brand=%s pages=%s orders=%s",
@@ -267,8 +357,12 @@ async def mark_failed(
     db: AsyncSession,
     sync_run_id: int,
     error: str,
+    *,
+    error_type: Optional[str] = None,
+    error_context: Optional[dict] = None,
+    failure_reason: Optional[str] = None,
 ) -> None:
-    """Mark a SyncRun as failed with an error message."""
+    """Mark a SyncRun as failed with an error message and optional taxonomy."""
     result = await db.execute(
         select(SyncRun).where(SyncRun.id == sync_run_id)
     )
@@ -285,13 +379,24 @@ async def mark_failed(
     run.completed_at = now
     run.updated_at = now
 
+    # Record error taxonomy if provided
+    if error_type is not None:
+        run.error_type = error_type
+    if error_context is not None:
+        run.error_context = error_context
+    if failure_reason is not None:
+        run.failure_reason = failure_reason
+    elif not run.failure_reason:
+        run.failure_reason = error[:500]
+
     logger.error(
         "[SYNC_RUN_STATE_TRANSITION] run_id=%s brand=%s from=%s to=failed"
-        " error=%s pages=%s",
+        " error=%s error_type=%s pages=%s",
         sync_run_id,
         run.brand_id,
         prior_status,
         error[:200],
+        error_type,
         run.pages_synced,
     )
     logger.error(
@@ -631,4 +736,14 @@ def serialize_sync_run(run: SyncRun, is_stalled: bool = False) -> dict:
         "updated_at": run.updated_at.isoformat() if run.updated_at else None,
         "estimated_completion_minutes": round(eta_minutes, 1) if eta_minutes is not None else None,
         "is_stalled": is_stalled,
+        # Detailed metrics (new observability fields)
+        "orders_fetched": getattr(run, "orders_fetched", 0) or 0,
+        "orders_inserted": getattr(run, "orders_inserted", 0) or 0,
+        "orders_updated": getattr(run, "orders_updated", 0) or 0,
+        "line_items_inserted": getattr(run, "line_items_inserted", 0) or 0,
+        "line_items_updated": getattr(run, "line_items_updated", 0) or 0,
+        "dead_letters_created": getattr(run, "dead_letters_created", 0) or 0,
+        "failure_reason": getattr(run, "failure_reason", None),
+        "error_type": getattr(run, "error_type", None),
+        "error_context": getattr(run, "error_context", None),
     }

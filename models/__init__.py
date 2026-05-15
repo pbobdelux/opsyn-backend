@@ -397,6 +397,46 @@ class SyncRun(Base):
     error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     stalled_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
+    # ------------------------------------------------------------------
+    # Detailed sync run metrics — per-run visibility for health endpoints
+    # ------------------------------------------------------------------
+    orders_fetched: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Total orders fetched from LeafLink API this run"
+    )
+    orders_inserted: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Orders newly inserted into the DB this run"
+    )
+    orders_updated: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Orders updated (upserted) in the DB this run"
+    )
+    line_items_inserted: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Order line items newly inserted this run"
+    )
+    line_items_updated: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Order line items updated this run"
+    )
+    dead_letters_created: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Dead-letter records created this run (failed orders/items)"
+    )
+    failure_reason: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Human-readable failure reason (populated on failed/stalled runs)"
+    )
+    error_type: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True,
+        comment="ErrorTaxonomy enum value for the primary failure (e.g. datetime_error, uuid_mismatch)"
+    )
+    error_context: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True,
+        comment="Structured error context dict for the primary failure"
+    )
+
     # Worker tracking
     worker_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
