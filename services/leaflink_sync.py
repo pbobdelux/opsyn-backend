@@ -64,6 +64,13 @@ from utils.json_utils import make_json_safe, normalize_datetime as normalize_dat
 # type-aware preserve_sql_datetime_fields() from PR #467, which correctly distinguishes between
 # JSON payload fields (must be ISO strings) and SQL TIMESTAMP columns (must be native datetime).
 
+# Canonical final-boundary sanitizer (PR #468) — runs immediately before every execute() call.
+# Distinguishes SQL TIMESTAMP columns (must stay datetime) from JSON payload fields (must be ISO strings).
+from services.sql_param_sanitizer import (
+    sanitize_sql_params as _canonical_sanitize_sql_params,
+    assert_no_datetime_in_json as _assert_no_datetime_in_json,
+)
+
 if TYPE_CHECKING:
     from services.background_sync_manager import BackgroundSyncManager
 
@@ -709,15 +716,9 @@ async def _dead_letter_line_item(
                 else None
             )
             _now_dl = ensure_utc(utc_now(), "now")
-            # [LINE_ITEM_ALLOWED_DATETIME] — created_at/updated_at are valid SQL TIMESTAMP
-            # bind params and must NOT be converted to ISO strings by any blanket validator.
-            logger.info(
+            # created_at/last_failed_at are valid SQL TIMESTAMP bind params — kept as datetime objects
+            logger.debug(
                 "[LINE_ITEM_ALLOWED_DATETIME] field=created_at type=%s tzinfo=%s",
-                type(_now_dl).__name__,
-                str(_now_dl.tzinfo) if _now_dl is not None else "None",
-            )
-            logger.info(
-                "[LINE_ITEM_ALLOWED_DATETIME] field=updated_at type=%s tzinfo=%s",
                 type(_now_dl).__name__,
                 str(_now_dl.tzinfo) if _now_dl is not None else "None",
             )
@@ -733,8 +734,16 @@ async def _dead_letter_line_item(
                 "now": _now_dl,
             }
             _dead_letter_params = apply_uuid_str_to_params(_dead_letter_params)
-            # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
-            _dead_letter_params = preserve_sql_datetime_fields(_dead_letter_params)
+            # Canonical final-boundary sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
+            _dead_letter_params = _canonical_sanitize_sql_params(
+                _dead_letter_params,
+                known_datetime_fields={"now", "created_at", "last_failed_at"},
+            )
+            logger.debug(
+                "[FINAL_SQL_PARAM_OK] dead_letter_write brand=%s external_id=%s",
+                brand_id,
+                external_order_id,
+            )
             await db.execute(
                 text("""
                     INSERT INTO dead_letter_line_items
@@ -840,9 +849,8 @@ async def _write_sync_dead_letter(
                 else json.dumps({})
             )
             now = ensure_utc(utc_now(), "now")
-            # [LINE_ITEM_ALLOWED_DATETIME] — created_at (now) is a valid SQL TIMESTAMP bind param
-            # and must NOT be converted to ISO strings by any blanket validator.
-            logger.info(
+            # created_at is a valid SQL TIMESTAMP bind param — kept as datetime object
+            logger.debug(
                 "[LINE_ITEM_ALLOWED_DATETIME] field=created_at type=%s tzinfo=%s",
                 type(now).__name__,
                 str(now.tzinfo) if now is not None else "None",
@@ -2052,11 +2060,20 @@ async def _insert_line_items_standalone(
             # Final barrier: ensure all UUID objects are strings before asyncpg execute()
             insert_params = apply_uuid_str_to_params(insert_params)
 
-            # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
-            insert_params = preserve_sql_datetime_fields(insert_params)
+            # Canonical final-boundary sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
+            insert_params = _canonical_sanitize_sql_params(
+                insert_params,
+                known_datetime_fields={"created_at", "updated_at"},
+            )
+            logger.debug(
+                "[FINAL_SQL_JSON_OK] line_item_upsert order_id=%s sku=%s",
+                insert_params.get("order_id"),
+                insert_params.get("sku"),
+            )
             await db.execute(text(line_insert_stmt), insert_params)
 
             inserted += 1
+
 
             await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
 
@@ -2568,8 +2585,16 @@ async def sync_leaflink_orders(
                     # Final barrier: ensure all UUID objects are strings before asyncpg execute()
                     _li_params = apply_uuid_str_to_params(_li_params)
 
-                    # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
-                    _li_params = preserve_sql_datetime_fields(_li_params)
+                    # Canonical final-boundary sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
+                    _li_params = _canonical_sanitize_sql_params(
+                        _li_params,
+                        known_datetime_fields={"created_at", "updated_at"},
+                    )
+                    logger.debug(
+                        "[FINAL_SQL_JSON_OK] line_item_upsert order_id=%s sku=%s",
+                        _li_params.get("order_id"),
+                        _li_params.get("sku"),
+                    )
                     await db.execute(text(_li_insert_stmt), _li_params)
 
                 total_lines_written += len(normalized_line_items)
@@ -3298,9 +3323,20 @@ RETURNING (xmax = 0) AS was_inserted
                                       )
                                       upsert_params[_field] = _value.replace(tzinfo=timezone.utc)
 
-                          # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved.
+                          # Canonical final-boundary sanitizer: JSON fields → ISO strings, SQL datetime params → preserved.
                           # This is the single canonical path for order header upserts.
-                          safe_params = preserve_sql_datetime_fields(upsert_params)
+                          safe_params = _canonical_sanitize_sql_params(
+                              upsert_params,
+                              known_datetime_fields={
+                                  "created_at", "updated_at", "synced_at", "last_synced_at",
+                                  "external_created_at", "external_updated_at",
+                              },
+                          )
+                          logger.debug(
+                              "[FINAL_SQL_PARAM_OK] order_header_upsert brand=%s external_id=%s",
+                              safe_params.get("brand_id"),
+                              safe_params.get("external_order_id"),
+                          )
 
                           upsert_result = await db.execute(text(upsert_stmt), safe_params)
 
@@ -4143,17 +4179,9 @@ async def sync_leaflink_line_items(
                 # AUDIT: All datetime fields wrapped with ensure_utc() at write boundary
                 now_val = ensure_utc(utc_now(), "created_at")
 
-                # [LINE_ITEM_ALLOWED_DATETIME] — prove field-aware validation is working.
-                # created_at and updated_at are valid SQL TIMESTAMP bind params and MUST
-                # remain as native datetime objects (asyncpg requires datetime for TIMESTAMPTZ).
-                # They are NOT JSON payload fields and must NOT be converted to ISO strings.
-                logger.info(
+                # created_at and updated_at are valid SQL TIMESTAMP bind params — kept as datetime objects
+                logger.debug(
                     "[LINE_ITEM_ALLOWED_DATETIME] field=created_at type=%s tzinfo=%s",
-                    type(now_val).__name__,
-                    str(now_val.tzinfo) if now_val is not None else "None",
-                )
-                logger.info(
-                    "[LINE_ITEM_ALLOWED_DATETIME] field=updated_at type=%s tzinfo=%s",
                     type(now_val).__name__,
                     str(now_val.tzinfo) if now_val is not None else "None",
                 )
@@ -4227,10 +4255,19 @@ async def sync_leaflink_line_items(
                 # Final barrier: ensure all UUID objects are strings before asyncpg execute()
                 insert_params = apply_uuid_str_to_params(insert_params)
 
-                # Type-aware sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
-                insert_params = preserve_sql_datetime_fields(insert_params)
+                # Canonical final-boundary sanitizer: JSON fields → ISO strings, SQL datetime params → preserved
+                insert_params = _canonical_sanitize_sql_params(
+                    insert_params,
+                    known_datetime_fields={"created_at", "updated_at"},
+                )
+                logger.debug(
+                    "[FINAL_SQL_JSON_OK] line_item_upsert order_id=%s sku=%s",
+                    insert_params.get("order_id"),
+                    insert_params.get("sku"),
+                )
                 await db.execute(text(line_upsert_stmt), insert_params)
                 inserted += 1
+
 
                 await db.execute(text(f"RELEASE SAVEPOINT {savepoint_name}"))
 
