@@ -232,6 +232,28 @@ def ensure_utc_datetime(value: Any) -> Optional[datetime]:
     raise ValueError(f"Cannot normalize datetime: {type(value).__name__}")
 
 
+def build_brand_filter_sql(column_name: str = "brand_id", param_name: str = "brand_id") -> str:
+    """Return safe SQL fragment for brand_id / org_id filtering on VARCHAR columns.
+
+    All ID columns in orders, sync_health, dead_letter_line_items,
+    sync_dead_letters, and brand_api_credentials are VARCHAR(120) or
+    VARCHAR(255) — NOT UUID.  Casting a VARCHAR parameter to UUID causes
+    PostgreSQL to raise:
+        operator does not exist: uuid = character varying
+
+    Use this helper everywhere a WHERE clause filters by brand_id or org_id
+    so the correct (no-cast) form is applied consistently.
+
+    Args:
+        column_name: The SQL column name (default "brand_id").
+        param_name:  The bind-parameter name (default "brand_id").
+
+    Returns:
+        SQL fragment like ``brand_id = :brand_id`` (no CAST).
+    """
+    return f"{column_name} = :{param_name}"
+
+
 def _cursor_hash(cursor: Optional[str]) -> Optional[str]:
     """Return a short hash of a cursor for safe logging."""
     if not cursor:
@@ -2229,7 +2251,7 @@ async def _write_sync_dead_letter(
                                      traceback_summary, payload_keys, problematic_field,
                                      problematic_value_preview, retry_count, created_at)
                                 VALUES
-                                    (:source, CAST(:brand_id AS uuid), CAST(:org_id AS uuid),
+                                    (:source, :brand_id, :org_id,
                                      :external_id, :order_number,
                                      :customer_name, CAST(:raw_payload AS jsonb), :error_stage, :error_message,
                                      :failure_stage, :failure_category, :exception_type, :exception_message,
@@ -2254,7 +2276,7 @@ async def _write_sync_dead_letter(
                                         (source, brand_id, org_id, external_id, order_number,
                                          raw_payload, error_stage, error_message, retry_count, created_at)
                                     VALUES
-                                        (:source, CAST(:brand_id AS uuid), CAST(:org_id AS uuid),
+                                        (:source, :brand_id, :org_id,
                                          :external_id, :order_number,
                                          CAST(:raw_payload AS jsonb), :error_stage, :error_message,
                                          0, :now)
@@ -6438,13 +6460,24 @@ async def upsert_sync_metrics_snapshot(
         _run_id_str = str(sync_run_id) if sync_run_id is not None else None
 
         async with AsyncSessionLocal() as _snap_db:
-            # Gather counts in a single session (no transaction needed for reads)
+            # Gather counts in a single session (no transaction needed for reads).
+            # All brand_id columns are VARCHAR(120) — no CAST to UUID needed.
+            _count_start = time.monotonic()
+            logger.info(
+                "[SYNC_STATUS_COUNT_QUERY] brand_id=%s source=upsert_sync_metrics_snapshot"
+                " cast_mode=none (brand_id is VARCHAR)",
+                brand_id,
+            )
             try:
                 _total_res = await _snap_db.execute(
                     select(_func_snap.count(_Order.id)).where(_Order.brand_id == brand_id)
                 )
                 total_local = _total_res.scalar() or 0
-            except Exception:
+            except Exception as _cnt_exc:
+                logger.warning(
+                    "[SYNC_STATUS_COUNT_QUERY] total_count_failed brand_id=%s error=%s",
+                    brand_id, str(_cnt_exc)[:200],
+                )
                 total_local = None
 
             try:
@@ -6481,16 +6514,25 @@ async def upsert_sync_metrics_snapshot(
                 total_failed = None
 
             try:
+                # sync_dead_letters.brand_id is VARCHAR — no CAST needed
                 _dl_res = await safe_execute(
                     _snap_db,
                     "SELECT COUNT(*) FROM sync_dead_letters "
-                    "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL",
+                    "WHERE brand_id = :brand_id AND resolved_at IS NULL",
                     {"brand_id": brand_id},
                     label="dead_letter_count_select",
                 )
                 dead_letter_count = _dl_res.scalar() or 0
             except Exception:
                 dead_letter_count = None
+
+            _count_duration_ms = round((time.monotonic() - _count_start) * 1000, 1)
+            logger.info(
+                "[SYNC_STATUS_COUNT_RESULT] brand_id=%s total_local=%s ok=%s partial=%s"
+                " failed=%s dead_letter=%s cast_mode_used=none query_duration_ms=%s",
+                brand_id, total_local, total_ok, total_partial,
+                total_failed, dead_letter_count, _count_duration_ms,
+            )
 
             # Upsert the snapshot row
             try:

@@ -682,6 +682,94 @@ async def inspect_schema_at_startup() -> None:
         )
 
 
+async def audit_id_column_types() -> None:
+    """Log actual PostgreSQL column types for all ID columns at startup.
+
+    Queries information_schema.columns for the tables that participate in
+    LeafLink sync and logs each ID column's actual data_type.  This makes
+    type mismatches (e.g. VARCHAR vs UUID) immediately visible in startup
+    logs so future regressions are caught before they cause runtime errors.
+
+    Key invariants verified:
+      - orders.brand_id        → character varying  (NOT uuid)
+      - orders.org_id          → character varying  (NOT uuid)
+      - order_lines.order_id   → uuid               (IS uuid)
+      - sync_health.brand_id   → character varying  (NOT uuid)
+      - sync_runs.brand_id     → character varying  (NOT uuid)
+      - dead_letter_line_items.brand_id → character varying (NOT uuid)
+      - sync_dead_letters.brand_id      → character varying (NOT uuid)
+
+    Logs [DB_ID_TYPE_AUDIT] for each column and [DB_ID_TYPE_MISMATCH] if
+    any column does not match the expected type.
+    """
+    if _engine is None:
+        logger.warning("[DB_ID_TYPE_AUDIT] engine not available — skipping audit")
+        return
+
+    # Expected types: (table, column) → expected data_type substring
+    _expected: list[tuple[str, str, str, str]] = [
+        ("orders",               "brand_id",  "character varying", "VARCHAR"),
+        ("orders",               "org_id",    "character varying", "VARCHAR"),
+        ("order_lines",          "order_id",  "uuid",              "UUID"),
+        ("sync_health",          "brand_id",  "character varying", "VARCHAR"),
+        ("sync_runs",            "brand_id",  "character varying", "VARCHAR"),
+        ("dead_letter_line_items", "brand_id", "character varying", "VARCHAR"),
+        ("sync_dead_letters",    "brand_id",  "character varying", "VARCHAR"),
+    ]
+
+    try:
+        async with _engine.connect() as conn:
+            for table_name, col_name, expected_type, label in _expected:
+                try:
+                    result = await conn.execute(
+                        text(
+                            """
+                            SELECT data_type, udt_name, character_maximum_length
+                            FROM information_schema.columns
+                            WHERE table_schema = 'public'
+                              AND table_name   = :table_name
+                              AND column_name  = :col_name
+                            """
+                        ),
+                        {"table_name": table_name, "col_name": col_name},
+                    )
+                    row = result.fetchone()
+                    if row is None:
+                        logger.warning(
+                            "[DB_ID_TYPE_AUDIT] table=%s column=%s status=NOT_FOUND"
+                            " — table may not exist yet",
+                            table_name, col_name,
+                        )
+                        continue
+
+                    actual_type, udt_name, max_len = row
+                    matches = expected_type in actual_type.lower()
+                    logger.info(
+                        "[DB_ID_TYPE_AUDIT] table=%s column=%s actual_type=%s"
+                        " udt=%s max_len=%s expected=%s match=%s",
+                        table_name, col_name, actual_type, udt_name,
+                        max_len, label, str(matches).lower(),
+                    )
+                    if not matches:
+                        logger.error(
+                            "[DB_ID_TYPE_MISMATCH] table=%s column=%s"
+                            " actual=%s expected=%s — SQL casts must match actual type."
+                            " VARCHAR columns must NOT use CAST(:x AS UUID).",
+                            table_name, col_name, actual_type, label,
+                        )
+                except Exception as col_exc:
+                    logger.warning(
+                        "[DB_ID_TYPE_AUDIT] table=%s column=%s audit_error=%s",
+                        table_name, col_name, str(col_exc)[:200],
+                    )
+    except Exception as exc:
+        logger.error(
+            "[DB_ID_TYPE_AUDIT] failed to run audit: %s",
+            exc,
+            exc_info=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Pool health telemetry — importable background task
 # ---------------------------------------------------------------------------
