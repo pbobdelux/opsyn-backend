@@ -553,6 +553,22 @@ async def release_sync_lock(db: AsyncSession, brand_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Count query logging helper — diagnoses UUID/VARCHAR type mismatches
+# ---------------------------------------------------------------------------
+
+def _log_count_query_params(label: str, brand_id: str, org_id: Optional[str] = None) -> None:
+    """Log count query parameters with type information for debugging UUID/VARCHAR mismatches."""
+    logger.info(
+        "[ROW_COUNT_SQL_SAFE] label=%s brand_id_type=%s brand_id_value=%s org_id_type=%s org_id_value=%s",
+        label,
+        type(brand_id).__name__,
+        brand_id,
+        type(org_id).__name__ if org_id else "None",
+        org_id,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Sync health state helpers
 # ---------------------------------------------------------------------------
 
@@ -2894,6 +2910,24 @@ async def sync_leaflink_orders_headers_only(
         batch_skipped = 0
         batch_dead_letter = 0
 
+        # Pre-commit row count — query BEFORE opening the batch transaction
+        _batch_db_before = 0
+        try:
+            # Ensure brand_id is a string, not UUID object
+            _brand_id_str = str(brand_id_value) if brand_id_value else brand_id_value
+            _log_count_query_params("pre_commit", _brand_id_str)
+
+            async with AsyncSessionLocal() as _pre_db:
+                _pre_res = await _pre_db.execute(
+                    select(func.count(Order.id)).where(Order.brand_id == _brand_id_str)
+                )
+                _batch_db_before = _pre_res.scalar() or 0
+        except Exception as _pre_exc:
+            logger.warning(
+                "[PRE_COMMIT_ROW_COUNT_ERROR] brand_id=%s batch=%s error=%s",
+                brand_id_value, batch_num, str(_pre_exc)[:200],
+            )
+
         try:
             async with AsyncSessionLocal() as db:
                 async with db.begin():
@@ -3681,6 +3715,35 @@ RETURNING (xmax = 0) AS was_inserted
             total_skipped += batch_skipped
             total_dead_letter += batch_dead_letter
 
+            # Post-commit row count — query AFTER the batch transaction commits
+            _batch_db_after = 0
+            try:
+                _brand_id_str = str(brand_id_value) if brand_id_value else brand_id_value
+                _log_count_query_params("post_commit", _brand_id_str)
+
+                async with AsyncSessionLocal() as _post_db:
+                    _post_res = await _post_db.execute(
+                        select(func.count(Order.id)).where(Order.brand_id == _brand_id_str)
+                    )
+                    _batch_db_after = _post_res.scalar() or 0
+            except Exception as _post_exc:
+                logger.warning(
+                    "[POST_COMMIT_ROW_COUNT_ERROR] brand_id=%s batch=%s error=%s",
+                    brand_id_value, batch_num, str(_post_exc)[:200],
+                )
+
+            logger.info(
+                "[BATCH_RECONCILIATION] brand_id=%s batch=%s/%s db_before=%s db_after=%s net_db_growth=%s batch_created=%s batch_updated=%s",
+                brand_id_value,
+                batch_num,
+                len(batches),
+                _batch_db_before,
+                _batch_db_after,
+                _batch_db_after - _batch_db_before,
+                batch_created,
+                batch_updated,
+            )
+
             # Visibility verification every 25 successful inserts
             if insert_success > 0 and insert_success % 25 == 0 and org_id_value is not None:
                 try:
@@ -3896,19 +3959,15 @@ RETURNING (xmax = 0) AS was_inserted
     # Query final visible count for this batch's brand+org scope
     _final_visible_count = 0
     try:
+        from sqlalchemy import func as _func_recon
+        _brand_id_str = str(brand_id_value) if brand_id_value else brand_id_value
+        _log_count_query_params("final_accounting", _brand_id_str)
+
         async with AsyncSessionLocal() as _final_db:
-            # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
-            # when asyncpg infers string params against native UUID columns.
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=final_accounting_visible_count columns=brand_id,org_id"
-            )
             _final_vis_result = await _final_db.execute(
-                text(
-                    "SELECT COUNT(id) FROM orders"
-                    " WHERE brand_id = CAST(:brand_id AS UUID)"
-                    " AND org_id = CAST(:org_id AS UUID)"
-                ),
-                {"brand_id": brand_id_value, "org_id": org_id_value},
+                select(_func_recon.count(Order.id)).where(
+                    Order.brand_id == _brand_id_str,
+                )
             )
             _final_visible_count = _final_vis_result.scalar() or 0
     except Exception as _fv_exc:
@@ -4873,31 +4932,36 @@ async def upsert_sync_metrics_snapshot(
 
         async with AsyncSessionLocal() as _snap_db:
             # Gather counts in a single session (no transaction needed for reads).
-            # Use explicit CAST to avoid "operator does not exist: uuid = character varying"
-            # when asyncpg infers string params against native UUID columns.
-            logger.info(
-                "[UUID_SQL_CAST_APPLIED] statement=sync_metrics_snapshot_counts columns=brand_id"
-            )
+            # Use plain string comparison (Order.brand_id == _brand_id_str) to avoid
+            # "operator does not exist: uuid = character varying" when brand_id and
+            # org_id are VARCHAR(120) columns, not UUID columns.
+            from sqlalchemy import func as _func_snap
+            from models import Order as _Order
+            _brand_id_str = str(brand_id) if brand_id else brand_id
+            _log_count_query_params("sync_status_snapshot", _brand_id_str)
+
             try:
                 _total_res = await _snap_db.execute(
-                    _text_snap(
-                        "SELECT COUNT(*) FROM orders"
-                        " WHERE brand_id = CAST(:brand_id AS UUID)"
-                    ),
-                    {"brand_id": brand_id},
+                    select(_func_snap.count(_Order.id)).where(_Order.brand_id == _brand_id_str)
                 )
                 total_local = _total_res.scalar() or 0
-            except Exception:
+                logger.info(
+                    "[SYNC_STATUS_COUNT_RESULT] brand_id=%s total_local_orders=%s",
+                    brand_id, total_local,
+                )
+            except Exception as _cnt_exc:
+                logger.warning(
+                    "[SYNC_STATUS_COUNT_QUERY] total_count_failed brand_id=%s error=%s",
+                    brand_id, str(_cnt_exc)[:200],
+                )
                 total_local = None
 
             try:
                 _ok_res = await _snap_db.execute(
-                    _text_snap(
-                        "SELECT COUNT(*) FROM orders"
-                        " WHERE brand_id = CAST(:brand_id AS UUID)"
-                        " AND sync_status = :status"
-                    ),
-                    {"brand_id": brand_id, "status": "ok"},
+                    select(_func_snap.count(_Order.id)).where(
+                        _Order.brand_id == _brand_id_str,
+                        _Order.sync_status == "ok",
+                    )
                 )
                 total_ok = _ok_res.scalar() or 0
             except Exception:
@@ -4905,12 +4969,10 @@ async def upsert_sync_metrics_snapshot(
 
             try:
                 _partial_res = await _snap_db.execute(
-                    _text_snap(
-                        "SELECT COUNT(*) FROM orders"
-                        " WHERE brand_id = CAST(:brand_id AS UUID)"
-                        " AND sync_status = :status"
-                    ),
-                    {"brand_id": brand_id, "status": "partial"},
+                    select(_func_snap.count(_Order.id)).where(
+                        _Order.brand_id == _brand_id_str,
+                        _Order.sync_status == "partial",
+                    )
                 )
                 total_partial = _partial_res.scalar() or 0
             except Exception:
@@ -4918,12 +4980,10 @@ async def upsert_sync_metrics_snapshot(
 
             try:
                 _failed_res = await _snap_db.execute(
-                    _text_snap(
-                        "SELECT COUNT(*) FROM orders"
-                        " WHERE brand_id = CAST(:brand_id AS UUID)"
-                        " AND sync_status = :status"
-                    ),
-                    {"brand_id": brand_id, "status": "failed"},
+                    select(_func_snap.count(_Order.id)).where(
+                        _Order.brand_id == _brand_id_str,
+                        _Order.sync_status == "failed",
+                    )
                 )
                 total_failed = _failed_res.scalar() or 0
             except Exception:
@@ -4933,9 +4993,9 @@ async def upsert_sync_metrics_snapshot(
                 _dl_res = await _snap_db.execute(
                     _text_snap(
                         "SELECT COUNT(*) FROM sync_dead_letters "
-                        "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL"
+                        "WHERE brand_id = :brand_id AND resolved_at IS NULL"
                     ),
-                    {"brand_id": brand_id},
+                    {"brand_id": _brand_id_str},
                 )
                 dead_letter_count = _dl_res.scalar() or 0
             except Exception:
