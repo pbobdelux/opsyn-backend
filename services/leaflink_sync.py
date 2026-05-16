@@ -1404,6 +1404,18 @@ def _record_order_outcome(external_order_id: Optional[str], action: OrderOutcome
     )
 
 
+def _log_count_query_params(label: str, brand_id: str, org_id: Optional[str] = None) -> None:
+    """Log count query parameters with type information for debugging UUID/VARCHAR mismatches."""
+    logger.info(
+        "[ROW_COUNT_SQL_SAFE] label=%s brand_id_type=%s brand_id_value=%s org_id_type=%s org_id_value=%s",
+        label,
+        type(brand_id).__name__,
+        brand_id,
+        type(org_id).__name__ if org_id else "None",
+        org_id,
+    )
+
+
 async def _record_batch_reconciliation(
     brand_id: str,
     fetched: int,
@@ -4281,9 +4293,13 @@ async def sync_leaflink_orders_headers_only(
         # [POST_COMMIT_ROW_COUNT] can show the exact delta this batch produced.
         _batch_db_before = 0
         try:
+            # Ensure brand_id is a string, not UUID object
+            _brand_id_str = str(brand_id_value) if brand_id_value else brand_id_value
+            _log_count_query_params("pre_commit", _brand_id_str)
+
             async with AsyncSessionLocal() as _pre_db:
                 _pre_res = await _pre_db.execute(
-                    select(func.count(Order.id)).where(Order.brand_id == brand_id_value)
+                    select(func.count(Order.id)).where(Order.brand_id == _brand_id_str)
                 )
                 _batch_db_before = _pre_res.scalar() or 0
         except Exception as _pre_exc:
@@ -5036,9 +5052,12 @@ RETURNING (xmax = 0) AS was_inserted
             # exactly what this batch wrote to the database.
             _batch_db_after = 0
             try:
+                _brand_id_str = str(brand_id_value) if brand_id_value else brand_id_value
+                _log_count_query_params("post_commit", _brand_id_str)
+
                 async with AsyncSessionLocal() as _post_db:
                     _post_res = await _post_db.execute(
-                        select(func.count(Order.id)).where(Order.brand_id == brand_id_value)
+                        select(func.count(Order.id)).where(Order.brand_id == _brand_id_str)
                     )
                     _batch_db_after = _post_res.scalar() or 0
             except Exception as _post_exc:
@@ -6462,6 +6481,8 @@ async def upsert_sync_metrics_snapshot(
         async with AsyncSessionLocal() as _snap_db:
             # Gather counts in a single session (no transaction needed for reads).
             # All brand_id columns are VARCHAR(120) — no CAST to UUID needed.
+            _brand_id_str = str(brand_id) if brand_id else brand_id
+            _log_count_query_params("sync_status_snapshot", _brand_id_str)
             _count_start = time.monotonic()
             logger.info(
                 "[SYNC_STATUS_COUNT_QUERY] brand_id=%s source=upsert_sync_metrics_snapshot"
@@ -6470,7 +6491,7 @@ async def upsert_sync_metrics_snapshot(
             )
             try:
                 _total_res = await _snap_db.execute(
-                    select(_func_snap.count(_Order.id)).where(_Order.brand_id == brand_id)
+                    select(_func_snap.count(_Order.id)).where(_Order.brand_id == _brand_id_str)
                 )
                 total_local = _total_res.scalar() or 0
             except Exception as _cnt_exc:
@@ -8099,11 +8120,14 @@ async def _sync_leaflink_background_continuous_inner(
         _db_orders_after = 0
         _db_orders_delta = 0
         try:
+            _brand_id_str = str(brand_id) if brand_id else brand_id
+            _log_count_query_params("final_accounting", _brand_id_str)
+
             from sqlalchemy import func as _func_recon
             async with AsyncSessionLocal() as _recon_db:
                 _before_res = await _recon_db.execute(
                     select(_func_recon.count(Order.id)).where(
-                        Order.brand_id == brand_id,
+                        Order.brand_id == _brand_id_str,
                         Order.created_at < _sync_start_time,
                     )
                 )
@@ -8111,7 +8135,7 @@ async def _sync_leaflink_background_continuous_inner(
 
                 _after_res = await _recon_db.execute(
                     select(_func_recon.count(Order.id)).where(
-                        Order.brand_id == brand_id,
+                        Order.brand_id == _brand_id_str,
                     )
                 )
                 _db_orders_after = _after_res.scalar() or 0

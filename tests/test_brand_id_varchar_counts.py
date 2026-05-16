@@ -354,3 +354,95 @@ class TestNoUuidCastInWhereClauses:
             "orders.org_id is VARCHAR(120) — remove the CAST.\n"
             + "\n".join(matches)
         )
+
+
+# ---------------------------------------------------------------------------
+# _log_count_query_params helper — validates logging and string coercion
+# ---------------------------------------------------------------------------
+
+class TestLogCountQueryParams:
+    """Verify _log_count_query_params is defined and emits [ROW_COUNT_SQL_SAFE]."""
+
+    def test_helper_is_importable(self):
+        from services.leaflink_sync import _log_count_query_params
+        assert callable(_log_count_query_params)
+
+    def test_row_count_sql_safe_marker_in_source(self):
+        import pathlib
+        src = pathlib.Path(__file__).parent.parent / "services" / "leaflink_sync.py"
+        source = src.read_text(encoding="utf-8")
+        assert "[ROW_COUNT_SQL_SAFE]" in source, (
+            "services/leaflink_sync.py must emit [ROW_COUNT_SQL_SAFE] via _log_count_query_params"
+        )
+
+    def test_helper_logs_string_type(self, caplog):
+        import logging
+        from services.leaflink_sync import _log_count_query_params
+        with caplog.at_level(logging.INFO, logger="services.leaflink_sync"):
+            _log_count_query_params("test_label", "some-brand-uuid-string")
+        assert any("[ROW_COUNT_SQL_SAFE]" in r.message for r in caplog.records), (
+            "_log_count_query_params must emit a [ROW_COUNT_SQL_SAFE] log line"
+        )
+        assert any("brand_id_type=str" in r.message for r in caplog.records), (
+            "_log_count_query_params must log brand_id_type=str for a plain string"
+        )
+
+    def test_helper_accepts_org_id(self, caplog):
+        import logging
+        from services.leaflink_sync import _log_count_query_params
+        with caplog.at_level(logging.INFO, logger="services.leaflink_sync"):
+            _log_count_query_params("test_label", "brand-123", org_id="org-456")
+        assert any("org_id_value=org-456" in r.message for r in caplog.records), (
+            "_log_count_query_params must log org_id_value when provided"
+        )
+
+    def test_pre_commit_uses_string_coercion_in_source(self):
+        """Verify the pre-commit count block calls str() on brand_id_value."""
+        import pathlib
+        src = pathlib.Path(__file__).parent.parent / "services" / "leaflink_sync.py"
+        source = src.read_text(encoding="utf-8")
+        assert '_log_count_query_params("pre_commit"' in source, (
+            "PRE_COMMIT_ROW_COUNT block must call _log_count_query_params(\"pre_commit\", ...)"
+        )
+
+    def test_post_commit_uses_string_coercion_in_source(self):
+        """Verify the post-commit count block calls str() on brand_id_value."""
+        import pathlib
+        src = pathlib.Path(__file__).parent.parent / "services" / "leaflink_sync.py"
+        source = src.read_text(encoding="utf-8")
+        assert '_log_count_query_params("post_commit"' in source, (
+            "POST_COMMIT_ROW_COUNT block must call _log_count_query_params(\"post_commit\", ...)"
+        )
+
+    def test_final_accounting_uses_string_coercion_in_source(self):
+        """Verify the final reconciliation block calls str() on brand_id."""
+        import pathlib
+        src = pathlib.Path(__file__).parent.parent / "services" / "leaflink_sync.py"
+        source = src.read_text(encoding="utf-8")
+        assert '_log_count_query_params("final_accounting"' in source, (
+            "Final accounting reconciliation block must call _log_count_query_params(\"final_accounting\", ...)"
+        )
+
+    def test_sync_status_snapshot_uses_string_coercion_in_source(self):
+        """Verify the sync_status snapshot block calls str() on brand_id."""
+        import pathlib
+        src = pathlib.Path(__file__).parent.parent / "services" / "leaflink_sync.py"
+        source = src.read_text(encoding="utf-8")
+        assert '_log_count_query_params("sync_status_snapshot"' in source, (
+            "upsert_sync_metrics_snapshot must call _log_count_query_params(\"sync_status_snapshot\", ...)"
+        )
+
+    def test_no_uuid_object_passed_to_count_queries(self):
+        """Verify str() coercion is applied before each count query in the source."""
+        import pathlib
+        import re
+        src = pathlib.Path(__file__).parent.parent / "services" / "leaflink_sync.py"
+        source = src.read_text(encoding="utf-8")
+        # Each count query site must have a _brand_id_str = str(...) assignment nearby
+        coercion_pattern = re.compile(r"_brand_id_str\s*=\s*str\(brand_id")
+        matches = coercion_pattern.findall(source)
+        assert len(matches) >= 4, (
+            f"Expected at least 4 str(brand_id...) coercions for count queries, found {len(matches)}. "
+            "All PRE_COMMIT, POST_COMMIT, final_accounting, and sync_status_snapshot blocks "
+            "must coerce brand_id to str before querying."
+        )
