@@ -312,7 +312,7 @@ async def reprocess_dead_letters(
             text("""
                 SELECT id, external_id, order_number, raw_payload, error_stage, retry_count
                 FROM sync_dead_letters
-                WHERE brand_id = CAST(:brand_id AS uuid)
+                WHERE brand_id = :brand_id
                   AND resolved_at IS NULL
                 ORDER BY created_at ASC
             """),
@@ -492,8 +492,8 @@ async def reprocess_order(
     from database import AsyncSessionLocal
     from services.leaflink_sync import sync_leaflink_orders
 
-    # Coerce brand_id to a valid UUID or None before using it in UUID columns.
-    # CAST(:brand_id AS uuid) in the SQL will fail if the value is not a valid UUID string.
+    # brand_id is compared directly (no CAST) — columns are VARCHAR(120), not UUID type.
+
     brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
 
     logger.info(
@@ -517,7 +517,7 @@ async def reprocess_order(
             text("""
                 SELECT id, external_id, order_number, raw_payload, error_stage, retry_count
                 FROM sync_dead_letters
-                WHERE brand_id = CAST(:brand_id AS uuid)
+                WHERE brand_id = :brand_id
                   AND external_id = :external_id
                   AND resolved_at IS NULL
                 ORDER BY created_at DESC
@@ -662,8 +662,8 @@ async def backfill_normalized_dates(
     """
     from services.leaflink_sync import normalize_datetime, ensure_utc
 
-    # Coerce brand_id to a valid UUID or None before using it in UUID columns.
-    # CAST(:brand_id AS uuid) in the SQL will fail if the value is not a valid UUID string.
+    # brand_id is compared directly (no CAST) — columns are VARCHAR(120), not UUID type.
+
     brand_id = safe_uuid_for_db(brand_id, "brand_id") or brand_id  # keep original if invalid so logging still works
 
     logger.info(
@@ -687,7 +687,7 @@ async def backfill_normalized_dates(
             text("""
                 SELECT id, external_order_id, raw_payload
                 FROM orders
-                WHERE brand_id = CAST(:brand_id AS uuid)
+                WHERE brand_id = :brand_id
                   AND raw_payload IS NOT NULL
                   AND (external_created_at IS NULL OR external_updated_at IS NULL)
                 ORDER BY id ASC

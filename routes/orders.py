@@ -419,16 +419,16 @@ async def get_orders(
         _total_rows_res = await db.execute(_text_diag("SELECT COUNT(*) FROM orders"))
         _total_rows = _total_rows_res.scalar() or 0
 
-        # Rows by brand_id — use CAST to avoid "operator does not exist: character varying = uuid"
+        # Rows by brand_id (no CAST — brand_id column is VARCHAR, not UUID type)
         _brand_rows_res = await db.execute(
-            _text_diag("SELECT COUNT(*) FROM orders WHERE brand_id = CAST(:brand_id AS uuid)"),
+            _text_diag("SELECT COUNT(*) FROM orders WHERE brand_id = :brand_id"),
             {"brand_id": brand_id},
         )
         _brand_rows = _brand_rows_res.scalar() or 0
 
         # Rows by org_id
         _org_rows_res = await db.execute(
-            _text_diag("SELECT COUNT(*) FROM orders WHERE org_id = CAST(:org_id AS uuid)"),
+            _text_diag("SELECT COUNT(*) FROM orders WHERE org_id = :org_id"),
             {"org_id": resolved_org_id},
         )
         _org_rows = _org_rows_res.scalar() or 0
@@ -437,7 +437,7 @@ async def get_orders(
         _both_rows_res = await db.execute(
             _text_diag(
                 "SELECT COUNT(*) FROM orders "
-                "WHERE brand_id = CAST(:brand_id AS uuid) AND org_id = CAST(:org_id AS uuid)"
+                "WHERE brand_id = :brand_id AND org_id = :org_id"
             ),
             {"brand_id": brand_id, "org_id": resolved_org_id},
         )
@@ -447,7 +447,7 @@ async def get_orders(
         _latest_res = await db.execute(
             _text_diag(
                 "SELECT MAX(created_at) FROM orders "
-                "WHERE brand_id = CAST(:brand_id AS uuid)"
+                "WHERE brand_id = :brand_id"
             ),
             {"brand_id": brand_id},
         )
@@ -2697,7 +2697,7 @@ async def orders_sync_debug(
                 SELECT COUNT(*) FROM (
                     SELECT external_order_id
                     FROM orders
-                    WHERE brand_id = CAST(:brand AS uuid)
+                    WHERE brand_id = :brand
                     GROUP BY external_order_id
                     HAVING COUNT(*) > 1
                 ) AS dups
@@ -2718,7 +2718,7 @@ async def orders_sync_debug(
                     MAX(external_updated_at) AS newest,
                     MIN(external_updated_at) AS oldest
                 FROM orders
-                WHERE brand_id = CAST(:brand AS uuid)
+                WHERE brand_id = :brand
             """),
             {"brand": brand},
         )
@@ -3859,6 +3859,26 @@ async def api_orders_full_resync(
     })
 
 
+async def _get_live_order_count(db: AsyncSession, brand_id: str) -> int:
+    """Get live order count from DB for a brand (VARCHAR brand_id, no CAST)."""
+    try:
+        result = await db.execute(
+            select(func.count(Order.id)).where(Order.brand_id == brand_id)
+        )
+        return result.scalar() or 0
+    except Exception as exc:
+        logger.warning(
+            "[SYNC_STATUS_LIVE_COUNT_ERROR] brand_id=%s error=%s",
+            brand_id,
+            str(exc)[:200],
+        )
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        return 0
+
+
 @router.get("/sync-status")
 async def api_orders_sync_status(
     brand_id: str = Query(..., description="Brand ID (UUID)"),
@@ -3902,7 +3922,7 @@ async def api_orders_sync_status(
                 "dead_letter_count, pages_processed, records_processed, "
                 "last_successful_sync_at, updated_at, sync_run_id "
                 "FROM sync_metrics_snapshots "
-                "WHERE brand_id = CAST(:brand_id AS UUID) "
+                "WHERE brand_id = :brand_id "
                 "ORDER BY updated_at DESC NULLS LAST "
                 "LIMIT 1"
             ),
@@ -3990,20 +4010,38 @@ async def api_orders_sync_status(
         current_sync_state = "idle"
 
     # ------------------------------------------------------------------ #
-    # Populate counts from snapshot (fast) or fallback to 0               #
+    # Live order count — always query DB directly (no CAST, no stale      #
+    # snapshot) so total_local_orders reflects the real DB state.         #
+    # ------------------------------------------------------------------ #
+    live_count = await _get_live_order_count(db, brand_id)
+    logger.info(
+        "[SYNC_STATUS_LIVE_COUNT] brand_id=%s live_count=%s",
+        brand_id,
+        live_count,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Populate counts — live count is authoritative for total_local_orders #
     # ------------------------------------------------------------------ #
     data_source = "sync_run"
     if snapshot:
-        total_local_orders = snapshot[0] or 0
+        snapshot_count = snapshot[0] or 0
         partial_sync_count = snapshot[2] or 0
         failed_order_count = snapshot[3] or 0
         snap_last_sync = snapshot[7]
-        data_source = "snapshot"
+        data_source = "live"
+        logger.info(
+            "[SYNC_STATUS_SNAPSHOT_COUNT] brand_id=%s snapshot_count=%s",
+            brand_id,
+            snapshot_count,
+        )
     else:
-        total_local_orders = 0
         partial_sync_count = 0
         failed_order_count = 0
         snap_last_sync = None
+
+    # total_local_orders is always the live DB count
+    total_local_orders = live_count
 
     # ------------------------------------------------------------------ #
     # Timestamps                                                           #
@@ -4172,7 +4210,7 @@ async def api_orders_sync_metrics(
                 "pages_processed, records_processed, sync_rate, "
                 "last_successful_sync_at, updated_at, sync_run_id "
                 "FROM sync_metrics_snapshots "
-                "WHERE brand_id = CAST(:brand_id AS UUID) "
+                "WHERE brand_id = :brand_id "
                 "ORDER BY updated_at DESC NULLS LAST "
                 "LIMIT 1"
             ),
@@ -4332,7 +4370,7 @@ async def api_orders_dead_letter_analysis(
         total_res = await db.execute(
             _text(
                 "SELECT COUNT(*) FROM sync_dead_letters "
-                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL"
+                "WHERE brand_id = :brand_id AND resolved_at IS NULL"
             ),
             {"brand_id": brand_id},
         )
@@ -4349,7 +4387,7 @@ async def api_orders_dead_letter_analysis(
         stage_res = await db.execute(
             _text(
                 "SELECT error_stage, COUNT(*) as cnt FROM sync_dead_letters "
-                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL "
+                "WHERE brand_id = :brand_id AND resolved_at IS NULL "
                 "GROUP BY error_stage ORDER BY cnt DESC"
             ),
             {"brand_id": brand_id},
@@ -4370,7 +4408,7 @@ async def api_orders_dead_letter_analysis(
                 "SELECT id, external_id, order_number, error_stage, error_message, "
                 "       raw_payload, created_at "
                 "FROM sync_dead_letters "
-                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL "
+                "WHERE brand_id = :brand_id AND resolved_at IS NULL "
                 "ORDER BY created_at DESC "
                 "LIMIT :lim"
             ),
@@ -4622,7 +4660,7 @@ async def api_orders_sync_status_debug(
         dl_res = await db.execute(
             _text(
                 "SELECT COUNT(*) FROM sync_dead_letters "
-                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL"
+                "WHERE brand_id = :brand_id AND resolved_at IS NULL"
             ),
             {"brand_id": brand_id},
         )
@@ -4674,7 +4712,7 @@ async def api_orders_sync_status_debug(
         fc_res = await db.execute(
             _text(
                 "SELECT error_message FROM sync_dead_letters "
-                "WHERE brand_id = CAST(:brand_id AS uuid) AND resolved_at IS NULL "
+                "WHERE brand_id = :brand_id AND resolved_at IS NULL "
                 "LIMIT 500"
             ),
             {"brand_id": brand_id},
@@ -4819,7 +4857,7 @@ async def api_orders_runtime_health(
                 "SELECT total_local_orders, dead_letter_count, sync_rate, "
                 "last_successful_sync_at, updated_at, sync_run_id "
                 "FROM sync_metrics_snapshots "
-                "WHERE brand_id = CAST(:brand_id AS UUID) "
+                "WHERE brand_id = :brand_id "
                 "ORDER BY updated_at DESC NULLS LAST "
                 "LIMIT 1"
             ),
@@ -4980,7 +5018,7 @@ async def orders_db_debug(
         if brand_id:
             _by_org_query = (
                 "SELECT org_id::text, COUNT(*) as cnt FROM orders "
-                "WHERE brand_id = CAST(:brand_id AS uuid) GROUP BY org_id ORDER BY cnt DESC LIMIT 20"
+                "WHERE brand_id = :brand_id GROUP BY org_id ORDER BY cnt DESC LIMIT 20"
             )
         _by_org_res = await db.execute(
             _text_debug(_by_org_query),
@@ -5007,7 +5045,7 @@ async def orders_db_debug(
         if brand_id:
             _latest_query = (
                 "SELECT id, org_id::text, brand_id::text, external_order_id, created_at "
-                "FROM orders WHERE brand_id = CAST(:brand_id AS uuid) ORDER BY id DESC LIMIT 1"
+                "FROM orders WHERE brand_id = :brand_id ORDER BY id DESC LIMIT 1"
             )
         _latest_res = await db.execute(
             _text_debug(_latest_query),
@@ -5029,7 +5067,7 @@ async def orders_db_debug(
         # 5. Null org_id count (critical diagnostic)
         _null_org_query = "SELECT COUNT(*) FROM orders WHERE org_id IS NULL"
         if brand_id:
-            _null_org_query = "SELECT COUNT(*) FROM orders WHERE org_id IS NULL AND brand_id = CAST(:brand_id AS uuid)"
+            _null_org_query = "SELECT COUNT(*) FROM orders WHERE org_id IS NULL AND brand_id = :brand_id"
         _null_org_res = await db.execute(
             _text_debug(_null_org_query),
             {"brand_id": brand_id} if brand_id else {},
@@ -5046,7 +5084,7 @@ async def orders_db_debug(
             _snap_query = (
                 "SELECT brand_id::text, sync_run_id, total_local_orders, pages_processed, "
                 "records_processed, updated_at "
-                "FROM sync_metrics_snapshots WHERE brand_id = CAST(:brand_id AS uuid) "
+                "FROM sync_metrics_snapshots WHERE brand_id = :brand_id "
                 "ORDER BY updated_at DESC LIMIT 5"
             )
         try:
