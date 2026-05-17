@@ -312,7 +312,7 @@ async def reprocess_dead_letters(
             text("""
                 SELECT id, external_id, order_number, raw_payload, error_stage, retry_count
                 FROM sync_dead_letters
-                WHERE brand_id = CAST(:brand_id AS uuid)
+                WHERE brand_id = :brand_id
                   AND resolved_at IS NULL
                 ORDER BY created_at ASC
             """),
@@ -517,7 +517,7 @@ async def reprocess_order(
             text("""
                 SELECT id, external_id, order_number, raw_payload, error_stage, retry_count
                 FROM sync_dead_letters
-                WHERE brand_id = CAST(:brand_id AS uuid)
+                WHERE brand_id = :brand_id
                   AND external_id = :external_id
                   AND resolved_at IS NULL
                 ORDER BY created_at DESC
@@ -687,7 +687,7 @@ async def backfill_normalized_dates(
             text("""
                 SELECT id, external_order_id, raw_payload
                 FROM orders
-                WHERE brand_id = CAST(:brand_id AS uuid)
+                WHERE brand_id = :brand_id
                   AND raw_payload IS NOT NULL
                   AND (external_created_at IS NULL OR external_updated_at IS NULL)
                 ORDER BY id ASC

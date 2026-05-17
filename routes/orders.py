@@ -3940,20 +3940,36 @@ async def api_orders_sync_status(
         current_sync_state = "idle"
 
     # ------------------------------------------------------------------ #
-    # Populate counts from snapshot (fast) or fallback to 0               #
+    # Live DB count — always authoritative for total_local_orders         #
+    # brand_id is VARCHAR(120) — _get_brand_order_count uses ORM (no CAST)#
     # ------------------------------------------------------------------ #
-    data_source = "sync_run"
+    live_count = await _get_brand_order_count(db, brand_id)
+    logger.info(
+        "[SYNC_STATUS_LIVE_COUNT] brand_id=%s live_count=%s",
+        brand_id,
+        live_count,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Populate partial/failed counts from snapshot; timestamps from snap  #
+    # ------------------------------------------------------------------ #
     if snapshot:
-        total_local_orders = snapshot[0] or 0
+        snapshot_count = snapshot[0] or 0
         partial_sync_count = snapshot[2] or 0
         failed_order_count = snapshot[3] or 0
         snap_last_sync = snapshot[7]
-        data_source = "snapshot"
+        logger.info(
+            "[SYNC_STATUS_SNAPSHOT_COUNT] brand_id=%s snapshot_count=%s",
+            brand_id,
+            snapshot_count,
+        )
     else:
-        total_local_orders = 0
         partial_sync_count = 0
         failed_order_count = 0
         snap_last_sync = None
+
+    total_local_orders = live_count
+    data_source = "live"
 
     # ------------------------------------------------------------------ #
     # Timestamps                                                           #
