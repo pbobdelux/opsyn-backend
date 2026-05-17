@@ -3892,7 +3892,17 @@ async def api_orders_sync_status(
     logger.info("[OrdersAPI] sync_status brand_id=%s", brand_id)
 
     # ------------------------------------------------------------------ #
-    # Fast path: read from snapshot cache                                  #
+    # Live count: always fetch from DB (never use stale snapshot count)   #
+    # ------------------------------------------------------------------ #
+    live_count = await _get_brand_order_count(db, brand_id)
+    logger.info(
+        "[SYNC_STATUS_LIVE_COUNT] brand_id=%s live_count=%s",
+        brand_id,
+        live_count,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Snapshot cache: used only for partial/failed counts and timestamps  #
     # ------------------------------------------------------------------ #
     snapshot = None
     try:
@@ -3902,7 +3912,7 @@ async def api_orders_sync_status(
                 "dead_letter_count, pages_processed, records_processed, "
                 "last_successful_sync_at, updated_at, sync_run_id "
                 "FROM sync_metrics_snapshots "
-                "WHERE brand_id = CAST(:brand_id AS UUID) "
+                "WHERE brand_id::text = :brand_id "
                 "ORDER BY updated_at DESC NULLS LAST "
                 "LIMIT 1"
             ),
@@ -3990,17 +4000,21 @@ async def api_orders_sync_status(
         current_sync_state = "idle"
 
     # ------------------------------------------------------------------ #
-    # Populate counts from snapshot (fast) or fallback to 0               #
+    # Populate counts: live count always used for total_local_orders.     #
+    # Snapshot used only for partial/failed counts and last sync time.    #
     # ------------------------------------------------------------------ #
-    data_source = "sync_run"
+    total_local_orders = live_count
+    data_source = "live"
     if snapshot:
-        total_local_orders = snapshot[0] or 0
         partial_sync_count = snapshot[2] or 0
         failed_order_count = snapshot[3] or 0
         snap_last_sync = snapshot[7]
-        data_source = "snapshot"
+        logger.info(
+            "[SYNC_STATUS_SNAPSHOT_COUNT] brand_id=%s snapshot_count=%s",
+            brand_id,
+            snapshot[0] or 0,
+        )
     else:
-        total_local_orders = 0
         partial_sync_count = 0
         failed_order_count = 0
         snap_last_sync = None
@@ -4044,6 +4058,19 @@ async def api_orders_sync_status(
         _last_updated_at,
         is_stalled,
         data_source,
+    )
+
+    logger.info(
+        "[SYNC_STATUS_RESPONSE] brand_id=%s total_local_orders=%s data_source=%s"
+        " current_sync_state=%s partial_sync_count=%s failed_order_count=%s"
+        " last_successful_sync_at=%s",
+        brand_id,
+        total_local_orders,
+        data_source,
+        current_sync_state,
+        partial_sync_count,
+        failed_order_count,
+        last_successful_sync_at,
     )
 
     return make_json_safe({
