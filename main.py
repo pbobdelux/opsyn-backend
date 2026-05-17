@@ -154,6 +154,7 @@ from routes.diagnostics import router as diagnostics_router  # noqa: E402
 from routes.drivers import router as drivers_router  # noqa: E402
 from routes.routes import router as routes_router  # noqa: E402
 from routes.driver_app import router as driver_app_router  # noqa: E402
+from routes.mobile import router as mobile_router  # noqa: E402
 from utils.json_utils import make_json_safe  # noqa: E402
 from services.sync_scheduler import run_scheduler  # noqa: E402
 
@@ -1088,6 +1089,9 @@ app.include_router(webhook_status_router)
 app.include_router(drivers_router)
 app.include_router(routes_router)
 app.include_router(driver_app_router)
+
+# Mobile API — lightweight iOS-facing endpoints under /api/mobile/
+app.include_router(mobile_router)
 
 logger.info("[Routes] registered all routers")
 
