@@ -65,24 +65,25 @@ def _compute_sync_status(
 
 
 # ---------------------------------------------------------------------------
-# GET /health — top-level service health
+# NOTE: The instant GET /health endpoint is now in routes/health_instant.py.
+# It is registered BEFORE this router in main.py so that /health returns
+# instantly (< 50ms, no DB calls).  The comprehensive check is available at
+# GET /health/deep (also in routes/health_instant.py).
+#
+# The legacy root handler below is kept as /health/deep-legacy for reference
+# but is no longer the primary /health route.
 # ---------------------------------------------------------------------------
 
-@router.get("")
-@router.get("/")
-async def health_root(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+@router.get("/deep")
+async def health_deep_legacy(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     """
-    Top-level service health check.
+    Legacy comprehensive health check — DB ping + LeafLink sync health.
 
-    Returns:
-      {
-        "ok": true,
-        "service": "opsyn-backend",
-        "version": "1.0.0",
-        "timestamp": "<ISO>",
-        "database": "ok|error",
-        "leaflink_sync": "ok|warning|error"
-      }
+    Kept for backward compatibility.  The canonical deep-check endpoint is
+    now GET /health/deep (registered in routes/health_instant.py).
+
+    The instant /health endpoint (no DB calls, < 50ms) is in
+    routes/health_instant.py and is registered first in main.py.
     """
     timestamp = _utc_now_iso()
     database_status = "ok"
