@@ -2,9 +2,10 @@ import base64
 import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Query
-from sqlalchemy import and_, func, select
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -332,6 +333,186 @@ def _compute_order_totals(order: Order, line_items: list[dict[str, Any]]) -> dic
         "unit_count": stored_unit_count or 0,
         "total_source": "missing",
     }
+
+
+async def _resolve_order_identifier(
+    db: AsyncSession,
+    org_id: str,
+    identifier: str,
+) -> tuple["Order | None", str]:
+    """
+    Resolve an order by any identifier format, scoped to org_id.
+
+    Tries in order:
+    1. Internal positive integer ID
+    2. order_number (exact match)
+    3. external_order_id (exact match)
+    4. external_id / UUID (exact match on Order.id)
+    5. Short suffix (last 8 chars of UUID, tenant-scoped)
+
+    Returns (order_or_None, matched_by_strategy).
+    Raises HTTP 409 if the short-suffix lookup is ambiguous.
+    """
+    # Try as positive integer ID
+    try:
+        order_id_int = int(identifier)
+        if order_id_int > 0:
+            result = await db.execute(
+                select(Order)
+                .where(
+                    and_(
+                        Order.id == str(order_id_int),
+                        Order.org_id == org_id,
+                    )
+                )
+                .options(selectinload(Order.lines))
+            )
+            order = result.scalar_one_or_none()
+            if order:
+                return order, "integer_id"
+    except (ValueError, TypeError):
+        pass
+
+    # Try as order_number (exact)
+    result = await db.execute(
+        select(Order)
+        .where(
+            and_(
+                Order.order_number == identifier,
+                Order.org_id == org_id,
+            )
+        )
+        .options(selectinload(Order.lines))
+    )
+    order = result.scalar_one_or_none()
+    if order:
+        return order, "order_number"
+
+    # Try as external_order_id (exact)
+    result = await db.execute(
+        select(Order)
+        .where(
+            and_(
+                Order.external_order_id == identifier,
+                Order.org_id == org_id,
+            )
+        )
+        .options(selectinload(Order.lines))
+    )
+    order = result.scalar_one_or_none()
+    if order:
+        return order, "external_order_id"
+
+    # Try as UUID / Order.id (exact)
+    try:
+        uuid_val = UUID(identifier)
+        result = await db.execute(
+            select(Order)
+            .where(
+                and_(
+                    Order.id == str(uuid_val),
+                    Order.org_id == org_id,
+                )
+            )
+            .options(selectinload(Order.lines))
+        )
+        order = result.scalar_one_or_none()
+        if order:
+            return order, "uuid"
+    except (ValueError, TypeError):
+        pass
+
+    # Try as short suffix (last 8 chars of UUID, tenant-scoped)
+    if len(identifier) == 8:
+        result = await db.execute(
+            select(Order)
+            .where(
+                and_(
+                    or_(
+                        Order.external_order_id.endswith(identifier),
+                        Order.id.endswith(identifier),
+                    ),
+                    Order.org_id == org_id,
+                )
+            )
+            .options(selectinload(Order.lines))
+        )
+        orders = result.scalars().all()
+        if len(orders) == 1:
+            return orders[0], "suffix"
+        elif len(orders) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Ambiguous identifier: {len(orders)} orders match suffix '{identifier}'",
+            )
+
+    return None, "not_found"
+
+
+def _build_crm_line_items_detail(order: "Order") -> list[dict[str, Any]]:
+    """
+    Build a normalized line-items list for the detail endpoint.
+
+    Extends _build_crm_line_items() with additional fields:
+    - product_id  (from line.mapped_product_id or raw_payload)
+    - brand_id    (from raw_payload)
+    - category    (from raw_payload)
+    """
+    items: list[dict[str, Any]] = []
+
+    # --- Source 1: ORM relationship rows ---
+    try:
+        lines = getattr(order, "lines", None)
+        if lines:
+            for line in lines:
+                try:
+                    unit_price = None
+                    if line.unit_price is not None:
+                        unit_price = float(line.unit_price)
+                    elif line.unit_price_cents is not None:
+                        unit_price = round(line.unit_price_cents / 100.0, 2)
+
+                    line_total = None
+                    if line.total_price is not None:
+                        line_total = float(line.total_price)
+                    elif line.total_price_cents is not None:
+                        line_total = round(line.total_price_cents / 100.0, 2)
+                    elif unit_price is not None and line.quantity:
+                        line_total = round(unit_price * (line.quantity or 0), 2)
+
+                    raw = getattr(line, "raw_payload", None) or {}
+                    items.append({
+                        "product_name": line.product_name,
+                        "sku": line.sku,
+                        "quantity": line.quantity or 0,
+                        "unit_price": unit_price,
+                        "line_total": line_total,
+                        "product_id": (
+                            line.mapped_product_id
+                            or raw.get("product_id")
+                            or raw.get("product")
+                        ),
+                        "brand_id": raw.get("brand_id") or raw.get("brand"),
+                        "category": raw.get("category") or raw.get("product_category"),
+                        "discounts": raw.get("discount_amount") or raw.get("discounts"),
+                        "shipping": raw.get("shipping"),
+                        "tax": raw.get("tax"),
+                        "product_identifiers": raw.get("product_identifiers"),
+                    })
+                except Exception:
+                    pass
+            if items:
+                return items
+    except Exception:
+        pass
+
+    # --- Fallback: delegate to the standard builder and inject None for new fields ---
+    base_items = _build_crm_line_items(order)
+    for item in base_items:
+        item.setdefault("product_id", None)
+        item.setdefault("brand_id", None)
+        item.setdefault("category", item.get("category"))
+    return base_items
 
 
 async def validate_crm_access(
@@ -855,43 +1036,171 @@ async def crm_orders(
         }
 
 
-@router.get("/orders/{order_id}/debug")
+@router.get("/orders/{order_identifier}/debug")
 async def crm_order_debug(
-    order_id: str,
+    order_identifier: str,
     org_id: str = Query(..., description="Organization ID (UUID or org_code)"),
-    brand_id: str = Query(..., description="Brand ID (UUID)"),
     x_opsyn_org: str | None = Header(None, description="Optional org_id from header"),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Debug endpoint — returns raw DB state, computed totals, and final payload.
+    Debug endpoint — resolves an order by any identifier and returns raw DB
+    state, all lookup candidates, computed totals, and the final API payload.
+
+    Accepts org_id only (no brand_id required). Resolves by:
+    integer id, order_number, external_order_id, UUID, or 8-char suffix.
 
     Use for diagnosis only. Do NOT expose in production UI.
     """
     try:
         resolved_identifier = x_opsyn_org or org_id
-        access_result = await validate_crm_access(db, resolved_identifier, brand_id)
-        if not access_result.get("ok"):
-            return {"ok": False, "error": access_result.get("error")}
 
-        order_result = await db.execute(
+        # Resolve org
+        org_lookup = await lookup_organization(db, resolved_identifier)
+        if not org_lookup.get("ok"):
+            return {"ok": False, "error": org_lookup.get("error")}
+        resolved_org = org_lookup["organization"]
+        resolved_org_id = str(resolved_org.id)
+
+        # Run all lookup strategies and record candidates
+        lookup_candidates = []
+
+        # Strategy: integer_id
+        try:
+            order_id_int = int(order_identifier)
+            if order_id_int > 0:
+                r = await db.execute(
+                    select(Order)
+                    .where(and_(Order.id == str(order_id_int), Order.org_id == resolved_org_id))
+                    .options(selectinload(Order.lines))
+                )
+                o = r.scalar_one_or_none()
+                lookup_candidates.append({
+                    "strategy": "integer_id",
+                    "matched": o is not None,
+                    "order_id": o.id if o else None,
+                    "order_number": o.order_number if o else None,
+                    "external_order_id": o.external_order_id if o else None,
+                })
+        except (ValueError, TypeError):
+            pass
+
+        # Strategy: order_number
+        r = await db.execute(
             select(Order)
+            .where(and_(Order.order_number == order_identifier, Order.org_id == resolved_org_id))
             .options(selectinload(Order.lines))
-            .where(and_(Order.id == order_id, Order.brand_id == brand_id))
         )
-        order = order_result.scalar_one_or_none()
-        if not order:
-            return {"ok": False, "error": "Order not found"}
+        o = r.scalar_one_or_none()
+        lookup_candidates.append({
+            "strategy": "order_number",
+            "matched": o is not None,
+            "order_id": o.id if o else None,
+            "order_number": o.order_number if o else None,
+            "external_order_id": o.external_order_id if o else None,
+        })
 
-        line_items = _build_crm_line_items(order)
+        # Strategy: external_order_id
+        r = await db.execute(
+            select(Order)
+            .where(and_(Order.external_order_id == order_identifier, Order.org_id == resolved_org_id))
+            .options(selectinload(Order.lines))
+        )
+        o = r.scalar_one_or_none()
+        lookup_candidates.append({
+            "strategy": "external_order_id",
+            "matched": o is not None,
+            "order_id": o.id if o else None,
+            "order_number": o.order_number if o else None,
+            "external_order_id": o.external_order_id if o else None,
+        })
+
+        # Strategy: uuid
+        try:
+            uuid_val = UUID(order_identifier)
+            r = await db.execute(
+                select(Order)
+                .where(and_(Order.id == str(uuid_val), Order.org_id == resolved_org_id))
+                .options(selectinload(Order.lines))
+            )
+            o = r.scalar_one_or_none()
+            lookup_candidates.append({
+                "strategy": "uuid",
+                "matched": o is not None,
+                "order_id": o.id if o else None,
+                "order_number": o.order_number if o else None,
+                "external_order_id": o.external_order_id if o else None,
+            })
+        except (ValueError, TypeError):
+            pass
+
+        # Strategy: suffix
+        if len(order_identifier) == 8:
+            r = await db.execute(
+                select(Order)
+                .where(
+                    and_(
+                        or_(
+                            Order.external_order_id.endswith(order_identifier),
+                            Order.id.endswith(order_identifier),
+                        ),
+                        Order.org_id == resolved_org_id,
+                    )
+                )
+                .options(selectinload(Order.lines))
+            )
+            suffix_orders = r.scalars().all()
+            for so in suffix_orders:
+                lookup_candidates.append({
+                    "strategy": "suffix",
+                    "matched": True,
+                    "order_id": so.id,
+                    "order_number": so.order_number,
+                    "external_order_id": so.external_order_id,
+                })
+            if not suffix_orders:
+                lookup_candidates.append({
+                    "strategy": "suffix",
+                    "matched": False,
+                    "order_id": None,
+                    "order_number": None,
+                    "external_order_id": None,
+                })
+
+        # Resolve the best match
+        order, matched_by = await _resolve_order_identifier(db, resolved_org_id, order_identifier)
+
+        if not order:
+            logger.warning(
+                "[CRM_ORDER_DETAIL_404] org_id=%s identifier=%s reason=not_found",
+                resolved_org_id,
+                order_identifier,
+            )
+            return make_json_safe({
+                "ok": False,
+                "identifier": order_identifier,
+                "lookup_candidates": lookup_candidates,
+                "matched_order": None,
+                "raw_order_fields": None,
+                "raw_order_lines": [],
+                "final_api_payload": None,
+                "error": f"Order not found for identifier '{order_identifier}'",
+            })
+
+        logger.info(
+            "[CRM_ORDER_DETAIL_LOOKUP] org_id=%s identifier=%s matched_by=%s",
+            resolved_org_id,
+            order_identifier,
+            matched_by,
+        )
+
+        line_items = _build_crm_line_items_detail(order)
         totals = _compute_order_totals(order, line_items)
 
-        raw_db_order = {
+        raw_order_fields = {
             "id": order.id,
-            "external_order_id": order.external_order_id,
             "order_number": order.order_number,
-            "customer_name": order.customer_name,
-            "status": order.status,
+            "external_order_id": order.external_order_id,
             "total_cents": order.total_cents,
             "amount": float(order.amount) if order.amount is not None else None,
             "item_count": order.item_count,
@@ -904,14 +1213,12 @@ async def crm_order_debug(
                 else None
             ),
             "orm_lines_count": len(order.lines) if order.lines else 0,
-            "external_created_at": order.external_created_at.isoformat() if order.external_created_at else None,
-            "external_updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
         }
 
-        raw_db_line_items = []
+        raw_order_lines = []
         if order.lines:
             for line in order.lines:
-                raw_db_line_items.append({
+                raw_order_lines.append({
                     "id": line.id,
                     "sku": line.sku,
                     "product_name": line.product_name,
@@ -922,10 +1229,12 @@ async def crm_order_debug(
                     "total_price_cents": line.total_price_cents,
                 })
 
-        final_payload = {
+        final_api_payload = {
+            "ok": True,
             "id": order.id,
             "order_number": order.order_number,
             "external_order_id": order.external_order_id,
+            "external_id": order.external_order_id,
             "customer_name": order.customer_name,
             "customer_id": order.customer_name,
             "status": order.status,
@@ -936,36 +1245,49 @@ async def crm_order_debug(
 
         return make_json_safe({
             "ok": True,
-            "order_id": order_id,
-            "raw_db_order": raw_db_order,
-            "raw_db_line_items": raw_db_line_items,
-            "computed_totals": totals,
-            "final_api_payload": final_payload,
+            "identifier": order_identifier,
+            "lookup_candidates": lookup_candidates,
+            "matched_order": {
+                "id": order.id,
+                "order_number": order.order_number,
+                "external_order_id": order.external_order_id,
+                "customer_name": order.customer_name,
+            },
+            "raw_order_fields": raw_order_fields,
+            "raw_order_lines": raw_order_lines,
+            "final_api_payload": final_api_payload,
         })
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error("[CRM] order_debug_failed order_id=%s error=%s", order_id, str(e)[:500], exc_info=True)
+        logger.error(
+            "[CRM] order_debug_failed identifier=%s error=%s",
+            order_identifier,
+            str(e)[:500],
+            exc_info=True,
+        )
         return {"ok": False, "error": str(e)[:500]}
 
 
-@router.get("/orders/{order_id}")
+@router.get("/orders/{order_identifier}")
 async def crm_order_detail(
-    order_id: str,
+    order_identifier: str,
     org_id: str = Query(..., description="Organization ID (UUID or org_code)"),
-    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    brand_id: Optional[str] = Query(None, description="Brand ID (UUID) — optional, used for access validation only"),
     x_opsyn_org: str | None = Header(None, description="Optional org_id from header"),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Get full detail for a single order, including corrected totals and line items.
 
-    Requires:
-    - org_id: Organization ID (UUID or org_code)
-    - brand_id: Brand ID (UUID)
+    Accepts org_id (required) and an optional brand_id for access validation.
+    Resolves the order by any of: internal id, order_number, external_order_id,
+    UUID, or 8-character display suffix (e.g. ``28b6e3a4``).
 
     Returns all order fields plus:
     - line_items[]: full line item array with product_name, sku, quantity,
-      unit_price, line_total, discounts, shipping, tax, category
+      unit_price, line_total, product_id, brand_id, category
     - total_amount, subtotal_amount, discount_total, shipping_total, tax_total
     - item_count, unit_count (corrected)
     - total_source: "stored" | "computed" | "missing"
@@ -973,70 +1295,71 @@ async def crm_order_detail(
     try:
         resolved_identifier = x_opsyn_org or org_id
         logger.info(
-            "[CRM] order_detail_requested order_id=%s org_id=%s brand_id=%s",
-            order_id,
+            "[CRM] order_detail_requested identifier=%s org_id=%s brand_id=%s",
+            order_identifier,
             resolved_identifier,
             brand_id,
         )
 
-        # Validate org and brand access
-        access_result = await validate_crm_access(db, resolved_identifier, brand_id)
-        if not access_result.get("ok"):
-            logger.warning("[CRM] order_detail_access_denied error=%s", access_result.get("error"))
-            return {"ok": False, "error": access_result.get("error")}
+        # Resolve org (brand_id is optional — org_id is the primary tenant scope)
+        if brand_id:
+            access_result = await validate_crm_access(db, resolved_identifier, brand_id)
+            if not access_result.get("ok"):
+                logger.warning("[CRM] order_detail_access_denied error=%s", access_result.get("error"))
+                return {"ok": False, "error": access_result.get("error")}
+            resolved_org_id = access_result["org_id"]
+        else:
+            org_lookup = await lookup_organization(db, resolved_identifier)
+            if not org_lookup.get("ok"):
+                logger.warning("[CRM] order_detail_org_not_found org_id=%s", resolved_identifier)
+                return {"ok": False, "error": org_lookup.get("error")}
+            resolved_org_id = str(org_lookup["organization"].id)
 
-        resolved_org_id = access_result["org_id"]
-
-        # Fetch order with lines eagerly loaded
-        order_result = await db.execute(
-            select(Order)
-            .options(selectinload(Order.lines))
-            .where(and_(Order.id == order_id, Order.brand_id == brand_id))
-        )
-        order = order_result.scalar_one_or_none()
+        # Multi-identifier lookup — resolves by any supported format
+        order, matched_by = await _resolve_order_identifier(db, resolved_org_id, order_identifier)
 
         if not order:
             logger.warning(
-                "[CRM] order_not_found order_id=%s org_id=%s brand_id=%s",
-                order_id,
+                "[CRM_ORDER_DETAIL_404] org_id=%s identifier=%s reason=not_found",
                 resolved_org_id,
-                brand_id,
+                order_identifier,
             )
             return {
                 "ok": False,
-                "error": "Order not found",
+                "error": f"Order not found for identifier '{order_identifier}'",
+                "identifier": order_identifier,
+                "org_id": resolved_org_id,
                 "synced_at": datetime.now(timezone.utc).isoformat(),
             }
 
-        # Build line items from best available source
-        line_items = _build_crm_line_items(order)
+        logger.info(
+            "[CRM_ORDER_DETAIL_LOOKUP] org_id=%s identifier=%s matched_by=%s",
+            resolved_org_id,
+            order_identifier,
+            matched_by,
+        )
+
+        # Build line items with extended fields (product_id, brand_id, category)
+        line_items = _build_crm_line_items_detail(order)
 
         # Compute corrected totals
         totals = _compute_order_totals(order, line_items)
 
-        has_discounts = any(li.get("discounts") for li in line_items)
+        first_sku = line_items[0].get("sku") if line_items else None
+        first_line_total = line_items[0].get("line_total") if line_items else None
 
         logger.info(
-            "[CRM_ORDER_LINE_ITEMS_AUDIT] order_id=%s line_item_count=%s unit_count=%s has_discounts=%s",
-            order_id,
+            "[CRM_ORDER_LINE_ITEMS_AUDIT] order_id=%s line_count=%s first_sku=%s first_line_total=%s",
+            order.id,
             len(line_items),
-            totals["unit_count"],
-            has_discounts,
-        )
-        logger.info(
-            "[CRM_ORDER_PAYLOAD_AUDIT] order_id=%s total_source=%s total_amount=%s "
-            "item_count=%s unit_count=%s",
-            order_id,
-            totals["total_source"],
-            totals["total_amount"],
-            totals["item_count"],
-            totals["unit_count"],
+            first_sku,
+            f"{first_line_total:.2f}" if first_line_total is not None else None,
         )
 
         return make_json_safe({
             "ok": True,
             "org_id": resolved_org_id,
-            "brand_id": brand_id,
+            "brand_id": order.brand_id,
             # Identity
             "id": order.id,
             "order_number": order.order_number,
@@ -1063,13 +1386,20 @@ async def crm_order_detail(
             # Payload truth metadata
             "has_line_items": len(line_items) > 0,
             "total_source": totals["total_source"],
-            # Full line items array
+            # Full line items array (with product_id, brand_id, category)
             "line_items": line_items,
             "synced_at": datetime.now(timezone.utc).isoformat(),
         })
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error("[CRM] order_detail_failed order_id=%s error=%s", order_id, str(e)[:500], exc_info=True)
+        logger.error(
+            "[CRM] order_detail_failed identifier=%s error=%s",
+            order_identifier,
+            str(e)[:500],
+            exc_info=True,
+        )
         return {
             "ok": False,
             "error": str(e)[:500],
