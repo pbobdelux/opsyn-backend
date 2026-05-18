@@ -199,7 +199,7 @@ async def _verify_bootstrap_columns() -> None:
 # =============================================================================
 logger.info("[BACKEND_IMPORT] importing ORM models and routers")
 
-from fastapi import Depends, FastAPI, HTTPException, Header, Request  # noqa: E402
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from sqlalchemy import select  # noqa: E402
@@ -1240,6 +1240,96 @@ def debug_routes():
 @app.post("/orders")
 def receive_orders(body: dict):
     return {"ok": True, "received": True}
+
+
+@app.get("/orders")
+async def get_orders_list(
+    brand_id: str = Query(..., description="Brand ID (required)"),
+    limit: int = Query(50, ge=1, le=200, description="Max rows to return (default 50, max 200)"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+    cursor: Optional[str] = Query(None, description="Opaque pagination cursor (overrides offset/limit when provided)"),
+    status: Optional[str] = Query(None, description="Filter by order status"),
+    mapping_status: Optional[str] = Query(None, description="Filter by sync/mapping status"),
+    search: Optional[str] = Query(None, description="Search customer_name or order_number"),
+    date_from: Optional[str] = Query(None, description="Filter orders created on or after this ISO date/datetime"),
+    date_to: Optional[str] = Query(None, description="Filter orders created on or before this ISO date/datetime"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Paginated, filtered order list — backward-compatible /orders endpoint.
+
+    Delegates to the same optimised implementation as /api/mobile/orders.
+    All filters applied at the SQL level; never loads the full order table.
+    Default limit: 50. Max limit: 200.
+    """
+    import time as _time
+    from routes.mobile import _query_orders_paginated, _decode_cursor, _utc_now_iso, ORDERS_MAX_LIMIT
+
+    t_start = _time.monotonic()
+
+    # Decode cursor → override offset/limit if provided
+    if cursor:
+        decoded = _decode_cursor(cursor)
+        if decoded is None:
+            return {"ok": False, "brand_id": brand_id, "error": "Invalid cursor format"}
+        offset, limit = decoded
+
+    logger.info(
+        "[ORDERS_LIST_REQUEST] endpoint=/orders brand_id=%s limit=%d offset=%d "
+        "cursor=%s filters={status=%s mapping_status=%s search=%s date_from=%s date_to=%s}",
+        brand_id, limit, offset, bool(cursor), status, mapping_status,
+        bool(search), date_from, date_to,
+    )
+
+    try:
+        result = await _query_orders_paginated(
+            db=db,
+            brand_id=brand_id,
+            limit=limit,
+            offset=offset,
+            status=status,
+            mapping_status=mapping_status,
+            search=search,
+            date_from=date_from,
+            date_to=date_to,
+            include_raw=False,
+        )
+
+        return make_json_safe({
+            "ok": True,
+            "brand_id": brand_id,
+            "items": result["items"],
+            "orders": result["items"],
+            "total_count": result["total_count"],
+            "count": result["count"],
+            "limit": result["limit"],
+            "offset": result["offset"],
+            "has_more": result["has_more"],
+            "next_cursor": result["next_cursor"],
+            "filters_applied": result["filters_applied"],
+            "duration_ms": result["duration_ms"],
+            "timestamp": _utc_now_iso(),
+        })
+
+    except Exception as exc:
+        elapsed_ms = round((_time.monotonic() - t_start) * 1000)
+        logger.error(
+            "[ORDERS_LIST_ERROR] endpoint=/orders brand_id=%s elapsed_ms=%d error=%s",
+            brand_id, elapsed_ms, str(exc)[:300], exc_info=True,
+        )
+        return {
+            "ok": False,
+            "brand_id": brand_id,
+            "items": [],
+            "orders": [],
+            "total_count": 0,
+            "count": 0,
+            "limit": limit,
+            "offset": offset,
+            "has_more": False,
+            "next_cursor": None,
+            "error": str(exc)[:300],
+        }
 
 
 @app.post("/error")
