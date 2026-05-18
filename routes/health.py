@@ -274,14 +274,17 @@ def _compute_sync_status(
 
 
 # ---------------------------------------------------------------------------
-# GET /health — top-level service health
+# GET /health/deep — comprehensive health check (moved from root)
+# The instant /health liveness probe is now in routes/health_instant.py.
 # ---------------------------------------------------------------------------
 
-@router.get("")
-@router.get("/")
-async def health_root(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+@router.get("/deep")
+async def health_deep_legacy(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     """
-    Top-level service health check.
+    Comprehensive health check — DB ping + LeafLink sync health.
+
+    Moved from GET /health to GET /health/deep so that the root /health
+    endpoint can respond instantly without any DB queries (iOS liveness probe).
 
     Returns:
       {

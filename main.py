@@ -128,6 +128,7 @@ logger.info("[BACKEND_IMPORT] importing ORM models and routers")
 from fastapi import Depends, FastAPI, HTTPException, Header, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from middleware.latency_tracking import LatencyTrackingMiddleware  # noqa: E402
+from middleware.timing import TimingMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
@@ -138,6 +139,7 @@ from leaflink.orders import router as leaflink_orders_router  # noqa: E402
 from routes.ai import router as ai_router  # noqa: E402
 from routes.crm import router as crm_router  # noqa: E402
 from routes.health import router as health_router  # noqa: E402
+from routes.health_instant import router as health_instant_router  # noqa: E402
 from routes.integrations import router as integrations_router, _api_router as integrations_api_router  # noqa: E402
 from routes.integrations_health import router as integrations_health_router  # noqa: E402
 from routes.leaflink_debug import router as leaflink_debug_router  # noqa: E402
@@ -995,11 +997,80 @@ async def lifespan(app: FastAPI):
         )
 
     # ---------------------------------------------------------------------------
+    # Create safe indexes for brand_id queries (CONCURRENTLY + IF NOT EXISTS
+    # so they never block existing traffic or fail on re-deploy).
+    # CREATE INDEX CONCURRENTLY must run outside a transaction block, so we
+    # use execution_options(isolation_level="AUTOCOMMIT") on a raw engine conn.
+    # ---------------------------------------------------------------------------
+    try:
+        from database import _engine as _idx_engine
+        if _idx_engine is not None:
+            _idx_statements = [
+                (
+                    "idx_orders_brand_updated",
+                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_brand_updated"
+                    " ON orders (brand_id, updated_at DESC)",
+                ),
+                (
+                    "idx_orders_brand_external_updated",
+                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_brand_external_updated"
+                    " ON orders (brand_id, external_updated_at DESC)",
+                ),
+                (
+                    "idx_orders_brand_created",
+                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_brand_created"
+                    " ON orders (brand_id, created_at DESC)",
+                ),
+            ]
+            for _idx_name, _idx_sql in _idx_statements:
+                try:
+                    async with _idx_engine.connect() as _idx_conn:
+                        await _idx_conn.execution_options(isolation_level="AUTOCOMMIT")
+                        await _idx_conn.execute(text(_idx_sql))
+                    logger.info("[STARTUP_INDEX_CREATED] index=%s", _idx_name)
+                except Exception as _idx_exc:
+                    logger.warning(
+                        "[STARTUP_INDEX_SKIPPED] index=%s error=%s",
+                        _idx_name,
+                        str(_idx_exc)[:200],
+                    )
+        else:
+            logger.warning("[STARTUP_INDEX_SKIPPED] reason=no_engine")
+    except Exception as _idx_outer_exc:
+        logger.warning("[STARTUP_INDEX_FAILED] error=%s", str(_idx_outer_exc)[:300])
+
+    # ---------------------------------------------------------------------------
+    # Log DB pool status for observability
+    # ---------------------------------------------------------------------------
+    try:
+        from database import _engine as _pool_engine
+        if _pool_engine is not None:
+            _pool = _pool_engine.pool
+            _pool_size = getattr(_pool, "size", lambda: "unknown")
+            _pool_size = _pool_size() if callable(_pool_size) else _pool_size
+            _pool_timeout = getattr(_pool, "timeout", lambda: "unknown")
+            _pool_timeout = _pool_timeout() if callable(_pool_timeout) else _pool_timeout
+            logger.info(
+                "[DB_POOL_STATUS] pool_size=%s pool_timeout=%s echo=%s",
+                _pool_size,
+                _pool_timeout,
+                getattr(_pool_engine, "echo", "unknown"),
+            )
+        else:
+            logger.warning("[DB_POOL_STATUS] engine_not_available")
+    except Exception as _pool_exc:
+        logger.warning("[DB_POOL_STATUS] failed error=%s", str(_pool_exc)[:200])
+
+    # ---------------------------------------------------------------------------
     # STARTUP_READY — emitted once all startup phases complete successfully.
     # Grep for this marker in Railway deploy logs to confirm a clean boot.
     # ---------------------------------------------------------------------------
     logger.info(
         "[STARTUP_READY] app_booted=true migrations_ok=true schema_valid=true"
+    )
+    logger.info(
+        "[BACKEND_STARTUP_READY] service=opsyn-backend version=1.0.0 timestamp=%s",
+        datetime.now(timezone.utc).isoformat(),
     )
 
     yield
@@ -1041,11 +1112,18 @@ app.add_middleware(
 # Latency tracking middleware — records p50/p95/p99 for all requests
 app.add_middleware(LatencyTrackingMiddleware)
 
+# Request timing middleware — logs [BACKEND_REQUEST_START] and [BACKEND_RESPONSE_SENT]
+app.add_middleware(TimingMiddleware)
+
 # ---------------------------------------------------------------------------
 # API ROUTERS
 # ---------------------------------------------------------------------------
 
 # Core system
+# health_instant_router must be registered BEFORE health_router so that
+# GET /health and GET /health/ resolve to the instant liveness probe
+# (no DB queries) rather than the legacy DB-checking root handler.
+app.include_router(health_instant_router)
 app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
@@ -1135,9 +1213,9 @@ def root():
     return {"ok": True, "service": APP_NAME, "env": APP_ENV}
 
 
-@app.get("/health")
-def health():
-    return {"ok": True, "status": "healthy", "time": utc_now_iso()}
+# NOTE: GET /health is handled by health_instant_router (routes/health_instant.py).
+# That router returns instantly without any DB queries, keeping iOS liveness
+# probes under 50ms. The legacy DB-checking handler is at GET /health/deep.
 
 
 @app.get("/ping")
