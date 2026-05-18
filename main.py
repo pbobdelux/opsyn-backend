@@ -206,11 +206,14 @@ from sqlalchemy import select  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
 
 from database import get_db  # noqa: E402
+from middleware.timing import TimingMiddleware  # noqa: E402
 from models import BrandAPICredential  # noqa: E402
 from leaflink.orders import router as leaflink_orders_router  # noqa: E402
 from routes.ai import router as ai_router  # noqa: E402
 from routes.crm import router as crm_router  # noqa: E402
 from routes.health import router as health_router  # noqa: E402
+from routes.health_instant import router as health_instant_router  # noqa: E402
+from routes.mobile import router as mobile_router  # noqa: E402
 from routes.integrations import router as integrations_router, _api_router as integrations_api_router  # noqa: E402
 from routes.integrations_health import router as integrations_health_router  # noqa: E402
 from routes.leaflink_debug import router as leaflink_debug_router  # noqa: E402
@@ -1022,6 +1025,56 @@ async def lifespan(app: FastAPI):
     print("✅ Sync scheduler task created")
 
     # ---------------------------------------------------------------------------
+    # Create performance indexes concurrently — MUST run outside a transaction.
+    # Wrapped in try/except so index creation failures never block app startup.
+    # ---------------------------------------------------------------------------
+    try:
+        from database import get_engine as _get_engine
+        _idx_engine = _get_engine()
+        if _idx_engine is not None:
+            # CREATE INDEX CONCURRENTLY requires AUTOCOMMIT (no transaction block).
+            async with _idx_engine.connect().execution_options(
+                isolation_level="AUTOCOMMIT"
+            ) as _idx_conn:
+                _indexes = [
+                    (
+                        "idx_orders_brand_updated",
+                        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_brand_updated "
+                        "ON orders (brand_id, updated_at)",
+                    ),
+                    (
+                        "idx_orders_brand_external_updated",
+                        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_brand_external_updated "
+                        "ON orders (brand_id, external_updated_at)",
+                    ),
+                    (
+                        "idx_orders_brand_created",
+                        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_brand_created "
+                        "ON orders (brand_id, created_at)",
+                    ),
+                ]
+                for _idx_name, _idx_sql in _indexes:
+                    try:
+                        await _idx_conn.execute(text(_idx_sql))
+                        logger.info(
+                            "[STARTUP_INDEX_OK] index=%s action=created_or_already_exists",
+                            _idx_name,
+                        )
+                    except Exception as _idx_exc:
+                        logger.warning(
+                            "[STARTUP_INDEX_WARN] index=%s error=%s",
+                            _idx_name,
+                            str(_idx_exc)[:300],
+                        )
+        else:
+            logger.warning("[STARTUP_INDEX_SKIP] reason=engine_not_available")
+    except Exception as _idx_outer_exc:
+        logger.warning(
+            "[STARTUP_INDEX_WARN] index_creation_failed error=%s",
+            str(_idx_outer_exc)[:300],
+        )
+
+    # ---------------------------------------------------------------------------
     # STARTUP_READY — emitted once all startup phases complete successfully.
     # Grep for this marker in Railway deploy logs to confirm a clean boot.
     # ---------------------------------------------------------------------------
@@ -1057,6 +1110,7 @@ app.include_router(watchdog_router)
 # ---------------------------------------------------------------------------
 # Middleware
 # ---------------------------------------------------------------------------
+app.add_middleware(TimingMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1068,6 +1122,11 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # API ROUTERS
 # ---------------------------------------------------------------------------
+
+# Instant health endpoints — registered FIRST so /health returns immediately
+# without DB calls.  health_router (prefix=/health) is registered after and
+# provides /health/db, /health/sync, /health/data, /health/deep (legacy).
+app.include_router(health_instant_router)
 
 # Core system
 app.include_router(health_router)
@@ -1114,6 +1173,9 @@ app.include_router(drivers_router)
 app.include_router(routes_router)
 app.include_router(driver_app_router)
 
+# Mobile API
+app.include_router(mobile_router)
+
 logger.info("[Routes] registered all routers")
 
 # Startup route dump
@@ -1154,11 +1216,6 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.get("/")
 def root():
     return {"ok": True, "service": APP_NAME, "env": APP_ENV}
-
-
-@app.get("/health")
-def health():
-    return {"ok": True, "status": "healthy", "time": utc_now_iso()}
 
 
 @app.get("/ping")
