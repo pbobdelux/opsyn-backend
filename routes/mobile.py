@@ -16,7 +16,7 @@ Endpoints:
     — Aggregate dashboard metrics from DB. No LeafLink calls, no order arrays.
 
   GET  /api/mobile/orders?brand_id=...&limit=100&cursor=...
-    — Paginated orders. Max 250 per page. Never returns all 16k orders.
+    — Paginated orders. Max 500 per page. Never returns all orders.
 
 Logging prefixes:
   [MOBILE_SYNC_COMMAND_ACCEPTED]
@@ -31,6 +31,7 @@ Logging prefixes:
 
 import base64
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -51,7 +52,7 @@ router = APIRouter(prefix="/api/mobile", tags=["mobile"])
 # Pagination constants
 # ---------------------------------------------------------------------------
 MOBILE_DEFAULT_LIMIT = 100
-MOBILE_MAX_LIMIT = 250
+MOBILE_MAX_LIMIT = 500
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +202,10 @@ async def mobile_sync_status(
     """Lightweight sync status for the iOS app.
 
     Returns ONLY status metrics — never returns order arrays.
-    Wraps sync_health + sync_runs data into a compact mobile-friendly response.
+    Uses efficient indexed queries with no expensive joins.
+    Response time: < 1 second.
     """
+    _t0 = time.monotonic()
     logger.info(
         "[MOBILE_SYNC_STATUS_RETURNED] brand_id=%s",
         brand_id,
@@ -211,24 +214,30 @@ async def mobile_sync_status(
     now = datetime.now(timezone.utc)
 
     # ------------------------------------------------------------------
-    # 1. Fetch sync_health row for this brand
+    # 1. Fetch sync_health + active/completed run + order count in one
+    #    efficient batch using raw SQL (no ORM joins, no N+1 queries).
     # ------------------------------------------------------------------
-    health: Optional[SyncHealth] = None
+    health_row = None
+    active_run_row = None
+    completed_run_row = None
+    total_local_orders = 0
+
     try:
-        _health_row = await db.execute(
+        health_res = await db.execute(
             text(
-                "SELECT id FROM sync_health"
+                "SELECT"
+                " consecutive_failures,"
+                " last_successful_sync_at,"
+                " last_attempted_sync_at,"
+                " last_error,"
+                " updated_at"
+                " FROM sync_health"
                 " WHERE brand_id = CAST(:brand_id AS UUID)"
                 " LIMIT 1"
             ),
             {"brand_id": brand_id},
         )
-        _health_id_row = _health_row.fetchone()
-        if _health_id_row is not None:
-            _health_res = await db.execute(
-                select(SyncHealth).where(SyncHealth.id == _health_id_row[0])
-            )
-            health = _health_res.scalar_one_or_none()
+        health_row = health_res.fetchone()
     except Exception as exc:
         logger.error(
             "[MOBILE_SYNC_STATUS_RETURNED] health_query_failed brand_id=%s error=%s",
@@ -240,30 +249,23 @@ async def mobile_sync_status(
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # 2. Fetch the most recent active or completed sync run
-    # ------------------------------------------------------------------
-    active_run: Optional[SyncRun] = None
-    last_completed_run: Optional[SyncRun] = None
     try:
-        active_run_res = await db.execute(
-            select(SyncRun).where(
-                SyncRun.brand_id == brand_id,
-                SyncRun.status.in_(["queued", "syncing"]),
-            ).order_by(SyncRun.started_at.desc()).limit(1)
+        active_res = await db.execute(
+            text(
+                "SELECT id, status, started_at, pages_synced,"
+                " orders_loaded_this_run, total_orders_available"
+                " FROM sync_runs"
+                " WHERE brand_id = :brand_id"
+                " AND status IN ('queued', 'syncing')"
+                " ORDER BY started_at DESC"
+                " LIMIT 1"
+            ),
+            {"brand_id": brand_id},
         )
-        active_run = active_run_res.scalar_one_or_none()
-
-        completed_run_res = await db.execute(
-            select(SyncRun).where(
-                SyncRun.brand_id == brand_id,
-                SyncRun.status == "completed",
-            ).order_by(SyncRun.completed_at.desc()).limit(1)
-        )
-        last_completed_run = completed_run_res.scalar_one_or_none()
+        active_run_row = active_res.fetchone()
     except Exception as exc:
         logger.error(
-            "[MOBILE_SYNC_STATUS_RETURNED] sync_run_query_failed brand_id=%s error=%s",
+            "[MOBILE_SYNC_STATUS_RETURNED] active_run_query_failed brand_id=%s error=%s",
             brand_id,
             str(exc)[:200],
         )
@@ -272,15 +274,36 @@ async def mobile_sync_status(
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # 3. Fetch total local order count (cheap indexed COUNT)
-    # ------------------------------------------------------------------
-    total_local_orders = 0
+    try:
+        completed_res = await db.execute(
+            text(
+                "SELECT id, completed_at, pages_synced,"
+                " orders_loaded_this_run, total_orders_available"
+                " FROM sync_runs"
+                " WHERE brand_id = :brand_id"
+                " AND status = 'completed'"
+                " ORDER BY completed_at DESC"
+                " LIMIT 1"
+            ),
+            {"brand_id": brand_id},
+        )
+        completed_run_row = completed_res.fetchone()
+    except Exception as exc:
+        logger.error(
+            "[MOBILE_SYNC_STATUS_RETURNED] completed_run_query_failed brand_id=%s error=%s",
+            brand_id,
+            str(exc)[:200],
+        )
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
     try:
         count_res = await db.execute(
             text(
                 "SELECT COUNT(*) FROM orders"
-                " WHERE brand_id::text = :brand_id"
+                " WHERE brand_id = :brand_id"
             ),
             {"brand_id": brand_id},
         )
@@ -297,33 +320,41 @@ async def mobile_sync_status(
             pass
 
     # ------------------------------------------------------------------
-    # 4. Derive current_sync_state
+    # 2. Derive current_sync_state
     # ------------------------------------------------------------------
-    if active_run is not None:
-        if active_run.status == "queued":
-            current_sync_state = "syncing"
-        else:
-            current_sync_state = "syncing"
-    elif last_completed_run is not None:
+    if active_run_row is not None:
+        current_sync_state = "syncing"
+        active_sync_run_id = str(active_run_row[0])
+        pages_synced = active_run_row[3] or 0
+        orders_loaded_this_run = active_run_row[4] or 0
+        total_leaflink_estimate = active_run_row[5]
+        # Stall detection: queued/syncing run started > 90s ago
+        started_at = active_run_row[2]
+        is_stalled = False
+        if started_at is not None:
+            try:
+                age_s = (now - started_at).total_seconds()
+                is_stalled = age_s > 90
+            except Exception:
+                is_stalled = False
+    elif completed_run_row is not None:
         current_sync_state = "completed"
-    elif health is not None and health.consecutive_failures > 0:
-        current_sync_state = "failed"
+        active_sync_run_id = None
+        is_stalled = False
+        pages_synced = completed_run_row[2] or 0
+        orders_loaded_this_run = completed_run_row[3] or 0
+        total_leaflink_estimate = completed_run_row[4]
     else:
-        current_sync_state = "idle"
+        consecutive_failures = (health_row[0] or 0) if health_row else 0
+        current_sync_state = "failed" if consecutive_failures > 0 else "idle"
+        active_sync_run_id = None
+        is_stalled = False
+        pages_synced = 0
+        orders_loaded_this_run = 0
+        total_leaflink_estimate = None
 
     # ------------------------------------------------------------------
-    # 5. Derive is_stalled
-    # ------------------------------------------------------------------
-    is_stalled = False
-    if active_run is not None:
-        try:
-            is_stalled = active_run.is_stalled(stall_threshold_seconds=90)
-        except Exception:
-            is_stalled = False
-
-    # ------------------------------------------------------------------
-    # 6. Derive safe_to_fetch_orders
-    #    True only when sync is idle/completed and not stalled
+    # 3. Derive safe_to_fetch_orders
     # ------------------------------------------------------------------
     safe_to_fetch_orders = (
         current_sync_state in ("idle", "completed")
@@ -331,51 +362,34 @@ async def mobile_sync_status(
     )
 
     # ------------------------------------------------------------------
-    # 7. Build response fields from available data
+    # 4. Build response fields from available data
     # ------------------------------------------------------------------
-    active_sync_run_id = str(active_run.id) if active_run else None
-
-    pages_synced = 0
-    orders_loaded_this_run = 0
-    total_leaflink_estimate = None
-    if active_run is not None:
-        pages_synced = active_run.pages_synced or 0
-        orders_loaded_this_run = active_run.orders_loaded_this_run or 0
-        total_leaflink_estimate = active_run.total_orders_available
-    elif last_completed_run is not None:
-        pages_synced = last_completed_run.pages_synced or 0
-        orders_loaded_this_run = last_completed_run.orders_loaded_this_run or 0
-        total_leaflink_estimate = last_completed_run.total_orders_available
-
-    failed_order_count = 0
-    if health is not None:
-        failed_order_count = health.consecutive_failures or 0
+    failed_order_count = (health_row[0] or 0) if health_row else 0
 
     last_successful_sync_at = None
-    if health is not None and health.last_successful_sync_at:
-        last_successful_sync_at = health.last_successful_sync_at.isoformat()
-    elif last_completed_run is not None and last_completed_run.completed_at:
-        try:
-            last_successful_sync_at = last_completed_run.completed_at.isoformat()
-        except Exception:
-            pass
+    if health_row and health_row[1]:
+        _ts = health_row[1]
+        last_successful_sync_at = _ts.isoformat() if hasattr(_ts, "isoformat") else str(_ts)
+    elif completed_run_row and completed_run_row[1]:
+        _ts = completed_run_row[1]
+        last_successful_sync_at = _ts.isoformat() if hasattr(_ts, "isoformat") else str(_ts)
 
     last_updated_at = now.isoformat()
-    if health is not None and health.updated_at:
-        try:
-            last_updated_at = health.updated_at.isoformat()
-        except Exception:
-            pass
+    if health_row and health_row[4]:
+        _ts = health_row[4]
+        last_updated_at = _ts.isoformat() if hasattr(_ts, "isoformat") else str(_ts)
 
+    elapsed_ms = round((time.monotonic() - _t0) * 1000, 2)
     logger.info(
         "[MOBILE_SYNC_STATUS_RETURNED] brand_id=%s state=%s active_run=%s"
-        " total_local=%s pages_synced=%s is_stalled=%s",
+        " total_local=%s pages_synced=%s is_stalled=%s elapsed_ms=%.2f",
         brand_id,
         current_sync_state,
         active_sync_run_id,
         total_local_orders,
         pages_synced,
         is_stalled,
+        elapsed_ms,
     )
 
     # CRITICAL: This response must NEVER include order arrays.
@@ -408,12 +422,13 @@ async def mobile_dashboard_summary(
 ):
     """Aggregate dashboard metrics for the iOS app.
 
-    Uses DB aggregate queries only — does NOT call LeafLink, does NOT trigger
-    sync, and does NOT return order arrays. Returns small, focused metrics.
+    Uses a single aggregate SQL query — no raw_payload serialization, no ORM
+    joins, no order arrays. Response time: < 2 seconds.
 
     If some metrics are not reliable (e.g. missing columns), returns 0 with
     metrics_partial=true. Never fakes values.
     """
+    _t0 = time.monotonic()
     logger.info(
         "[MOBILE_DASHBOARD_SUMMARY_RETURNED] brand_id=%s",
         brand_id,
@@ -423,158 +438,46 @@ async def mobile_dashboard_summary(
     metrics_partial = False
 
     # ------------------------------------------------------------------
-    # 1. Total orders for this brand
+    # Single aggregate query — all metrics in one DB round-trip.
+    # Uses brand_id plain VARCHAR comparison (no UUID cast on orders)
+    # to leverage the idx_orders_brand_updated index.
     # ------------------------------------------------------------------
     total_orders = 0
-    try:
-        total_res = await db.execute(
-            text(
-                "SELECT COUNT(*) FROM orders"
-                " WHERE brand_id::text = :brand_id"
-            ),
-            {"brand_id": brand_id},
-        )
-        total_orders = total_res.scalar() or 0
-    except Exception as exc:
-        logger.error(
-            "[MOBILE_DASHBOARD_SUMMARY_RETURNED] total_orders_failed brand_id=%s error=%s",
-            brand_id,
-            str(exc)[:200],
-        )
-        metrics_partial = True
-        try:
-            await db.rollback()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # 2. Ready count — orders with status = 'approved' or 'received'
-    #    (orders that are ready to be dispatched)
-    # ------------------------------------------------------------------
     ready_count = 0
-    try:
-        ready_res = await db.execute(
-            text(
-                "SELECT COUNT(*) FROM orders"
-                " WHERE brand_id::text = :brand_id"
-                " AND status IN ('approved', 'received', 'open')"
-            ),
-            {"brand_id": brand_id},
-        )
-        ready_count = ready_res.scalar() or 0
-    except Exception as exc:
-        logger.error(
-            "[MOBILE_DASHBOARD_SUMMARY_RETURNED] ready_count_failed brand_id=%s error=%s",
-            brand_id,
-            str(exc)[:200],
-        )
-        metrics_partial = True
-        try:
-            await db.rollback()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # 3. Blocked count — orders with review_status = 'blocked'
-    # ------------------------------------------------------------------
     blocked_count = 0
     blocked_revenue = 0.0
-    try:
-        blocked_res = await db.execute(
-            text(
-                "SELECT COUNT(*), COALESCE(SUM(amount), 0)"
-                " FROM orders"
-                " WHERE brand_id::text = :brand_id"
-                " AND review_status = 'blocked'"
-            ),
-            {"brand_id": brand_id},
-        )
-        blocked_row = blocked_res.fetchone()
-        if blocked_row:
-            blocked_count = int(blocked_row[0] or 0)
-            blocked_revenue = float(blocked_row[1] or 0)
-    except Exception as exc:
-        logger.error(
-            "[MOBILE_DASHBOARD_SUMMARY_RETURNED] blocked_metrics_failed brand_id=%s error=%s",
-            brand_id,
-            str(exc)[:200],
-        )
-        metrics_partial = True
-        try:
-            await db.rollback()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # 4. At-risk revenue — orders overdue > 0 days
-    # ------------------------------------------------------------------
     at_risk_revenue = 0.0
-    try:
-        at_risk_res = await db.execute(
-            text(
-                "SELECT COALESCE(SUM(amount), 0)"
-                " FROM orders"
-                " WHERE brand_id::text = :brand_id"
-                " AND days_overdue > 0"
-            ),
-            {"brand_id": brand_id},
-        )
-        at_risk_revenue = float(at_risk_res.scalar() or 0)
-    except Exception as exc:
-        logger.error(
-            "[MOBILE_DASHBOARD_SUMMARY_RETURNED] at_risk_revenue_failed brand_id=%s error=%s",
-            brand_id,
-            str(exc)[:200],
-        )
-        metrics_partial = True
-        try:
-            await db.rollback()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # 5. AR due total — sum of balance_due across all orders
-    # ------------------------------------------------------------------
     ar_due_total = 0.0
-    try:
-        ar_res = await db.execute(
-            text(
-                "SELECT COALESCE(SUM(balance_due), 0)"
-                " FROM orders"
-                " WHERE brand_id::text = :brand_id"
-            ),
-            {"brand_id": brand_id},
-        )
-        ar_due_total = float(ar_res.scalar() or 0)
-    except Exception as exc:
-        logger.error(
-            "[MOBILE_DASHBOARD_SUMMARY_RETURNED] ar_due_total_failed brand_id=%s error=%s",
-            brand_id,
-            str(exc)[:200],
-        )
-        metrics_partial = True
-        try:
-            await db.rollback()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # 6. Routes ready count — orders with delivery_status = 'assigned'
-    # ------------------------------------------------------------------
     routes_ready_count = 0
+
     try:
-        routes_res = await db.execute(
+        agg_res = await db.execute(
             text(
-                "SELECT COUNT(*) FROM orders"
-                " WHERE brand_id::text = :brand_id"
-                " AND delivery_status = 'assigned'"
+                "SELECT"
+                "  COUNT(*) AS total_orders,"
+                "  COUNT(*) FILTER (WHERE status IN ('approved', 'received', 'open')) AS ready_count,"
+                "  COUNT(*) FILTER (WHERE review_status = 'blocked') AS blocked_count,"
+                "  COALESCE(SUM(amount) FILTER (WHERE review_status = 'blocked'), 0) AS blocked_revenue,"
+                "  COALESCE(SUM(amount) FILTER (WHERE days_overdue > 0), 0) AS at_risk_revenue,"
+                "  COALESCE(SUM(balance_due), 0) AS ar_due_total,"
+                "  COUNT(*) FILTER (WHERE delivery_status = 'assigned') AS routes_ready_count"
+                " FROM orders"
+                " WHERE brand_id = :brand_id"
             ),
             {"brand_id": brand_id},
         )
-        routes_ready_count = int(routes_res.scalar() or 0)
+        agg_row = agg_res.fetchone()
+        if agg_row:
+            total_orders = int(agg_row[0] or 0)
+            ready_count = int(agg_row[1] or 0)
+            blocked_count = int(agg_row[2] or 0)
+            blocked_revenue = float(agg_row[3] or 0)
+            at_risk_revenue = float(agg_row[4] or 0)
+            ar_due_total = float(agg_row[5] or 0)
+            routes_ready_count = int(agg_row[6] or 0)
     except Exception as exc:
         logger.error(
-            "[MOBILE_DASHBOARD_SUMMARY_RETURNED] routes_ready_count_failed brand_id=%s error=%s",
+            "[MOBILE_DASHBOARD_SUMMARY_RETURNED] aggregate_query_failed brand_id=%s error=%s",
             brand_id,
             str(exc)[:200],
         )
@@ -585,7 +488,7 @@ async def mobile_dashboard_summary(
             pass
 
     # ------------------------------------------------------------------
-    # 7. Last updated timestamp from sync_health
+    # Last updated timestamp from sync_health (single indexed lookup)
     # ------------------------------------------------------------------
     last_updated_at = now.isoformat()
     try:
@@ -612,10 +515,11 @@ async def mobile_dashboard_summary(
         except Exception:
             pass
 
+    elapsed_ms = round((time.monotonic() - _t0) * 1000, 2)
     logger.info(
         "[MOBILE_DASHBOARD_SUMMARY_RETURNED] brand_id=%s total_orders=%s"
         " ready=%s blocked=%s blocked_revenue=%.2f ar_due=%.2f"
-        " routes_ready=%s metrics_partial=%s",
+        " routes_ready=%s metrics_partial=%s elapsed_ms=%.2f",
         brand_id,
         total_orders,
         ready_count,
@@ -624,6 +528,7 @@ async def mobile_dashboard_summary(
         ar_due_total,
         routes_ready_count,
         metrics_partial,
+        elapsed_ms,
     )
 
     return make_json_safe({
@@ -649,16 +554,20 @@ async def mobile_dashboard_summary(
 @router.get("/orders")
 async def mobile_orders_paginated(
     brand_id: str = Query(..., description="Brand ID (UUID)"),
-    limit: int = Query(MOBILE_DEFAULT_LIMIT, ge=1, description="Orders per page (default 100, max 250)"),
+    limit: int = Query(MOBILE_DEFAULT_LIMIT, ge=1, description="Orders per page (default 100, max 500)"),
     cursor: Optional[str] = Query(None, description="Opaque cursor for cursor-based pagination"),
     fresh: bool = Query(False, description="If true, bypass any upstream caching"),
+    include_raw: bool = Query(False, description="If true, include raw_payload in response"),
     db: AsyncSession = Depends(get_db),
 ):
     """Paginated orders for the iOS app.
 
-    Enforces a hard maximum of 250 orders per page. Never returns all 16k orders.
+    Enforces a hard maximum of 500 orders per page. Never returns all orders.
     Uses cursor-based pagination for efficiency. Supports fresh=true to bypass
     any upstream caching.
+
+    raw_payload is excluded by default (include_raw=true to include it) to
+    reduce response size and serialization time.
 
     Uses raw SQL with plain VARCHAR brand_id comparison (no UUID casts) and sorts
     by COALESCE(external_updated_at, updated_at, created_at) DESC so the newest
@@ -667,6 +576,8 @@ async def mobile_orders_paginated(
     Cursor format: base64("id=<UUID>&sort_ts=<ISO>")
     """
     import json as _json
+
+    _t0 = time.monotonic()
 
     # ------------------------------------------------------------------
     # Pagination guard — clamp limit to [1, MOBILE_MAX_LIMIT]
@@ -682,11 +593,12 @@ async def mobile_orders_paginated(
         limit = MOBILE_MAX_LIMIT
 
     logger.info(
-        "[MOBILE_ORDERS_QUERY]\nbrand_id=%s\nlimit=%s\ncursor=%s\nfresh=%s\nsource_table=orders",
+        "[MOBILE_ORDERS_QUERY_START] brand_id=%s limit=%s cursor=%s fresh=%s include_raw=%s",
         brand_id,
         limit,
         "present" if cursor else "none",
         fresh,
+        include_raw,
     )
 
     # ------------------------------------------------------------------
@@ -704,7 +616,7 @@ async def mobile_orders_paginated(
             cursor_sort_ts = parts.get("sort_ts") or None
         except Exception as cursor_exc:
             logger.error(
-                "[MOBILE_ORDERS_QUERY] cursor_decode_error brand_id=%s error=%s",
+                "[MOBILE_ORDERS_QUERY_START] cursor_decode_error brand_id=%s error=%s",
                 brand_id,
                 cursor_exc,
             )
@@ -728,17 +640,14 @@ async def mobile_orders_paginated(
         ts_row = ts_res.fetchone()
         if ts_row:
             logger.info(
-                "[MOBILE_ORDERS_DB_MAX_TIMESTAMPS]\n"
-                "max_external_updated_at=%s\n"
-                "max_updated_at=%s\n"
-                "max_created_at=%s",
+                "[MOBILE_ORDERS_DB_MAX_TIMESTAMPS] max_external_updated_at=%s max_updated_at=%s max_created_at=%s",
                 ts_row[0],
                 ts_row[1],
                 ts_row[2],
             )
     except Exception as ts_exc:
         logger.warning(
-            "[MOBILE_ORDERS_QUERY] max_timestamps_failed brand_id=%s error=%s",
+            "[MOBILE_ORDERS_QUERY_START] max_timestamps_failed brand_id=%s error=%s",
             brand_id,
             str(ts_exc)[:200],
         )
@@ -749,14 +658,17 @@ async def mobile_orders_paginated(
 
     # ------------------------------------------------------------------
     # Build raw SQL query — plain VARCHAR comparison, no UUID casts.
+    # Exclude raw_payload by default to reduce response size.
     # Sort by newest COALESCE(external_updated_at, updated_at, created_at) DESC
     # so the most recently updated orders always appear first.
     # ------------------------------------------------------------------
+    raw_payload_col = "raw_payload," if include_raw else "NULL AS raw_payload,"
+
     base_sql = (
         "SELECT"
         " id, org_id, brand_id, external_order_id, order_number, customer_name, status,"
         " total_cents, amount, item_count, unit_count,"
-        " line_items_json, raw_payload, source,"
+        f" line_items_json, {raw_payload_col} source,"
         " review_status, sync_status, sync_health_status, sync_health_missing_fields,"
         " synced_at, last_synced_at,"
         " created_at, updated_at, external_created_at, external_updated_at"
@@ -789,6 +701,7 @@ async def mobile_orders_paginated(
     )
     params["fetch_limit"] = limit + 1
 
+    _db_t0 = time.monotonic()
     try:
         rows_res = await db.execute(text(base_sql), params)
         raw_rows = rows_res.fetchall()
@@ -796,7 +709,7 @@ async def mobile_orders_paginated(
         rows = [dict(zip(col_names, row)) for row in raw_rows]
     except Exception as exc:
         logger.error(
-            "[MOBILE_ORDERS_QUERY] db_query_failed brand_id=%s error=%s",
+            "[MOBILE_ORDERS_QUERY_START] db_query_failed brand_id=%s error=%s",
             brand_id,
             str(exc)[:300],
         )
@@ -810,9 +723,17 @@ async def mobile_orders_paginated(
             "detail": str(exc)[:300],
         }
 
+    _db_elapsed_ms = round((time.monotonic() - _db_t0) * 1000, 2)
+
     has_more = len(rows) > limit
     if has_more:
         rows = rows[:limit]
+
+    logger.info(
+        "[MOBILE_ORDERS_QUERY_DONE] count=%s elapsed_ms=%.2f",
+        len(rows),
+        _db_elapsed_ms,
+    )
 
     # ------------------------------------------------------------------
     # Total count (cheap indexed COUNT, plain VARCHAR comparison)
@@ -829,7 +750,7 @@ async def mobile_orders_paginated(
         total_count = count_res.scalar() or 0
     except Exception as exc:
         logger.error(
-            "[MOBILE_ORDERS_QUERY] count_failed brand_id=%s error=%s",
+            "[MOBILE_ORDERS_QUERY_START] count_failed brand_id=%s error=%s",
             brand_id,
             str(exc)[:200],
         )
@@ -856,7 +777,7 @@ async def mobile_orders_paginated(
             except Exception:
                 line_items = None
 
-        # Resolve raw_payload — may be a dict or raw JSON string
+        # Resolve raw_payload — may be a dict or raw JSON string (only if included)
         raw_payload = row.get("raw_payload")
         if isinstance(raw_payload, str):
             try:
@@ -934,43 +855,27 @@ async def mobile_orders_paginated(
         return str(val)
 
     # ------------------------------------------------------------------
-    # Serialize rows — derive missing fields, log each row
+    # Serialize rows — derive missing fields, log first 3 rows only
     # ------------------------------------------------------------------
+    _ser_t0 = time.monotonic()
     serialized_orders = []
-    for row in rows:
+    for _row_idx, row in enumerate(rows):
         derived = _derive_counts_and_amount(row)
 
-        lij = derived["line_items_json"]
-        rp = derived["raw_payload"]
-        logger.info(
-            "[MOBILE_ORDER_REAL_ROW]\n"
-            "id=%s\n"
-            "external_order_id=%s\n"
-            "order_number=%s\n"
-            "customer_name=%s\n"
-            "total_cents=%s\n"
-            "amount=%s\n"
-            "item_count=%s\n"
-            "unit_count=%s\n"
-            "line_items_json_len=%s\n"
-            "raw_payload_len=%s\n"
-            "external_created_at=%s\n"
-            "external_updated_at=%s\n"
-            "updated_at=%s",
-            row.get("id"),
-            row.get("external_order_id"),
-            row.get("order_number"),
-            row.get("customer_name"),
-            row.get("total_cents"),
-            derived["amount"],
-            derived["item_count"],
-            derived["unit_count"],
-            len(lij) if isinstance(lij, list) else (1 if lij else 0),
-            len(rp) if isinstance(rp, dict) else (len(str(rp)) if rp else 0),
-            _ts_iso(row.get("external_created_at")),
-            _ts_iso(row.get("external_updated_at")),
-            _ts_iso(row.get("updated_at")),
-        )
+        # Log first 3 rows for diagnostics
+        if _row_idx < 3:
+            lij = derived["line_items_json"]
+            rp = derived["raw_payload"]
+            logger.info(
+                "[MOBILE_ORDER_REAL_ROW] id=%s customer=%s total_cents=%s amount=%s"
+                " item_count=%s unit_count=%s",
+                row.get("id"),
+                row.get("customer_name"),
+                row.get("total_cents"),
+                derived["amount"],
+                derived["item_count"],
+                derived["unit_count"],
+            )
 
         serialized_orders.append({
             "id": str(row["id"]) if row.get("id") else None,
@@ -985,7 +890,7 @@ async def mobile_orders_paginated(
             "item_count": derived["item_count"],
             "unit_count": derived["unit_count"],
             "line_items_json": derived["line_items_json"],
-            "raw_payload": derived["raw_payload"],
+            "raw_payload": derived["raw_payload"] if include_raw else None,
             "source": row.get("source"),
             "review_status": row.get("review_status"),
             "sync_status": row.get("sync_status"),
@@ -998,6 +903,8 @@ async def mobile_orders_paginated(
             "external_created_at": _ts_iso(row.get("external_created_at")),
             "external_updated_at": _ts_iso(row.get("external_updated_at")),
         })
+
+    _ser_elapsed_ms = round((time.monotonic() - _ser_t0) * 1000, 2)
 
     # ------------------------------------------------------------------
     # Build next_cursor from last row's sort key
@@ -1030,17 +937,23 @@ async def mobile_orders_paginated(
         or last_item.get("updated_at")
         or last_item.get("created_at")
     )
+
+    _response_bytes = 0
+    try:
+        import json as _json2
+        _response_bytes = len(_json2.dumps(serialized_orders).encode())
+    except Exception:
+        pass
+
     logger.info(
-        "[MOBILE_ORDERS_QUERY_RESULT]\n"
-        "count=%s\n"
-        "first_order_id=%s\n"
-        "first_customer=%s\n"
-        "first_total_cents=%s\n"
-        "first_amount=%s\n"
-        "first_item_count=%s\n"
-        "first_unit_count=%s\n"
-        "newest_timestamp=%s\n"
-        "oldest_timestamp=%s",
+        "[MOBILE_ORDERS_SERIALIZE_DONE] elapsed_ms=%.2f bytes=%d",
+        _ser_elapsed_ms,
+        _response_bytes,
+    )
+    logger.info(
+        "[MOBILE_ORDERS_QUERY_RESULT] count=%s first_order_id=%s first_customer=%s"
+        " first_total_cents=%s first_amount=%s first_item_count=%s first_unit_count=%s"
+        " newest_timestamp=%s oldest_timestamp=%s",
         len(serialized_orders),
         first.get("id"),
         first.get("customer_name"),
