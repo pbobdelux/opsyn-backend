@@ -6,6 +6,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, Header, Query
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from database import get_db
 from models import Order, OrderLine, BrandAPICredential
@@ -16,6 +17,321 @@ from utils.json_utils import make_json_safe
 logger = logging.getLogger("crm")
 
 router = APIRouter(prefix="/crm", tags=["crm"])
+
+
+# ---------------------------------------------------------------------------
+# Helpers — payload truth functions
+# ---------------------------------------------------------------------------
+
+def _build_crm_line_items(order: Order) -> list[dict[str, Any]]:
+    """
+    Build a normalized line-items list from the best available source.
+
+    Priority:
+      1. order.lines  (OrderLine ORM rows — most reliable)
+      2. order.line_items_json  (normalized JSONB from sync)
+      3. order.raw_payload  (fallback extraction)
+
+    Returns a list of dicts with: product_name, sku, quantity, unit_price,
+    line_total, discounts, shipping, tax, category, product_identifiers.
+    """
+    items: list[dict[str, Any]] = []
+
+    # --- Source 1: ORM relationship rows ---
+    try:
+        lines = getattr(order, "lines", None)
+        if lines:
+            for line in lines:
+                try:
+                    unit_price = None
+                    if line.unit_price is not None:
+                        unit_price = float(line.unit_price)
+                    elif line.unit_price_cents is not None:
+                        unit_price = round(line.unit_price_cents / 100.0, 2)
+
+                    line_total = None
+                    if line.total_price is not None:
+                        line_total = float(line.total_price)
+                    elif line.total_price_cents is not None:
+                        line_total = round(line.total_price_cents / 100.0, 2)
+                    elif unit_price is not None and line.quantity:
+                        line_total = round(unit_price * (line.quantity or 0), 2)
+
+                    # Pull extra fields from raw_payload if available
+                    raw = getattr(line, "raw_payload", None) or {}
+                    items.append({
+                        "product_name": line.product_name,
+                        "sku": line.sku,
+                        "quantity": line.quantity or 0,
+                        "unit_price": unit_price,
+                        "line_total": line_total,
+                        "discounts": raw.get("discount_amount") or raw.get("discounts"),
+                        "shipping": raw.get("shipping"),
+                        "tax": raw.get("tax"),
+                        "category": raw.get("category") or raw.get("product_category"),
+                        "product_identifiers": raw.get("product_identifiers"),
+                    })
+                except Exception:
+                    pass
+            if items:
+                return items
+    except Exception:
+        pass
+
+    # --- Source 2: line_items_json ---
+    try:
+        raw_json = order.line_items_json
+        if isinstance(raw_json, list) and raw_json:
+            for item in raw_json:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    qty = item.get("quantity") or item.get("qty") or 0
+                    unit_price = item.get("unit_price")
+                    if unit_price is None and item.get("unit_price_cents") is not None:
+                        unit_price = round(item["unit_price_cents"] / 100.0, 2)
+                    line_total = item.get("total_price") or item.get("line_total")
+                    if line_total is None and item.get("total_price_cents") is not None:
+                        line_total = round(item["total_price_cents"] / 100.0, 2)
+                    if line_total is None and unit_price is not None and qty:
+                        line_total = round(float(unit_price) * int(qty), 2)
+                    items.append({
+                        "product_name": item.get("product_name") or item.get("name"),
+                        "sku": item.get("sku"),
+                        "quantity": qty,
+                        "unit_price": float(unit_price) if unit_price is not None else None,
+                        "line_total": float(line_total) if line_total is not None else None,
+                        "discounts": item.get("discount_amount") or item.get("discounts"),
+                        "shipping": item.get("shipping"),
+                        "tax": item.get("tax"),
+                        "category": item.get("category") or item.get("product_category"),
+                        "product_identifiers": item.get("product_identifiers"),
+                    })
+                except Exception:
+                    pass
+            if items:
+                return items
+        if isinstance(raw_json, dict):
+            nested = raw_json.get("line_items")
+            if isinstance(nested, list) and nested:
+                return _build_crm_line_items_from_list(nested)
+    except Exception:
+        pass
+
+    # --- Source 3: raw_payload fallback ---
+    try:
+        raw_payload = order.raw_payload
+        if isinstance(raw_payload, dict):
+            candidate = (
+                raw_payload.get("line_items")
+                or raw_payload.get("items")
+                or raw_payload.get("order_items")
+                or raw_payload.get("products")
+                or raw_payload.get("ordered_items")
+                or []
+            )
+            if isinstance(candidate, list) and candidate:
+                return _build_crm_line_items_from_list(candidate)
+    except Exception:
+        pass
+
+    return []
+
+
+def _build_crm_line_items_from_list(raw_list: list) -> list[dict[str, Any]]:
+    """Normalize a raw list of line-item dicts into the CRM line-item shape."""
+    items = []
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        try:
+            qty = item.get("quantity") or item.get("qty") or 0
+            unit_price = item.get("unit_price")
+            if unit_price is None and item.get("unit_price_cents") is not None:
+                unit_price = round(item["unit_price_cents"] / 100.0, 2)
+            line_total = item.get("total_price") or item.get("line_total")
+            if line_total is None and item.get("total_price_cents") is not None:
+                line_total = round(item["total_price_cents"] / 100.0, 2)
+            if line_total is None and unit_price is not None and qty:
+                line_total = round(float(unit_price) * int(qty), 2)
+            items.append({
+                "product_name": item.get("product_name") or item.get("name"),
+                "sku": item.get("sku"),
+                "quantity": qty,
+                "unit_price": float(unit_price) if unit_price is not None else None,
+                "line_total": float(line_total) if line_total is not None else None,
+                "discounts": item.get("discount_amount") or item.get("discounts"),
+                "shipping": item.get("shipping"),
+                "tax": item.get("tax"),
+                "category": item.get("category") or item.get("product_category"),
+                "product_identifiers": item.get("product_identifiers"),
+            })
+        except Exception:
+            pass
+    return items
+
+
+def _compute_order_totals(order: Order, line_items: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Compute correct totals and counts for an order.
+
+    Strategy:
+      1. If stored total_cents > 0: use it as total_amount (source="stored").
+         Also try to pull subtotal/discount/shipping/tax from raw_payload.
+      2. If stored total missing/zero but valid line items exist: compute
+         from line items (source="computed").
+      3. No usable pricing data: return None totals (source="missing").
+
+    Returns a dict with:
+      total_amount, subtotal_amount, discount_total, shipping_total,
+      tax_total, item_count, unit_count, total_source
+    """
+    # --- Pull order-level financial breakdown from raw_payload if available ---
+    raw = {}
+    try:
+        if order.raw_payload and isinstance(order.raw_payload, dict):
+            raw = order.raw_payload
+    except Exception:
+        pass
+
+    def _raw_money(key: str) -> float | None:
+        val = raw.get(key)
+        if val is None:
+            return None
+        try:
+            f = float(val)
+            return f if f != 0.0 else None
+        except (TypeError, ValueError):
+            return None
+
+    # --- Strategy 1: stored total ---
+    stored_total_cents = None
+    try:
+        stored_total_cents = order.total_cents
+    except Exception:
+        pass
+
+    stored_amount = None
+    try:
+        if order.amount is not None:
+            stored_amount = float(order.amount)
+    except Exception:
+        pass
+
+    # Resolve stored total (prefer total_cents, fall back to amount)
+    stored_total: float | None = None
+    if stored_total_cents is not None and stored_total_cents > 0:
+        stored_total = round(stored_total_cents / 100.0, 2)
+    elif stored_amount is not None and stored_amount > 0:
+        stored_total = round(stored_amount, 2)
+
+    if stored_total is not None and stored_total > 0:
+        # Use stored total; try to enrich breakdown from raw_payload
+        subtotal = _raw_money("subtotal") or _raw_money("subtotal_price")
+        discount = _raw_money("discount_total") or _raw_money("total_discounts") or 0.0
+        shipping = _raw_money("shipping_total") or _raw_money("total_shipping") or 0.0
+        tax = _raw_money("tax_total") or _raw_money("total_tax") or 0.0
+
+        stored_item_count = None
+        try:
+            stored_item_count = order.item_count
+        except Exception:
+            pass
+        stored_unit_count = None
+        try:
+            stored_unit_count = order.unit_count
+        except Exception:
+            pass
+
+        item_count = stored_item_count if stored_item_count is not None else len(line_items)
+        unit_count = (
+            stored_unit_count
+            if stored_unit_count is not None
+            else sum((li.get("quantity") or 0) for li in line_items)
+        )
+
+        return {
+            "total_amount": stored_total,
+            "subtotal_amount": subtotal,
+            "discount_total": discount if discount else 0.0,
+            "shipping_total": shipping if shipping else 0.0,
+            "tax_total": tax if tax else 0.0,
+            "item_count": item_count,
+            "unit_count": unit_count,
+            "total_source": "stored",
+        }
+
+    # --- Strategy 2: compute from line items ---
+    if line_items:
+        try:
+            subtotal = sum(
+                float(li.get("line_total") or 0)
+                if li.get("line_total") is not None
+                else (float(li.get("unit_price") or 0) * int(li.get("quantity") or 0))
+                for li in line_items
+            )
+            discount_raw = _raw_money("discount_total") or _raw_money("total_discounts")
+            discount = discount_raw if discount_raw is not None else sum(
+                float(li.get("discounts") or 0) for li in line_items
+                if li.get("discounts") is not None
+            )
+            shipping = _raw_money("shipping_total") or _raw_money("total_shipping") or 0.0
+            tax = _raw_money("tax_total") or _raw_money("total_tax") or 0.0
+            total = round(subtotal - discount + shipping + tax, 2)
+
+            item_count = len(line_items)
+            unit_count = sum((li.get("quantity") or 0) for li in line_items)
+
+            logger.info(
+                "[CRM_ORDER_TOTAL_COMPUTED] order_id=%s subtotal=%.2f discount=%.2f "
+                "shipping=%.2f tax=%.2f final=%.2f",
+                getattr(order, "id", "unknown"),
+                subtotal,
+                discount,
+                shipping,
+                tax,
+                total,
+            )
+
+            return {
+                "total_amount": total,
+                "subtotal_amount": round(subtotal, 2),
+                "discount_total": round(discount, 2),
+                "shipping_total": round(shipping, 2),
+                "tax_total": round(tax, 2),
+                "item_count": item_count,
+                "unit_count": unit_count,
+                "total_source": "computed",
+            }
+        except Exception as exc:
+            logger.warning(
+                "[CRM_ORDER_TOTAL_COMPUTED] compute_failed order_id=%s error=%s",
+                getattr(order, "id", "unknown"),
+                str(exc)[:200],
+            )
+
+    # --- Strategy 3: no usable pricing data ---
+    stored_item_count = None
+    try:
+        stored_item_count = order.item_count
+    except Exception:
+        pass
+    stored_unit_count = None
+    try:
+        stored_unit_count = order.unit_count
+    except Exception:
+        pass
+
+    return {
+        "total_amount": None,
+        "subtotal_amount": None,
+        "discount_total": None,
+        "shipping_total": None,
+        "tax_total": None,
+        "item_count": stored_item_count or 0,
+        "unit_count": stored_unit_count or 0,
+        "total_source": "missing",
+    }
 
 
 async def validate_crm_access(
@@ -390,7 +706,9 @@ async def crm_orders(
     - Filter by status
     - Filter by date range
 
-    Returns: orders array + next_cursor (if more results)
+    Returns: orders array + next_cursor (if more results).
+    Each order row includes corrected totals, item/unit counts, and
+    a total_source field ("stored" | "computed" | "missing").
     """
     try:
         resolved_identifier = x_opsyn_org or org_id
@@ -411,8 +729,14 @@ async def crm_orders(
 
         resolved_org_id = access_result["org_id"]
 
-        # Build query with filters scoped to brand_id
-        query = select(Order).where(Order.brand_id == brand_id)
+        # Build query with filters scoped to brand_id.
+        # Eagerly load order lines so _build_crm_line_items can use them
+        # without triggering lazy-load errors in async context.
+        query = (
+            select(Order)
+            .options(selectinload(Order.lines))
+            .where(Order.brand_id == brand_id)
+        )
 
         if customer_name:
             query = query.where(Order.customer_name.ilike(f"%{customer_name}%"))
@@ -434,7 +758,7 @@ async def crm_orders(
             except Exception:
                 pass
 
-        # Cursor-based pagination
+        # Cursor-based pagination — stable sort: external_created_at DESC, id DESC
         if cursor:
             try:
                 cursor_id = base64.b64decode(cursor).decode()
@@ -453,17 +777,42 @@ async def crm_orders(
             orders_list = orders_list[:limit]
 
         orders = []
+        total_source_counts: dict[str, int] = {"stored": 0, "computed": 0, "missing": 0}
+
         for order in orders_list:
+            # Build line items (lightweight — no full serialization needed for list)
+            line_items = _build_crm_line_items(order)
+
+            # Compute corrected totals
+            totals = _compute_order_totals(order, line_items)
+            total_source_counts[totals["total_source"]] = (
+                total_source_counts.get(totals["total_source"], 0) + 1
+            )
+
             orders.append({
                 "id": order.id,
-                "external_id": order.external_order_id,
-                "customer_name": order.customer_name,
                 "order_number": order.order_number,
+                "external_order_id": order.external_order_id,
+                "external_id": order.external_order_id,  # backward-compat alias
+                "customer_name": order.customer_name,
+                "customer_id": order.customer_name,  # customer_name is the stable ID
                 "status": order.status,
-                "amount": float(order.amount or 0) / 100.0,
-                "item_count": order.item_count or 0,
+                "external_created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+                "order_date": order.external_created_at.isoformat() if order.external_created_at else None,
                 "created_at": order.external_created_at.isoformat() if order.external_created_at else None,
                 "updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
+                # Corrected financial fields
+                "total_amount": totals["total_amount"],
+                "subtotal_amount": totals["subtotal_amount"],
+                "discount_total": totals["discount_total"],
+                "shipping_total": totals["shipping_total"],
+                "tax_total": totals["tax_total"],
+                # Corrected counts
+                "item_count": totals["item_count"],
+                "unit_count": totals["unit_count"],
+                # Payload truth metadata
+                "has_line_items": len(line_items) > 0,
+                "total_source": totals["total_source"],
             })
 
         next_cursor = None
@@ -471,11 +820,15 @@ async def crm_orders(
             next_cursor = base64.b64encode(str(orders[-1]["id"]).encode()).decode()
 
         logger.info(
-            "[CRM] orders_returned org_id=%s brand_id=%s count=%s has_more=%s",
+            "[CRM_ORDER_PAYLOAD_AUDIT] org_id=%s brand_id=%s count=%s has_more=%s "
+            "total_source_stored=%s total_source_computed=%s total_source_missing=%s",
             resolved_org_id,
             brand_id,
             len(orders),
             has_more,
+            total_source_counts.get("stored", 0),
+            total_source_counts.get("computed", 0),
+            total_source_counts.get("missing", 0),
         )
 
         return make_json_safe({
@@ -498,6 +851,228 @@ async def crm_orders(
             "count": 0,
             "has_more": False,
             "next_cursor": None,
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+@router.get("/orders/{order_id}/debug")
+async def crm_order_debug(
+    order_id: str,
+    org_id: str = Query(..., description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    x_opsyn_org: str | None = Header(None, description="Optional org_id from header"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Debug endpoint — returns raw DB state, computed totals, and final payload.
+
+    Use for diagnosis only. Do NOT expose in production UI.
+    """
+    try:
+        resolved_identifier = x_opsyn_org or org_id
+        access_result = await validate_crm_access(db, resolved_identifier, brand_id)
+        if not access_result.get("ok"):
+            return {"ok": False, "error": access_result.get("error")}
+
+        order_result = await db.execute(
+            select(Order)
+            .options(selectinload(Order.lines))
+            .where(and_(Order.id == order_id, Order.brand_id == brand_id))
+        )
+        order = order_result.scalar_one_or_none()
+        if not order:
+            return {"ok": False, "error": "Order not found"}
+
+        line_items = _build_crm_line_items(order)
+        totals = _compute_order_totals(order, line_items)
+
+        raw_db_order = {
+            "id": order.id,
+            "external_order_id": order.external_order_id,
+            "order_number": order.order_number,
+            "customer_name": order.customer_name,
+            "status": order.status,
+            "total_cents": order.total_cents,
+            "amount": float(order.amount) if order.amount is not None else None,
+            "item_count": order.item_count,
+            "unit_count": order.unit_count,
+            "has_line_items_json": order.line_items_json is not None,
+            "has_raw_payload": order.raw_payload is not None,
+            "line_items_json_count": (
+                len(order.line_items_json)
+                if isinstance(order.line_items_json, list)
+                else None
+            ),
+            "orm_lines_count": len(order.lines) if order.lines else 0,
+            "external_created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+            "external_updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
+        }
+
+        raw_db_line_items = []
+        if order.lines:
+            for line in order.lines:
+                raw_db_line_items.append({
+                    "id": line.id,
+                    "sku": line.sku,
+                    "product_name": line.product_name,
+                    "quantity": line.quantity,
+                    "unit_price": float(line.unit_price) if line.unit_price is not None else None,
+                    "unit_price_cents": line.unit_price_cents,
+                    "total_price": float(line.total_price) if line.total_price is not None else None,
+                    "total_price_cents": line.total_price_cents,
+                })
+
+        final_payload = {
+            "id": order.id,
+            "order_number": order.order_number,
+            "external_order_id": order.external_order_id,
+            "customer_name": order.customer_name,
+            "customer_id": order.customer_name,
+            "status": order.status,
+            "external_created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+            "line_items": line_items,
+            **totals,
+        }
+
+        return make_json_safe({
+            "ok": True,
+            "order_id": order_id,
+            "raw_db_order": raw_db_order,
+            "raw_db_line_items": raw_db_line_items,
+            "computed_totals": totals,
+            "final_api_payload": final_payload,
+        })
+
+    except Exception as e:
+        logger.error("[CRM] order_debug_failed order_id=%s error=%s", order_id, str(e)[:500], exc_info=True)
+        return {"ok": False, "error": str(e)[:500]}
+
+
+@router.get("/orders/{order_id}")
+async def crm_order_detail(
+    order_id: str,
+    org_id: str = Query(..., description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    x_opsyn_org: str | None = Header(None, description="Optional org_id from header"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get full detail for a single order, including corrected totals and line items.
+
+    Requires:
+    - org_id: Organization ID (UUID or org_code)
+    - brand_id: Brand ID (UUID)
+
+    Returns all order fields plus:
+    - line_items[]: full line item array with product_name, sku, quantity,
+      unit_price, line_total, discounts, shipping, tax, category
+    - total_amount, subtotal_amount, discount_total, shipping_total, tax_total
+    - item_count, unit_count (corrected)
+    - total_source: "stored" | "computed" | "missing"
+    """
+    try:
+        resolved_identifier = x_opsyn_org or org_id
+        logger.info(
+            "[CRM] order_detail_requested order_id=%s org_id=%s brand_id=%s",
+            order_id,
+            resolved_identifier,
+            brand_id,
+        )
+
+        # Validate org and brand access
+        access_result = await validate_crm_access(db, resolved_identifier, brand_id)
+        if not access_result.get("ok"):
+            logger.warning("[CRM] order_detail_access_denied error=%s", access_result.get("error"))
+            return {"ok": False, "error": access_result.get("error")}
+
+        resolved_org_id = access_result["org_id"]
+
+        # Fetch order with lines eagerly loaded
+        order_result = await db.execute(
+            select(Order)
+            .options(selectinload(Order.lines))
+            .where(and_(Order.id == order_id, Order.brand_id == brand_id))
+        )
+        order = order_result.scalar_one_or_none()
+
+        if not order:
+            logger.warning(
+                "[CRM] order_not_found order_id=%s org_id=%s brand_id=%s",
+                order_id,
+                resolved_org_id,
+                brand_id,
+            )
+            return {
+                "ok": False,
+                "error": "Order not found",
+                "synced_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        # Build line items from best available source
+        line_items = _build_crm_line_items(order)
+
+        # Compute corrected totals
+        totals = _compute_order_totals(order, line_items)
+
+        has_discounts = any(li.get("discounts") for li in line_items)
+
+        logger.info(
+            "[CRM_ORDER_LINE_ITEMS_AUDIT] order_id=%s line_item_count=%s unit_count=%s has_discounts=%s",
+            order_id,
+            len(line_items),
+            totals["unit_count"],
+            has_discounts,
+        )
+        logger.info(
+            "[CRM_ORDER_PAYLOAD_AUDIT] order_id=%s total_source=%s total_amount=%s "
+            "item_count=%s unit_count=%s",
+            order_id,
+            totals["total_source"],
+            totals["total_amount"],
+            totals["item_count"],
+            totals["unit_count"],
+        )
+
+        return make_json_safe({
+            "ok": True,
+            "org_id": resolved_org_id,
+            "brand_id": brand_id,
+            # Identity
+            "id": order.id,
+            "order_number": order.order_number,
+            "external_order_id": order.external_order_id,
+            "external_id": order.external_order_id,  # backward-compat alias
+            "customer_name": order.customer_name,
+            "customer_id": order.customer_name,  # customer_name is the stable ID
+            "status": order.status,
+            "review_status": order.review_status,
+            # Timestamps
+            "external_created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+            "order_date": order.external_created_at.isoformat() if order.external_created_at else None,
+            "created_at": order.external_created_at.isoformat() if order.external_created_at else None,
+            "updated_at": order.external_updated_at.isoformat() if order.external_updated_at else None,
+            # Corrected financial fields
+            "total_amount": totals["total_amount"],
+            "subtotal_amount": totals["subtotal_amount"],
+            "discount_total": totals["discount_total"],
+            "shipping_total": totals["shipping_total"],
+            "tax_total": totals["tax_total"],
+            # Corrected counts
+            "item_count": totals["item_count"],
+            "unit_count": totals["unit_count"],
+            # Payload truth metadata
+            "has_line_items": len(line_items) > 0,
+            "total_source": totals["total_source"],
+            # Full line items array
+            "line_items": line_items,
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    except Exception as e:
+        logger.error("[CRM] order_detail_failed order_id=%s error=%s", order_id, str(e)[:500], exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e)[:500],
             "synced_at": datetime.now(timezone.utc).isoformat(),
         }
 
