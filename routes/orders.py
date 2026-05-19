@@ -10,13 +10,13 @@ from typing import Optional
 
 import requests
 
-from fastapi import APIRouter, Depends, Header, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from sqlalchemy import cast, func, literal_column, select
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal, get_db
-from models import BrandAPICredential, Order, SyncRequest, SyncRun
+from models import BrandAPICredential, Order, OrderLine, SyncRequest, SyncRun
 from services.watchdog_client import emit_watchdog_event
 from utils.json_utils import make_json_safe
 
@@ -326,10 +326,10 @@ LEAFLINK_PAGE_SIZE = 100        # Orders per LeafLink page
 async def get_orders(
     x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
     brand_id: str = Query(..., description="Brand ID (UUID)"),
-    limit: int = Query(100, ge=1, le=1000, description="Orders per page (default 100, max 1000)"),
+    limit: int = Query(50, ge=1, le=200, description="Orders per page (default 50, max 200)"),
     offset: int = Query(0, ge=0, description="Offset for pagination (default 0)"),
     cursor: Optional[str] = Query(None, description="Opaque cursor for cursor-based pagination"),
-    sort_by: str = Query("updated_at", description="Sort field: updated_at, created_at, external_updated_at"),
+    sort_by: str = Query("external_created_at", description="Sort field: external_created_at, updated_at, created_at, external_updated_at"),
     sort_order: str = Query("desc", description="asc or desc"),
     include_line_items: bool = Query(False, description="Include full line_items (default false for list mode)"),
     db: AsyncSession = Depends(get_db),
@@ -499,13 +499,18 @@ async def get_orders(
     # ------------------------------------------------------------------ #
     # Resolve sort column                                                  #
     # ------------------------------------------------------------------ #
-    if sort_by == "created_at":
+    if sort_by == "external_created_at":
+        sort_col = Order.external_created_at
+    elif sort_by == "created_at":
         sort_col = Order.created_at
     elif sort_by == "external_updated_at":
         sort_col = Order.external_updated_at
-    else:
-        sort_by = "updated_at"
+    elif sort_by == "updated_at":
         sort_col = Order.updated_at
+    else:
+        # Default: newest orders first by external_created_at
+        sort_by = "external_created_at"
+        sort_col = Order.external_created_at
 
     # ------------------------------------------------------------------ #
     # Build base query - SCOPED BY ORG_ID AND BRAND_ID                    #
@@ -5425,6 +5430,277 @@ async def pagination_debug(
         "loaded_vs_visible_gap": loaded_vs_visible_gap,
         "persistence_health": persistence_health,
     }
+
+
+@router.get("/orders-health")
+async def orders_health_check(
+    brand_id: Optional[str] = Query(None, description="Brand ID to scope health check (optional)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Health check for the orders system.
+
+    Returns aggregate counts, newest order dates, order_lines count,
+    orders-without-lines count, and a sync_status of 'current' or 'stale'.
+
+    Logs a [ORDERS_HEALTH] line with all key metrics for easy grep.
+    """
+    from sqlalchemy import text as _text_health
+
+    try:
+        # Build brand filter clause
+        brand_clause = "WHERE brand_id = :brand_id" if brand_id else ""
+        brand_params: dict = {"brand_id": brand_id} if brand_id else {}
+
+        # Aggregate order stats
+        orders_sql = _text_health(f"""
+            SELECT
+                COUNT(*) AS total_orders,
+                MAX(external_created_at) AS newest_external_created_at,
+                MAX(synced_at) AS newest_synced_at,
+                (
+                    SELECT external_order_id FROM orders
+                    {brand_clause}
+                    ORDER BY external_created_at DESC NULLS LAST
+                    LIMIT 1
+                ) AS newest_external_order_id
+            FROM orders
+            {brand_clause}
+        """)
+        orders_result = await db.execute(orders_sql, brand_params)
+        row = orders_result.fetchone()
+
+        total_orders = row[0] if row else 0
+        newest_external_created_at = row[1] if row else None
+        newest_synced_at = row[2] if row else None
+        newest_external_order_id = row[3] if row else None
+
+        # Order lines count
+        lines_sql = _text_health(
+            "SELECT COUNT(*) FROM order_lines ol "
+            + ("JOIN orders o ON ol.order_id = o.id WHERE o.brand_id = :brand_id" if brand_id else "")
+        )
+        lines_result = await db.execute(lines_sql, brand_params)
+        order_lines_count = lines_result.scalar() or 0
+
+        # Orders without any lines
+        no_lines_sql = _text_health(
+            "SELECT COUNT(*) FROM orders o "
+            + ("WHERE o.brand_id = :brand_id AND " if brand_id else "WHERE ")
+            + "NOT EXISTS (SELECT 1 FROM order_lines ol WHERE ol.order_id = o.id)"
+        )
+        no_lines_result = await db.execute(no_lines_sql, brand_params)
+        orders_without_lines_count = no_lines_result.scalar() or 0
+
+        # Determine sync staleness (stale if newest order is > 1 day old)
+        now = datetime.now(timezone.utc)
+        is_stale = True
+        if newest_external_created_at is not None:
+            _newest = (
+                newest_external_created_at
+                if newest_external_created_at.tzinfo is not None
+                else newest_external_created_at.replace(tzinfo=timezone.utc)
+            )
+            is_stale = (now - _newest).days > 1
+
+        sync_status = "stale" if is_stale else "current"
+
+        logger.info(
+            "[ORDERS_HEALTH] brand_id=%s total_orders=%s newest_external_created_at=%s "
+            "newest_synced_at=%s order_lines_count=%s orders_without_lines=%s sync_status=%s",
+            brand_id or "all",
+            total_orders,
+            newest_external_created_at,
+            newest_synced_at,
+            order_lines_count,
+            orders_without_lines_count,
+            sync_status,
+        )
+
+        return {
+            "ok": True,
+            "brand_id": brand_id,
+            "total_orders": total_orders,
+            "newest_external_created_at": newest_external_created_at.isoformat() if newest_external_created_at else None,
+            "newest_synced_at": newest_synced_at.isoformat() if newest_synced_at else None,
+            "newest_external_order_id": newest_external_order_id,
+            "order_lines_count": order_lines_count,
+            "orders_without_lines_count": orders_without_lines_count,
+            "sync_status": sync_status,
+            "timestamp": now.isoformat(),
+        }
+
+    except Exception as exc:
+        logger.error("[ORDERS_HEALTH] error brand_id=%s error=%s", brand_id, str(exc)[:300], exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "error": str(exc)[:300]}
+
+
+async def _resolve_order_identifier_for_lines(
+    db: AsyncSession,
+    order_identifier: str,
+) -> Optional[Order]:
+    """
+    Resolve an order identifier to an Order ORM object.
+
+    Tries in order:
+    1. Exact match on Order.id (internal UUID)
+    2. Exact match on Order.external_order_id (LeafLink UUID)
+    3. Short suffix match — last 8 chars of external_order_id (e.g. '28b6e3a4')
+
+    Returns the Order with a synthetic `.matched_by` attribute set to
+    'internal_id', 'external_order_id', or 'short_id' for logging.
+    Returns None if no match found.
+    """
+    # 1. Try internal UUID exact match
+    try:
+        result = await db.execute(
+            select(Order).where(Order.id == order_identifier)
+        )
+        order = result.scalar_one_or_none()
+        if order is not None:
+            order.matched_by = "internal_id"  # type: ignore[attr-defined]
+            return order
+    except Exception:
+        await db.rollback()
+
+    # 2. Try external_order_id exact match
+    try:
+        result = await db.execute(
+            select(Order).where(Order.external_order_id == order_identifier)
+        )
+        order = result.scalar_one_or_none()
+        if order is not None:
+            order.matched_by = "external_order_id"  # type: ignore[attr-defined]
+            return order
+    except Exception:
+        await db.rollback()
+
+    # 3. Try short suffix match (last 8 chars of external_order_id)
+    if len(order_identifier) <= 8:
+        try:
+            from sqlalchemy import text as _text_suffix
+            result = await db.execute(
+                _text_suffix(
+                    "SELECT id FROM orders WHERE external_order_id LIKE :suffix LIMIT 2"
+                ),
+                {"suffix": f"%{order_identifier}"},
+            )
+            rows = result.fetchall()
+            if len(rows) == 1:
+                # Unique match — fetch the full ORM object
+                matched_id = rows[0][0]
+                orm_result = await db.execute(
+                    select(Order).where(Order.id == matched_id)
+                )
+                order = orm_result.scalar_one_or_none()
+                if order is not None:
+                    order.matched_by = "short_id"  # type: ignore[attr-defined]
+                    return order
+            elif len(rows) > 1:
+                logger.warning(
+                    "[ORDER_LINES_RESOLVE] short_id_ambiguous order_identifier=%s matched_count=%d",
+                    order_identifier,
+                    len(rows),
+                )
+        except Exception:
+            await db.rollback()
+
+    return None
+
+
+@router.get("/{order_identifier}/line-items")
+async def get_order_line_items(
+    order_identifier: str,
+    brand_id: Optional[str] = Query(None, description="Brand ID for tenant scoping (optional but recommended)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get line items for an order by any identifier format.
+
+    Accepts:
+    - Internal DB order UUID (Order.id)
+    - external_order_id (LeafLink UUID, e.g. '9cc48b36-9b35-477a-8e66-780028b6e3a4')
+    - Short display suffix (last 8 chars, e.g. '28b6e3a4')
+
+    Returns a list of line item objects with sku, product_name, quantity,
+    unit_price, line_total, product_id, brand_id, and category.
+
+    Logs [ORDER_LINES_REQUEST], [ORDER_LINES_RESOLVE], [ORDER_LINES_RESULT],
+    and [ORDER_LINES_NOT_FOUND] for easy grep/audit.
+    """
+    from sqlalchemy.orm import selectinload as _selectinload_lines
+
+    logger.info("[ORDER_LINES_REQUEST] order_identifier=%s brand_id=%s", order_identifier, brand_id)
+
+    # Resolve identifier to internal Order
+    order = await _resolve_order_identifier_for_lines(db, order_identifier)
+
+    if not order:
+        logger.warning("[ORDER_LINES_NOT_FOUND] order_identifier=%s brand_id=%s", order_identifier, brand_id)
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    matched_by = getattr(order, "matched_by", "unknown")
+    logger.info(
+        "[ORDER_LINES_RESOLVE] matched_by=%s order_db_id=%s external_order_id=%s brand_id=%s",
+        matched_by,
+        order.id,
+        order.external_order_id,
+        order.brand_id,
+    )
+
+    # Optional brand scoping — reject if order belongs to a different brand
+    if brand_id and order.brand_id and str(order.brand_id) != str(brand_id):
+        logger.warning(
+            "[ORDER_LINES_BRAND_MISMATCH] order_identifier=%s order_brand_id=%s requested_brand_id=%s",
+            order_identifier,
+            order.brand_id,
+            brand_id,
+        )
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    # Query order_lines with correct join: orders.id -> order_lines.order_id
+    try:
+        lines_result = await db.execute(
+            select(OrderLine)
+            .where(OrderLine.order_id == order.id)
+            .order_by(OrderLine.created_at)
+        )
+        lines = lines_result.scalars().all()
+    except Exception as exc:
+        logger.error(
+            "[ORDER_LINES_QUERY_ERROR] order_db_id=%s error=%s",
+            order.id,
+            str(exc)[:300],
+            exc_info=True,
+        )
+        await db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to query order lines")
+
+    logger.info(
+        "[ORDER_LINES_RESULT] order_db_id=%s external_order_id=%s count=%d",
+        order.id,
+        order.external_order_id,
+        len(lines),
+    )
+
+    return make_json_safe([
+        {
+            "id": line.id,
+            "sku": line.sku,
+            "product_name": line.product_name,
+            "quantity": line.quantity,
+            "unit_price": float(line.unit_price) if line.unit_price is not None else None,
+            "line_total": float(line.total_price) if line.total_price is not None else None,
+            "product_id": getattr(line, "mapped_product_id", None),
+            "brand_id": order.brand_id,
+            "category": getattr(line, "category", None),
+        }
+        for line in lines
+    ])
 
 
 @router.get("/{order_id}")
