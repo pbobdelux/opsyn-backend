@@ -497,8 +497,10 @@ def serialize_order(order: Order) -> dict[str, Any]:
         line_items = []
 
     # Amount — fault-tolerant with safe_money_to_float
+    # `order.amount` and `order.total_cents` are stored in cents — divide by 100
     try:
-        amount = money_to_float(order.amount)
+        _raw_amount = money_to_float(order.amount)
+        amount = round(_raw_amount / 100.0, 2) if _raw_amount is not None else None
         if amount is None and order.total_cents is not None:
             amount = cents_to_amount(order.total_cents)
     except Exception:
@@ -837,7 +839,9 @@ async def get_order_detail(order_id: str, db: AsyncSession = Depends(get_db)):
 
     line_items = build_line_items(order)
 
-    amount = money_to_float(order.amount)
+    # `order.amount` and `order.total_cents` are stored in cents — divide by 100
+    _raw_amount = money_to_float(order.amount)
+    amount = round(_raw_amount / 100.0, 2) if _raw_amount is not None else None
     if amount is None and order.total_cents is not None:
         amount = cents_to_amount(order.total_cents)
 
