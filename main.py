@@ -141,7 +141,7 @@ from routes.health import router as health_router  # noqa: E402
 from routes.integrations import router as integrations_router, _api_router as integrations_api_router  # noqa: E402
 from routes.integrations_health import router as integrations_health_router  # noqa: E402
 from routes.leaflink_debug import router as leaflink_debug_router  # noqa: E402
-from routes.orders import router as orders_router  # noqa: E402
+from routes.orders import router as orders_router, orders_api_router  # noqa: E402
 from routes.voice import router as voice_router  # noqa: E402
 from routes.voice_brain import router as voice_brain_router  # noqa: E402
 from routes.admin import router as admin_router  # noqa: E402
@@ -1069,6 +1069,9 @@ app.include_router(leaflink_orders_router)
 # Orders API — router owns its full prefix (/api/leaflink/orders/...)
 # Do NOT add a prefix here; the router definition already includes it.
 app.include_router(orders_router)
+
+# Brand app orders API — /api/orders/... (line-items, health)
+app.include_router(orders_api_router)
 
 # LeafLink debug
 app.include_router(leaflink_debug_router, prefix="/leaflink")
