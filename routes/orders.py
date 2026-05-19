@@ -338,7 +338,7 @@ async def get_orders(
     limit: int = Query(100, ge=1, le=1000, description="Orders per page (default 100, max 1000)"),
     offset: int = Query(0, ge=0, description="Offset for pagination (default 0)"),
     cursor: Optional[str] = Query(None, description="Opaque cursor for cursor-based pagination"),
-    sort_by: str = Query("updated_at", description="Sort field: updated_at, created_at, external_updated_at"),
+    sort_by: str = Query("external_created_at", description="Sort field: external_created_at, updated_at, created_at, external_updated_at"),
     sort_order: str = Query("desc", description="asc or desc"),
     include_line_items: bool = Query(False, description="Include full line_items (default false for list mode)"),
     db: AsyncSession = Depends(get_db),
@@ -382,6 +382,15 @@ async def get_orders(
         limit,
         offset,
         include_line_items,
+    )
+    logger.info(
+        "[ORDERS_LIST_REQUEST] brand_id=%s limit=%s offset=%s sort_by=%s sort_order=%s org_id=%s",
+        brand_id,
+        limit,
+        offset,
+        sort_by,
+        sort_order,
+        x_opsyn_org,
     )
 
     # Resolve org_id (supports UUID or org_code)
@@ -510,9 +519,11 @@ async def get_orders(
         sort_col = Order.created_at
     elif sort_by == "external_updated_at":
         sort_col = Order.external_updated_at
+    elif sort_by == "external_created_at":
+        sort_col = Order.external_created_at
     else:
-        sort_by = "updated_at"
-        sort_col = Order.updated_at
+        sort_by = "external_created_at"
+        sort_col = Order.external_created_at
 
     # ------------------------------------------------------------------ #
     # Build base query - SCOPED BY ORG_ID AND BRAND_ID                    #
@@ -560,10 +571,10 @@ async def get_orders(
 
 
     if sort_order == "asc":
-        query = query.order_by(sort_col.asc(), Order.id.asc())
+        query = query.order_by(sort_col.asc().nullslast(), Order.created_at.asc())
     else:
         sort_order = "desc"
-        query = query.order_by(sort_col.desc(), Order.id.desc())
+        query = query.order_by(sort_col.desc().nullslast(), Order.created_at.desc())
 
     # ------------------------------------------------------------------ #
     # Apply cursor filter OR offset                                        #
@@ -748,6 +759,13 @@ async def get_orders(
         limit,
         offset,
     )
+    logger.info(
+        "[ORDERS_LIST_RESULT] returned=%s total=%s has_more=%s brand_id=%s",
+        len(serialized_orders),
+        total_in_database,
+        has_more,
+        brand_id,
+    )
 
     return make_json_safe({
         "ok": True,
@@ -762,6 +780,7 @@ async def get_orders(
         "next_cursor": next_cursor,
         "prev_cursor": prev_cursor,
     })
+
 
 
 @router.get("/health")
@@ -5677,3 +5696,343 @@ async def get_order(
             "ar_note": _safe_col(order, "ar_note"),
         },
     })
+
+
+# =============================================================================
+# /api/orders router — dedicated endpoints for the Brand app
+# Prefix: /api/orders
+# =============================================================================
+
+orders_api_router = APIRouter(prefix="/api/orders", tags=["orders-api"])
+_orders_api_logger = logging.getLogger("orders_api")
+
+
+@orders_api_router.get("/{order_id}/line-items")
+async def get_order_line_items(
+    order_id: str,
+    x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return line items for a single order.
+
+    Accepts order_id as:
+    1. Internal DB UUID (order.id)
+    2. Full external_order_id
+    3. Short 8-char suffix of external_order_id (display format used by Brand app)
+
+    Requires:
+    - X-OPSYN-ORG header: Organization ID (UUID or org_code)
+    - brand_id query param: Brand ID (UUID)
+    """
+    from fastapi.responses import JSONResponse
+    from leaflink.orders import build_line_items, _DEFER_OPTS as _ll_defer_opts_li
+    from services.organization_service import lookup_organization
+    from sqlalchemy import and_, or_
+    from sqlalchemy.orm import selectinload as _selectinload_li
+
+    _orders_api_logger.info(
+        "[ORDER_LINES_REQUEST] order_id_param=%s brand_id=%s org_id=%s",
+        order_id,
+        brand_id,
+        x_opsyn_org,
+    )
+
+    if not x_opsyn_org:
+        return JSONResponse(status_code=400, content={"detail": "X-OPSYN-ORG header is required"})
+
+    if not brand_id:
+        return JSONResponse(status_code=400, content={"detail": "brand_id query parameter is required"})
+
+    # Resolve org
+    org_lookup = await lookup_organization(db, x_opsyn_org)
+    if not org_lookup.get("ok"):
+        return JSONResponse(status_code=400, content={"detail": org_lookup.get("error")})
+
+    resolved_org = org_lookup.get("organization")
+    resolved_org_id = str(resolved_org.id)
+
+    # Validate brand belongs to org
+    from models.auth_models import Brand as _Brand
+    brand_result = await db.execute(
+        select(_Brand).where(
+            and_(
+                _Brand.id == cast(brand_id, PG_UUID(as_uuid=False)),
+                _Brand.org_id == cast(resolved_org_id, PG_UUID(as_uuid=False)),
+            )
+        )
+    )
+    brand_obj = brand_result.scalar_one_or_none()
+    if not brand_obj:
+        return JSONResponse(status_code=404, content={"detail": "Brand not found or does not belong to organization"})
+
+    # ------------------------------------------------------------------ #
+    # Resolve order — try three ID formats in priority order              #
+    # ------------------------------------------------------------------ #
+    order = None
+    matched_by: str | None = None
+
+    # Strategy 1: internal DB UUID
+    try:
+        result1 = await db.execute(
+            select(Order)
+            .options(_selectinload_li(Order.lines), *_ll_defer_opts_li)
+            .where(
+                and_(
+                    Order.id == order_id,
+                    Order.org_id == cast(resolved_org_id, PG_UUID(as_uuid=False)),
+                    Order.brand_id == brand_id,
+                )
+            )
+        )
+        order = result1.scalar_one_or_none()
+        if order:
+            matched_by = "internal_id"
+    except Exception as _exc1:
+        _orders_api_logger.warning(
+            "[ORDER_LINES_REQUEST] internal_id_lookup_failed order_id=%s error=%s",
+            order_id,
+            str(_exc1)[:200],
+        )
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    # Strategy 2: full external_order_id
+    if not order:
+        try:
+            result2 = await db.execute(
+                select(Order)
+                .options(_selectinload_li(Order.lines), *_ll_defer_opts_li)
+                .where(
+                    and_(
+                        Order.external_order_id == order_id,
+                        Order.org_id == cast(resolved_org_id, PG_UUID(as_uuid=False)),
+                        Order.brand_id == brand_id,
+                    )
+                )
+            )
+            order = result2.scalar_one_or_none()
+            if order:
+                matched_by = "external_order_id"
+        except Exception as _exc2:
+            _orders_api_logger.warning(
+                "[ORDER_LINES_REQUEST] external_id_lookup_failed order_id=%s error=%s",
+                order_id,
+                str(_exc2)[:200],
+            )
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
+    # Strategy 3: short 8-char suffix of external_order_id
+    if not order and len(order_id) <= 8:
+        try:
+            from sqlalchemy import text as _text_li
+            result3 = await db.execute(
+                _text_li(
+                    "SELECT id FROM orders "
+                    "WHERE brand_id = CAST(:brand_id AS uuid) "
+                    "AND org_id = CAST(:org_id AS uuid) "
+                    "AND RIGHT(external_order_id, 8) = :suffix "
+                    "LIMIT 1"
+                ),
+                {"brand_id": brand_id, "org_id": resolved_org_id, "suffix": order_id[-8:]},
+            )
+            row3 = result3.fetchone()
+            if row3:
+                resolved_internal_id = row3[0]
+                result3b = await db.execute(
+                    select(Order)
+                    .options(_selectinload_li(Order.lines), *_ll_defer_opts_li)
+                    .where(Order.id == resolved_internal_id)
+                )
+                order = result3b.scalar_one_or_none()
+                if order:
+                    matched_by = "short_id"
+        except Exception as _exc3:
+            _orders_api_logger.warning(
+                "[ORDER_LINES_REQUEST] short_id_lookup_failed order_id=%s error=%s",
+                order_id,
+                str(_exc3)[:200],
+            )
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
+    if not order:
+        _orders_api_logger.warning(
+            "[ORDER_LINES_NOT_FOUND] order_id_param=%s brand_id=%s org_id=%s",
+            order_id,
+            brand_id,
+            resolved_org_id,
+        )
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+
+    _orders_api_logger.info(
+        "[ORDER_LINES_RESOLVE] matched_by=%s order_db_id=%s external_order_id=%s",
+        matched_by,
+        order.id,
+        order.external_order_id,
+    )
+
+    # Build line items using the shared helper (tries ORM lines → JSON → raw_payload)
+    line_items = build_line_items(order)
+
+    _orders_api_logger.info(
+        "[ORDER_LINES_RESULT] count=%s order_id=%s",
+        len(line_items),
+        order.id,
+    )
+
+    return make_json_safe({
+        "ok": True,
+        "order_id": order.id,
+        "external_order_id": order.external_order_id,
+        "brand_id": brand_id,
+        "org_id": resolved_org_id,
+        "matched_by": matched_by,
+        "line_items": line_items,
+        "count": len(line_items),
+    })
+
+
+@orders_api_router.get("/health")
+async def orders_api_health(
+    x_opsyn_org: str | None = Header(None, description="Organization ID (UUID or org_code)"),
+    brand_id: str = Query(..., description="Brand ID (UUID)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Health check for the orders subsystem.
+
+    Returns counts, newest order dates, sync status, and line item coverage
+    for the given brand. Useful for diagnosing stale data and missing line items.
+    """
+    from fastapi.responses import JSONResponse
+    from services.organization_service import lookup_organization
+    from sqlalchemy import text as _text_health
+
+    if not x_opsyn_org:
+        return JSONResponse(status_code=400, content={"detail": "X-OPSYN-ORG header is required"})
+    if not brand_id:
+        return JSONResponse(status_code=400, content={"detail": "brand_id query parameter is required"})
+
+    # Resolve org
+    org_lookup = await lookup_organization(db, x_opsyn_org)
+    if not org_lookup.get("ok"):
+        return JSONResponse(status_code=400, content={"detail": org_lookup.get("error")})
+
+    resolved_org = org_lookup.get("organization")
+    resolved_org_id = str(resolved_org.id)
+
+    try:
+        # Total orders for brand
+        total_orders_res = await db.execute(
+            _text_health(
+                "SELECT COUNT(*) FROM orders "
+                "WHERE brand_id = CAST(:brand_id AS uuid) AND org_id = CAST(:org_id AS uuid)"
+            ),
+            {"brand_id": brand_id, "org_id": resolved_org_id},
+        )
+        total_orders = total_orders_res.scalar() or 0
+
+        # Newest external_created_at and its external_order_id
+        newest_res = await db.execute(
+            _text_health(
+                "SELECT MAX(external_created_at), MAX(last_synced_at) "
+                "FROM orders "
+                "WHERE brand_id = CAST(:brand_id AS uuid) AND org_id = CAST(:org_id AS uuid)"
+            ),
+            {"brand_id": brand_id, "org_id": resolved_org_id},
+        )
+        newest_row = newest_res.fetchone()
+        newest_external_created_at = newest_row[0] if newest_row else None
+        newest_synced_at = newest_row[1] if newest_row else None
+
+        # external_order_id of the newest order
+        newest_order_id_res = await db.execute(
+            _text_health(
+                "SELECT external_order_id FROM orders "
+                "WHERE brand_id = CAST(:brand_id AS uuid) AND org_id = CAST(:org_id AS uuid) "
+                "ORDER BY external_created_at DESC NULLS LAST LIMIT 1"
+            ),
+            {"brand_id": brand_id, "org_id": resolved_org_id},
+        )
+        newest_order_id_row = newest_order_id_res.fetchone()
+        newest_external_order_id = newest_order_id_row[0] if newest_order_id_row else None
+
+        # Count rows in order_lines for this brand's orders
+        order_lines_count_res = await db.execute(
+            _text_health(
+                "SELECT COUNT(*) FROM order_lines ol "
+                "JOIN orders o ON ol.order_id = o.id "
+                "WHERE o.brand_id = CAST(:brand_id AS uuid) AND o.org_id = CAST(:org_id AS uuid)"
+            ),
+            {"brand_id": brand_id, "org_id": resolved_org_id},
+        )
+        order_lines_count = order_lines_count_res.scalar() or 0
+
+        # Orders with no line items (neither in order_lines nor line_items_json)
+        orders_without_lines_res = await db.execute(
+            _text_health(
+                "SELECT COUNT(*) FROM orders o "
+                "WHERE o.brand_id = CAST(:brand_id AS uuid) AND o.org_id = CAST(:org_id AS uuid) "
+                "AND NOT EXISTS (SELECT 1 FROM order_lines ol WHERE ol.order_id = o.id) "
+                "AND (o.line_items_json IS NULL OR o.line_items_json = '[]'::jsonb)"
+            ),
+            {"brand_id": brand_id, "org_id": resolved_org_id},
+        )
+        orders_without_lines_count = orders_without_lines_res.scalar() or 0
+
+        # Determine sync_status
+        sync_status = "unknown"
+        if newest_synced_at is not None:
+            _synced_at_aware = newest_synced_at
+            if hasattr(_synced_at_aware, "tzinfo") and _synced_at_aware.tzinfo is None:
+                _synced_at_aware = _synced_at_aware.replace(tzinfo=timezone.utc)
+            _age_seconds = (datetime.now(timezone.utc) - _synced_at_aware).total_seconds()
+            sync_status = "healthy" if _age_seconds < 3600 else "stale"
+
+        _orders_api_logger.info(
+            "[ORDERS_HEALTH] total_orders=%s newest_external_created_at=%s newest_synced_at=%s "
+            "order_lines_count=%s orders_without_lines_count=%s sync_status=%s brand_id=%s",
+            total_orders,
+            newest_external_created_at,
+            newest_synced_at,
+            order_lines_count,
+            orders_without_lines_count,
+            sync_status,
+            brand_id,
+        )
+
+        return make_json_safe({
+            "ok": True,
+            "brand_id": brand_id,
+            "org_id": resolved_org_id,
+            "total_orders": total_orders,
+            "newest_external_created_at": newest_external_created_at,
+            "newest_synced_at": newest_synced_at,
+            "newest_external_order_id": newest_external_order_id,
+            "order_lines_count": order_lines_count,
+            "orders_without_lines_count": orders_without_lines_count,
+            "sync_status": sync_status,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+    except Exception as exc:
+        _orders_api_logger.error(
+            "[ORDERS_HEALTH] error brand_id=%s error=%s",
+            brand_id,
+            str(exc)[:500],
+            exc_info=True,
+        )
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        return JSONResponse(status_code=500, content={"detail": "Health check failed", "error": str(exc)[:200]})
