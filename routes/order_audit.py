@@ -194,10 +194,11 @@ async def audit_order_totals(
         ) = row
 
         # Resolve stored_total: prefer amount, fall back to total_cents/100
+        # Both `amount` and `total_cents` are stored in cents — divide by 100
         stored_total: Optional[float] = None
         if amount is not None:
             try:
-                stored_total = float(amount)
+                stored_total = round(float(amount) / 100.0, 2)
             except (TypeError, ValueError):
                 stored_total = None
         if stored_total is None and total_cents is not None:
@@ -350,10 +351,11 @@ async def audit_single_order_total(
         line_rows = []
 
     # Compute totals
+    # Both `amount` and `total_cents` are stored in cents — divide by 100
     stored_total: Optional[float] = None
     if amount is not None:
         try:
-            stored_total = float(amount)
+            stored_total = round(float(amount) / 100.0, 2)
         except (TypeError, ValueError):
             stored_total = None
     if stored_total is None and total_cents is not None:

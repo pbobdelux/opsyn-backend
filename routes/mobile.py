@@ -221,12 +221,13 @@ async def _query_orders_paginated(
         item = make_json_safe(raw_item)
 
         # Resolve stored_total: prefer amount, fall back to total_cents / 100
+        # Both `amount` and `total_cents` are stored in cents — divide by 100
         stored_total: Optional[float] = None
         _amount = raw_item.get("amount")
         _total_cents = raw_item.get("total_cents")
         if _amount is not None:
             try:
-                stored_total = float(_amount)
+                stored_total = round(float(_amount) / 100.0, 2)
             except (TypeError, ValueError):
                 stored_total = None
         if stored_total is None and _total_cents is not None:

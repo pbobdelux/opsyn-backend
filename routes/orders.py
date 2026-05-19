@@ -671,7 +671,8 @@ async def get_orders(
         # may not exist in the database yet (deferred above).
         def _enrich_order_totals(o) -> dict:
             """Build list-mode order dict with enriched total fields."""
-            _stored = float(o.amount) if o.amount else None
+            # `o.amount` and `o.total_cents` are stored in cents — divide by 100
+            _stored = round(float(o.amount) / 100.0, 2) if o.amount else None
             if _stored is None and o.total_cents is not None:
                 try:
                     _stored = round(int(o.total_cents) / 100.0, 2)
@@ -712,7 +713,7 @@ async def get_orders(
                 "order_number": o.order_number,
                 "customer_name": o.customer_name,
                 "status": o.status,
-                "amount": float(o.amount) if o.amount else 0,
+                "amount": round(float(o.amount) / 100.0, 2) if o.amount else 0,
                 # Total fields — enriched for accurate UI display
                 "stored_total": _stored,
                 "derived_lines_total": _derived,
