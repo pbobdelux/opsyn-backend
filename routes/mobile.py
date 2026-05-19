@@ -168,7 +168,7 @@ async def _query_orders_paginated(
             updated_at{raw_col}
         FROM orders
         WHERE {where_sql}
-        ORDER BY created_at DESC, id DESC
+        ORDER BY external_created_at DESC NULLS LAST, created_at DESC, id DESC
         LIMIT :fetch_limit
         OFFSET :offset
     """)
