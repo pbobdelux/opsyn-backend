@@ -126,7 +126,7 @@ async def audit_order_totals(
                     o.amount,
                     o.total_cents,
                     COALESCE(
-                        SUM(ol.quantity * ol.unit_price),
+                        SUM(ol.quantity * ol.unit_price / 100.0),
                         0
                     ) AS derived_lines_total,
                     COUNT(ol.id) AS line_item_count
@@ -369,17 +369,33 @@ async def audit_single_order_total(
     for line_row in line_rows:
         line_id, sku, product_name, quantity, unit_price, total_price = line_row
         qty = int(quantity or 0)
-        up = float(unit_price or 0)
-        tp = float(total_price or 0) if total_price else round(qty * up, 2)
-        derived_lines_total += tp
+        # unit_price and total_price are stored in cents — divide by 100
+        raw_up = float(unit_price or 0)
+        raw_tp = float(total_price or 0) if total_price is not None else None
+        scaled_up = raw_up / 100.0
+        scaled_tp = (raw_tp / 100.0) if raw_tp is not None else round(qty * scaled_up, 2)
+        contribution = scaled_tp
+        derived_lines_total += contribution
+        logger.info(
+            "[ORDER_LINE_PRICE_SCALE_AUDIT] order_id=%s line_id=%s"
+            " raw_unit_price=%s scaled_unit_price=%s"
+            " raw_total_price=%s scaled_total_price=%s quantity=%s",
+            order_id,
+            line_id,
+            raw_up,
+            scaled_up,
+            raw_tp,
+            scaled_tp,
+            qty,
+        )
         line_items.append({
             "id": line_id,
             "sku": sku,
             "product_name": product_name,
             "quantity": qty,
-            "unit_price": up,
-            "total_price": tp,
-            "line_contribution": tp,
+            "unit_price": scaled_up,
+            "total_price": scaled_tp,
+            "line_contribution": contribution,
         })
 
     derived_lines_total = round(derived_lines_total, 2)

@@ -167,7 +167,7 @@ async def _query_orders_paginated(
             o.created_at,
             o.updated_at,
             COALESCE(
-                (SELECT SUM(ol.quantity * ol.unit_price)
+                (SELECT SUM(ol.quantity * ol.unit_price / 100.0)
                  FROM order_lines ol
                  WHERE ol.order_id = o.id),
                 0
@@ -236,7 +236,16 @@ async def _query_orders_paginated(
             except (TypeError, ValueError):
                 stored_total = None
 
+        # derived_lines_total is already scaled to dollars by the SQL subquery (/ 100.0)
         derived = float(raw_item.get("derived_lines_total") or 0)
+
+        logger.debug(
+            "[ORDER_LINE_PRICE_SCALE_AUDIT] order_id=%s"
+            " scaled_derived_lines_total=%s stored_total=%s",
+            raw_item.get("id"),
+            round(derived, 2),
+            stored_total,
+        )
 
         # Compute display_total and total_source
         has_stored = stored_total is not None and stored_total > 0
