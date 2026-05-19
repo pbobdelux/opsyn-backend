@@ -222,7 +222,7 @@ async def health_sync(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
                     (
                         SELECT COUNT(*)
                         FROM sync_dead_letters sdl
-                        WHERE sdl.brand_id = sh.brand_id::uuid
+                        WHERE sdl.brand_id = sh.brand_id
                           AND sdl.resolved_at IS NULL
                     ) AS dead_letter_count,
                     (

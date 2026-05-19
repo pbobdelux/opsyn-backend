@@ -441,7 +441,27 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         )
 
     async with _AsyncSessionLocal() as session:
-        yield session
+        try:
+            yield session
+        except Exception as exc:
+            # Rollback on any unhandled exception so the connection is returned
+            # to the pool in a clean state.  Without this, failed queries leave
+            # the connection in an aborted transaction and the garbage collector
+            # eventually cleans it up — causing pool exhaustion under load.
+            logger.warning(
+                "[DB_SESSION_ROLLBACK] session_id=%s error=%s",
+                id(session),
+                str(exc)[:200],
+            )
+            try:
+                await session.rollback()
+            except Exception as rollback_exc:
+                logger.error(
+                    "[DB_SESSION_ROLLBACK_FAILED] session_id=%s rollback_error=%s",
+                    id(session),
+                    str(rollback_exc)[:200],
+                )
+            raise
 
 
 async def refresh_connection_pool() -> None:
