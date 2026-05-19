@@ -669,14 +669,55 @@ async def get_orders(
         # List mode: headers only with routing fields, no line_items.
         # Use getattr() with safe defaults for dispatch/AR columns that
         # may not exist in the database yet (deferred above).
-        serialized_orders = [
-            {
+        def _enrich_order_totals(o) -> dict:
+            """Build list-mode order dict with enriched total fields."""
+            _stored = float(o.amount) if o.amount else None
+            if _stored is None and o.total_cents is not None:
+                try:
+                    _stored = round(int(o.total_cents) / 100.0, 2)
+                except (TypeError, ValueError):
+                    _stored = None
+
+            # Derive total from loaded line items (if available)
+            _lines = getattr(o, "lines", None) or []
+            try:
+                _derived = round(
+                    sum(
+                        (float(line.quantity or 0)) * (float(line.unit_price or 0))
+                        for line in _lines
+                    ),
+                    2,
+                )
+            except Exception:
+                _derived = 0.0
+
+            _has_stored = _stored is not None and _stored > 0
+            _has_derived = _derived > 0
+            if not _has_stored and not _has_derived:
+                _display = 0.0
+                _source = "unknown"
+            elif not _has_stored:
+                _display = _derived
+                _source = "derived_lines"
+            elif _has_derived and _stored < (_derived * 0.5):
+                _display = _derived
+                _source = "derived_lines"
+            else:
+                _display = round(_stored, 2)
+                _source = "stored"
+
+            return {
                 "id": o.id,
                 "external_id": o.external_order_id,
                 "order_number": o.order_number,
                 "customer_name": o.customer_name,
                 "status": o.status,
                 "amount": float(o.amount) if o.amount else 0,
+                # Total fields — enriched for accurate UI display
+                "stored_total": _stored,
+                "derived_lines_total": _derived,
+                "display_total": _display,
+                "total_source": _source,
                 "item_count": o.item_count,
                 "unit_count": o.unit_count,
                 "review_status": o.review_status or "ok",
@@ -706,8 +747,8 @@ async def get_orders(
                 "invoice_number": _safe_col(o, "invoice_number"),
                 "ar_note": _safe_col(o, "ar_note"),
             }
-            for o in orders
-        ]
+
+        serialized_orders = [_enrich_order_totals(o) for o in orders]
 
     logger.info(
         "[OrdersAPI] returned org_id=%s brand_id=%s count=%s total_in_db=%s latest_order_date=%s",
