@@ -679,16 +679,34 @@ async def get_orders(
                 except (TypeError, ValueError):
                     _stored = None
 
-            # Derive total from loaded line items (if available)
+            # Derive total from loaded line items (if available).
+            # unit_price and total_price are stored in cents — divide by 100.
             _lines = getattr(o, "lines", None) or []
             try:
-                _derived = round(
-                    sum(
-                        (float(line.quantity or 0)) * (float(line.unit_price or 0))
-                        for line in _lines
-                    ),
-                    2,
-                )
+                _line_contributions = []
+                for line in _lines:
+                    qty = float(line.quantity or 0)
+                    raw_up = float(line.unit_price or 0)
+                    raw_tp = line.total_price
+                    scaled_up = raw_up / 100.0
+                    if raw_tp is not None:
+                        contribution = float(raw_tp) / 100.0
+                    else:
+                        contribution = qty * scaled_up
+                    _line_contributions.append(contribution)
+                    logger.debug(
+                        "[ORDER_LINE_PRICE_SCALE_AUDIT] order_id=%s line_id=%s"
+                        " raw_unit_price=%s scaled_unit_price=%s"
+                        " raw_total_price=%s scaled_total_price=%s quantity=%s",
+                        o.id,
+                        line.id,
+                        raw_up,
+                        scaled_up,
+                        raw_tp,
+                        float(raw_tp) / 100.0 if raw_tp is not None else None,
+                        qty,
+                    )
+                _derived = round(sum(_line_contributions), 2)
             except Exception:
                 _derived = 0.0
 

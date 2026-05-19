@@ -159,14 +159,29 @@ def cents_to_amount(cents: int | None) -> float | None:
 
 
 def serialize_line(line: OrderLine) -> dict[str, Any]:
-    unit_price = money_to_float(line.unit_price)
-    total_price = money_to_float(line.total_price)
+    # unit_price and total_price are stored in cents in the DB — divide by 100
+    raw_unit_price = money_to_float(line.unit_price)
+    raw_total_price = money_to_float(line.total_price)
 
-    if unit_price is None and line.unit_price_cents is not None:
-        unit_price = cents_to_amount(line.unit_price_cents)
+    if raw_unit_price is None and line.unit_price_cents is not None:
+        raw_unit_price = money_to_float(line.unit_price_cents)
 
-    if total_price is None and line.total_price_cents is not None:
-        total_price = cents_to_amount(line.total_price_cents)
+    if raw_total_price is None and line.total_price_cents is not None:
+        raw_total_price = money_to_float(line.total_price_cents)
+
+    unit_price = round(raw_unit_price / 100.0, 4) if raw_unit_price is not None else None
+    total_price = round(raw_total_price / 100.0, 2) if raw_total_price is not None else None
+
+    logger.debug(
+        "[ORDER_LINE_PRICE_SCALE_AUDIT] line_id=%s raw_unit_price=%s scaled_unit_price=%s"
+        " raw_total_price=%s scaled_total_price=%s quantity=%s",
+        line.id,
+        raw_unit_price,
+        unit_price,
+        raw_total_price,
+        total_price,
+        line.quantity,
+    )
 
     return {
         "id": line.id,
@@ -183,14 +198,28 @@ def serialize_line(line: OrderLine) -> dict[str, Any]:
 
 def serialize_json_line(item: dict[str, Any]) -> dict[str, Any]:
     quantity = item.get("quantity") or item.get("qty") or 0
-    unit_price = item.get("unit_price")
-    total_price = item.get("total_price")
+    raw_unit_price = item.get("unit_price")
+    raw_total_price = item.get("total_price")
 
-    if unit_price is None and item.get("unit_price_cents") is not None:
-        unit_price = cents_to_amount(item.get("unit_price_cents"))
+    if raw_unit_price is None and item.get("unit_price_cents") is not None:
+        raw_unit_price = money_to_float(item.get("unit_price_cents"))
 
-    if total_price is None and item.get("total_price_cents") is not None:
-        total_price = cents_to_amount(item.get("total_price_cents"))
+    if raw_total_price is None and item.get("total_price_cents") is not None:
+        raw_total_price = money_to_float(item.get("total_price_cents"))
+
+    # unit_price and total_price in JSON blobs are also stored in cents — divide by 100
+    unit_price = round(float(raw_unit_price) / 100.0, 4) if raw_unit_price is not None else None
+    total_price = round(float(raw_total_price) / 100.0, 2) if raw_total_price is not None else None
+
+    logger.debug(
+        "[ORDER_LINE_PRICE_SCALE_AUDIT] line_id=json_line raw_unit_price=%s scaled_unit_price=%s"
+        " raw_total_price=%s scaled_total_price=%s quantity=%s",
+        raw_unit_price,
+        unit_price,
+        raw_total_price,
+        total_price,
+        quantity,
+    )
 
     return {
         "id": None,
@@ -521,16 +550,31 @@ def serialize_order(order: Order) -> dict[str, Any]:
     except Exception:
         unit_count = 0
 
-    # Compute derived_lines_total, display_total, and total_source
-    # derived_lines_total = SUM(quantity * unit_price) from line_items
+    # Compute derived_lines_total, display_total, and total_source.
+    # unit_price and total_price are already scaled to dollars by serialize_line /
+    # serialize_json_line — no further /100 needed here.
     try:
-        derived_lines_total = round(
-            sum(
-                (item.get("quantity") or 0) * (item.get("unit_price") or 0)
-                for item in line_items
-            ),
-            2,
-        )
+        _line_contributions = []
+        for item in line_items:
+            qty = item.get("quantity") or 0
+            up = item.get("unit_price") or 0
+            tp = item.get("total_price")
+            # Prefer total_price when available; fall back to quantity * unit_price
+            contribution = float(tp) if tp is not None else float(qty) * float(up)
+            _line_contributions.append(contribution)
+            logger.debug(
+                "[ORDER_LINE_PRICE_SCALE_AUDIT] order_id=%s line_id=%s"
+                " raw_unit_price=%s scaled_unit_price=%s"
+                " raw_total_price=%s scaled_total_price=%s quantity=%s",
+                getattr(order, "id", "unknown"),
+                item.get("id"),
+                item.get("unit_price"),
+                up,
+                item.get("total_price"),
+                tp,
+                qty,
+            )
+        derived_lines_total = round(sum(_line_contributions), 2)
     except Exception:
         derived_lines_total = 0.0
 
@@ -848,15 +892,30 @@ async def get_order_detail(order_id: str, db: AsyncSession = Depends(get_db)):
     item_count = order.item_count if order.item_count is not None else len(line_items)
     unit_count = order.unit_count if order.unit_count is not None else sum((item.get("quantity") or 0) for item in line_items)
 
-    # Compute derived_lines_total, display_total, and total_source for detail view
+    # Compute derived_lines_total, display_total, and total_source for detail view.
+    # unit_price and total_price are already scaled to dollars by serialize_line /
+    # serialize_json_line — no further /100 needed here.
     try:
-        _detail_derived = round(
-            sum(
-                (item.get("quantity") or 0) * (item.get("unit_price") or 0)
-                for item in line_items
-            ),
-            2,
-        )
+        _detail_line_contributions = []
+        for item in line_items:
+            qty = item.get("quantity") or 0
+            up = item.get("unit_price") or 0
+            tp = item.get("total_price")
+            contribution = float(tp) if tp is not None else float(qty) * float(up)
+            _detail_line_contributions.append(contribution)
+            logger.info(
+                "[ORDER_LINE_PRICE_SCALE_AUDIT] order_id=%s line_id=%s"
+                " raw_unit_price=%s scaled_unit_price=%s"
+                " raw_total_price=%s scaled_total_price=%s quantity=%s",
+                order_id,
+                item.get("id"),
+                item.get("unit_price"),
+                up,
+                item.get("total_price"),
+                tp,
+                qty,
+            )
+        _detail_derived = round(sum(_detail_line_contributions), 2)
     except Exception:
         _detail_derived = 0.0
 
