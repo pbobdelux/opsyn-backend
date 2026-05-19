@@ -519,6 +519,37 @@ def serialize_order(order: Order) -> dict[str, Any]:
     except Exception:
         unit_count = 0
 
+    # Compute derived_lines_total, display_total, and total_source
+    # derived_lines_total = SUM(quantity * unit_price) from line_items
+    try:
+        derived_lines_total = round(
+            sum(
+                (item.get("quantity") or 0) * (item.get("unit_price") or 0)
+                for item in line_items
+            ),
+            2,
+        )
+    except Exception:
+        derived_lines_total = 0.0
+
+    stored_total = amount  # already resolved above
+    _has_stored = stored_total is not None and stored_total > 0
+    _has_derived = derived_lines_total > 0
+    if not _has_stored and not _has_derived:
+        display_total = 0.0
+        total_source = "unknown"
+    elif not _has_stored:
+        display_total = derived_lines_total
+        total_source = "derived_lines"
+    elif _has_derived and stored_total < (derived_lines_total * 0.5):
+        # Stored total is less than 50% of derived — likely stale or wrong field
+        display_total = derived_lines_total
+        total_source = "derived_lines"
+    else:
+        display_total = round(stored_total, 2)
+        total_source = "stored"
+
+
     blockers = derive_blockers(line_items)
     review_status = derive_review_status(line_items, blockers, order)
     sync_health = compute_sync_health(order, line_items)
@@ -584,6 +615,11 @@ def serialize_order(order: Order) -> dict[str, Any]:
         "customer_name": customer_name,
         "status": status,
         "amount": amount,
+        # Total fields — enriched for accurate UI display
+        "stored_total": stored_total,
+        "derived_lines_total": derived_lines_total,
+        "display_total": display_total,
+        "total_source": total_source,
         "item_count": item_count,
         "unit_count": unit_count,
         "line_items": line_items,
@@ -808,6 +844,46 @@ async def get_order_detail(order_id: str, db: AsyncSession = Depends(get_db)):
     item_count = order.item_count if order.item_count is not None else len(line_items)
     unit_count = order.unit_count if order.unit_count is not None else sum((item.get("quantity") or 0) for item in line_items)
 
+    # Compute derived_lines_total, display_total, and total_source for detail view
+    try:
+        _detail_derived = round(
+            sum(
+                (item.get("quantity") or 0) * (item.get("unit_price") or 0)
+                for item in line_items
+            ),
+            2,
+        )
+    except Exception:
+        _detail_derived = 0.0
+
+    _detail_stored = amount
+    _detail_has_stored = _detail_stored is not None and _detail_stored > 0
+    _detail_has_derived = _detail_derived > 0
+    if not _detail_has_stored and not _detail_has_derived:
+        _detail_display = 0.0
+        _detail_source = "unknown"
+    elif not _detail_has_stored:
+        _detail_display = _detail_derived
+        _detail_source = "derived_lines"
+    elif _detail_has_derived and _detail_stored < (_detail_derived * 0.5):
+        _detail_display = _detail_derived
+        _detail_source = "derived_lines"
+    else:
+        _detail_display = round(_detail_stored, 2)
+        _detail_source = "stored"
+
+    logger.info(
+        "[ORDER_TOTAL_AUDIT] order_id=%s external_order_id=%s "
+        "stored_total=%s derived_lines_total=%s delta=%s total_source=%s line_item_count=%d",
+        order_id,
+        order.external_order_id,
+        _detail_stored,
+        _detail_derived,
+        round((_detail_stored or 0) - _detail_derived, 2),
+        _detail_source,
+        len(line_items),
+    )
+
     blockers = derive_blockers(line_items)
     review_status = derive_review_status(line_items, blockers, order)
 
@@ -852,6 +928,11 @@ async def get_order_detail(order_id: str, db: AsyncSession = Depends(get_db)):
             "customer_name": order.customer_name,
             "status": order.status,
             "amount": amount,
+            # Total fields — enriched for accurate UI display
+            "stored_total": _detail_stored,
+            "derived_lines_total": _detail_derived,
+            "display_total": _detail_display,
+            "total_source": _detail_source,
             "item_count": item_count,
             "unit_count": unit_count,
             "line_items": line_items,

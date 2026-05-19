@@ -144,34 +144,41 @@ async def _query_orders_paginated(
 
     main_sql = text(f"""
         SELECT
-            id,
-            brand_id,
-            external_order_id,
-            order_number,
-            customer_name,
-            status,
-            total_cents,
-            amount,
-            item_count,
-            unit_count,
-            line_items_json,
-            source,
-            review_status,
-            sync_status,
-            delivery_status,
-            payment_status,
-            external_created_at,
-            external_updated_at,
-            synced_at,
-            last_synced_at,
-            created_at,
-            updated_at{raw_col}
-        FROM orders
+            o.id,
+            o.brand_id,
+            o.external_order_id,
+            o.order_number,
+            o.customer_name,
+            o.status,
+            o.total_cents,
+            o.amount,
+            o.item_count,
+            o.unit_count,
+            o.line_items_json,
+            o.source,
+            o.review_status,
+            o.sync_status,
+            o.delivery_status,
+            o.payment_status,
+            o.external_created_at,
+            o.external_updated_at,
+            o.synced_at,
+            o.last_synced_at,
+            o.created_at,
+            o.updated_at,
+            COALESCE(
+                (SELECT SUM(ol.quantity * ol.unit_price)
+                 FROM order_lines ol
+                 WHERE ol.order_id = o.id),
+                0
+            ) AS derived_lines_total{(",\n                    o.raw_payload") if include_raw else ""}
+        FROM orders o
         WHERE {where_sql}
-        ORDER BY external_created_at DESC NULLS LAST, created_at DESC, id DESC
+        ORDER BY o.external_created_at DESC NULLS LAST, o.created_at DESC, o.id DESC
         LIMIT :fetch_limit
         OFFSET :offset
     """)
+
 
     t_query = time.monotonic()
     rows_result = await db.execute(main_sql, params)
@@ -193,7 +200,7 @@ async def _query_orders_paginated(
     total_count = count_result.scalar() or 0
     count_ms = round((time.monotonic() - t_count) * 1000)
 
-    # Serialise rows
+    # Serialise rows — include derived_lines_total from the subquery
     base_keys = [
         "id", "brand_id", "external_order_id", "order_number",
         "customer_name", "status", "total_cents", "amount",
@@ -201,11 +208,57 @@ async def _query_orders_paginated(
         "review_status", "sync_status", "delivery_status",
         "payment_status", "external_created_at", "external_updated_at",
         "synced_at", "last_synced_at", "created_at", "updated_at",
+        "derived_lines_total",
     ]
     if include_raw:
         base_keys.append("raw_payload")
 
-    items = [make_json_safe(dict(zip(base_keys, row))) for row in rows]
+    raw_items = [dict(zip(base_keys, row)) for row in rows]
+
+    # Enrich each item with display_total and total_source
+    items = []
+    for raw_item in raw_items:
+        item = make_json_safe(raw_item)
+
+        # Resolve stored_total: prefer amount, fall back to total_cents / 100
+        stored_total: Optional[float] = None
+        _amount = raw_item.get("amount")
+        _total_cents = raw_item.get("total_cents")
+        if _amount is not None:
+            try:
+                stored_total = float(_amount)
+            except (TypeError, ValueError):
+                stored_total = None
+        if stored_total is None and _total_cents is not None:
+            try:
+                stored_total = round(int(_total_cents) / 100.0, 2)
+            except (TypeError, ValueError):
+                stored_total = None
+
+        derived = float(raw_item.get("derived_lines_total") or 0)
+
+        # Compute display_total and total_source
+        has_stored = stored_total is not None and stored_total > 0
+        has_derived = derived > 0
+        if not has_stored and not has_derived:
+            display_total = 0.0
+            total_source = "unknown"
+        elif not has_stored:
+            display_total = round(derived, 2)
+            total_source = "derived_lines"
+        elif has_derived and stored_total < (derived * 0.5):
+            # Stored total is less than 50% of derived — likely stale or wrong field
+            display_total = round(derived, 2)
+            total_source = "derived_lines"
+        else:
+            display_total = round(stored_total, 2)
+            total_source = "stored"
+
+        item["stored_total"] = stored_total
+        item["derived_lines_total"] = round(derived, 2)
+        item["display_total"] = display_total
+        item["total_source"] = total_source
+        items.append(item)
 
     # Build next_cursor for the next page
     next_cursor: Optional[str] = None
