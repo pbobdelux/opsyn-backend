@@ -5,7 +5,8 @@ from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, cast, func, or_, select
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -541,13 +542,23 @@ async def validate_crm_access(
     resolved_org = org_lookup.get("organization")
     resolved_org_id = str(resolved_org.id)
 
-    # Validate brand exists and belongs to org
-    brand_result = await db.execute(
-        select(Brand).where(
-            and_(Brand.id == brand_id, Brand.org_id == resolved_org_id)
+    # Validate brand exists and belongs to org.
+    # Brand.id and Brand.org_id are UUID columns — cast string params to UUID
+    # to avoid "operator does not exist: uuid = character varying" errors.
+    try:
+        brand_result = await db.execute(
+            select(Brand).where(
+                and_(
+                    Brand.id == cast(brand_id, PG_UUID(as_uuid=False)),
+                    Brand.org_id == cast(resolved_org_id, PG_UUID(as_uuid=False)),
+                )
+            )
         )
-    )
-    brand = brand_result.scalar_one_or_none()
+        brand = brand_result.scalar_one_or_none()
+    except Exception as exc:
+        logger.error("[CRM] brand_lookup_error brand_id=%s org_id=%s error=%s", brand_id, resolved_org_id, exc)
+        await db.rollback()
+        return {"ok": False, "error": "Database error during brand validation"}
 
     if not brand:
         logger.warning("[CRM] brand_not_found brand_id=%s org_id=%s", brand_id, resolved_org_id)
